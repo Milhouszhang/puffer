@@ -26,6 +26,52 @@ fn todo_write_rejects_multiple_in_progress_items() {
 }
 
 #[test]
+fn todo_write_emits_verification_nudge_for_main_thread_completion() {
+    let mut state = temp_state();
+    let cwd = state.cwd.clone();
+    let output = crate::runtime::claude_tools::workflow::todo_write::execute_todo_write(
+        &mut state,
+        &cwd,
+        json!({
+            "todos": [
+                {"content": "Ship feature", "status": "completed", "activeForm": "Shipping feature"},
+                {"content": "Run tests", "status": "completed", "activeForm": "Running tests"},
+                {"content": "Write summary", "status": "completed", "activeForm": "Writing summary"}
+            ]
+        }),
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(parsed["verificationNudgeNeeded"], true);
+    assert!(parsed["note"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("subagent_type=\"verification\""));
+}
+
+#[test]
+fn todo_write_skips_verification_nudge_for_team_context() {
+    let mut state = temp_state();
+    state.active_team_name = Some("alpha-team".to_string());
+    let cwd = state.cwd.clone();
+    let output = crate::runtime::claude_tools::workflow::todo_write::execute_todo_write(
+        &mut state,
+        &cwd,
+        json!({
+            "todos": [
+                {"content": "Ship feature", "status": "completed", "activeForm": "Shipping feature"},
+                {"content": "Run tests", "status": "completed", "activeForm": "Running tests"},
+                {"content": "Write summary", "status": "completed", "activeForm": "Writing summary"}
+            ]
+        }),
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(parsed["verificationNudgeNeeded"], false);
+    assert!(parsed["note"].is_null());
+}
+
+#[test]
 fn config_tool_supports_editor_mode() {
     let mut state = temp_state();
     let cwd = state.cwd.clone();
@@ -469,6 +515,100 @@ fn task_update_sets_timestamps_for_progress() {
     assert_eq!(task["status"], "in_progress");
     assert!(task["started_at_ms"].is_number());
     assert!(task["updated_at_ms"].is_number());
+}
+
+#[test]
+fn task_update_emits_verification_nudge_when_last_visible_task_completes() {
+    let mut state = temp_state();
+    let cwd = state.cwd.clone();
+    let mut task_ids = Vec::new();
+    for subject in ["Ship feature", "Run tests", "Write summary"] {
+        let created = crate::runtime::claude_tools::workflow::task_create::execute_task_create(
+            &mut state,
+            &cwd,
+            json!({
+                "subject": subject,
+                "description": subject
+            }),
+        )
+        .unwrap();
+        let created: Value = serde_json::from_str(&created).unwrap();
+        task_ids.push(created["task"]["id"].as_str().unwrap().to_string());
+    }
+
+    for task_id in &task_ids[0..2] {
+        crate::runtime::claude_tools::workflow::task_update::execute_task_update(
+            &mut state,
+            &cwd,
+            json!({
+                "taskId": task_id,
+                "status": "completed"
+            }),
+        )
+        .unwrap();
+    }
+
+    let output = crate::runtime::claude_tools::workflow::task_update::execute_task_update(
+        &mut state,
+        &cwd,
+        json!({
+            "taskId": task_ids[2],
+            "status": "completed"
+        }),
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(parsed["verificationNudgeNeeded"], true);
+    assert!(parsed["note"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("subagent_type=\"verification\""));
+}
+
+#[test]
+fn task_update_skips_verification_nudge_for_team_context() {
+    let mut state = temp_state();
+    state.active_team_name = Some("alpha-team".to_string());
+    let cwd = state.cwd.clone();
+    let mut task_ids = Vec::new();
+    for subject in ["Ship feature", "Run tests", "Write summary"] {
+        let created = crate::runtime::claude_tools::workflow::task_create::execute_task_create(
+            &mut state,
+            &cwd,
+            json!({
+                "subject": subject,
+                "description": subject
+            }),
+        )
+        .unwrap();
+        let created: Value = serde_json::from_str(&created).unwrap();
+        task_ids.push(created["task"]["id"].as_str().unwrap().to_string());
+    }
+
+    let mut last_output = None;
+    for task_id in task_ids {
+        last_output = Some(
+            crate::runtime::claude_tools::workflow::task_update::execute_task_update(
+                &mut state,
+                &cwd,
+                json!({
+                    "taskId": task_id,
+                    "status": "completed"
+                }),
+            )
+            .unwrap(),
+        );
+    }
+
+    let parsed: Value = serde_json::from_str(&last_output.unwrap()).unwrap();
+    assert_eq!(parsed["verificationNudgeNeeded"], false);
+    assert!(parsed["note"].is_null());
+
+    let tasks_path = ConfigPaths::discover(&cwd)
+        .workspace_config_dir
+        .join("runtime/claude_workflow/tasks.json");
+    let persisted: Value = serde_json::from_str(&fs::read_to_string(tasks_path).unwrap()).unwrap();
+    assert_eq!(persisted["tasks"].as_array().unwrap().len(), 3);
 }
 
 #[test]

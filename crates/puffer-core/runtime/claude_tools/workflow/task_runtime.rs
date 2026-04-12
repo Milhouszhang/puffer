@@ -2,6 +2,7 @@ use super::store::{
     load_store, now_ms, process_is_running, save_store, tasks_path, StoredTask, StoredTodo,
     TaskStore, TodoInputItem,
 };
+use crate::{AppState, MessageRole};
 use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
 use serde_json::Value;
@@ -112,6 +113,15 @@ pub(super) fn should_emit_verification_nudge_for_tasks(tasks: &[StoredTask]) -> 
         && !visible
             .iter()
             .any(|task| contains_verification_marker(&task.subject))
+}
+
+/// Returns true when the current runtime context belongs to a nested subagent.
+pub(super) fn is_subagent_context(state: &AppState) -> bool {
+    state.transcript.first().is_some_and(|message| {
+        message.role == MessageRole::System
+            && (message.text.contains("You are a coding subagent")
+                || message.text.contains("You are a verification specialist"))
+    })
 }
 
 /// Captures child-process output together with timeout state.

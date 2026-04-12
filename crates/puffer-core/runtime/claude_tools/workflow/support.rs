@@ -3,15 +3,14 @@ use super::store::{
     find_team_for_session, git_ahead_count, git_dirty, git_head_commit, git_toplevel, is_git_repo,
     load_store, messages_path, next_task_id, now_ms, register_team_member,
     remove_claude_team_artifacts, resolve_recipients, save_store, shutdown_requests_path,
-    task_output_path, tasks_path, team_lead_agent_id, teams_path, todos_path,
-    validate_ask_user_questions, workflow_root, worktrees_path, write_claude_team_file, AgentInput,
-    AgentStore, AskUserQuestionInput, ClaudeTeamFile, ClaudeTeamMember, ConfigInput,
-    EnterWorktreeInput, ExitWorktreeInput, MessageStore, PendingShutdownRequest, PowerShellInput,
-    SendMessageInput, ShutdownRequestStore, StoredAgent, StoredMessage, StoredTask, StoredTeam,
-    StoredTodo, StoredWorktree, TaskStore, TeamCreateInput, TeamStore, TodoStore, TodoWriteInput,
-    WorktreeStore,
+    task_output_path, tasks_path, team_lead_agent_id, teams_path, validate_ask_user_questions,
+    workflow_root, worktrees_path, write_claude_team_file, AgentInput, AgentStore,
+    AskUserQuestionInput, ClaudeTeamFile, ClaudeTeamMember, ConfigInput, EnterWorktreeInput,
+    ExitWorktreeInput, MessageStore, PendingShutdownRequest, PowerShellInput, SendMessageInput,
+    ShutdownRequestStore, StoredAgent, StoredMessage, StoredTask, StoredTeam, StoredWorktree,
+    TaskStore, TeamCreateInput, TeamStore, WorktreeStore,
 };
-use super::task_runtime::{terminal_task_status, validate_todos, wait_for_child_output};
+use super::task_runtime::{terminal_task_status, wait_for_child_output};
 use crate::config_settings::{
     config_setting_path, config_setting_scope, get_config_value, persist_config_setting,
     scope_label, set_config_value,
@@ -615,33 +614,6 @@ pub(super) fn execute_team_delete(
         "success": true,
         "message": format!("Cleaned up directories and worktrees for team \"{}\"", team.team_name),
         "team_name": team.team_name,
-    }))?)
-}
-
-/// Executes the live `TodoWrite` workflow tool.
-pub(super) fn execute_todo_write(
-    state: &mut AppState,
-    _cwd: &Path,
-    input: Value,
-) -> Result<String> {
-    let parsed: TodoWriteInput =
-        serde_json::from_value(input).context("invalid TodoWrite input")?;
-    validate_todos(&parsed.todos)?;
-    let mut store = load_store::<TodoStore>(&todos_path(state.session.cwd.as_path()))?;
-    let old = store.todos.clone();
-    store.todos = parsed
-        .todos
-        .into_iter()
-        .map(|todo| StoredTodo {
-            content: todo.content,
-            status: todo.status,
-            active_form: todo.active_form,
-        })
-        .collect();
-    save_store(&todos_path(state.session.cwd.as_path()), &store)?;
-    Ok(serde_json::to_string_pretty(&json!({
-        "oldTodos": old,
-        "newTodos": store.todos
     }))?)
 }
 

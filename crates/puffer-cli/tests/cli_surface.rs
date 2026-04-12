@@ -240,6 +240,26 @@ fn mcp_round_trip_add_get_list_remove() {
 }
 
 #[test]
+fn mcp_reset_project_choices_clears_workspace_enablement_state() {
+    let (_tempdir, workspace, puffer_home) = configured_workspace();
+    let paths = ConfigPaths::discover(&workspace);
+    let state_path = paths.workspace_config_dir.join("mcp_servers.toml");
+    fs::write(&state_path, "disabled = [\"demo\"]\n").expect("mcp enablement");
+
+    let reset = run_puffer(&workspace, &puffer_home, &["mcp", "reset-project-choices"]);
+    assert!(reset.status.success(), "{reset:?}");
+    let reset_text = String::from_utf8_lossy(&reset.stdout);
+    assert!(
+        reset_text.contains("Reset project-scoped MCP enablement choices."),
+        "{reset_text}"
+    );
+    assert!(
+        !state_path.exists(),
+        "expected {state_path:?} to be removed"
+    );
+}
+
+#[test]
 fn plugin_round_trip_install_disable_enable_validate_uninstall() {
     let (tempdir, workspace, puffer_home) = configured_workspace();
     let manifest_path = tempdir.path().join("demo-plugin.yaml");

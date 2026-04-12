@@ -127,15 +127,22 @@ pub(crate) fn run_mcp_command(
             Ok(())
         }
         McpCommand::Remove { name, scope } => remove_mcp_server(paths, scope, &name),
-        McpCommand::ResetProjectChoices => {
-            println!("Puffer does not persist project MCP approval state yet.");
-            Ok(())
-        }
+        McpCommand::ResetProjectChoices => reset_project_mcp_choices(paths),
         McpCommand::Serve => {
             println!("Puffer does not expose an MCP server bridge yet.");
             Ok(())
         }
     }
+}
+
+fn reset_project_mcp_choices(paths: &ConfigPaths) -> Result<()> {
+    ensure_workspace_dirs(paths)?;
+    let state_path = paths.workspace_config_dir.join("mcp_servers.toml");
+    remove_if_exists(&state_path)?;
+    println!(
+        "Reset project-scoped MCP enablement choices.\nPuffer will use the default MCP state the next time resources load."
+    );
+    Ok(())
 }
 
 /// Handles top-level plugin management commands.

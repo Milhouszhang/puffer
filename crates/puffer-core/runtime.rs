@@ -15,6 +15,7 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+mod agent_memory;
 #[cfg(test)]
 mod agent_runtime_tests;
 mod agents;

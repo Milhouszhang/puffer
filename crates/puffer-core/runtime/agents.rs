@@ -1,5 +1,6 @@
 use crate::agent_catalog::load_agent_resources;
 use crate::plan_mode::enter_plan_mode;
+use crate::runtime::agent_memory::build_agent_memory_section;
 use crate::runtime::claude_tools::workflow::store::{register_team_member, ClaudeTeamMember};
 use crate::tool_names::tool_spec_matches_selector;
 use crate::{AppState, MessageRole};
@@ -319,7 +320,7 @@ fn prepare_agent_execution(
     nested_state.transcript.clear();
     nested_state.push_message(
         MessageRole::System,
-        build_agent_system_prompt(agent_source, &agent.value)?,
+        build_agent_system_prompt(&nested_cwd, agent_source, &agent.value)?,
     );
     let effective_mode = input
         .mode
@@ -903,8 +904,15 @@ fn tool_matches_selector(tool: &ToolSpec, selector: &str) -> bool {
     tool_spec_matches_selector(tool, selector)
 }
 
-fn build_agent_system_prompt(resources: &LoadedResources, agent: &AgentSpec) -> Result<String> {
+pub(super) fn build_agent_system_prompt(
+    cwd: &Path,
+    resources: &LoadedResources,
+    agent: &AgentSpec,
+) -> Result<String> {
     let mut sections = vec![agent.prompt.trim().to_string()];
+    if let Some(memory_section) = build_agent_memory_section(cwd, agent)? {
+        sections.push(memory_section);
+    }
     for skill_name in &agent.skills {
         let Some(skill) = skill_by_name(resources, skill_name) else {
             bail!(

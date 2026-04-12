@@ -434,7 +434,11 @@ pub(crate) enum McpCommand {
         scope: ResourceScope,
     },
     /// Import MCP servers from Claude Desktop.
-    AddFromClaudeDesktop,
+    AddFromClaudeDesktop {
+        /// Configuration scope.
+        #[arg(short = 's', long = "scope", value_enum, default_value_t = ResourceScope::Local)]
+        scope: ResourceScope,
+    },
     /// Get details about one MCP server.
     Get {
         /// Stable MCP server id.
@@ -526,7 +530,7 @@ pub(crate) enum McpTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{Cli, Command, McpCommand, ResourceScope};
     use clap::Parser;
 
     #[test]
@@ -568,5 +572,17 @@ mod tests {
         assert_eq!(cwd.as_deref(), Some("/tmp/demo"));
         assert!(!no_alt_screen);
         assert_eq!(prompt, ["hello", "from", "remote"]);
+    }
+
+    #[test]
+    fn mcp_add_from_desktop_accepts_scope_override() {
+        let cli = Cli::parse_from(["puffer", "mcp", "add-from-claude-desktop", "--scope", "user"]);
+        let Some(Command::Mcp {
+            command: Some(McpCommand::AddFromClaudeDesktop { scope }),
+        }) = cli.subcommand
+        else {
+            panic!("expected mcp add-from-claude-desktop command");
+        };
+        assert_eq!(scope, ResourceScope::User);
     }
 }

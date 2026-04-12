@@ -4,6 +4,7 @@ mod authflow;
 mod benchmark_run;
 mod cli_args;
 mod command_surface;
+mod command_surface_desktop;
 mod desktop_api;
 mod desktop_api_types;
 mod resource_fs;

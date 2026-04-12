@@ -4,6 +4,9 @@ use puffer_resources::{AgentMemoryScope, AgentSpec};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const MAX_AGENT_MEMORY_LINES: usize = 200;
+const MAX_AGENT_MEMORY_BYTES: usize = 25_000;
+
 /// Builds the persistent memory section for one agent when memory is enabled.
 pub(super) fn build_agent_memory_section(cwd: &Path, agent: &AgentSpec) -> Result<Option<String>> {
     let Some(scope) = agent.memory.as_ref() else {
@@ -36,7 +39,7 @@ pub(super) fn build_agent_memory_section(cwd: &Path, agent: &AgentSpec) -> Resul
     if let Ok(content) = fs::read_to_string(&entrypoint) {
         let trimmed = content.trim();
         if !trimmed.is_empty() {
-            lines.push(format!("Current memory:\n{trimmed}"));
+            lines.push(format!("Current memory:\n{}", truncate_memory_content(trimmed)));
         }
     }
 
@@ -75,6 +78,41 @@ fn user_claude_dir(cwd: &Path) -> PathBuf {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| paths.user_config_dir.clone())
         .join(".claude")
+}
+
+fn truncate_memory_content(content: &str) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    let line_truncated = lines.len() > MAX_AGENT_MEMORY_LINES;
+    let byte_truncated = content.len() > MAX_AGENT_MEMORY_BYTES;
+
+    if !line_truncated && !byte_truncated {
+        return content.to_string();
+    }
+
+    let mut truncated = if line_truncated {
+        lines
+            .into_iter()
+            .take(MAX_AGENT_MEMORY_LINES)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        content.to_string()
+    };
+
+    if truncated.len() > MAX_AGENT_MEMORY_BYTES {
+        let cut_at = truncated
+            .char_indices()
+            .take_while(|(index, _)| *index <= MAX_AGENT_MEMORY_BYTES)
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or(MAX_AGENT_MEMORY_BYTES);
+        truncated.truncate(cut_at);
+    }
+
+    truncated.push_str(
+        "\n\n[Agent memory truncated to stay within prompt limits. Keep MEMORY.md concise.]",
+    );
+    truncated
 }
 
 #[cfg(test)]
@@ -130,5 +168,23 @@ mod tests {
 
         assert!(rendered.contains("Persistent Agent Memory"));
         assert!(rendered.contains(".claude/agent-memory/reviewer/MEMORY.md"));
+    }
+
+    #[test]
+    fn build_agent_memory_section_truncates_large_memory_files() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(".claude/agent-memory/reviewer/MEMORY.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let oversized = (0..250)
+            .map(|index| format!("line {index}: remember this detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, oversized).unwrap();
+
+        let rendered = build_agent_memory_section(temp.path(), &agent(AgentMemoryScope::Project))
+            .unwrap()
+            .unwrap();
+
+        assert!(rendered.contains("Agent memory truncated to stay within prompt limits"));
     }
 }

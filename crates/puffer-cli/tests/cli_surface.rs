@@ -240,11 +240,22 @@ fn mcp_round_trip_add_get_list_remove() {
 }
 
 #[test]
-fn mcp_reset_project_choices_clears_workspace_enablement_state() {
+fn mcp_reset_project_choices_clears_workspace_entries_but_keeps_other_disables() {
     let (_tempdir, workspace, puffer_home) = configured_workspace();
     let paths = ConfigPaths::discover(&workspace);
     let state_path = paths.workspace_config_dir.join("mcp_servers.toml");
-    fs::write(&state_path, "disabled = [\"demo\"]\n").expect("mcp enablement");
+    let mcp_dir = paths.workspace_config_dir.join("resources/mcp_servers");
+    fs::create_dir_all(&mcp_dir).expect("workspace mcp dir");
+    fs::write(
+        mcp_dir.join("demo.yaml"),
+        r#"id: demo
+display_name: Demo
+transport: stdio
+target: demo
+"#,
+    )
+    .expect("workspace mcp manifest");
+    fs::write(&state_path, "disabled = [\"demo\", \"docs\"]\n").expect("mcp enablement");
 
     let reset = run_puffer(&workspace, &puffer_home, &["mcp", "reset-project-choices"]);
     assert!(reset.status.success(), "{reset:?}");
@@ -253,6 +264,31 @@ fn mcp_reset_project_choices_clears_workspace_enablement_state() {
         reset_text.contains("Reset project-scoped MCP enablement choices."),
         "{reset_text}"
     );
+    let updated = fs::read_to_string(&state_path).expect("updated mcp enablement");
+    assert!(!updated.contains("demo"), "{updated}");
+    assert!(updated.contains("docs"), "{updated}");
+}
+
+#[test]
+fn mcp_reset_project_choices_removes_enablement_file_when_no_entries_remain() {
+    let (_tempdir, workspace, puffer_home) = configured_workspace();
+    let paths = ConfigPaths::discover(&workspace);
+    let state_path = paths.workspace_config_dir.join("mcp_servers.toml");
+    let mcp_dir = paths.workspace_config_dir.join("resources/mcp_servers");
+    fs::create_dir_all(&mcp_dir).expect("workspace mcp dir");
+    fs::write(
+        mcp_dir.join("demo.yaml"),
+        r#"id: demo
+display_name: Demo
+transport: stdio
+target: demo
+"#,
+    )
+    .expect("workspace mcp manifest");
+    fs::write(&state_path, "disabled = [\"demo\"]\n").expect("mcp enablement");
+
+    let reset = run_puffer(&workspace, &puffer_home, &["mcp", "reset-project-choices"]);
+    assert!(reset.status.success(), "{reset:?}");
     assert!(
         !state_path.exists(),
         "expected {state_path:?} to be removed"

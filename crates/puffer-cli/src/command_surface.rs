@@ -9,6 +9,7 @@ use puffer_core::load_agent_catalog;
 use puffer_provider_registry::{AuthMode, AuthStore, ProviderRegistry};
 use puffer_resources::{LoadedResources, McpServerSpec, PluginSpec, SourceKind};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -138,11 +139,51 @@ pub(crate) fn run_mcp_command(
 fn reset_project_mcp_choices(paths: &ConfigPaths) -> Result<()> {
     ensure_workspace_dirs(paths)?;
     let state_path = paths.workspace_config_dir.join("mcp_servers.toml");
-    remove_if_exists(&state_path)?;
+    if state_path.exists() {
+        let mut enablement: CliMcpEnablement = toml::from_str(&fs::read_to_string(&state_path)?)?;
+        let workspace_selectors = workspace_mcp_selectors(paths)?;
+        enablement
+            .disabled
+            .retain(|selector| !workspace_selectors.contains(&normalize_selector(selector)));
+        if enablement.disabled.is_empty() {
+            remove_if_exists(&state_path)?;
+        } else {
+            fs::write(&state_path, toml::to_string_pretty(&enablement)?)?;
+        }
+    }
     println!(
         "Reset project-scoped MCP enablement choices.\nPuffer will use the default MCP state the next time resources load."
     );
     Ok(())
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct CliMcpEnablement {
+    #[serde(default)]
+    disabled: Vec<String>,
+}
+
+fn workspace_mcp_selectors(paths: &ConfigPaths) -> Result<BTreeSet<String>> {
+    let dir = resource_dir(paths, ResourceScope::Local, "mcp_servers");
+    if !dir.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let mut selectors = BTreeSet::new();
+    for entry in sorted_dir_entries(&dir)? {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("yaml")
+            && path.extension().and_then(|ext| ext.to_str()) != Some("yml")
+        {
+            continue;
+        }
+        let spec: McpServerSpec = serde_yaml::from_str(&fs::read_to_string(&path)?)?;
+        selectors.insert(normalize_selector(&spec.id));
+    }
+    Ok(selectors)
+}
+
+fn normalize_selector(selector: &str) -> String {
+    selector.trim().to_ascii_lowercase()
 }
 
 /// Handles top-level plugin management commands.

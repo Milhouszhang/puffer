@@ -11,7 +11,7 @@ pub(super) fn build_agent_memory_section(cwd: &Path, agent: &AgentSpec) -> Resul
     };
     let entrypoint = agent_memory_entrypoint(cwd, &agent.id, scope);
     if let Some(parent) = entrypoint.parent() {
-        fs::create_dir_all(parent)?;
+        let _ = fs::create_dir_all(parent);
     }
 
     let scope_note = match scope {
@@ -117,5 +117,18 @@ mod tests {
             .unwrap();
 
         assert!(rendered.contains(".claude/agent-memory-local/reviewer/MEMORY.md"));
+    }
+
+    #[test]
+    fn build_agent_memory_section_tolerates_uncreatable_parent() {
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join(".claude"), "occupied").unwrap();
+
+        let rendered = build_agent_memory_section(temp.path(), &agent(AgentMemoryScope::Project))
+            .unwrap()
+            .unwrap();
+
+        assert!(rendered.contains("Persistent Agent Memory"));
+        assert!(rendered.contains(".claude/agent-memory/reviewer/MEMORY.md"));
     }
 }

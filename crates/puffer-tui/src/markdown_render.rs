@@ -277,9 +277,7 @@ where
 
     fn end_heading(&mut self) {
         self.pop_inline_style();
-        // Don't set needs_newline — the heading's ## prefix and bold styling
-        // provide enough visual separation without an extra blank line after it.
-        // Blank lines *before* headings are still added by start_heading.
+        self.needs_newline = true;
     }
 
     fn start_blockquote(&mut self) {
@@ -754,7 +752,7 @@ mod tests {
     #[test]
     fn headings() {
         let text = render_markdown_text("# Heading 1\n## Heading 2\n");
-        assert_eq!(text_lines(&text), vec!["# Heading 1", "## Heading 2"]);
+        assert_eq!(text_lines(&text), vec!["# Heading 1", "", "## Heading 2"]);
     }
 
     #[test]
@@ -790,5 +788,27 @@ mod tests {
         assert_eq!(text_lines(&text), vec!["@@ hdr", "-old", "+new"]);
         assert_ne!(text.lines[0].style, text.lines[1].style);
         assert_ne!(text.lines[1].style, text.lines[2].style);
+    }
+
+    #[test]
+    fn block_spacing_exactly_one_blank_line() {
+        // Every block-level transition should produce exactly 1 blank line.
+        let text = render_markdown_text(
+            "## Heading\n\nParagraph one.\n\nParagraph two.\n\n## Another\n\n- item\n",
+        );
+        assert_eq!(
+            text_lines(&text),
+            vec![
+                "## Heading",
+                "",               // 1 blank line after heading
+                "Paragraph one.",
+                "",               // 1 blank line between paragraphs
+                "Paragraph two.",
+                "",               // 1 blank line before heading
+                "## Another",
+                "",               // 1 blank line before list
+                "- item",
+            ]
+        );
     }
 }

@@ -277,7 +277,9 @@ where
 
     fn end_heading(&mut self) {
         self.pop_inline_style();
-        self.needs_newline = true;
+        // Don't set needs_newline — the heading's ## prefix and bold styling
+        // provide enough visual separation without an extra blank line after it.
+        // Blank lines *before* headings are still added by start_heading.
     }
 
     fn start_blockquote(&mut self) {
@@ -752,7 +754,7 @@ mod tests {
     #[test]
     fn headings() {
         let text = render_markdown_text("# Heading 1\n## Heading 2\n");
-        assert_eq!(text_lines(&text), vec!["# Heading 1", "", "## Heading 2"]);
+        assert_eq!(text_lines(&text), vec!["# Heading 1", "## Heading 2"]);
     }
 
     #[test]

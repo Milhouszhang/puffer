@@ -231,4 +231,25 @@ mod tests {
         assert!(!written.exists());
         assert!(message.contains("Skipped (env unsupported): private"));
     }
+
+    #[test]
+    fn imports_into_user_scope_when_requested() {
+        let tempdir = tempdir().unwrap();
+        let paths = ConfigPaths::discover(tempdir.path());
+        ensure_workspace_dirs(&paths).unwrap();
+        let config_path = tempdir.path().join("claude_desktop_config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"mcpServers":{"docs":{"command":"npx","args":["-y","docs-server"]}}}"#,
+        )
+        .unwrap();
+
+        let message =
+            import_claude_desktop_mcp_servers_from_file(&paths, ResourceScope::User, &config_path)
+                .unwrap();
+
+        let written = paths.user_config_dir.join("resources/mcp_servers/docs.yaml");
+        assert!(written.exists());
+        assert!(message.contains(&paths.user_config_dir.display().to_string()));
+    }
 }

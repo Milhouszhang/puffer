@@ -11,6 +11,11 @@ async function completeStubbedOnboarding(page: Page): Promise<void> {
   await page.getByRole("button", { name: /Next/ }).click();
   await expect(page.getByRole("heading", { name: "Pick your agent provider" })).toBeVisible();
   await page.getByRole("button", { name: /Next/ }).click();
+  await expect(page.getByRole("heading", { name: "Connect AgentEnv" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "AgentEnv account" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Save AgentEnv" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "SSH hosts" })).toHaveCount(0);
+  await page.getByRole("button", { name: /Next/ }).click();
   await expect(page.getByRole("heading", { name: "Connect your tools" })).toBeVisible();
   await page.getByRole("button", { name: /Next/ }).click();
   await expect(page.getByRole("heading", { name: "What may Puffer learn?" })).toBeVisible();
@@ -111,14 +116,17 @@ test("auth-free local provider satisfies onboarding provider requirement", async
   await expect(page.getByLabel("API key for Anthropic")).toHaveCount(0);
 });
 
-test("ready onboarding includes remote execution setup", async ({ page }) => {
+test("onboarding includes AgentEnv remote execution setup", async ({ page }) => {
   await openForcedOnboarding(page);
 
-  await completeStubbedOnboarding(page);
-  await expect(page.getByRole("heading", { name: "Workspace is ready" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Remote Execution" })).toBeVisible();
+  await page.getByRole("button", { name: /Next/ }).click();
+  await expect(page.getByRole("heading", { name: "Pick your agent provider" })).toBeVisible();
+  await page.getByRole("button", { name: /Next/ }).click();
+  await expect(page.getByRole("heading", { name: "Connect AgentEnv" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "AgentEnv account" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Save remote settings" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Save AgentEnv" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "SSH hosts" })).toHaveCount(0);
+  await expect(page.getByText("Advanced AgentEnv settings")).toBeVisible();
 });
 
 test("skip flag does not bypass provider login with only non-agent auth", async ({ page }) => {

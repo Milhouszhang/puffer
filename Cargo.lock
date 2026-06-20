@@ -4564,7 +4564,6 @@ dependencies = [
  "puffer-subscriptions",
  "puffer-tools",
  "puffer-transport-anthropic",
- "puffer-workflow",
  "qrcode",
  "rand 0.8.6",
  "regex",

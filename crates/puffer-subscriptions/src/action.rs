@@ -201,9 +201,9 @@ pub trait Outbound: Send + Sync {
     fn send(&self, platform: &str, target: &str, text: &str) -> Result<String>;
 }
 
-/// Trait for triggering native Puffer workflows from subscription actions.
+/// Trait for triggering workflow runtime actions from subscription events.
 pub trait WorkflowActionRunner: Send + Sync {
-    /// Runs `slug` with `trigger` as the interpolation payload.
+    /// Executes workflow `slug` with `trigger` as the runtime payload.
     fn run_workflow(&self, slug: &str, trigger: serde_json::Value) -> Result<WorkflowActionOutput>;
 
     /// Executes a Puffer tool call from a workflow action.

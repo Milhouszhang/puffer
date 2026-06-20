@@ -1280,6 +1280,15 @@ async fn dispatch_request(
                 crate::daemon_browser_settings::handle_save_browser_settings(&s, &p)
             }))
         }
+        "workflow_backend_get_config" => respond!(detached!(|s| {
+            crate::daemon_workflow_runtime::handle_workflow_backend_get_config(&s)
+        })),
+        "workflow_backend_save_config" => respond!(detached!(|s, p| {
+            crate::daemon_workflow_runtime::handle_workflow_backend_save_config(&s, &p)
+        })),
+        "workflow_backend_test_connection" => respond!(detached!(|s| {
+            crate::daemon_workflow_runtime::handle_workflow_backend_test_connection(&s)
+        })),
         "list_mcp_servers" => respond!(detached!(|s| handle_list_mcp_servers(&s))),
         "add_mcp_server" => respond!(detached!(|s, p| handle_add_mcp_server(&s, &p))),
         "list_lambda_skill_libraries" => {
@@ -1445,10 +1454,24 @@ async fn dispatch_request(
             respond!(detached!(|s, p| handle_install_local_model(&s, &p)))
         }
         "workflow_list" => respond!(crate::daemon_workflows::handle_workflow_list(&state.paths)),
-        "workflow_save" => respond!(crate::daemon_workflows::handle_workflow_save(
-            &state.paths,
-            &params
-        )),
+        "workflow_create" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_create(s.config_paths(), &p)
+        })),
+        "workflow_deploy" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_deploy(s.config_paths(), &p)
+        })),
+        "workflow_execute" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_execute(s.config_paths(), &p)
+        })),
+        "workflow_list_executions" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_list_executions(s.config_paths(), &p)
+        })),
+        "workflow_get_execution" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_get_execution(s.config_paths(), &p)
+        })),
+        "workflow_open_ui" => respond!(detached!(|s| {
+            crate::daemon_workflow_runtime::handle_workflow_open_ui(&s)
+        })),
         "workflow_binding_create" => respond!(
             crate::daemon_workflows::handle_workflow_binding_create(&state.paths, &params)
         ),
@@ -1486,15 +1509,6 @@ async fn dispatch_request(
             &state.paths,
             &params
         )),
-        "workflow_runs_list" => respond!(crate::daemon_workflows::handle_workflow_runs_list(
-            &state.paths,
-            &params
-        )),
-        "workflow_run_show" => respond!(crate::daemon_workflows::handle_workflow_run_show(
-            &state.paths,
-            &params
-        )),
-
         "run_agent_turn" => {
             let tx_clone = tx.clone();
             let state_clone = state.clone();

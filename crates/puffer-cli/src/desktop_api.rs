@@ -13,7 +13,6 @@ use puffer_session_store::{
     GitDiffSnapshot, MessageActor, SessionRecord, SessionStore, SessionSummary, TranscriptEvent,
     TranscriptRewrite, TurnBoundaryState,
 };
-use puffer_workflow::WorkflowStore;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -30,6 +29,7 @@ use crate::desktop_api_types::{
     RepoStatusDto, ResourceCountsDto, SanitizedProxyEndpointDto, SecretSummaryDto,
     SecretsSettingsDto, SessionDetailDto, SessionGroupsPageDto, SessionListItemDto,
     SettingsConfigDto, SettingsSessionSummaryDto, SettingsSnapshotDto, TimelineItemDto,
+    WorkflowBackendOptionDto, WorkflowBackendSettingsDto,
 };
 
 /// Runs one hidden desktop JSON command for SSH-backed desktop integrations.
@@ -172,19 +172,14 @@ pub(crate) fn run_desktop_api(
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
         DesktopApiCommand::WorkflowList => {
-            let store = WorkflowStore::new(&paths.workspace_config_dir);
-            println!("{}", serde_json::to_string_pretty(&store.snapshot()?)?);
-        }
-        DesktopApiCommand::WorkflowRunsList { workflow_slug } => {
-            let store = WorkflowStore::new(&paths.workspace_config_dir);
+            let client = crate::daemon_workflow_runtime::workflow_runtime_client(paths, config)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&store.list_runs_for(&workflow_slug)?)?
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "workflows": client.list_workflows()?,
+                    "runs": [],
+                }))?
             );
-        }
-        DesktopApiCommand::WorkflowRunsShow { idx } => {
-            let store = WorkflowStore::new(&paths.workspace_config_dir);
-            println!("{}", serde_json::to_string_pretty(&store.get_run(idx)?)?);
         }
     }
     Ok(())
@@ -431,6 +426,7 @@ pub(crate) fn load_settings_snapshot(
         auth: auth_statuses(auth_store),
         providers: providers.provider_entries().map(provider_summary).collect(),
         browser: browser_settings_dto(paths, config),
+        workflow_backend: workflow_backend_settings_dto(paths, config)?,
         network_proxy: network_proxy_settings_dto(config),
         secrets: secrets_settings_dto(paths)?,
     })
@@ -507,6 +503,59 @@ fn browser_settings_dto(paths: &ConfigPaths, config: &PufferConfig) -> BrowserSe
                 .collect(),
         },
     }
+}
+
+/// Builds the redacted workflow backend settings snapshot for the desktop UI.
+pub(crate) fn workflow_backend_settings_dto(
+    paths: &ConfigPaths,
+    config: &PufferConfig,
+) -> Result<WorkflowBackendSettingsDto> {
+    let mut workflow_backend = config.workflow_backend.clone();
+    workflow_backend.normalize();
+    let store_file = SecretVault::default_path(&paths.user_config_dir);
+    let has_token = if workflow_backend.api_token_secret_id.is_empty() {
+        false
+    } else {
+        SecretVault::list_metadata(&store_file)?
+            .into_iter()
+            .any(|secret| secret.id == workflow_backend.api_token_secret_id)
+    };
+    Ok(WorkflowBackendSettingsDto {
+        mode: workflow_backend.mode,
+        api_url: workflow_backend.api_base_url,
+        ui_url: workflow_backend.frontend_url,
+        workspace_id: workflow_backend.workspace_id,
+        has_token,
+        options: workflow_backend_options(),
+    })
+}
+
+fn workflow_backend_options() -> Vec<WorkflowBackendOptionDto> {
+    use puffer_config::{WorkflowBackendConfig, WorkflowBackendMode};
+
+    vec![
+        WorkflowBackendOptionDto {
+            mode: WorkflowBackendMode::Local,
+            label: "Run locally".to_string(),
+            description: "Runs workflows through a local runtime on this device.".to_string(),
+            api_url: WorkflowBackendConfig::default_api_base_url(WorkflowBackendMode::Local)
+                .to_string(),
+            ui_url: WorkflowBackendConfig::default_frontend_url(WorkflowBackendMode::Local)
+                .to_string(),
+        },
+        WorkflowBackendOptionDto {
+            mode: WorkflowBackendMode::AgentEnvCloud,
+            label: "Run on AgentEnv Cloud".to_string(),
+            description: "Sends required workflow data to AgentEnv Cloud for execution."
+                .to_string(),
+            api_url: WorkflowBackendConfig::default_api_base_url(
+                WorkflowBackendMode::AgentEnvCloud,
+            )
+            .to_string(),
+            ui_url: WorkflowBackendConfig::default_frontend_url(WorkflowBackendMode::AgentEnvCloud)
+                .to_string(),
+        },
+    ]
 }
 
 fn secrets_settings_dto(paths: &ConfigPaths) -> Result<SecretsSettingsDto> {

@@ -150,9 +150,9 @@ pub enum ActionSpec {
         #[serde(default)]
         template: Option<String>,
     },
-    /// Trigger a registered native Puffer workflow.
+    /// Trigger a deployed workflow in the configured workflow runtime.
     RunWorkflow {
-        /// Workflow slug to run.
+        /// Workflow id or slug to run.
         slug: String,
     },
     /// Invoke a connector action.

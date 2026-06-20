@@ -8,9 +8,12 @@ mod monitor_ignore_result;
 mod monitor_memory;
 mod monitor_reply_send;
 mod monitor_rules;
+#[cfg(test)]
+mod monitor_snapshot_tests;
 mod monitor_task_complete;
 mod monitor_task_ignore;
 mod planned;
+mod runtime;
 mod task_snapshot;
 
 pub(crate) use binding_delete::handle_workflow_binding_delete;
@@ -22,9 +25,13 @@ pub(crate) use monitor_reply_send::handle_monitor_reply_send;
 pub(crate) use monitor_rules::{handle_monitor_rule_add, handle_monitor_rule_delete};
 pub(crate) use monitor_task_complete::handle_monitor_task_complete;
 pub(crate) use monitor_task_ignore::handle_monitor_task_ignore;
+pub(crate) use runtime::{
+    handle_workflow_create, handle_workflow_deploy, handle_workflow_execute,
+    handle_workflow_get_execution, handle_workflow_list_executions,
+};
 
 use anyhow::{Context, Result};
-use puffer_config::ConfigPaths;
+use puffer_config::{load_config, ConfigPaths};
 use puffer_core::subscription_manager;
 use puffer_subscriptions::{
     connection_subscriber_manifest, connection_workflow_trigger_supported, connector_runtime_hints,
@@ -32,7 +39,6 @@ use puffer_subscriptions::{
     ConnectorTemplate, FilterSpec, SubscriberManifestRoots, TaggedFilterSpec, WorkflowBindingSpec,
     WorkflowBindingStatus,
 };
-use puffer_workflow::{RegisterOptions, WorkflowStore};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -40,8 +46,15 @@ use std::fs;
 
 /// Returns the workflow editor snapshot with connector catalog context.
 pub(crate) fn handle_workflow_list(paths: &ConfigPaths) -> Result<Value> {
-    let store = WorkflowStore::new(&paths.workspace_config_dir);
-    let mut snapshot = serde_json::to_value(store.snapshot()?)?;
+    let (workflows, workflow_error) = match runtime_workflows(paths) {
+        Ok(workflows) => (workflows, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    let mut snapshot = json!({
+        "workflows": workflows,
+        "runs": [],
+        "workflow_error": workflow_error,
+    });
     let ignore_filter_sync_error =
         monitor_task_ignore::sync_monitor_ignore_filters_from_tasks(paths)
             .err()
@@ -59,24 +72,6 @@ pub(crate) fn handle_workflow_list(paths: &ConfigPaths) -> Result<Value> {
                 .unwrap_or(Value::Null),
         );
     }
-    Ok(snapshot)
-}
-
-/// Saves one workflow definition and returns the refreshed editor snapshot.
-pub(crate) fn handle_workflow_save(paths: &ConfigPaths, params: &Value) -> Result<Value> {
-    let workflow = params
-        .get("workflow")
-        .or_else(|| params.get("definition"))
-        .cloned()
-        .context("missing workflow")?;
-    let store = WorkflowStore::new(&paths.workspace_config_dir);
-    store.register_json(workflow, RegisterOptions::default())?;
-    let mut snapshot = serde_json::to_value(store.snapshot()?)?;
-    add_connector_context(paths, &mut snapshot);
-    add_workflow_binding_context(paths, &mut snapshot);
-    add_monitor_task_context(paths, &mut snapshot);
-    monitor_memory::add_monitor_memory_context(paths, &mut snapshot);
-    task_snapshot::add_task_context(paths, &mut snapshot);
     Ok(snapshot)
 }
 
@@ -123,7 +118,7 @@ pub(crate) fn handle_workflow_binding_create(paths: &ConfigPaths, params: &Value
     handle_workflow_list(paths)
 }
 
-/// Toggles a native workflow or subscription workflow binding.
+/// Toggles a workflow binding.
 pub(crate) fn handle_workflow_toggle(paths: &ConfigPaths, params: &Value) -> Result<Value> {
     let slug = params
         .get("slug")
@@ -133,31 +128,11 @@ pub(crate) fn handle_workflow_toggle(paths: &ConfigPaths, params: &Value) -> Res
         .get("enabled")
         .and_then(Value::as_bool)
         .context("missing enabled")?;
-    let store = WorkflowStore::new(&paths.workspace_config_dir);
-    if let Some(mut workflow) = store.get(slug)? {
-        workflow.enabled = enabled;
-        let workflow = store.upsert(workflow)?;
-        if let Ok(manager) = subscription_manager() {
-            let binding_slug = format!("workflow-{}", workflow.slug);
-            if manager.store().get(&binding_slug).is_some() {
-                manager
-                    .store()
-                    .set_status(&binding_slug, workflow_status(enabled))?;
-                manager.refresh_connection_consumers()?;
-            }
-        }
-        return handle_workflow_list(paths);
-    }
     let manager = subscription_manager()?;
     let binding_slug = if manager.store().get(slug).is_some() {
         slug.to_string()
     } else {
-        let native_slug = format!("workflow-{slug}");
-        if manager.store().get(&native_slug).is_some() {
-            native_slug
-        } else {
-            anyhow::bail!("workflow `{slug}` not found");
-        }
+        anyhow::bail!("workflow binding `{slug}` not found");
     };
     manager
         .store()
@@ -166,25 +141,13 @@ pub(crate) fn handle_workflow_toggle(paths: &ConfigPaths, params: &Value) -> Res
     handle_workflow_list(paths)
 }
 
-/// Returns the persisted runs for one workflow slug.
-pub(crate) fn handle_workflow_runs_list(paths: &ConfigPaths, params: &Value) -> Result<Value> {
-    let slug = params
-        .get("workflowSlug")
-        .or_else(|| params.get("workflow_slug"))
-        .and_then(Value::as_str)
-        .context("missing workflowSlug")?;
-    let store = WorkflowStore::new(&paths.workspace_config_dir);
-    Ok(serde_json::to_value(store.list_runs_for(slug)?)?)
-}
-
-/// Returns one persisted workflow run by global index.
-pub(crate) fn handle_workflow_run_show(paths: &ConfigPaths, params: &Value) -> Result<Value> {
-    let idx = params
-        .get("idx")
-        .and_then(Value::as_u64)
-        .context("missing idx")?;
-    let store = WorkflowStore::new(&paths.workspace_config_dir);
-    Ok(serde_json::to_value(store.get_run(idx)?)?)
+fn runtime_workflows(paths: &ConfigPaths) -> Result<Vec<puffer_workflow::WorkflowRuntimeWorkflow>> {
+    let config = load_config(paths).context("load workflow backend config")?;
+    let client = crate::daemon_workflow_runtime::workflow_runtime_client(paths, &config)
+        .context("create workflow runtime client")?;
+    client
+        .list_workflows()
+        .context("list workflows from configured runtime")
 }
 
 fn add_connector_context(paths: &ConfigPaths, snapshot: &mut Value) {
@@ -817,227 +780,6 @@ mod tests {
     }
 
     #[test]
-    fn workflow_snapshot_includes_monitor_tasks() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let paths = ConfigPaths::discover(tempdir.path());
-        let task_path = monitor_tasks_path(&paths);
-        std::fs::create_dir_all(task_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &task_path,
-            serde_json::to_string_pretty(&json!({
-                "tasks": [
-                    {
-                        "task_id": "monitor-1",
-                        "subject": "Answer Telegram support ping",
-                        "description": "Alice asked whether the deployment is finished.",
-                        "status": "pending",
-                        "metadata": {
-                            "_monitor": true,
-                            "monitor_connection": "telegram-user",
-                            "monitor_connector": "telegram-login",
-                            "monitor_memory_path": "/tmp/telegram-user.md",
-                            "actions": [
-                                {
-                                    "actionName": "Draft reply",
-                                    "actionPrompt": "Draft a concise reply to Alice."
-                                }
-                            ],
-                            "possibleIgnoreReasons": ["duplicate support ping"],
-                            "source_context": {
-                                "connector": "telegram-login",
-                                "chat_id": 42
-                            },
-                            "source_text": "回调失败率刚升到 18%，16:00 前给结论。",
-                            "source_message_id": 6836,
-                            "completion_policy": "human_gated_reply",
-                            "pending_reply": {
-                                "id": "draft-monitor-1-1",
-                                "status": "draft_ready",
-                                "version": 1,
-                                "agent_draft_text": "Deployment finished an hour ago."
-                            }
-                        },
-                        "started_at_ms": 10,
-                        "updated_at_ms": 20
-                    }
-                ]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let snapshot = handle_workflow_list(&paths).unwrap();
-        let tasks = snapshot["monitor_tasks"].as_array().unwrap();
-
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0]["task_id"], "monitor-1");
-        assert_eq!(tasks[0]["monitor_connection"], "telegram-user");
-        assert_eq!(tasks[0]["monitor_connector"], "telegram-login");
-        assert_eq!(tasks[0]["monitor_memory_path"], "/tmp/telegram-user.md");
-        assert_eq!(tasks[0]["actions"][0]["name"], "Draft reply");
-        assert_eq!(
-            tasks[0]["actions"][0]["prompt"],
-            "Draft a concise reply to Alice."
-        );
-        assert_eq!(
-            tasks[0]["possible_ignore_reasons"][0],
-            "duplicate support ping"
-        );
-        // The human-gated reply review state must surface on monitor_tasks[]
-        // (the array bobo's Home renders), not only on the tasks[] snapshot.
-        assert_eq!(tasks[0]["source_context"]["chat_id"], 42);
-        // The server-stamped verbatim text rides along on source_context so
-        // UIs can show the original message next to the LLM paraphrase.
-        assert_eq!(
-            tasks[0]["source_context"]["text"],
-            "回调失败率刚升到 18%，16:00 前给结论。"
-        );
-        assert_eq!(tasks[0]["source_context"]["message_id"], 6836);
-        assert_eq!(tasks[0]["completion_policy"], "human_gated_reply");
-        assert_eq!(tasks[0]["pending_reply"]["id"], "draft-monitor-1-1");
-        assert_eq!(tasks[0]["pending_reply"]["status"], "draft_ready");
-        assert_eq!(tasks[0]["pending_reply"]["version"], 1);
-        assert_eq!(
-            tasks[0]["pending_reply"]["agent_draft_text"],
-            "Deployment finished an hour ago."
-        );
-        assert_eq!(snapshot["monitor_task_error"], Value::Null);
-    }
-
-    #[test]
-    fn workflow_snapshot_enriches_monitor_sender_avatar_from_telegram_peer_cache() {
-        let tempdir = tempfile::tempdir().unwrap();
-        // Without the home override, user_config_dir resolves to the REAL
-        // ~/.puffer and this test clobbers the developer's peer cache.
-        let _home = puffer_config::set_puffer_home_override(tempdir.path());
-        let paths = ConfigPaths::discover(tempdir.path());
-        let avatar = "data:image/jpeg;base64,ZmFrZS1hdmF0YXI=";
-        let account_dir = paths
-            .user_config_dir
-            .join("telegram-accounts")
-            .join("telegram-user");
-        std::fs::create_dir_all(&account_dir).unwrap();
-        std::fs::write(
-            account_dir.join("peer-cache.json"),
-            serde_json::to_vec_pretty(&json!({
-                "version": 1,
-                "peers": [{
-                    "id": "5229190700",
-                    "numeric_id": 5229190700_i64,
-                    "kind": "user",
-                    "title": "Helen",
-                    "username": "helen",
-                    "avatar": avatar,
-                    "is_bot": false,
-                    "updated_at_ms": 1_700_000_000_000_i64
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let task_path = monitor_tasks_path(&paths);
-        std::fs::create_dir_all(task_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &task_path,
-            serde_json::to_string_pretty(&json!({
-                "tasks": [{
-                    "task_id": "monitor-avatar",
-                    "subject": "Reply to Helen",
-                    "description": "Helen asked for the shipping ETA.",
-                    "status": "pending",
-                    "metadata": {
-                        "_monitor": true,
-                        "monitor_connection": "telegram-user",
-                        "monitor_connector": "telegram-login",
-                        "chat_id": "5229190700",
-                        "sender_id": "5229190700",
-                        "sender_username": "helen"
-                    },
-                    "started_at_ms": 10,
-                    "updated_at_ms": 20
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let snapshot = handle_workflow_list(&paths).unwrap();
-        let tasks = snapshot["monitor_tasks"].as_array().unwrap();
-
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0]["source_context"]["sender"]["avatar_url"], avatar);
-        // The display name rides along from the same peer-cache entry, so
-        // accounts without an @username stop rendering as "Unknown sender".
-        assert_eq!(tasks[0]["source_context"]["sender"]["name"], "Helen");
-    }
-
-    #[test]
-    fn workflow_snapshot_enriches_sender_name_without_username_or_avatar() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let _home = puffer_config::set_puffer_home_override(tempdir.path());
-        let paths = ConfigPaths::discover(tempdir.path());
-        let account_dir = paths
-            .user_config_dir
-            .join("telegram-accounts")
-            .join("telegram-user");
-        std::fs::create_dir_all(&account_dir).unwrap();
-        // Mirrors the reported case: a contact with a display name but no
-        // @username and no profile photo (Telegram letter-avatar account).
-        std::fs::write(
-            account_dir.join("peer-cache.json"),
-            serde_json::to_vec_pretty(&json!({
-                "version": 1,
-                "peers": [{
-                    "id": "8759047281",
-                    "numeric_id": 8759047281_i64,
-                    "kind": "user",
-                    "title": "博阿 杜",
-                    "first_name": "博阿",
-                    "last_name": "杜",
-                    "is_bot": false,
-                    "updated_at_ms": 1_700_000_000_000_i64
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let task_path = monitor_tasks_path(&paths);
-        std::fs::create_dir_all(task_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &task_path,
-            serde_json::to_string_pretty(&json!({
-                "tasks": [{
-                    "task_id": "monitor-name",
-                    "subject": "调研国保单位清单",
-                    "description": "Telegram 联系人发来请求。",
-                    "status": "pending",
-                    "metadata": {
-                        "_monitor": true,
-                        "monitor_connection": "telegram-user",
-                        "monitor_connector": "telegram-login",
-                        "chat_id": "8759047281",
-                        "sender_id": "8759047281"
-                    },
-                    "started_at_ms": 10,
-                    "updated_at_ms": 20
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let snapshot = handle_workflow_list(&paths).unwrap();
-        let tasks = snapshot["monitor_tasks"].as_array().unwrap();
-
-        assert_eq!(tasks[0]["source_context"]["sender"]["name"], "博阿 杜");
-        assert!(tasks[0]["source_context"]["sender"]
-            .get("avatar_url")
-            .is_none());
-    }
-
-    #[test]
     fn workflow_binding_json_marks_monitor_bindings() {
         let tempdir = tempfile::tempdir().unwrap();
         let paths = ConfigPaths::discover(tempdir.path());
@@ -1152,40 +894,5 @@ mod tests {
 
         assert_eq!(snapshot["monitor_tasks"].as_array().unwrap().len(), 0);
         assert_eq!(snapshot["monitor_task_error"], Value::Null);
-    }
-
-    #[test]
-    fn workflow_save_upserts_definition_and_returns_snapshot() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let paths = ConfigPaths::discover(tempdir.path());
-
-        let snapshot = handle_workflow_save(
-            &paths,
-            &json!({
-                "workflow": {
-                    "schema": "puffer.workflow.v1",
-                    "slug": "saved-pipeline",
-                    "enabled": true,
-                    "trigger": {"type": "connection", "connection_slug": "telegram-user", "pattern": "hi"},
-                    "pipeline": {
-                        "name": "Saved pipeline",
-                        "nodes": [
-                            {"id": "reply", "type": "puffer", "prompt": "Draft a reply."}
-                        ]
-                    }
-                }
-            }),
-        )
-        .unwrap();
-
-        assert_eq!(snapshot["workflows"].as_array().unwrap().len(), 1);
-        assert_eq!(snapshot["workflows"][0]["slug"], "saved-pipeline");
-        assert_eq!(
-            snapshot["workflows"][0]["pipeline"]["name"],
-            "Saved pipeline"
-        );
-
-        let listed = handle_workflow_list(&paths).unwrap();
-        assert_eq!(listed["workflows"][0]["slug"], "saved-pipeline");
     }
 }

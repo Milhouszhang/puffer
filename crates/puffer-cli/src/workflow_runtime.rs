@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use puffer_config::{ConfigPaths, PufferConfig};
+use puffer_config::{load_config, ConfigPaths, PufferConfig};
 use puffer_core::{
     execute_tool_action_once, execute_user_turn_streaming,
     execute_user_turn_streaming_without_tools, AppState, TurnStreamEvent,
@@ -10,42 +10,20 @@ use puffer_session_store::{SessionStore, BACKGROUND_SESSION_TAG};
 use puffer_subscriptions::{
     install_workflow_runner, ActionUsage, WorkflowActionOutput, WorkflowActionRunner,
 };
-use puffer_workflow::{
-    AgentExecution, AgentExecutor, CronDeduper, CronExpression, DagRunner, ExecutionContext,
-    TriggerSpec, WorkflowStore,
-};
-use serde_json::json;
+use puffer_workflow::WorkflowRuntimeRecord;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
-use time::{OffsetDateTime, UtcOffset};
+
+use crate::workflow_runtime_helpers::workflow_execute_summary;
 
 const OPENAI_TASK_AGENT_MODEL: &str = "gpt-5.4-mini";
 const ANTHROPIC_TASK_AGENT_MODEL: &str = "claude-haiku-4-5-20251001";
 
-/// Owns native workflow trigger hooks for the current process.
-pub(crate) struct WorkflowRuntime {
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
-}
+/// Keeps the process-wide workflow action dispatch hook installed.
+pub(crate) struct WorkflowRuntime;
 
-impl WorkflowRuntime {
-    fn stop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Drop for WorkflowRuntime {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// Installs workflow action dispatch and starts cron polling.
+/// Installs workflow action dispatch for subscription-triggered actions.
 pub(crate) fn install(
     paths: &ConfigPaths,
     config: &PufferConfig,
@@ -61,17 +39,8 @@ pub(crate) fn install(
         auth_store: auth_store.clone(),
         lock: Mutex::new(()),
     });
-    install_workflow_runner(runner.clone()).context("failed to install workflow runner")?;
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let thread_stop = stop.clone();
-    let thread = thread::Builder::new()
-        .name("puffer-workflow-cron".to_string())
-        .spawn(move || cron_loop(runner, thread_stop))
-        .context("failed to start workflow cron thread")?;
-    Ok(WorkflowRuntime {
-        stop,
-        thread: Some(thread),
-    })
+    install_workflow_runner(runner).context("failed to install workflow runner")?;
+    Ok(WorkflowRuntime)
 }
 
 struct ProcessWorkflowRunner {
@@ -86,27 +55,17 @@ struct ProcessWorkflowRunner {
 impl WorkflowActionRunner for ProcessWorkflowRunner {
     fn run_workflow(&self, slug: &str, trigger: serde_json::Value) -> Result<WorkflowActionOutput> {
         let _guard = self.lock.lock().unwrap();
-        let store = WorkflowStore::new(&self.paths.workspace_config_dir);
-        let definition = store
-            .get(slug)?
-            .ok_or_else(|| anyhow::anyhow!("workflow `{slug}` is not registered"))?;
-        if !definition.enabled {
-            anyhow::bail!("workflow `{slug}` is disabled");
-        }
-        let run = DagRunner::new(
-            &store,
-            PufferAgentExecutor {
-                paths: self.paths.clone(),
-                config: self.config.clone(),
-                resources: self.resources.clone(),
-                providers: self.providers.clone(),
-                auth_store: self.auth_store.clone(),
-            },
-        )
-        .run(&definition, trigger, None)?;
-        Ok(WorkflowActionOutput::new(format!(
-            "workflow `{slug}` run #{} {:?}",
-            run.idx, run.status
+        let config = load_config(&self.paths).context("load workflow backend config")?;
+        let client = crate::daemon_workflow_runtime::workflow_runtime_client(&self.paths, &config)
+            .context("create workflow runtime client")?;
+        let mut fields = BTreeMap::new();
+        fields.insert("input".to_string(), trigger);
+        let request = WorkflowRuntimeRecord::new(fields);
+        let response = client
+            .execute_workflow(slug, &request)
+            .with_context(|| format!("execute workflow `{slug}` through workflow runtime"))?;
+        Ok(WorkflowActionOutput::new(workflow_execute_summary(
+            slug, &response,
         )))
     }
 
@@ -462,7 +421,9 @@ fn record_monitor_source_text(paths: &ConfigPaths, trigger: &serde_json::Value) 
                 changed = true;
             }
             if let Some(message_id) = message_id {
-                if context.get("message_id").and_then(serde_json::Value::as_i64)
+                if context
+                    .get("message_id")
+                    .and_then(serde_json::Value::as_i64)
                     != Some(message_id)
                 {
                     context.insert(
@@ -477,120 +438,6 @@ fn record_monitor_source_text(paths: &ConfigPaths, trigger: &serde_json::Value) 
     if changed {
         std::fs::write(&path, serde_json::to_string_pretty(&store)?)
             .with_context(|| format!("failed to write {}", path.display()))?;
-    }
-    Ok(())
-}
-
-struct PufferAgentExecutor {
-    paths: ConfigPaths,
-    config: PufferConfig,
-    resources: LoadedResources,
-    providers: ProviderRegistry,
-    auth_store: AuthStore,
-}
-
-impl AgentExecutor for PufferAgentExecutor {
-    fn execute(&mut self, context: ExecutionContext) -> Result<AgentExecution> {
-        let session_store = SessionStore::from_paths(&self.paths)?;
-        let cwd = context
-            .working_dir
-            .as_ref()
-            .map(PathBuf::from)
-            .map(|path| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    self.paths.workspace_root.join(path)
-                }
-            })
-            .unwrap_or_else(|| self.paths.workspace_root.clone());
-        let session = session_store
-            .create_session_with_tags(cwd.clone(), vec![BACKGROUND_SESSION_TAG.to_string()])?;
-        let mut state = AppState::new(self.config.clone(), cwd, session);
-        if let Some(model) = context.model.as_deref().and_then(non_empty_trimmed) {
-            apply_explicit_model(&mut state, model);
-        } else {
-            apply_authenticated_provider_fallback(&mut state, &self.providers, &self.auth_store);
-        }
-        let prompt = if let Some(agent) = context.agent {
-            format!(
-                "Run as Puffer workflow agent `{agent}`.\n\n{}",
-                context.prompt
-            )
-        } else {
-            context.prompt
-        };
-        let output = execute_user_turn_streaming(
-            &mut state,
-            &self.resources,
-            &self.providers,
-            &mut self.auth_store,
-            &prompt,
-            |_| {},
-        )?;
-        Ok(AgentExecution {
-            output: output.assistant_text,
-        })
-    }
-}
-
-fn cron_loop(runner: Arc<ProcessWorkflowRunner>, stop: Arc<std::sync::atomic::AtomicBool>) {
-    let mut deduper = CronDeduper::default();
-    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-        if let Err(error) = poll_cron(&runner, &mut deduper) {
-            eprintln!("workflow cron poll failed: {error:#}");
-        }
-        for _ in 0..30 {
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            thread::sleep(Duration::from_secs(1));
-        }
-    }
-}
-
-fn poll_cron(runner: &ProcessWorkflowRunner, deduper: &mut CronDeduper) -> Result<()> {
-    let now = local_now();
-    let minute_epoch = now.unix_timestamp() / 60;
-    let minute = now.minute() as u32;
-    let hour = now.hour() as u32;
-    let day = now.day() as u32;
-    let month = u8::from(now.month()) as u32;
-    let weekday = now.weekday().number_days_from_sunday() as u32;
-    let store = WorkflowStore::new(&runner.paths.workspace_config_dir);
-    for definition in store.list()? {
-        if !definition.enabled {
-            continue;
-        }
-        let TriggerSpec::Cron { cron } = &definition.trigger else {
-            continue;
-        };
-        if CronExpression::parse(cron)?.matches(minute, hour, day, month, weekday)
-            && deduper.mark_if_new(&definition.slug, minute_epoch)
-        {
-            let trigger_key = format!("cron:{}:{minute_epoch}", definition.slug);
-            let trigger = json!({
-                "type": "cron",
-                "cron": cron,
-                "scheduled_minute_epoch": minute_epoch,
-            });
-            let _guard = runner.lock.lock().unwrap();
-            let run = DagRunner::new(
-                &store,
-                PufferAgentExecutor {
-                    paths: runner.paths.clone(),
-                    config: runner.config.clone(),
-                    resources: runner.resources.clone(),
-                    providers: runner.providers.clone(),
-                    auth_store: runner.auth_store.clone(),
-                },
-            )
-            .run(&definition, trigger, Some(trigger_key))?;
-            eprintln!(
-                "workflow cron fired `{}` as run #{} {:?}",
-                definition.slug, run.idx, run.status
-            );
-        }
     }
     Ok(())
 }
@@ -717,11 +564,6 @@ fn authenticated_fallback_provider(
                     .map(|provider| provider.id.clone())
             })
         })
-}
-
-fn local_now() -> OffsetDateTime {
-    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-    OffsetDateTime::now_utc().to_offset(offset)
 }
 
 #[cfg(test)]

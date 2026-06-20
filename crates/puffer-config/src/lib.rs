@@ -5,6 +5,10 @@ mod home_override;
 mod project_memory;
 mod proxy;
 mod settings_catalog;
+mod workflow_backend;
+
+#[cfg(test)]
+mod workflow_backend_tests;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -33,6 +37,7 @@ pub use settings_catalog::{
     normalize_config_setting_key, parse_config_cli_value, supported_config_settings,
     ConfigSettingScope, ConfigSettingSpec, ConfigSettingValueKind,
 };
+pub use workflow_backend::{WorkflowBackendConfig, WorkflowBackendMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PufferConfig {
@@ -65,6 +70,8 @@ pub struct PufferConfig {
     pub network: NetworkConfig,
     #[serde(default)]
     pub media: MediaConfig,
+    #[serde(default)]
+    pub workflow_backend: WorkflowBackendConfig,
     pub mascot: MascotConfig,
     pub ui: UiConfig,
     /// When set, the runtime constructs a remote `RemoteToolRunner` against
@@ -298,6 +305,7 @@ impl Default for PufferConfig {
             browser: BrowserConfig::default(),
             network: NetworkConfig::default(),
             media: MediaConfig::default(),
+            workflow_backend: WorkflowBackendConfig::default(),
             mascot: MascotConfig {
                 id: "clawd".to_string(),
                 display_name: "Clawd".to_string(),
@@ -489,6 +497,7 @@ pub fn load_config(paths: &ConfigPaths) -> Result<PufferConfig> {
     if let Some(snapshot) = user_preferences {
         snapshot.restore(&mut config);
     }
+    config.workflow_backend.normalize();
     Ok(config)
 }
 
@@ -503,6 +512,7 @@ struct UserPreferenceSnapshot {
     browser: BrowserConfig,
     network: NetworkConfig,
     media: MediaConfig,
+    workflow_backend: WorkflowBackendConfig,
 }
 
 impl UserPreferenceSnapshot {
@@ -518,6 +528,7 @@ impl UserPreferenceSnapshot {
             browser: config.browser.clone(),
             network: config.network.clone(),
             media: config.media.clone(),
+            workflow_backend: config.workflow_backend.clone(),
         }
     }
 
@@ -532,19 +543,20 @@ impl UserPreferenceSnapshot {
         config.browser = self.browser;
         config.network = self.network;
         config.media = self.media;
+        config.workflow_backend = self.workflow_backend;
     }
 }
 
 /// Saves the user-level Puffer configuration file.
 pub fn save_user_config(paths: &ConfigPaths, config: &PufferConfig) -> Result<()> {
     ensure_workspace_dirs(paths)?;
-    write_config_file(&paths.user_config_file(), config)
+    write_normalized_config_file(&paths.user_config_file(), config)
 }
 
 /// Saves the workspace-level Puffer configuration file.
 pub fn save_workspace_config(paths: &ConfigPaths, config: &PufferConfig) -> Result<()> {
     ensure_workspace_dirs(paths)?;
-    write_config_file(&paths.workspace_config_file(), config)
+    write_normalized_config_file(&paths.workspace_config_file(), config)
 }
 
 /// Ensures the standard user and workspace configuration directories exist.
@@ -621,6 +633,12 @@ fn write_config_file(path: &Path, config: &PufferConfig) -> Result<()> {
     let raw = toml::to_string_pretty(config)
         .with_context(|| format!("failed to serialize config file {}", path.display()))?;
     fs::write(path, raw).with_context(|| format!("failed to write config file {}", path.display()))
+}
+
+fn write_normalized_config_file(path: &Path, config: &PufferConfig) -> Result<()> {
+    let mut normalized = config.clone();
+    normalized.workflow_backend.normalize();
+    write_config_file(path, &normalized)
 }
 
 #[cfg(test)]

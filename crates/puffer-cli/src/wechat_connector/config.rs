@@ -100,7 +100,8 @@ impl InstanceConfig {
                 .with_context(|| format!("create wechat state dir {}", parent.display()))?;
         }
         let raw = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, raw).with_context(|| format!("write wechat config {}", path.display()))?;
+        std::fs::write(&path, raw)
+            .with_context(|| format!("write wechat config {}", path.display()))?;
         Ok(())
     }
 

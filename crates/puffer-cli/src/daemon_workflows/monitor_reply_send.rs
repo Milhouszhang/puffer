@@ -1,9 +1,9 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use puffer_config::ConfigPaths;
 use puffer_subscriber_runtime::{Event, EventEnvelope};
 use puffer_subscriptions::{ActionDispatcher, ActionSpec, BuiltinActionDispatcher};
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -589,15 +589,15 @@ fn non_empty(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use puffer_config::ConfigPaths;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use std::fs;
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::Duration;
 
     use super::{
-        MonitorReplySender, ReplySendTarget, handle_monitor_reply_send_with_sender,
-        source_context_hash,
+        handle_monitor_reply_send_with_sender, source_context_hash, MonitorReplySender,
+        ReplySendTarget,
     };
     use crate::daemon_workflows::monitor_task_ignore::monitor_tasks_path;
 
@@ -1181,11 +1181,9 @@ mod tests {
         )
         .expect_err("send must reject pending replies not created by MonitorReplyDraft");
 
-        assert!(
-            error
-                .to_string()
-                .contains("was not created by MonitorReplyDraft")
-        );
+        assert!(error
+            .to_string()
+            .contains("was not created by MonitorReplyDraft"));
         assert_eq!(sender.calls.lock().unwrap().len(), 0);
     }
 

@@ -1,7 +1,7 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use puffer_subscriptions::{
-    ConnectorTemplate, SubscriberManifestRoots, connector_workflow_trigger_supported,
-    suggested_connection_slug,
+    connector_workflow_trigger_supported, suggested_connection_slug, ConnectorTemplate,
+    SubscriberManifestRoots,
 };
 
 /// Resolves the connector template for a planned workflow binding connection.

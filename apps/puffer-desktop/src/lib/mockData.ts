@@ -651,6 +651,7 @@ export const mockSettingsSnapshot: SettingsSnapshot = {
     defaultProvider: "anthropic",
     defaultModel: "claude-sonnet-4-5",
     openaiBaseUrl: null,
+    openaiDisplayName: null,
     theme: "puffer",
     media: {
       image: null,
@@ -715,6 +716,11 @@ export const mockSettingsSnapshot: SettingsSnapshot = {
     storeFile: "/home/c/.puffer/secrets.json",
     keySource: "local-key-file",
     chromeImportSupported: false,
+    sources: [
+      { id: "chrome", label: "Chrome", available: true },
+      { id: "firefox", label: "Firefox", available: false },
+      { id: "1password", label: "1Password", available: false }
+    ],
     items: []
   }
 };

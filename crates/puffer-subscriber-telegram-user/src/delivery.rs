@@ -9,13 +9,16 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
-use grammers_client::types::{Chat, Message};
+use grammers_client::types::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::events::{build_message_event, emit};
+use crate::activity_state::record_message_activity;
+use crate::events::{build_message_event, emit, message_peer_metadata};
+use crate::history_cache::TelegramHistoryCache;
 use crate::notifications::NotificationMuteCache;
+use crate::peer_cache::TelegramPeerCache;
 use crate::state::SkillEnv;
 
 const DELIVERY_SOURCE_LIVE: &str = "live";
@@ -116,40 +119,58 @@ pub(crate) async fn emit_message_if_new(
     delivery_source: &str,
     source_received_at_ms: Option<i128>,
 ) -> anyhow::Result<bool> {
+    let notification_muted = notification_mutes.message_chat_muted(message);
+    let notification_silent = message.silent();
+    append_message_diagnostic(
+        env,
+        "telegram_update_received",
+        message,
+        delivery_source,
+        source_received_at_ms,
+        notification_muted,
+        notification_silent,
+        None,
+    );
     if !cursor.is_new(message) {
-        let notification_muted = notification_mutes.message_chat_muted(message);
-        let notification_silent = message.silent();
         append_message_diagnostic(
             env,
-            "duplicate",
+            "delivery_duplicate",
             message,
             delivery_source,
             source_received_at_ms,
             notification_muted,
             notification_silent,
+            None,
         );
         return Ok(false);
     }
-    let notification_muted = notification_mutes.message_chat_muted(message);
-    let notification_silent = message.silent();
+    if let Err(error) = record_message_history(env, message) {
+        warn!(
+            chat = %message.chat().id(),
+            message_id = message.id(),
+            %error,
+            "failed to record Telegram message in bounded history cache"
+        );
+    }
+    if let Err(error) = record_message_activity(env, message) {
+        warn!(
+            chat = %message.chat().id(),
+            message_id = message.id(),
+            %error,
+            "failed to record Telegram message in activity state"
+        );
+    }
     let is_outgoing = message.outgoing();
     if should_suppress_message(is_outgoing, notification_muted, notification_silent) {
-        // Outgoing (self-sent) messages are recorded as seen but never emitted
-        // into the triage pipeline: otherwise the user's own messages spin up a
-        // triage turn (burning credits) and can be misread as incoming tasks.
-        let stage = if is_outgoing {
-            "suppressed_outgoing"
-        } else {
-            "suppressed"
-        };
         append_message_diagnostic(
             env,
-            stage,
+            "delivery_suppressed",
             message,
             delivery_source,
             source_received_at_ms,
             notification_muted,
             notification_silent,
+            None,
         );
         cursor.record_seen(message);
         cursor.save(env)?;
@@ -159,26 +180,42 @@ pub(crate) async fn emit_message_if_new(
             is_outgoing,
             notification_muted,
             notification_silent,
-            "skipped Telegram message (outgoing or muted/silent)"
+            "skipped Telegram message (muted/silent)"
         );
         return Ok(false);
     }
+    let peer_cache = TelegramPeerCache::load(env).unwrap_or_default();
     let event = build_message_event(
         &env.topic,
         message,
+        Some(&peer_cache),
         notification_muted,
         delivery_source,
         source_received_at_ms,
     );
-    emit(&event)?;
+    if let Err(error) = emit(&event) {
+        let error_text = error.to_string();
+        append_message_diagnostic(
+            env,
+            "delivery_emit_failed",
+            message,
+            delivery_source,
+            source_received_at_ms,
+            notification_muted,
+            notification_silent,
+            Some(error_text.as_str()),
+        );
+        return Err(error);
+    }
     append_message_diagnostic(
         env,
-        "emitted",
+        "delivery_emitted",
         message,
         delivery_source,
         source_received_at_ms,
         notification_muted,
         notification_silent,
+        None,
     );
     cursor.record_seen(message);
     cursor.save(env)?;
@@ -204,24 +241,42 @@ pub(crate) async fn emit_live_message_if_new(
     .await
 }
 
+fn record_message_history(env: &SkillEnv, message: &Message) -> anyhow::Result<()> {
+    // This read-modify-write path relies on the subscriber processing updates
+    // serially. Startup hydration performs a merged final save so resume
+    // backfill writes made through this path are not overwritten.
+    let original = TelegramHistoryCache::load(env).unwrap_or_default();
+    let mut cache = original.clone();
+    cache.observe_message(message);
+    cache.save_if_changed(env, &original)
+}
+
 fn message_notifications_suppressed(notification_muted: bool, notification_silent: bool) -> bool {
     notification_muted || notification_silent
 }
 
 /// Whether a message should be recorded as seen but NOT emitted into the triage
-/// pipeline. Outgoing (self-sent) messages are always suppressed so the user's
-/// own messages never trigger a triage turn (the #569 credit-burn bug); muted /
-/// silent chats are suppressed per the user's notification settings.
+/// pipeline. Muted/silent chats are suppressed per the user's notification
+/// settings. Outgoing messages are no longer suppressed here — they carry
+/// `is_outgoing: true` in the payload so downstream gating can decide.
 fn should_suppress_message(
-    is_outgoing: bool,
+    _is_outgoing: bool,
     notification_muted: bool,
     notification_silent: bool,
 ) -> bool {
-    is_outgoing || message_notifications_suppressed(notification_muted, notification_silent)
+    message_notifications_suppressed(notification_muted, notification_silent)
 }
 
 fn message_chat_key(message: &Message) -> String {
     message.chat().id().to_string()
+}
+
+fn telegram_message_key(connection_slug: &str, chat_id: i64, message_id: i32) -> String {
+    format!("{connection_slug}:{chat_id}:{message_id}")
+}
+
+fn telegram_dedup_key(chat_id: i64, message_id: i32) -> String {
+    format!("{chat_id}:{message_id}")
 }
 
 fn append_message_diagnostic(
@@ -232,39 +287,36 @@ fn append_message_diagnostic(
     source_received_at_ms: Option<i128>,
     notification_muted: bool,
     notification_silent: bool,
+    error: Option<&str>,
 ) {
     let path = env.state_dir.join("message-diagnostics.ndjson");
     let now_ms = now_unix_millis();
     let chat = message.chat();
-    let (chat_kind, chat_title, chat_username) = describe_chat(&chat);
-    let chat_is_bot = telegram_chat_is_bot(&chat);
+    let chat_id = chat.id();
+    let message_id = message.id();
+    let peer_cache = TelegramPeerCache::load(env).unwrap_or_default();
+    let peer = message_peer_metadata(message, Some(&peer_cache));
     let date_ms = i128::from(message.date().timestamp_millis());
-    let (sender_id, sender_username, sender_name, sender_is_bot) = match message.sender() {
-        Some(sender) => (
-            Some(sender.id()),
-            sender.username().map(|value| value.to_string()),
-            Some(chat_display_name(&sender)),
-            telegram_chat_is_bot(&sender),
-        ),
-        None => (None, None, None, false),
-    };
-    if chat_is_bot || sender_is_bot {
+    if peer.chat_is_bot || peer.sender_is_bot {
         return;
     }
     let record = json!({
         "at_ms": now_ms,
         "stage": stage,
+        "connection_slug": env.topic,
+        "message_key": telegram_message_key(&env.topic, chat_id, message_id),
+        "dedup_key": telegram_dedup_key(chat_id, message_id),
         "delivery_source": delivery_source,
-        "chat_id": chat.id(),
-        "chat_kind": chat_kind,
-        "chat_title": chat_title,
-        "chat_username": chat_username,
-        "chat_is_bot": chat_is_bot,
-        "sender_id": sender_id,
-        "sender_username": sender_username,
-        "sender_name": sender_name,
-        "sender_is_bot": sender_is_bot,
-        "message_id": message.id(),
+        "chat_id": chat_id,
+        "chat_kind": peer.chat_kind,
+        "chat_title": peer.chat_title,
+        "chat_username": peer.chat_username,
+        "chat_is_bot": peer.chat_is_bot,
+        "sender_id": peer.sender_id,
+        "sender_username": peer.sender_username,
+        "sender_name": peer.sender_name,
+        "sender_is_bot": peer.sender_is_bot,
+        "message_id": message_id,
         "date_ms": date_ms,
         "source_received_at_ms": source_received_at_ms,
         "subscriber_receive_lag_ms": source_received_at_ms.map(|received_at_ms| received_at_ms - date_ms),
@@ -273,47 +325,10 @@ fn append_message_diagnostic(
         "notification_silent": notification_silent,
         "suppressed": message_notifications_suppressed(notification_muted, notification_silent),
         "is_outgoing": message.outgoing(),
+        "error": error,
         "text_prefix": truncate_text(message.text(), 200),
     });
     crate::diagnostics::append_ndjson(&path, &record);
-}
-
-fn describe_chat(chat: &Chat) -> (&'static str, Option<String>, Option<String>) {
-    match chat {
-        Chat::User(_) => (
-            "user",
-            Some(chat_display_name(chat)),
-            chat.username().map(|value| value.to_string()),
-        ),
-        Chat::Group(_) => (
-            "group",
-            Some(chat.name().to_string()),
-            chat.username().map(|value| value.to_string()),
-        ),
-        Chat::Channel(_) => (
-            "channel",
-            Some(chat.name().to_string()),
-            chat.username().map(|value| value.to_string()),
-        ),
-    }
-}
-
-fn chat_display_name(chat: &Chat) -> String {
-    match chat {
-        Chat::User(user) => user.full_name(),
-        Chat::Group(_) | Chat::Channel(_) => chat.name().to_string(),
-    }
-}
-
-fn telegram_chat_is_bot(chat: &Chat) -> bool {
-    matches!(chat, Chat::User(user) if user.raw.bot)
-        || chat
-            .username()
-            .is_some_and(telegram_username_looks_like_bot)
-}
-
-fn telegram_username_looks_like_bot(username: &str) -> bool {
-    username.to_ascii_lowercase().ends_with("bot")
 }
 
 fn truncate_text(value: &str, max_chars: usize) -> String {
@@ -366,15 +381,25 @@ mod tests {
     }
 
     #[test]
-    fn outgoing_messages_are_suppressed() {
-        // #569: the user's own (outgoing) messages must be suppressed from the
-        // triage pipeline even when the chat is not muted/silent.
-        assert!(should_suppress_message(true, false, false));
+    fn outgoing_messages_are_emitted_unless_muted() {
+        // outgoing + not muted/silent => NOT suppressed (it gets emitted)
+        assert!(!should_suppress_message(true, false, false));
+        // outgoing + muted => suppressed (muting still wins)
         assert!(should_suppress_message(true, true, false));
+        // outgoing + silent => suppressed
         assert!(should_suppress_message(true, false, true));
-        // Incoming messages still follow the notification-suppression rules.
-        assert!(!should_suppress_message(false, false, false));
+        // incoming + muted => suppressed (unchanged)
         assert!(should_suppress_message(false, true, false));
-        assert!(should_suppress_message(false, false, true));
+        // incoming + not muted => not suppressed (unchanged)
+        assert!(!should_suppress_message(false, false, false));
+    }
+
+    #[test]
+    fn telegram_message_trace_identity_uses_connection_chat_and_message() {
+        assert_eq!(
+            telegram_message_key("telegram-user", 42, 7),
+            "telegram-user:42:7"
+        );
+        assert_eq!(telegram_dedup_key(42, 7), "42:7");
     }
 }

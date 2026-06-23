@@ -131,7 +131,11 @@ impl SetupFlow {
         self.announce_desktop(&cfg, &authority);
 
         // 3. Make sure WeChat is installed (large download on first run).
-        if !self.rt.block_on(instance.wechat_installed()).unwrap_or(false) {
+        if !self
+            .rt
+            .block_on(instance.wechat_installed())
+            .unwrap_or(false)
+        {
             self.status("Downloading and installing WeChat into the container (large download, please wait)…");
             self.rt
                 .block_on(instance.install_wechat())
@@ -345,33 +349,33 @@ impl SetupFlow {
     fn register(&self) -> Result<bool> {
         let manager = puffer_core::subscription_manager()?;
         let description = format!("WeChat ({})", self.connection_slug);
-        let registered = if let Some(existing) = manager.connection_store().get(&self.connection_slug)
-        {
-            if existing.connector_slug != CONNECTOR_SLUG {
-                bail!(
-                    "connection `{}` already exists for connector `{}`",
-                    self.connection_slug,
-                    existing.connector_slug
-                );
-            }
-            manager
-                .connection_store()
-                .update(&self.connection_slug, |record| {
-                    record.description = description.clone();
-                    record.state = ConnectionState::Authenticated;
-                    record.auth_failure_notified = false;
-                })?;
-            false
-        } else {
-            manager
-                .connection_store()
-                .create(ConnectionRecord::authenticated(
-                    &self.connection_slug,
-                    CONNECTOR_SLUG,
-                    description,
-                ))?;
-            true
-        };
+        let registered =
+            if let Some(existing) = manager.connection_store().get(&self.connection_slug) {
+                if existing.connector_slug != CONNECTOR_SLUG {
+                    bail!(
+                        "connection `{}` already exists for connector `{}`",
+                        self.connection_slug,
+                        existing.connector_slug
+                    );
+                }
+                manager
+                    .connection_store()
+                    .update(&self.connection_slug, |record| {
+                        record.description = description.clone();
+                        record.state = ConnectionState::Authenticated;
+                        record.auth_failure_notified = false;
+                    })?;
+                false
+            } else {
+                manager
+                    .connection_store()
+                    .create(ConnectionRecord::authenticated(
+                        &self.connection_slug,
+                        CONNECTOR_SLUG,
+                        description,
+                    ))?;
+                true
+            };
         manager.refresh_connection_consumers()?;
         manager.refresh_connection_auth()?;
         Ok(registered)
@@ -448,7 +452,10 @@ mod tests {
 
     #[test]
     fn parses_connection_slug_with_default() {
-        assert_eq!(parse_connection_slug("wechat-login").unwrap(), "wechat-user");
+        assert_eq!(
+            parse_connection_slug("wechat-login").unwrap(),
+            "wechat-user"
+        );
         assert_eq!(parse_connection_slug("wechat-login work").unwrap(), "work");
         assert!(parse_connection_slug("wechat-login a b").is_err());
         assert!(parse_connection_slug("gmail-browser").is_err());

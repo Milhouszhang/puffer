@@ -12,8 +12,19 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-mod chrome;
+mod chromium;
+mod der;
+mod firefox;
 mod keychain;
+pub mod onepassword;
+pub mod onepassword_1pux;
+#[cfg(target_os = "windows")]
+pub mod win_chrome_import;
+
+pub use onepassword::{
+    connect_onepassword, ensure_op_authorized, import_resolved_logins, is_op_reference,
+    launch_onepassword_app, op_authorized, op_cli_available, resolve_op_reference, ResolvedLogin,
+};
 
 const STORE_VERSION: u32 = 1;
 const KEY_BYTES: usize = 32;
@@ -77,16 +88,112 @@ pub struct ResolvedSecret {
     pub value: String,
 }
 
-/// Summary of a Chrome credential import pass.
+/// Summary of a browser credential import pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ChromeImportReport {
+pub struct ImportReport {
     /// Number of credentials written to the encrypted Puffer store.
     pub imported: usize,
-    /// Number of Chrome rows skipped because they were unusable or duplicates.
+    /// Number of source rows skipped because they were unusable or duplicates.
     pub skipped: usize,
     /// Non-secret import diagnostics.
     pub errors: Vec<String>,
+}
+
+/// Back-compat alias for the original Chrome-only report type.
+pub type ChromeImportReport = ImportReport;
+
+/// One credential decrypted from an external browser store, ready for import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportedCredential {
+    pub(crate) origin_url: String,
+    pub(crate) username: String,
+    pub(crate) password: String,
+}
+
+/// A browser credential store Puffer can import saved logins from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserSource {
+    Chrome,
+    Firefox,
+}
+
+impl BrowserSource {
+    /// Stable source id stored on each secret and used by the RPC/UI.
+    pub fn id(self) -> &'static str {
+        match self {
+            BrowserSource::Chrome => "chrome",
+            BrowserSource::Firefox => "firefox",
+        }
+    }
+
+    /// User-facing source name.
+    pub fn label(self) -> &'static str {
+        match self {
+            BrowserSource::Chrome => "Chrome",
+            BrowserSource::Firefox => "Firefox",
+        }
+    }
+
+    /// All known sources, in display order.
+    pub fn all() -> [BrowserSource; 2] {
+        [BrowserSource::Chrome, BrowserSource::Firefox]
+    }
+
+    /// Resolves a source from its stable id.
+    pub fn from_id(id: &str) -> Option<BrowserSource> {
+        BrowserSource::all()
+            .into_iter()
+            .find(|source| source.id() == id)
+    }
+
+    fn load_credentials(self) -> Result<Vec<ImportedCredential>> {
+        match self {
+            BrowserSource::Chrome => chromium::load_saved_credentials(chromium::Chromium::Chrome),
+            BrowserSource::Firefox => firefox::load_saved_credentials(),
+        }
+    }
+
+    fn is_available(self) -> bool {
+        match self {
+            BrowserSource::Chrome => chromium::is_available(chromium::Chromium::Chrome),
+            BrowserSource::Firefox => firefox::is_available(),
+        }
+    }
+}
+
+/// Availability of one browser source for display in settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceAvailability {
+    /// Stable source id (e.g. `chrome`, `firefox`).
+    pub id: String,
+    /// User-facing source name.
+    pub label: String,
+    /// Whether at least one importable profile currently exists.
+    pub available: bool,
+}
+
+/// Lists every import source (browsers + 1Password) and its availability.
+pub fn available_browser_sources() -> Vec<SourceAvailability> {
+    let mut sources: Vec<SourceAvailability> = BrowserSource::all()
+        .into_iter()
+        .map(|source| SourceAvailability {
+            id: source.id().to_string(),
+            label: source.label().to_string(),
+            available: source.is_available(),
+        })
+        .collect();
+    // 1Password is not a browser source. Offer it whenever the `op` CLI is
+    // installed OR the 1Password desktop app is present — in the app-but-no-CLI
+    // case clicking "Sync from 1Password" auto-installs the CLI, so the button
+    // must NOT be disabled there.
+    sources.push(SourceAvailability {
+        id: "1password".to_string(),
+        label: "1Password".to_string(),
+        available: onepassword::op_cli_available() || onepassword::onepassword_app_installed(),
+    });
+    sources
 }
 
 /// Encrypted JSON-backed secret vault.
@@ -297,13 +404,18 @@ impl SecretVault {
     }
 
     /// Imports decryptable Chrome saved credentials into the encrypted vault.
-    pub fn import_chrome_saved_credentials(&self) -> Result<ChromeImportReport> {
-        self.sync_chrome_saved_credentials()
+    pub fn import_chrome_saved_credentials(&self) -> Result<ImportReport> {
+        self.sync_browser_source(BrowserSource::Chrome)
     }
 
-    /// Syncs decryptable Chrome saved credentials into the encrypted vault.
-    pub fn sync_chrome_saved_credentials(&self) -> Result<ChromeImportReport> {
-        let credentials = chrome::load_saved_credentials()?;
+    /// Back-compat alias for [`Self::import_chrome_saved_credentials`].
+    pub fn sync_chrome_saved_credentials(&self) -> Result<ImportReport> {
+        self.sync_browser_source(BrowserSource::Chrome)
+    }
+
+    /// Imports decryptable saved credentials from one browser source.
+    pub fn sync_browser_source(&self, source: BrowserSource) -> Result<ImportReport> {
+        let credentials = source.load_credentials()?;
         let mut imported = 0usize;
         let mut skipped = 0usize;
         let mut errors = Vec::new();
@@ -312,25 +424,82 @@ impl SecretVault {
                 skipped += 1;
                 continue;
             }
-            let label = chrome_secret_label(&credential);
+            let label = browser_secret_label(source, &credential);
             match self.put(SecretUpsert {
                 id: None,
                 label,
-                description: Some(chrome_site_description(&credential.origin_url)),
+                description: Some(site_description(&credential.origin_url)),
                 value: credential.password,
                 username: non_empty_option(Some(credential.username)),
                 origin: Some(credential.origin_url),
-                source: "chrome".to_string(),
+                source: source.id().to_string(),
             }) {
                 Ok(_) => imported += 1,
                 Err(error) => errors.push(error.to_string()),
             }
         }
-        Ok(ChromeImportReport {
+        Ok(ImportReport {
             imported,
             skipped,
             errors,
         })
+    }
+
+    /// Imports every accessible 1Password login via the `op` CLI, resolving each
+    /// to its plaintext value and storing it in the encrypted vault.
+    pub fn sync_onepassword_references(&self) -> Result<ImportReport> {
+        // Detect-first: if `op` isn't authorized yet, open the app best-effort and
+        // return actionable guidance — so the user never has to configure it by
+        // hand (falls back to the `.1pux` path the UI also offers).
+        onepassword::connect_onepassword()?;
+        // Batch-fetch every login WITH its values (one structured `op item get`
+        // per item; the whole batch is one biometric authorization). A single
+        // item that fails to fetch is skipped + reported, not fatal.
+        let (logins, fetch_errors) = onepassword::import_resolved_logins()?;
+        let mut report = self.store_resolved_logins(logins);
+        report.errors.extend(fetch_errors);
+        Ok(report)
+    }
+
+    /// Imports 1Password logins from a `.1pux` export file (no `op` CLI / no app
+    /// integration — just the file the desktop app produces). Imports every vault
+    /// in the file.
+    pub fn sync_onepassword_export(&self, path: &std::path::Path) -> Result<ImportReport> {
+        let logins = onepassword_1pux::import_logins(path)?;
+        Ok(self.store_resolved_logins(logins))
+    }
+
+    /// Stores a batch of resolved 1Password logins into the vault (encrypted at
+    /// rest, exactly like browser-imported credentials). Items without a password
+    /// are skipped; per-item `put` failures are reported, not fatal. Shared by the
+    /// `op` CLI path and the `.1pux` export-file path.
+    fn store_resolved_logins(&self, logins: Vec<onepassword::ResolvedLogin>) -> ImportReport {
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = Vec::new();
+        for login in logins {
+            if login.password.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            match self.put(SecretUpsert {
+                id: None,
+                label: login.label,
+                description: Some("1Password login".to_string()),
+                value: login.password,
+                username: non_empty_option(login.username),
+                origin: login.origin,
+                source: "1password".to_string(),
+            }) {
+                Ok(_) => imported += 1,
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        ImportReport {
+            imported,
+            skipped,
+            errors,
+        }
     }
 
     fn load_store(&self) -> Result<SecretStoreFile> {
@@ -510,15 +679,15 @@ fn is_generic_secret_search_term(term: &str) -> bool {
     )
 }
 
-fn chrome_secret_label(credential: &chrome::ChromeCredential) -> String {
-    let host = chrome_site_description(&credential.origin_url);
+fn browser_secret_label(source: BrowserSource, credential: &ImportedCredential) -> String {
+    let host = site_description(&credential.origin_url);
     match credential.username.trim() {
-        "" => format!("Chrome {host}"),
-        username => format!("Chrome {username} @ {host}"),
+        "" => format!("{} {host}", source.label()),
+        username => format!("{} {username} @ {host}", source.label()),
     }
 }
 
-fn chrome_site_description(origin_url: &str) -> String {
+fn site_description(origin_url: &str) -> String {
     origin_url
         .split("://")
         .nth(1)

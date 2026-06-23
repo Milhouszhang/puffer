@@ -4,6 +4,7 @@
   import { onDestroy, tick } from "svelte";
   import BrandLogo from "../../design/BrandLogo.svelte";
   import Icon, { type IconName } from "../../design/Icon.svelte";
+  import LoadingDots from "../../design/LoadingDots.svelte";
   import MessageBody from "../../components/MessageBody.svelte";
   import ToolCard from "./ToolCard.svelte";
   import DiffCard from "./DiffCard.svelte";
@@ -171,6 +172,7 @@
   let expandedActivityIds = $state<string[]>([]);
   let expandedRecapIds = $state<string[]>([]);
   let selectedActivityChildren = $state<Record<string, string>>({});
+  let autoExpandedCanvasActivityIds = $state<string[]>([]);
   let fastMode = $state(false);
   let permissionMode = $state<AgentPermissionMode>("workspace-write");
   let routingSelectionKey = $state<string | null>(null);
@@ -1143,6 +1145,7 @@
       resetAttachmentDropState();
       expandedActivityIds = [];
       selectedActivityChildren = {};
+      autoExpandedCanvasActivityIds = [];
       lastSessionId = nextSessionId;
       scheduleComposerResize({ anchorThread: false });
       void tick().then(() => {
@@ -1401,6 +1404,21 @@
     }
   }
 
+  async function submitCanvasStateMessage(message: string): Promise<boolean | void> {
+    const targetSessionId = session?.id ?? null;
+    if (!targetSessionId) return false;
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      if ((session?.id ?? null) !== targetSessionId) return false;
+      if (!turnRunning && !submitInFlight) return onSubmitMessage(message);
+      await delay(500);
+    }
+    return false;
+  }
+
+  function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   function onKeydown(e: KeyboardEvent) {
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && !e.shiftKey) {
@@ -1479,10 +1497,48 @@
     return false;
   });
 
+  $effect(() => {
+    const expanded = new Set(expandedActivityIds);
+    const autoExpanded = new Set(autoExpandedCanvasActivityIds);
+    const selected = { ...selectedActivityChildren };
+    let changedExpanded = false;
+    let changedAutoExpanded = false;
+    let changedSelected = false;
+
+    for (let idx = 0; idx < distributedRows.length; idx += 1) {
+      const row = distributedRows[idx];
+      if (row.kind !== "agent" || !shouldCollapseActivity(row, idx)) continue;
+      const canvasChild = canvasActivityChild(row.children);
+      if (!canvasChild) continue;
+      const activityId = activityGroupId(row, idx);
+      if (!autoExpanded.has(activityId)) {
+        autoExpanded.add(activityId);
+        changedAutoExpanded = true;
+        if (!expanded.has(activityId)) {
+          expanded.add(activityId);
+          changedExpanded = true;
+        }
+      }
+      if (!selected[activityId] || !row.children.some((child) => child.id === selected[activityId])) {
+        selected[activityId] = canvasChild.id;
+        changedSelected = true;
+      }
+    }
+
+    if (changedExpanded) expandedActivityIds = Array.from(expanded);
+    if (changedAutoExpanded) autoExpandedCanvasActivityIds = Array.from(autoExpanded);
+    if (changedSelected) selectedActivityChildren = selected;
+  });
+
+  let typingElapsedLabel = $derived(formatElapsed(turnStartedAtMs));
+  let typingDotsActive = $derived.by(
+    () => turnRunning && turnThinking && (!turnStatusHint || turnStatusHint === "Thinking")
+  );
   let typingLabel = $derived.by(() => {
     const elapsed = formatElapsed(turnStartedAtMs);
     const suffix = elapsed ? ` (${elapsed})` : "";
     if (turnRunning) {
+      if (typingDotsActive) return null;
       if (turnStatusHint) return `${turnStatusHint}${suffix}`;
       if (turnThinking) return `Thinking${suffix}`;
       if (activeTurnHasVisibleText) return null;
@@ -1491,6 +1547,7 @@
     if (agentState === "awaiting") return `${engineerName} paused - waiting for your response`;
     return null;
   });
+  let showTyping = $derived(Boolean(typingLabel) || typingDotsActive);
 
   $effect(() => {
     void session?.id;
@@ -1499,12 +1556,14 @@
     void pendingPermissions;
     void pendingQuestions;
     void typingLabel;
+    void showTyping;
     scheduleThreadScrollButtonStateRefresh();
   });
 
   function shouldCollapseActivity(row: Extract<RowKind, { kind: "agent" }>, idx: number): boolean {
     const isActiveTurn = idx === activeTurnAgentRowIndex;
     if (row.children.some(isGateActivity)) return true;
+    if (row.children.some((child) => child.kind === "assistant")) return false;
     return !isActiveTurn && row.children.length > 0 && Boolean(row.item?.body.trim());
   }
 
@@ -1567,6 +1626,16 @@
 
   function compactToolName(name: string | null | undefined): string {
     return (name ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  }
+
+  function isCanvasActivity(child: ActivityChild): child is ToolTimelineItem {
+    if (child.kind !== "tool") return false;
+    if (compactToolName(child.toolName) !== "canvas") return false;
+    return Array.isArray(parseInputObject(child)?.body);
+  }
+
+  function canvasActivityChild(children: ActivityChild[]): ToolTimelineItem | null {
+    return children.find(isCanvasActivity) ?? null;
   }
 
   function isSubagentToolName(name: string | null | undefined): boolean {
@@ -2143,7 +2212,7 @@
       <div class="pf-chat-thread-inner">
         {#if loading && rows.length === 0}
           <div class="state">Loading conversation…</div>
-        {:else if rows.length === 0 && !typingLabel}
+        {:else if rows.length === 0 && !showTyping}
           <div class="state">No messages in this session yet. Send a prompt to get started.</div>
         {:else}
           {#each distributedRows as row, idx (row.key)}
@@ -2319,6 +2388,7 @@
                                         sessionId={session?.id ?? null}
                                         defaultCollapsed={false}
                                         {onOpenChatIntent}
+                                        onSubmitCanvasState={submitCanvasStateMessage}
                                       />
                                     {:else if selected.child.kind === "diff"}
                                       <DiffCard item={selected.child as DiffTimelineItem} defaultCollapsed={false} />
@@ -2352,6 +2422,7 @@
                                 item={child as ToolTimelineItem}
                                 sessionId={session?.id ?? null}
                                 {onOpenChatIntent}
+                                onSubmitCanvasState={submitCanvasStateMessage}
                               />
                             {:else if child.kind === "diff"}
                               <DiffCard item={child as DiffTimelineItem} />
@@ -2416,11 +2487,20 @@
             {/if}
           {/each}
 
-          {#if typingLabel}
+          {#if showTyping}
             <div class="pf-msg" data-role="agent" style="opacity: 0.85;">
               <div class="pf-msg-avatar"><BrandLogo size={26} /></div>
               <div class="pf-msg-body">
-                <div class="typing">{typingLabel}</div>
+                <div class="typing">
+                  {#if typingDotsActive}
+                    <LoadingDots label="Thinking" />
+                    {#if typingElapsedLabel}
+                      <span class="typing-elapsed">({typingElapsedLabel})</span>
+                    {/if}
+                  {:else}
+                    {typingLabel}
+                  {/if}
+                </div>
               </div>
             </div>
           {/if}
@@ -3112,6 +3192,9 @@
   .activity-panel :global(.pf-tool-body) {
     max-height: 360px;
   }
+  .activity-panel :global(.pf-tool-body.pf-tool-canvas-body) {
+    max-height: min(680px, calc(100vh - 240px));
+  }
   .gate-detail-panel {
     display: flex;
     flex-direction: column;
@@ -3158,6 +3241,10 @@
     font-size: var(--pf-chat-detail-size);
     color: var(--muted-foreground);
     font-family: var(--font-sans);
+  }
+  .typing-elapsed {
+    color: var(--muted-foreground);
+    font-size: var(--pf-chat-meta-size);
   }
   .activity-thought {
     display: flex;

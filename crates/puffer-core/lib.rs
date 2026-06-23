@@ -83,6 +83,7 @@ pub use runtime::teammate_loop;
 pub use runtime::{
     browser_auto_review_runtime_result_from_json, execute_side_question,
     execute_user_prompt_streaming as execute_user_turn_streaming,
+    execute_user_prompt_streaming_excluding_tools as execute_user_turn_streaming_excluding_tools,
     execute_user_prompt_streaming_with_cancel as execute_user_turn_streaming_with_cancel,
     execute_user_prompt_streaming_with_permissions as execute_user_turn_streaming_with_permissions,
     execute_user_prompt_streaming_with_permissions_and_cancel as execute_user_turn_streaming_with_permissions_and_cancel,
@@ -105,13 +106,28 @@ pub use runtime::{
     TurnUsageReport, UserQuestionPromptRequest, UserQuestionPromptResponse,
 };
 pub use runtime::{install_observability, observability_handle};
-pub use state::{AppState, MessageRole, RenderedMessage, TaskRecord, TaskStatus};
+pub use state::{
+    AppState, MessageRole, MonitorTaskCreateGateContext, RenderedAttachment, RenderedMessage,
+    TaskRecord, TaskStatus,
+};
 
 use anyhow::Result;
 use puffer_provider_registry::{AuthStore, ProviderRegistry};
 use puffer_resources::LoadedResources;
 use puffer_session_store::{SessionStore, SessionSummary};
 use std::path::Path;
+
+/// Applies an interactive Canvas state patch for a live daemon bridge.
+pub fn apply_canvas_state_patch(
+    cwd: &Path,
+    session_id: &str,
+    canvas_id: &str,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    runtime::claude_tools::workflow::canvas::apply_canvas_state_patch(
+        cwd, session_id, canvas_id, patch,
+    )
+}
 
 /// Executes a standalone LSP query against the configured workspace language servers.
 pub fn execute_lsp_query(

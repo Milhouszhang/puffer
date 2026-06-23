@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
 use puffer_core::subscription_manager;
-use puffer_subscriptions::{FilterSpec, WorkflowBindingSpec, installed_workflow_runner};
+use puffer_subscriptions::{installed_workflow_runner, FilterSpec, WorkflowBindingSpec};
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

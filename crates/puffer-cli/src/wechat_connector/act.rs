@@ -61,7 +61,10 @@ fn send_key() -> String {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "Return".to_string());
-    if key.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '_') {
+    if key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '_')
+    {
         key
     } else {
         "Return".to_string()
@@ -88,8 +91,7 @@ pub(crate) async fn send_message(
 ) -> Result<ActOutcome> {
     let recipient = resolve_recipient(input)?;
     // Body text is OPTIONAL when an attachment is present (media-only send).
-    let body = first_str(input, &["text", "message", "caption"])
-        .filter(|s| !s.trim().is_empty());
+    let body = first_str(input, &["text", "message", "caption"]).filter(|s| !s.trim().is_empty());
 
     // Validate the quote/reply precondition BEFORE any side effect — a reply
     // needs a body, and bailing here avoids sending attachments then erroring.
@@ -121,7 +123,9 @@ pub(crate) async fn send_message(
             .map_err(|e| anyhow!("attachment resolve task failed: {e}"))??
     };
     if body.is_none() && attachments.is_empty() {
-        bail!("send_message requires `text` (or `message`) or an attachment (`image`/`file`/`media`)");
+        bail!(
+            "send_message requires `text` (or `message`) or an attachment (`image`/`file`/`media`)"
+        );
     }
 
     // One up-front anti-ban gate. For a media-only send the gate label is made
@@ -154,11 +158,22 @@ pub(crate) async fn send_message(
     let mut files = 0usize;
     let mut sent = 0usize;
     let result = perform_sends(
-        instance, human, &mut policy, &recipient, &attachments, body.as_deref(),
-        quoting.as_deref(), &nonce, &mut images, &mut files, &mut sent,
+        instance,
+        human,
+        &mut policy,
+        &recipient,
+        &attachments,
+        body.as_deref(),
+        quoting.as_deref(),
+        &nonce,
+        &mut images,
+        &mut files,
+        &mut sent,
     )
     .await;
-    let _ = instance.exec_bash(&format!("rm -rf '/tmp/wocm/{nonce}'")).await; // best-effort cleanup
+    let _ = instance
+        .exec_bash(&format!("rm -rf '/tmp/wocm/{nonce}'"))
+        .await; // best-effort cleanup
 
     if let Err(error) = result {
         // Once ANY message has physically left, do NOT let the host retry the
@@ -218,7 +233,10 @@ async fn perform_sends(
         }
         *sent += 1;
         // Unique per-message label so repeated media doesn't pollute text dedup.
-        policy.record_send(recipient, &format!("[attachment {} @{nonce}-{idx}]", att.filename))?;
+        policy.record_send(
+            recipient,
+            &format!("[attachment {} @{nonce}-{idx}]", att.filename),
+        )?;
         if let Some(caption) = att.caption.as_deref().filter(|c| !c.trim().is_empty()) {
             sleep(human.think_time()).await;
             focus_message_input(instance, human).await?;
@@ -272,7 +290,9 @@ pub(crate) async fn mention(
         bail!("mention requires `mention` (a member name or array of names)");
     }
     // Reject @all unless explicitly allowed (it broadcasts to everyone).
-    let at_all_allowed = std::env::var("WECHAT_ALLOW_AT_ALL").map(|v| v.trim() == "1").unwrap_or(false);
+    let at_all_allowed = std::env::var("WECHAT_ALLOW_AT_ALL")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
     if names.iter().any(|n| is_at_all(n)) && !at_all_allowed {
         bail!("@all (broadcast to all members) is blocked (set WECHAT_ALLOW_AT_ALL=1 to override)");
     }
@@ -309,7 +329,10 @@ pub(crate) async fn mention(
 
     policy.record_send(&recipient, &gate_text)?;
     Ok(ActOutcome {
-        summary: format!("Sent WeChat group message to {recipient} mentioning {}", names.join(", ")),
+        summary: format!(
+            "Sent WeChat group message to {recipient} mentioning {}",
+            names.join(", ")
+        ),
         output: json!({ "recipient": recipient, "mentions": names }),
     })
 }
@@ -358,7 +381,9 @@ pub(crate) async fn logout(
     sleep_ms(700).await;
     let item = locate_menu_item(instance, ui::LOG_OUT)
         .await?
-        .ok_or_else(|| anyhow!("could not find the log-out item in the WeChat menu (is it open?)"))?;
+        .ok_or_else(|| {
+            anyhow!("could not find the log-out item in the WeChat menu (is it open?)")
+        })?;
     human_click(instance, item).await?;
     sleep_ms(700).await;
     // Confirm dialog (button is usually the same log-out label, sometimes "exit").
@@ -372,7 +397,10 @@ pub(crate) async fn logout(
     }
 
     Ok(ActOutcome {
-        summary: format!("Logged out of WeChat `{}` (container + data kept)", instance.name()),
+        summary: format!(
+            "Logged out of WeChat `{}` (container + data kept)",
+            instance.name()
+        ),
         output: json!({ "logged_out": true }),
     })
 }
@@ -393,7 +421,10 @@ async fn more_menu_point(instance: &WechatInstance) -> (i32, i32) {
         .await
         .unwrap_or_default();
     let mut it = geom.split_whitespace();
-    match (it.next().and_then(|v| v.parse().ok()), it.next().and_then(|v| v.parse().ok())) {
+    match (
+        it.next().and_then(|v| v.parse().ok()),
+        it.next().and_then(|v| v.parse().ok()),
+    ) {
         (Some(x), Some(y)) => (x, y),
         _ => (31, 762),
     }
@@ -403,7 +434,10 @@ async fn more_menu_point(instance: &WechatInstance) -> (i32, i32) {
 async fn locate_menu_item(instance: &WechatInstance, label: &str) -> Result<Option<(i32, i32)>> {
     for _ in 0..2 {
         sleep_ms(500).await;
-        let png = instance.screenshot_png().await.context("screenshot to locate menu item")?;
+        let png = instance
+            .screenshot_png()
+            .await
+            .context("screenshot to locate menu item")?;
         let want = label.to_string();
         let coords = tokio::task::spawn_blocking(move || read::read_menu_item_coords(&png, &want))
             .await
@@ -429,8 +463,11 @@ pub(crate) async fn react(
     human: &Human,
 ) -> Result<ActOutcome> {
     let recipient = resolve_recipient(input)?;
-    let who = first_str(input, &["on", "member", "who", "at", "target_user", "user_name"])
-        .unwrap_or_else(|| recipient.clone());
+    let who = first_str(
+        input,
+        &["on", "member", "who", "at", "target_user", "user_name"],
+    )
+    .unwrap_or_else(|| recipient.clone());
 
     ensure_ready(instance, cfg).await?;
     // A pat is still an outbound interaction — count it against the anti-ban caps,
@@ -467,7 +504,9 @@ pub(crate) async fn react(
         .map_err(|e| anyhow!("pat menu task failed: {e}"))?
         .context("read the pat menu item")?;
     let pat_point = coords.ok_or_else(|| {
-        anyhow!("the pat item was not found in the avatar menu (this WeChat build may not support it)")
+        anyhow!(
+            "the pat item was not found in the avatar menu (this WeChat build may not support it)"
+        )
     })?;
     human_click(instance, pat_point).await?;
     sleep_ms(800).await;
@@ -542,8 +581,7 @@ async fn quote_message(instance: &WechatInstance, snippet: &str, human: &Human) 
         .await
         .map_err(|e| anyhow!("quote menu task failed: {e}"))?
         .context("read the quote menu item")?;
-    let menu_point =
-        coords.ok_or_else(|| anyhow!("the quote item was not found in the menu"))?;
+    let menu_point = coords.ok_or_else(|| anyhow!("the quote item was not found in the menu"))?;
     human_click(instance, menu_point).await?;
     sleep(human.think_time()).await;
     Ok(())
@@ -642,7 +680,10 @@ async fn open_chat(instance: &WechatInstance, recipient: &str, human: &Human) ->
         // If the requested chat is ALREADY open, do not click its conversation
         // row — clicking the currently-open row TOGGLES the chat closed (verified
         // live), which is what broke a 2nd consecutive send to the same chat.
-        if super::atspi::open_chat_is(instance, recipient).await.unwrap_or(false) {
+        if super::atspi::open_chat_is(instance, recipient)
+            .await
+            .unwrap_or(false)
+        {
             return Ok(());
         }
         for attempt in 0..4 {
@@ -773,7 +814,10 @@ async fn focus_message_input(instance: &WechatInstance, human: &Human) -> Result
         .unwrap_or_default();
     let point = {
         let mut it = geom.split_whitespace();
-        match (it.next().and_then(|v| v.parse().ok()), it.next().and_then(|v| v.parse().ok())) {
+        match (
+            it.next().and_then(|v| v.parse().ok()),
+            it.next().and_then(|v| v.parse().ok()),
+        ) {
             (Some(x), Some(y)) => (x, y),
             _ => (640, 720), // center-bottom of the 1280x800 capture
         }
@@ -789,7 +833,10 @@ async fn focus_message_input(instance: &WechatInstance, human: &Human) -> Result
 /// unreadable/empty header, or a mismatch all abort. Opt out only with
 /// `WECHAT_VERIFY_RECIPIENT=0` (then it is skipped entirely).
 async fn verify_open_chat(instance: &WechatInstance, recipient: &str) -> Result<()> {
-    if std::env::var("WECHAT_VERIFY_RECIPIENT").map(|v| v.trim() == "0").unwrap_or(false) {
+    if std::env::var("WECHAT_VERIFY_RECIPIENT")
+        .map(|v| v.trim() == "0")
+        .unwrap_or(false)
+    {
         return Ok(());
     }
     // Verify via the accessibility tree: the open chat's header label carries the
@@ -799,7 +846,10 @@ async fn verify_open_chat(instance: &WechatInstance, recipient: &str) -> Result<
     // differently) fall through to the screen-reading check below.
     if super::atspi::available(instance).await {
         for attempt in 0..6 {
-            if super::atspi::open_chat_is(instance, recipient).await.unwrap_or(false) {
+            if super::atspi::open_chat_is(instance, recipient)
+                .await
+                .unwrap_or(false)
+            {
                 return Ok(());
             }
             if attempt < 5 {
@@ -874,7 +924,10 @@ fn title_matches(title: &str, recipient: &str) -> bool {
 
 /// Normalizes a name for comparison: collapse whitespace + casefold.
 fn normalize(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Best-effort delivery confirmation (H4): after pressing send, vision-reads the
@@ -883,7 +936,10 @@ fn normalize(s: &str) -> String {
 /// DOUBLE SEND, which is worse than a cap undercount. Set
 /// `WECHAT_VERIFY_DELIVERY=0` to skip the check entirely.
 async fn confirm_delivery(instance: &WechatInstance, body: &str) -> Result<()> {
-    if std::env::var("WECHAT_VERIFY_DELIVERY").map(|v| v.trim() == "0").unwrap_or(false) {
+    if std::env::var("WECHAT_VERIFY_DELIVERY")
+        .map(|v| v.trim() == "0")
+        .unwrap_or(false)
+    {
         return Ok(());
     }
     // Confirm via the accessibility tree: the sent body appears as a message
@@ -891,7 +947,10 @@ async fn confirm_delivery(instance: &WechatInstance, body: &str) -> Result<()> {
     // retry briefly). On a match we're done.
     if super::atspi::available(instance).await {
         for attempt in 0..6 {
-            if super::atspi::body_in_history(instance, body).await.unwrap_or(false) {
+            if super::atspi::body_in_history(instance, body)
+                .await
+                .unwrap_or(false)
+            {
                 return Ok(());
             }
             if attempt < 5 {
@@ -973,11 +1032,20 @@ fn resolve_recipient(input: &Value) -> Result<String> {
     first_str(
         input,
         &[
-            "to", "target", "contact", "chat", "chat_id", "user", "receive_id", "name",
+            "to",
+            "target",
+            "contact",
+            "chat",
+            "chat_id",
+            "user",
+            "receive_id",
+            "name",
         ],
     )
     .ok_or_else(|| {
-        anyhow!("send_message requires a recipient (`to`/`contact`: a WeChat contact or group name)")
+        anyhow!(
+            "send_message requires a recipient (`to`/`contact`: a WeChat contact or group name)"
+        )
     })
 }
 
@@ -1068,12 +1136,10 @@ const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "heic"
 /// Caps at 9 (WeChat's per-batch limit).
 fn collect_attachments(input: &Value) -> Result<Vec<Attachment>> {
     let mut specs: Vec<(Value, Option<bool>)> = Vec::new();
-    let mut push = |v: &Value, hint: Option<bool>, specs: &mut Vec<(Value, Option<bool>)>| {
-        match v {
-            Value::Array(items) => items.iter().for_each(|i| specs.push((i.clone(), hint))),
-            Value::Null => {}
-            other => specs.push((other.clone(), hint)),
-        }
+    let mut push = |v: &Value, hint: Option<bool>, specs: &mut Vec<(Value, Option<bool>)>| match v {
+        Value::Array(items) => items.iter().for_each(|i| specs.push((i.clone(), hint))),
+        Value::Null => {}
+        other => specs.push((other.clone(), hint)),
     };
     for key in ["image", "photo"] {
         if let Some(v) = input.get(key) {
@@ -1111,7 +1177,10 @@ fn collect_attachments(input: &Value) -> Result<Vec<Attachment>> {
     // Enforce the per-send cap BEFORE downloading/reading anything (don't pull 50
     // files into memory just to reject them).
     if specs.len() > 9 {
-        bail!("too many attachments ({}); WeChat allows at most 9 per send", specs.len());
+        bail!(
+            "too many attachments ({}); WeChat allows at most 9 per send",
+            specs.len()
+        );
     }
     let mut out = Vec::new();
     for (value, hint) in specs {
@@ -1138,12 +1207,14 @@ fn resolve_attachment(value: &Value, hint: Option<bool>) -> Result<Attachment> {
     let (src, kind, caption, explicit_name) = match value {
         Value::String(s) => (s.trim().to_string(), None, None, None),
         Value::Object(_) => {
-            let src = first_str(value, &["path", "file", "url", "src", "media"]).ok_or_else(|| {
-                anyhow!("attachment object needs a `path`, `file`, or `url`")
-            })?;
+            let src = first_str(value, &["path", "file", "url", "src", "media"])
+                .ok_or_else(|| anyhow!("attachment object needs a `path`, `file`, or `url`"))?;
             (
                 src,
-                value.get("kind").and_then(Value::as_str).map(str::to_lowercase),
+                value
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .map(str::to_lowercase),
                 first_str(value, &["caption"]),
                 first_str(value, &["filename", "name"]),
             )
@@ -1165,7 +1236,10 @@ fn resolve_attachment(value: &Value, hint: Option<bool>) -> Result<Attachment> {
         let path = validate_local_attachment_path(&src)?;
         let meta = std::fs::metadata(&path).with_context(|| format!("stat attachment {src}"))?;
         if meta.len() > MAX_ATTACHMENT_BYTES {
-            bail!("attachment {src} is {} bytes, over the {MAX_ATTACHMENT_BYTES}-byte cap", meta.len());
+            bail!(
+                "attachment {src} is {} bytes, over the {MAX_ATTACHMENT_BYTES}-byte cap",
+                meta.len()
+            );
         }
         let bytes = std::fs::read(&path).with_context(|| format!("read attachment file {src}"))?;
         let name = path
@@ -1231,14 +1305,19 @@ fn validate_local_attachment_path(src: &str) -> Result<std::path::PathBuf> {
         .map(PathBuf::from)
         .collect();
     if let Some(home) = &home {
-        for sub in [".puffer", ".ssh", ".aws", ".gnupg", ".config", ".kube", ".docker"] {
+        for sub in [
+            ".puffer", ".ssh", ".aws", ".gnupg", ".config", ".kube", ".docker",
+        ] {
             blocked.push(PathBuf::from(home).join(sub));
         }
     }
     for dir in &blocked {
         let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
         if path.starts_with(&canon) {
-            bail!("refusing to attach a file under a sensitive directory: {}", path.display());
+            bail!(
+                "refusing to attach a file under a sensitive directory: {}",
+                path.display()
+            );
         }
     }
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -1249,7 +1328,9 @@ fn validate_local_attachment_path(src: &str) -> Result<std::path::PathBuf> {
             || lname == ".git-credentials"
             || lname == "id_rsa"
             || lname == "id_ed25519"
-            || [".dbkey", ".pem", ".key", ".keystore", ".p12"].iter().any(|e| lname.ends_with(e));
+            || [".dbkey", ".pem", ".key", ".keystore", ".p12"]
+                .iter()
+                .any(|e| lname.ends_with(e));
         if credential {
             bail!("refusing to attach a credential-like file: {name}");
         }
@@ -1270,7 +1351,10 @@ fn validate_local_attachment_path(src: &str) -> Result<std::path::PathBuf> {
                     roots.push(PathBuf::from(home).join(sub));
                 }
             }
-            roots.into_iter().filter_map(|d| std::fs::canonicalize(&d).ok()).collect()
+            roots
+                .into_iter()
+                .filter_map(|d| std::fs::canonicalize(&d).ok())
+                .collect()
         }
     };
     if !allowed.iter().any(|a| path.starts_with(a)) {
@@ -1291,15 +1375,23 @@ fn download_attachment(src: &str) -> Result<(Vec<u8>, String)> {
     use std::net::ToSocketAddrs;
 
     let url = reqwest::Url::parse(src).with_context(|| format!("parse attachment URL {src}"))?;
-    let host = url.host_str().ok_or_else(|| anyhow!("attachment URL has no host: {src}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("attachment URL has no host: {src}"))?;
     let port = url.port_or_known_default().unwrap_or(443);
     // Resolve ONCE, reject internal targets, and PIN the validated address so
     // reqwest connects to exactly the IP we checked (defeats DNS-rebinding TOCTOU,
     // where a second resolution at connect time could point at an internal host).
     let mut chosen: Option<std::net::SocketAddr> = None;
-    for addr in (host, port).to_socket_addrs().with_context(|| format!("resolve {host}"))? {
+    for addr in (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve {host}"))?
+    {
         if is_blocked_ip(&addr.ip()) {
-            bail!("refusing to download attachment from a private/loopback address ({})", addr.ip());
+            bail!(
+                "refusing to download attachment from a private/loopback address ({})",
+                addr.ip()
+            );
         }
         if chosen.is_none() {
             chosen = Some(addr);
@@ -1313,7 +1405,10 @@ fn download_attachment(src: &str) -> Result<(Vec<u8>, String)> {
         .resolve(host, addr) // pin DNS to the validated address (no rebinding)
         .build()
         .context("build attachment http client")?;
-    let resp = client.get(url).send().with_context(|| format!("download attachment {src}"))?;
+    let resp = client
+        .get(url)
+        .send()
+        .with_context(|| format!("download attachment {src}"))?;
     if !resp.status().is_success() {
         bail!("download attachment {src}: HTTP {}", resp.status());
     }
@@ -1362,11 +1457,17 @@ fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
             let embedded_v4 = v6.to_ipv4_mapped().or_else(|| {
                 if seg[0] == 0x0064 && seg[1] == 0xff9b {
                     Some(std::net::Ipv4Addr::new(
-                        (seg[6] >> 8) as u8, seg[6] as u8, (seg[7] >> 8) as u8, seg[7] as u8,
+                        (seg[6] >> 8) as u8,
+                        seg[6] as u8,
+                        (seg[7] >> 8) as u8,
+                        seg[7] as u8,
                     ))
                 } else if seg[0] == 0x2002 {
                     Some(std::net::Ipv4Addr::new(
-                        (seg[1] >> 8) as u8, seg[1] as u8, (seg[2] >> 8) as u8, seg[2] as u8,
+                        (seg[1] >> 8) as u8,
+                        seg[1] as u8,
+                        (seg[2] >> 8) as u8,
+                        seg[2] as u8,
                     ))
                 } else {
                     None
@@ -1492,7 +1593,11 @@ fn sanitize_filename(name: &str) -> String {
 /// A short anti-ban gate label for a media-only send (no text to dedup on).
 fn media_gate_label(atts: &[Attachment]) -> String {
     let images = atts.iter().filter(|a| a.as_image).count();
-    format!("[media {} image(s), {} file(s)]", images, atts.len() - images)
+    format!(
+        "[media {} image(s), {} file(s)]",
+        images,
+        atts.len() - images
+    )
 }
 
 /// One-line human summary of what was sent.
@@ -1563,7 +1668,10 @@ mod tests {
 
     #[test]
     fn reply_snippet_from_string_and_object() {
-        assert_eq!(reply_snippet(&json!({"reply_to": "hi there"})).as_deref(), Some("hi there"));
+        assert_eq!(
+            reply_snippet(&json!({"reply_to": "hi there"})).as_deref(),
+            Some("hi there")
+        );
         assert_eq!(
             reply_snippet(&json!({"quote": {"text": "  quoted  "}})).as_deref(),
             Some("quoted")
@@ -1576,9 +1684,24 @@ mod tests {
     #[test]
     fn media_gate_label_counts_kinds() {
         let atts = vec![
-            Attachment { filename: "a.png".into(), bytes: vec![], as_image: true, caption: None },
-            Attachment { filename: "b.pdf".into(), bytes: vec![], as_image: false, caption: None },
-            Attachment { filename: "c.jpg".into(), bytes: vec![], as_image: true, caption: None },
+            Attachment {
+                filename: "a.png".into(),
+                bytes: vec![],
+                as_image: true,
+                caption: None,
+            },
+            Attachment {
+                filename: "b.pdf".into(),
+                bytes: vec![],
+                as_image: false,
+                caption: None,
+            },
+            Attachment {
+                filename: "c.jpg".into(),
+                bytes: vec![],
+                as_image: true,
+                caption: None,
+            },
         ];
         assert_eq!(media_gate_label(&atts), "[media 2 image(s), 1 file(s)]");
     }

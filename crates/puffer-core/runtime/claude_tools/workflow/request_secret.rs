@@ -135,7 +135,16 @@ fn request_secret(
             PermissionPromptAction::Deny => bail!("permission denied by user"),
         }
     }
-    let token = register_masked_secret(state, secret.value)?;
+    // A stored value is usually plaintext — browser and 1Password imports save the
+    // resolved password. Only a manually-added `op://...` reference is resolved to
+    // its live value on demand, so that reference's plaintext never persists.
+    let value = if puffer_secrets::is_op_reference(&secret.value) {
+        puffer_secrets::resolve_op_reference(&secret.value)
+            .with_context(|| format!("resolve 1Password reference for secret `{}`", secret.label))?
+    } else {
+        secret.value
+    };
+    let token = register_masked_secret(state, value)?;
     Ok(serde_json::to_string_pretty(&json!({
         "secret": token,
         "id": secret.id,

@@ -3,7 +3,7 @@ use super::{
     sync_monitor_ignore_filters_from_tasks,
 };
 use puffer_config::ConfigPaths;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::fs;
 
 #[test]

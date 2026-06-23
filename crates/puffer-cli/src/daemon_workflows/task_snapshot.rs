@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
 use puffer_subscriptions::normalize_contact_id;
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fs;

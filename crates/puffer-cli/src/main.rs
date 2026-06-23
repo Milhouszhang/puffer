@@ -22,6 +22,8 @@ mod daemon_fs_watch;
 mod daemon_gcal_browser_setup;
 mod daemon_gmail_browser_setup;
 mod daemon_lambda_skills;
+#[path = "daemon_lark_browser_setup.rs"]
+mod daemon_lark_browser_setup;
 mod daemon_local_model;
 mod daemon_lsp;
 mod daemon_pty;
@@ -32,6 +34,7 @@ mod daemon_title;
 mod daemon_turn_recovery;
 mod daemon_turn_routing;
 mod daemon_ui_state;
+#[cfg(unix)]
 mod daemon_wechat_browser_setup;
 mod daemon_workflow_backend_settings;
 mod daemon_workflow_runtime;
@@ -44,6 +47,10 @@ mod gmail_browser;
 mod gmail_browser_log;
 mod heartbeat;
 mod internal_tools;
+#[path = "lark_browser.rs"]
+mod lark_browser;
+#[path = "lark_browser_script.rs"]
+mod lark_browser_script;
 mod lark_connector;
 mod media_internal_tools;
 mod non_interactive;
@@ -53,6 +60,7 @@ mod runner_selection;
 mod subscriber_tool_args;
 mod subscriber_tools;
 mod subscriptions;
+#[cfg(unix)]
 mod wechat_connector;
 mod workflow_runtime;
 mod workflow_runtime_helpers;
@@ -104,7 +112,21 @@ use crate::auth_provider::{
     OauthFamily,
 };
 
+const CLI_MAIN_STACK_SIZE_BYTES: usize = 32 * 1024 * 1024;
+
 fn main() -> Result<()> {
+    let handle = std::thread::Builder::new()
+        .name("puffer-main".to_string())
+        .stack_size(CLI_MAIN_STACK_SIZE_BYTES)
+        .spawn(run_main)
+        .context("spawn puffer main thread")?;
+    match handle.join() {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn run_main() -> Result<()> {
     let cli = Cli::parse();
 
     // Hidden subscriber subcommand dispatches to a baked-in skill driver
@@ -160,6 +182,9 @@ fn main() -> Result<()> {
         );
     }
     providers.apply_openai_base_url_override(config.openai_base_url.as_deref());
+    if let Some(display_name) = config.openai_display_name.as_deref() {
+        providers.set_openai_display_name(display_name);
+    }
     if !config.openai_headers.is_empty() {
         providers.set_openai_headers(
             config
@@ -477,6 +502,17 @@ fn main() -> Result<()> {
             &paths,
         ),
         Some(Command::Tool { command }) => run_tool_command(command, &resources, &cwd),
+        Some(Command::WinChromeImport { args }) => {
+            #[cfg(target_os = "windows")]
+            {
+                puffer_secrets::win_chrome_import::dispatch(&args)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = args;
+                anyhow::bail!("__win-chrome-import is Windows-only")
+            }
+        }
         Some(Command::Remote {
             target,
             cwd,
@@ -1371,6 +1407,7 @@ fn run_subscriber(id: &str) -> Result<()> {
             "email" => puffer_subscriber_email::run().await,
             "gcal-browser" => crate::gcal_browser::run_subscriber().await,
             "gmail-browser" => crate::gmail_browser::run_subscriber().await,
+            "lark-browser" => crate::lark_browser::run_subscriber().await,
             other => Err(anyhow::anyhow!(
                 "unknown subscriber id `{other}`; this puffer build does not bundle a driver for it"
             )),
@@ -1391,6 +1428,7 @@ fn run_connector_bridge(id: &str, args: &[String]) -> Result<()> {
         match id {
             "lark-user" => lark_connector::run("user", args).await,
             "lark-bot" => lark_connector::run("bot", args).await,
+            #[cfg(unix)]
             "wechat-user" => wechat_connector::run("user", args).await,
             other => Err(anyhow::anyhow!(
                 "unknown connector id `{other}`; this puffer build does not bundle a bridge for it"

@@ -1,6 +1,6 @@
 use super::{handle_monitor_task_complete, monitor_tasks_path};
 use puffer_config::ConfigPaths;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::fs;
 
 fn write_store(paths: &ConfigPaths, store: Value) {

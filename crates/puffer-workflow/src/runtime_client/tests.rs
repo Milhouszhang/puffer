@@ -24,14 +24,43 @@ fn runtime_calls_share_one_client_and_normalize_v1_paths() {
     }))
     .expect("create request");
     let create_body = serde_json::to_string(&create_request).expect("create body");
+    let update_request: WorkflowRuntimeUpdateWorkflowRequest = serde_json::from_value(json!({
+        "name": "Puffer smoke edited",
+        "definition": {
+            "nodes": [
+                {
+                    "id": "smoke-noop",
+                    "type": "noop",
+                    "name": "Smoke noop",
+                    "config": {},
+                    "position": {"x": 12, "y": 34}
+                }
+            ],
+            "edges": []
+        }
+    }))
+    .expect("update request");
+    let update_body = serde_json::to_string(&update_request).expect("update body");
     let execute_request: WorkflowRuntimeExecuteRequest = serde_json::from_value(json!({
         "input": {"manual": true}
     }))
     .expect("execute request");
     let execute_body = serde_json::to_string(&execute_request).expect("execute body");
     let in_memory_request: WorkflowRuntimeInMemoryExecuteRequest = serde_json::from_value(json!({
+        "definition": {
+            "nodes": [
+                {
+                    "id": "smoke-noop",
+                    "type": "noop",
+                    "name": "Smoke noop",
+                    "config": {},
+                    "position": {"x": 0, "y": 0}
+                }
+            ],
+            "edges": []
+        },
         "input": {"manual": true},
-        "workflow": {"name": "inline"},
+        "triggerNodeId": "smoke-noop"
     }))
     .expect("in-memory request");
     let in_memory_body = serde_json::to_string(&in_memory_request).expect("in-memory body");
@@ -56,6 +85,17 @@ fn runtime_calls_share_one_client_and_normalize_v1_paths() {
             response: MockResponse::Http {
                 status: 200,
                 body: r#"{"data":[{"id":"node-a"}]}"#.to_string(),
+            },
+        },
+        MockExchange {
+            method: "GET",
+            path: "/v1/workflows/node-definitions/noop".to_string(),
+            required_headers: vec![("x-api-key".to_string(), "token-123".to_string())],
+            forbidden_headers: vec!["x-workspace-id".to_string()],
+            expected_body: None,
+            response: MockResponse::Http {
+                status: 200,
+                body: r#"{"data":{"type":"noop","name":"Noop","schemas":{"config":{}}}}"#.to_string(),
             },
         },
         MockExchange {
@@ -94,6 +134,17 @@ fn runtime_calls_share_one_client_and_normalize_v1_paths() {
             },
         },
         MockExchange {
+            method: "PUT",
+            path: format!("/v1/workflows/{workflow_id}"),
+            required_headers: workspace_headers(),
+            forbidden_headers: Vec::new(),
+            expected_body: Some(update_body),
+            response: MockResponse::Http {
+                status: 200,
+                body: format!(r#"{{"data":{{"id":"{workflow_id}","name":"Puffer smoke edited","definition":{{"nodes":[],"edges":[]}}}}}}"#),
+            },
+        },
+        MockExchange {
             method: "POST",
             path: format!("/v1/workflows/{workflow_id}/deploy"),
             required_headers: workspace_headers(),
@@ -103,6 +154,19 @@ fn runtime_calls_share_one_client_and_normalize_v1_paths() {
                 status: 200,
                 body: format!(
                     r#"{{"data":{{"id":"{workflow_id}","workspaceId":"ws-123","name":"Puffer smoke","description":null,"version":2,"status":"active","definition":{{}},"publishedDefinition":{{}},"publishedAt":"2026-06-18T00:00:00Z","createdAt":"2026-06-18T00:00:00Z","updatedAt":"2026-06-18T00:00:00Z","webhookEndpoints":[]}}}}"#
+                ),
+            },
+        },
+        MockExchange {
+            method: "POST",
+            path: format!("/v1/workflows/{workflow_id}/undeploy"),
+            required_headers: workspace_headers(),
+            forbidden_headers: Vec::new(),
+            expected_body: None,
+            response: MockResponse::Http {
+                status: 200,
+                body: format!(
+                    r#"{{"data":{{"id":"{workflow_id}","workspaceId":"ws-123","name":"Puffer smoke","description":null,"version":2,"status":"draft","definition":{{}},"publishedDefinition":null,"publishedAt":null,"createdAt":"2026-06-18T00:00:00Z","updatedAt":"2026-06-18T00:00:00Z","webhookEndpoints":[]}}}}"#
                 ),
             },
         },
@@ -147,7 +211,7 @@ fn runtime_calls_share_one_client_and_normalize_v1_paths() {
             expected_body: Some(in_memory_body),
             response: MockResponse::Http {
                 status: 200,
-                body: r#"{"data":{"executionId":"exec-inline"}}"#.to_string(),
+                body: r#"{"data":{"status":"completed","output":{"ok":true},"nodeOutputs":{},"nodeLogs":{},"duration":5,"startedAt":"2026-06-18T00:00:00Z","completedAt":"2026-06-18T00:00:00Z"}}"#.to_string(),
             },
         },
     ]);
@@ -165,6 +229,12 @@ fn runtime_calls_share_one_client_and_normalize_v1_paths() {
         Some("node-a")
     );
 
+    let node_definition = client.get_node_definition("noop").expect("node detail");
+    assert_eq!(
+        node_definition.get("type").and_then(Value::as_str),
+        Some("noop")
+    );
+
     let workflows = client.list_workflows().expect("workflows");
     assert_eq!(
         workflows[0].get("id").and_then(Value::as_str),
@@ -179,12 +249,28 @@ fn runtime_calls_share_one_client_and_normalize_v1_paths() {
     let workflow = client.get_workflow(workflow_id).expect("workflow");
     assert_eq!(workflow.get("name").and_then(Value::as_str), Some("Demo"));
 
+    let updated = client
+        .update_workflow(workflow_id, &update_request)
+        .expect("update workflow");
+    assert_eq!(
+        updated.get("name").and_then(Value::as_str),
+        Some("Puffer smoke edited")
+    );
+
     let deployed = client
         .deploy_workflow(workflow_id)
         .expect("deploy workflow");
     assert_eq!(
         deployed.get("status").and_then(Value::as_str),
         Some("active")
+    );
+
+    let undeployed = client
+        .undeploy_workflow(workflow_id)
+        .expect("undeploy workflow");
+    assert_eq!(
+        undeployed.get("status").and_then(Value::as_str),
+        Some("draft")
     );
 
     let execute_response = client
@@ -213,8 +299,8 @@ fn runtime_calls_share_one_client_and_normalize_v1_paths() {
         .execute_in_memory(&in_memory_request)
         .expect("execute in memory");
     assert_eq!(
-        in_memory.get("executionId").and_then(Value::as_str),
-        Some("exec-inline")
+        in_memory.get("status").and_then(Value::as_str),
+        Some("completed")
     );
     transport.assert_drained();
 }

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -120,7 +120,7 @@ fn truncate_memory(content: String) -> (String, bool) {
 mod tests {
     use super::{add_monitor_memory_context, handle_monitor_memory_save};
     use puffer_config::ConfigPaths;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::fs;
 
     #[test]
@@ -184,9 +184,11 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("invalid monitor memory connection slug"));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid monitor memory connection slug")
+        );
         assert!(!tempdir.path().join("outside.md").exists());
     }
 }

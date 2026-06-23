@@ -1,3 +1,6 @@
+use crate::agentenv_definition::{
+    AgentEnvCreateWorkflowRequest, AgentEnvInMemoryExecuteRequest, AgentEnvUpdateWorkflowRequest,
+};
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use reqwest::{Method, StatusCode, Url};
@@ -217,13 +220,19 @@ pub type WorkflowRuntimeNodeDefinition = WorkflowRuntimeRecord;
 pub type WorkflowRuntimeApiKeyContext = WorkflowRuntimeRecord;
 
 /// Request payload sent to `POST /v1/workflows`.
-pub type WorkflowRuntimeCreateWorkflowRequest = WorkflowRuntimeRecord;
+pub type WorkflowRuntimeCreateWorkflowRequest = AgentEnvCreateWorkflowRequest;
+
+/// Request payload sent to `PUT /v1/workflows/:id`.
+pub type WorkflowRuntimeUpdateWorkflowRequest = AgentEnvUpdateWorkflowRequest;
 
 /// Workflow object returned by workflow list and get calls.
 pub type WorkflowRuntimeWorkflow = WorkflowRuntimeRecord;
 
 /// Response payload returned by `POST /v1/workflows/:id/deploy`.
 pub type WorkflowRuntimeDeployResponse = WorkflowRuntimeRecord;
+
+/// Response payload returned by `POST /v1/workflows/:id/undeploy`.
+pub type WorkflowRuntimeUndeployResponse = WorkflowRuntimeRecord;
 
 /// Execution object returned by workflow execution APIs.
 pub type WorkflowRuntimeExecution = WorkflowRuntimeRecord;
@@ -235,7 +244,7 @@ pub type WorkflowRuntimeExecuteRequest = WorkflowRuntimeRecord;
 pub type WorkflowRuntimeExecuteResponse = WorkflowRuntimeRecord;
 
 /// Request payload sent to `POST /v1/workflows/execute-in-memory`.
-pub type WorkflowRuntimeInMemoryExecuteRequest = WorkflowRuntimeRecord;
+pub type WorkflowRuntimeInMemoryExecuteRequest = AgentEnvInMemoryExecuteRequest;
 
 /// Response payload returned by `POST /v1/workflows/execute-in-memory`.
 pub type WorkflowRuntimeInMemoryExecuteResponse = WorkflowRuntimeRecord;
@@ -390,6 +399,20 @@ impl WorkflowRuntimeClient {
         parse_record_list(payload, "/v1/workflows/node-definitions")
     }
 
+    /// Fetches one runtime node definition by AgentEnv node type.
+    pub fn get_node_definition(
+        &self,
+        node_type: &str,
+    ) -> WorkflowRuntimeResult<WorkflowRuntimeNodeDefinition> {
+        let payload = self.send_request(
+            Method::GET,
+            &["workflows", "node-definitions", node_type],
+            false,
+            None,
+        )?;
+        parse_record(payload, "/v1/workflows/node-definitions/:type")
+    }
+
     /// Lists workflows visible to the configured workspace.
     pub fn list_workflows(&self) -> WorkflowRuntimeResult<Vec<WorkflowRuntimeWorkflow>> {
         let payload = self.send_request(Method::GET, &["workflows"], true, None)?;
@@ -401,7 +424,7 @@ impl WorkflowRuntimeClient {
         &self,
         request: &WorkflowRuntimeCreateWorkflowRequest,
     ) -> WorkflowRuntimeResult<WorkflowRuntimeWorkflow> {
-        let payload = self.send_request(Method::POST, &["workflows"], true, Some(request))?;
+        let payload = self.send_json_request(Method::POST, &["workflows"], true, request)?;
         parse_record(payload, "/v1/workflows")
     }
 
@@ -411,6 +434,17 @@ impl WorkflowRuntimeClient {
         workflow_id: &str,
     ) -> WorkflowRuntimeResult<WorkflowRuntimeWorkflow> {
         let payload = self.send_request(Method::GET, &["workflows", workflow_id], true, None)?;
+        parse_record(payload, "/v1/workflows/:id")
+    }
+
+    /// Updates one workflow draft by id.
+    pub fn update_workflow(
+        &self,
+        workflow_id: &str,
+        request: &WorkflowRuntimeUpdateWorkflowRequest,
+    ) -> WorkflowRuntimeResult<WorkflowRuntimeWorkflow> {
+        let payload =
+            self.send_json_request(Method::PUT, &["workflows", workflow_id], true, request)?;
         parse_record(payload, "/v1/workflows/:id")
     }
 
@@ -428,17 +462,31 @@ impl WorkflowRuntimeClient {
         parse_record(payload, "/v1/workflows/:id/deploy")
     }
 
+    /// Undeploys one workflow by id.
+    pub fn undeploy_workflow(
+        &self,
+        workflow_id: &str,
+    ) -> WorkflowRuntimeResult<WorkflowRuntimeUndeployResponse> {
+        let payload = self.send_request(
+            Method::POST,
+            &["workflows", workflow_id, "undeploy"],
+            true,
+            None,
+        )?;
+        parse_record(payload, "/v1/workflows/:id/undeploy")
+    }
+
     /// Executes one deployed workflow by id.
     pub fn execute_workflow(
         &self,
         workflow_id: &str,
         request: &WorkflowRuntimeExecuteRequest,
     ) -> WorkflowRuntimeResult<WorkflowRuntimeExecuteResponse> {
-        let payload = self.send_request(
+        let payload = self.send_json_request(
             Method::POST,
             &["workflows", workflow_id, "execute"],
             true,
-            Some(request),
+            request,
         )?;
         parse_record(payload, "/v1/workflows/:id/execute")
     }
@@ -477,11 +525,11 @@ impl WorkflowRuntimeClient {
         &self,
         request: &WorkflowRuntimeInMemoryExecuteRequest,
     ) -> WorkflowRuntimeResult<WorkflowRuntimeInMemoryExecuteResponse> {
-        let payload = self.send_request(
+        let payload = self.send_json_request(
             Method::POST,
             &["workflows", "execute-in-memory"],
             true,
-            Some(request),
+            request,
         )?;
         parse_record(payload, "/v1/workflows/execute-in-memory")
     }
@@ -532,7 +580,7 @@ impl WorkflowRuntimeClient {
         method: Method,
         path_segments: &[&str],
         include_workspace_id: bool,
-        body: Option<&WorkflowRuntimeRecord>,
+        body: Option<String>,
     ) -> WorkflowRuntimeResult<Value> {
         let url = self.endpoint_url(path_segments);
         let mut headers = vec![("X-API-Key".to_string(), self.api_key.clone())];
@@ -543,13 +591,22 @@ impl WorkflowRuntimeClient {
             method,
             url: url.clone(),
             headers,
-            body: body
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(WorkflowRuntimeError::incompatible_runtime)?,
+            body,
         };
         let response = self.transport.send(request)?;
         map_http_response(url, response.status, &response.body_text)
+    }
+
+    fn send_json_request<T: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        path_segments: &[&str],
+        include_workspace_id: bool,
+        body: &T,
+    ) -> WorkflowRuntimeResult<Value> {
+        let body_text =
+            serde_json::to_string(body).map_err(WorkflowRuntimeError::incompatible_runtime)?;
+        self.send_request(method, path_segments, include_workspace_id, Some(body_text))
     }
 
     fn endpoint_url(&self, path_segments: &[&str]) -> Url {

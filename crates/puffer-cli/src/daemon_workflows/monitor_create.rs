@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
 use puffer_core::subscription_manager;
 use puffer_subscriptions::{
-    connection_workflow_trigger_supported, normalize_contact_id, ActionSpec, ConnectionRecord,
-    ConnectionState, WorkflowBindingSpec, WorkflowBindingStatus,
+    ActionSpec, ConnectionRecord, ConnectionState, WorkflowBindingSpec, WorkflowBindingStatus,
+    connection_workflow_trigger_supported, normalize_contact_id,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -511,9 +511,11 @@ mod tests {
 
         let error = ensure_connection_auth_usable(&connection).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("/connect telegram-login telegram-user"));
+        assert!(
+            error
+                .to_string()
+                .contains("/connect telegram-login telegram-user")
+        );
     }
 
     #[test]
@@ -523,9 +525,11 @@ mod tests {
         let path = monitor_memory_path(&paths, "telegram-user").unwrap();
 
         ensure_monitor_memory(&path, "telegram-user", "telegram-login").unwrap();
-        assert!(fs::read_to_string(&path)
-            .unwrap()
-            .contains("telegram-login"));
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("telegram-login")
+        );
 
         fs::write(&path, "custom ignore rules").unwrap();
         ensure_monitor_memory(&path, "telegram-user", "telegram-login").unwrap();

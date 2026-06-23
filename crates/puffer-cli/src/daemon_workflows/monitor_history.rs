@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
 use puffer_core::subscription_manager;
 use puffer_subscriptions::{ActionSpec, WorkflowBindingRun, WorkflowBindingSpec};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 const DEFAULT_LIMIT: usize = 200;

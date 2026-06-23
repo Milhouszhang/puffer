@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use puffer_config::{load_config, ConfigPaths};
-use puffer_workflow::WorkflowRuntimeRecord;
+use puffer_workflow::{
+    WorkflowRuntimeCreateWorkflowRequest, WorkflowRuntimeInMemoryExecuteRequest,
+    WorkflowRuntimeRecord, WorkflowRuntimeUpdateWorkflowRequest,
+};
 use serde_json::Value;
 
 const WORKFLOW_ID_KEYS: &[&str] = &[
@@ -14,8 +17,26 @@ const WORKFLOW_ID_KEYS: &[&str] = &[
 /// Creates one workflow in the configured runtime.
 pub(crate) fn handle_workflow_create(paths: &ConfigPaths, params: &Value) -> Result<Value> {
     let client = workflow_runtime_client(paths)?;
-    let request = record_param_or_root(params, "workflow", "workflow_create")?;
+    let request = typed_param_or_root::<WorkflowRuntimeCreateWorkflowRequest>(
+        params,
+        "workflow",
+        "workflow_create",
+    )?;
     Ok(serde_json::to_value(client.create_workflow(&request)?)?)
+}
+
+/// Updates one workflow draft in the configured runtime.
+pub(crate) fn handle_workflow_update(paths: &ConfigPaths, params: &Value) -> Result<Value> {
+    let client = workflow_runtime_client(paths)?;
+    let workflow_id = required_string(params, WORKFLOW_ID_KEYS, "workflow id")?;
+    let request = typed_param_or_root::<WorkflowRuntimeUpdateWorkflowRequest>(
+        params,
+        "workflow",
+        "workflow_update",
+    )?;
+    Ok(serde_json::to_value(
+        client.update_workflow(&workflow_id, &request)?,
+    )?)
 }
 
 /// Deploys one workflow in the configured runtime.
@@ -23,6 +44,33 @@ pub(crate) fn handle_workflow_deploy(paths: &ConfigPaths, params: &Value) -> Res
     let client = workflow_runtime_client(paths)?;
     let workflow_id = required_string(params, WORKFLOW_ID_KEYS, "workflow id")?;
     Ok(serde_json::to_value(client.deploy_workflow(&workflow_id)?)?)
+}
+
+/// Undeploys one workflow in the configured runtime.
+pub(crate) fn handle_workflow_undeploy(paths: &ConfigPaths, params: &Value) -> Result<Value> {
+    let client = workflow_runtime_client(paths)?;
+    let workflow_id = required_string(params, WORKFLOW_ID_KEYS, "workflow id")?;
+    Ok(serde_json::to_value(
+        client.undeploy_workflow(&workflow_id)?,
+    )?)
+}
+
+/// Lists AgentEnv node definitions from the configured runtime.
+pub(crate) fn handle_workflow_node_definitions(paths: &ConfigPaths) -> Result<Value> {
+    let client = workflow_runtime_client(paths)?;
+    Ok(serde_json::to_value(client.list_node_definitions()?)?)
+}
+
+/// Fetches one AgentEnv node definition from the configured runtime.
+pub(crate) fn handle_workflow_node_definition(
+    paths: &ConfigPaths,
+    params: &Value,
+) -> Result<Value> {
+    let client = workflow_runtime_client(paths)?;
+    let node_type = required_string(params, &["type", "nodeType", "node_type"], "node type")?;
+    Ok(serde_json::to_value(
+        client.get_node_definition(&node_type)?,
+    )?)
 }
 
 /// Executes one workflow in the configured runtime.
@@ -33,6 +81,20 @@ pub(crate) fn handle_workflow_execute(paths: &ConfigPaths, params: &Value) -> Re
     Ok(serde_json::to_value(
         client.execute_workflow(&workflow_id, &request)?,
     )?)
+}
+
+/// Executes an in-memory workflow definition in the configured runtime.
+pub(crate) fn handle_workflow_execute_in_memory(
+    paths: &ConfigPaths,
+    params: &Value,
+) -> Result<Value> {
+    let client = workflow_runtime_client(paths)?;
+    let request = typed_param_or_root::<WorkflowRuntimeInMemoryExecuteRequest>(
+        params,
+        "request",
+        "workflow_execute_in_memory",
+    )?;
+    Ok(serde_json::to_value(client.execute_in_memory(&request)?)?)
 }
 
 /// Lists executions for one workflow from the configured runtime.
@@ -90,6 +152,15 @@ fn workflow_execute_request(params: &Value) -> Result<WorkflowRuntimeRecord> {
 fn record_param_or_root(params: &Value, key: &str, label: &str) -> Result<WorkflowRuntimeRecord> {
     let value = params.get(key).unwrap_or(params).clone();
     WorkflowRuntimeRecord::try_from(value).with_context(|| format!("{label} must be a JSON object"))
+}
+
+fn typed_param_or_root<T>(params: &Value, key: &str, label: &str) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let value = params.get(key).unwrap_or(params).clone();
+    serde_json::from_value(value)
+        .with_context(|| format!("{label} must match AgentEnv workflow JSON"))
 }
 
 fn required_string(params: &Value, keys: &[&str], label: &str) -> Result<String> {

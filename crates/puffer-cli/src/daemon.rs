@@ -1453,15 +1453,32 @@ async fn dispatch_request(
         "install_local_model" => {
             respond!(detached!(|s, p| handle_install_local_model(&s, &p)))
         }
-        "workflow_list" => respond!(crate::daemon_workflows::handle_workflow_list(&state.paths)),
+        "workflow_list" => respond!(detached!(|s| {
+            crate::daemon_workflows::handle_workflow_list(s.config_paths())
+        })),
         "workflow_create" => respond!(detached!(|s, p| {
             crate::daemon_workflows::handle_workflow_create(s.config_paths(), &p)
+        })),
+        "workflow_update" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_update(s.config_paths(), &p)
         })),
         "workflow_deploy" => respond!(detached!(|s, p| {
             crate::daemon_workflows::handle_workflow_deploy(s.config_paths(), &p)
         })),
+        "workflow_undeploy" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_undeploy(s.config_paths(), &p)
+        })),
+        "workflow_node_definitions" => respond!(detached!(|s| {
+            crate::daemon_workflows::handle_workflow_node_definitions(s.config_paths())
+        })),
+        "workflow_node_definition" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_node_definition(s.config_paths(), &p)
+        })),
         "workflow_execute" => respond!(detached!(|s, p| {
             crate::daemon_workflows::handle_workflow_execute(s.config_paths(), &p)
+        })),
+        "workflow_execute_in_memory" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_execute_in_memory(s.config_paths(), &p)
         })),
         "workflow_list_executions" => respond!(detached!(|s, p| {
             crate::daemon_workflows::handle_workflow_list_executions(s.config_paths(), &p)

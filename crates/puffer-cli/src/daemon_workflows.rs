@@ -27,7 +27,9 @@ pub(crate) use monitor_task_complete::handle_monitor_task_complete;
 pub(crate) use monitor_task_ignore::handle_monitor_task_ignore;
 pub(crate) use runtime::{
     handle_workflow_create, handle_workflow_deploy, handle_workflow_execute,
-    handle_workflow_get_execution, handle_workflow_list_executions,
+    handle_workflow_execute_in_memory, handle_workflow_get_execution,
+    handle_workflow_list_executions, handle_workflow_node_definition,
+    handle_workflow_node_definitions, handle_workflow_undeploy, handle_workflow_update,
 };
 
 use anyhow::{Context, Result};
@@ -44,7 +46,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::fs;
 
-/// Returns the workflow editor snapshot with connector catalog context.
+/// Returns the workflow runtime snapshot with connector catalog context.
 pub(crate) fn handle_workflow_list(paths: &ConfigPaths) -> Result<Value> {
     let (workflows, workflow_error) = match runtime_workflows(paths) {
         Ok(workflows) => (workflows, None),
@@ -157,10 +159,6 @@ fn add_connector_context(paths: &ConfigPaths, snapshot: &mut Value) {
     let (connectors, connections, connector_error) = match subscription_manager() {
         Ok(manager) => {
             let roots = subscriber_manifest_roots(paths);
-            let refresh_error = manager
-                .refresh_connection_consumers()
-                .err()
-                .map(|error| error.to_string());
             let connectors = manager
                 .connector_store()
                 .list_with_builtins()
@@ -201,7 +199,7 @@ fn add_connector_context(paths: &ConfigPaths, snapshot: &mut Value) {
                     connection_snapshot_json(connection, can_trigger_workflow)
                 })
                 .collect::<Vec<_>>();
-            (connectors, connections, refresh_error)
+            (connectors, connections, None)
         }
         Err(error) => (Vec::new(), Vec::new(), Some(error.to_string())),
     };

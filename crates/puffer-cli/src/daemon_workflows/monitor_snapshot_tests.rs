@@ -216,7 +216,9 @@ fn workflow_snapshot_enriches_sender_name_without_username_or_avatar() {
     let tasks = snapshot["monitor_tasks"].as_array().unwrap();
 
     assert_eq!(tasks[0]["source_context"]["sender"]["name"], "博阿 杜");
-    assert!(tasks[0]["source_context"]["sender"]
-        .get("avatar_url")
-        .is_none());
+    assert!(
+        tasks[0]["source_context"]["sender"]
+            .get("avatar_url")
+            .is_none()
+    );
 }

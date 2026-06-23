@@ -44,7 +44,7 @@ pub(crate) fn handle_workflow_backend_test_connection(state: &DaemonState) -> Re
     workflow_backend_test_connection_value(state.config_paths(), &config)
 }
 
-/// Opens the configured AgentEnv workflow console in the system browser.
+/// Opens the configured workflow runtime console in the system browser.
 pub(crate) fn handle_workflow_open_ui(state: &DaemonState) -> Result<Value> {
     let config = state.config_snapshot();
     workflow_open_ui_value(&config, true)

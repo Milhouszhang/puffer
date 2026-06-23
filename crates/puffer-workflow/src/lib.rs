@@ -1,7 +1,13 @@
 //! AgentEnv-compatible workflow runtime client APIs.
 
+mod agentenv_definition;
 mod runtime_client;
 
+pub use agentenv_definition::{
+    AgentEnvCreateWorkflowRequest, AgentEnvInMemoryExecuteRequest, AgentEnvUpdateWorkflowRequest,
+    AgentEnvWorkflowDefinition, AgentEnvWorkflowEdge, AgentEnvWorkflowNode,
+    AgentEnvWorkflowPosition,
+};
 pub use runtime_client::{
     WorkflowRuntimeApiKeyContext, WorkflowRuntimeClient, WorkflowRuntimeClientConfig,
     WorkflowRuntimeConnectionStep, WorkflowRuntimeConnectionStepState,
@@ -10,5 +16,5 @@ pub use runtime_client::{
     WorkflowRuntimeExecuteRequest, WorkflowRuntimeExecuteResponse, WorkflowRuntimeExecution,
     WorkflowRuntimeInMemoryExecuteRequest, WorkflowRuntimeInMemoryExecuteResponse,
     WorkflowRuntimeNodeDefinition, WorkflowRuntimeRecord, WorkflowRuntimeResult,
-    WorkflowRuntimeWorkflow,
+    WorkflowRuntimeUndeployResponse, WorkflowRuntimeUpdateWorkflowRequest, WorkflowRuntimeWorkflow,
 };

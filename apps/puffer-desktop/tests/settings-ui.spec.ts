@@ -8,6 +8,12 @@ async function openProviderSetup(page: Page, providerName: string) {
   return page.getByRole("dialog", { name: `Connect ${displayName}` });
 }
 
+async function openWorkflowBackendSettings(page: Page) {
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.locator(".pf-settings-nav").getByRole("button", { name: "Workflows" }).click();
+  return page.locator(".pf-settings-pane");
+}
+
 test("empty provider registry still offers built-in setup options", async ({ page }) => {
   const daemon = new FakeDaemon({ auth: [], providers: [] });
   await daemon.install(page);
@@ -1853,6 +1859,91 @@ test("MCP settings do not reload-loop when no servers are configured", async ({ 
   await expect(page.getByText("No MCP servers configured.")).toBeVisible();
   await page.waitForTimeout(300);
   expect(daemon.requests.filter((request) => request.method === "list_mcp_servers")).toHaveLength(1);
+});
+
+test("workflow settings switch between Local and Cloud defaults", async ({ page }) => {
+  const daemon = new FakeDaemon();
+  await daemon.install(page);
+  await daemon.open(page);
+
+  const pane = await openWorkflowBackendSettings(page);
+
+  await expect(pane.getByRole("radio", { name: /Run locally/ })).toBeChecked();
+  await expect(pane.getByLabel("API URL")).toHaveValue("http://127.0.0.1:3000");
+  await expect(pane.getByLabel("Workflow Console URL")).toHaveValue("http://localhost:5173");
+
+  await pane.getByRole("radio", { name: /Run on AgentEnv Cloud/ }).check();
+  await expect(pane.getByLabel("API URL")).toHaveValue("https://api.agentenv.io");
+  await expect(pane.getByLabel("Workflow Console URL")).toHaveValue("https://agentenv.io");
+  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
+});
+
+test("workflow settings save token and show masked configured state", async ({ page }) => {
+  const daemon = new FakeDaemon();
+  await daemon.install(page);
+  await daemon.open(page);
+
+  const pane = await openWorkflowBackendSettings(page);
+  await pane.getByLabel("Workspace ID").fill("workspace-local");
+  await pane.getByLabel("API Token").fill("local-secret-token");
+  await pane.getByRole("button", { name: "Save" }).click();
+
+  const save = await daemon.waitForRequest("workflow_backend_save_config");
+  expect(save.params).toMatchObject({
+    mode: "local",
+    apiUrl: "http://127.0.0.1:3000",
+    uiUrl: "http://localhost:5173",
+    workspaceId: "workspace-local",
+    apiToken: "local-secret-token"
+  });
+  await expect(pane.getByLabel("API Token")).toHaveValue("");
+  await expect(pane.locator(".pf-workflow-backend-token .pf-status-pill")).toContainText("Configured");
+  await expect(pane.getByText("Workflow settings saved. API token is configured.")).toBeVisible();
+  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
+});
+
+test("workflow settings test connection success", async ({ page }) => {
+  const daemon = new FakeDaemon();
+  await daemon.install(page);
+  await daemon.open(page);
+
+  const pane = await openWorkflowBackendSettings(page);
+  await pane.getByLabel("Workspace ID").fill("workspace-local");
+  await pane.getByLabel("API Token").fill("local-secret-token");
+  await pane.getByRole("button", { name: "Test Connection" }).click();
+
+  await daemon.waitForRequest("workflow_backend_save_config");
+  await daemon.waitForRequest("workflow_backend_test_connection");
+  await expect(pane.getByLabel("Workflow connection result")).toContainText("Connection succeeded.");
+  await expect(pane.getByLabel("Workflow connection result")).toContainText("Workflow runtime API is reachable.");
+  await expect(pane.getByLabel("API Token")).toHaveValue("");
+  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
+});
+
+test("workflow settings test connection failure", async ({ page }) => {
+  const daemon = new FakeDaemon();
+  daemon.setWorkflowBackendConnection({
+    success: false,
+    runtime: { state: "passed", message: "Workflow runtime API is reachable." },
+    auth: {
+      state: "failed",
+      message: "invalid token",
+      error: { kind: "invalid_token", message: "invalid token", statusCode: 401 }
+    },
+    workspace: { state: "skipped", message: "Skipped because authentication did not pass." }
+  });
+  await daemon.install(page);
+  await daemon.open(page);
+
+  const pane = await openWorkflowBackendSettings(page);
+  await pane.getByLabel("API Token").fill("bad-token");
+  await pane.getByRole("button", { name: "Test Connection" }).click();
+
+  await daemon.waitForRequest("workflow_backend_test_connection");
+  await expect(pane.getByLabel("Workflow connection result")).toContainText("Unable to connect to workflow runtime.");
+  await expect(pane.getByLabel("Workflow connection result")).toContainText("invalid token");
+  await expect(pane.getByLabel("API Token")).toHaveValue("");
+  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
 });
 
 test("connector settings renders dynamic AskUserQuestion inputs", async ({ page }) => {

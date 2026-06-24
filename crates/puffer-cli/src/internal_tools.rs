@@ -23,6 +23,7 @@ pub(crate) fn run_internal_tool_command(
         InternalToolCommand::ImageGeneration(args) => {
             media_internal_tools::run_image_generation(args)
         }
+        InternalToolCommand::RequestSecret(args) => subscriber_tools::run_request_secret(args),
         InternalToolCommand::Slack(args) => subscriber_tools::run_slack(args),
         InternalToolCommand::Telegram(args) => subscriber_tools::run_telegram(args),
         InternalToolCommand::VideoGeneration(args) => {

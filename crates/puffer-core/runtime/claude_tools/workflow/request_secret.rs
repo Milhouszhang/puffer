@@ -1000,6 +1000,57 @@ mod tests {
         );
     }
 
+    // Security: `collect` over the internal path is insert-only too (it shares the
+    // same write policy as `create`), so a connector cannot overwrite an existing
+    // secret by collecting under a colliding name.
+    #[test]
+    fn request_secret_internal_collect_is_insert_only() {
+        use crate::runtime::UserQuestionPromptResponse;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _secret_env = secret_test_env(dir.path());
+        let mut state = temp_state(dir.path());
+
+        let first = with_user_question_prompt_handler(
+            |req| {
+                let q = req.questions[0]["question"].as_str().unwrap().to_string();
+                UserQuestionPromptResponse {
+                    answers: serde_json::Map::from_iter([(q, json!("first-value"))]),
+                    annotations: serde_json::Map::new(),
+                }
+            },
+            || {
+                call_internal_request_secret(
+                    &mut state,
+                    dir.path(),
+                    json!({"action": "collect", "name": "Mailbox"}),
+                )
+            },
+        );
+        assert!(first.success, "reason: {:?}", first.reason);
+        assert_eq!(open_test_vault(dir.path()).reveal("Mailbox").unwrap().value, "first-value");
+
+        // A second collect under the same name is refused; the value is unchanged.
+        let second = with_user_question_prompt_handler(
+            |req| {
+                let q = req.questions[0]["question"].as_str().unwrap().to_string();
+                UserQuestionPromptResponse {
+                    answers: serde_json::Map::from_iter([(q, json!("second-value"))]),
+                    annotations: serde_json::Map::new(),
+                }
+            },
+            || {
+                call_internal_request_secret(
+                    &mut state,
+                    dir.path(),
+                    json!({"action": "collect", "name": "Mailbox"}),
+                )
+            },
+        );
+        assert!(!second.success, "collect overwrite by name must be refused");
+        assert_eq!(open_test_vault(dir.path()).reveal("Mailbox").unwrap().value, "first-value");
+    }
+
     // Security (Fix A): writes over the internal path are insert-only. A child can
     // create a new secret, but cannot overwrite an existing one — neither by an
     // injected `id` nor by reusing the label of a prior agent-created secret.

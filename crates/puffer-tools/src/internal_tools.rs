@@ -107,6 +107,8 @@ mod tests {
         assert!(helpers.contains("'/tmp/puffer' internal-tool 'image-generation' \"$@\""));
         assert!(helpers.contains("videogen()"));
         assert!(helpers.contains("'/tmp/puffer' internal-tool 'video-generation' \"$@\""));
+        assert!(helpers.contains("request_secret()"));
+        assert!(helpers.contains("'/tmp/puffer' internal-tool 'request-secret' \"$@\""));
     }
 
     #[test]

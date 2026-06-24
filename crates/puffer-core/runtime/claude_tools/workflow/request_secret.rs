@@ -123,14 +123,14 @@ fn request_secret(
         .filter(|value| !value.is_empty())
         .context("RequestSecret requires `id` or `label`")?;
     let secret = vault.reveal(&selector)?;
-    if !state.secret_access_state.allows(&secret.id) {
+    if !state.secret_session_granted(&secret.id) {
         match prompt_for_secret(&secret.id, &secret.label, parsed.reason.as_deref()) {
             PermissionPromptAction::AllowOnce => {}
             PermissionPromptAction::AllowSession => {
-                state.secret_access_state.allow_secret(secret.id.clone());
+                state.grant_secret_for_session(secret.id.clone());
             }
             PermissionPromptAction::AllowAllSession => {
-                state.secret_access_state.allow_all();
+                state.grant_all_secrets_for_session();
             }
             PermissionPromptAction::Deny => bail!("permission denied by user"),
         }
@@ -743,5 +743,269 @@ mod tests {
             .unwrap();
         assert_eq!(summary.origin.as_deref(), Some("https://ridge.com"));
         assert_eq!(summary.username.as_deref(), Some("user@example.com"));
+    }
+
+    #[test]
+    fn request_secret_session_grant_is_per_secret_and_allow_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let _secret_env = secret_test_env(dir.path());
+        let mut state = temp_state(dir.path());
+        let paths = ConfigPaths::discover(dir.path());
+        ensure_workspace_dirs(&paths).unwrap();
+        let vault = SecretVault::open(SecretVault::default_path(&paths.user_config_dir)).unwrap();
+        for label in ["Alpha", "Beta"] {
+            vault
+                .put(SecretUpsert {
+                    id: None,
+                    label: label.to_string(),
+                    description: None,
+                    value: format!("raw-{label}"),
+                    username: None,
+                    origin: None,
+                    source: "manual".to_string(),
+                })
+                .unwrap();
+        }
+
+        // Approving Alpha for the session must not require re-approval for Alpha,
+        // but must NOT silently approve Beta.
+        with_permission_prompt_handler(
+            |_| PermissionPromptAction::AllowSession,
+            || execute_request_secret(&mut state, dir.path(), json!({"label": "Alpha"})),
+        )
+        .unwrap();
+        // Alpha again: a Deny handler proves no prompt fires (already granted).
+        with_permission_prompt_handler(
+            |_| PermissionPromptAction::Deny,
+            || execute_request_secret(&mut state, dir.path(), json!({"label": "Alpha"})),
+        )
+        .expect("granted secret should not re-prompt");
+        // Beta: not granted yet, so the Deny handler rejects it.
+        let beta_denied = with_permission_prompt_handler(
+            |_| PermissionPromptAction::Deny,
+            || execute_request_secret(&mut state, dir.path(), json!({"label": "Beta"})),
+        );
+        assert!(beta_denied.is_err(), "ungranted secret must require approval");
+
+        // Allow-all then covers Beta without a further prompt.
+        with_permission_prompt_handler(
+            |_| PermissionPromptAction::AllowAllSession,
+            || execute_request_secret(&mut state, dir.path(), json!({"label": "Beta"})),
+        )
+        .unwrap();
+        with_permission_prompt_handler(
+            |_| PermissionPromptAction::Deny,
+            || execute_request_secret(&mut state, dir.path(), json!({"label": "Beta"})),
+        )
+        .expect("allow-all should cover every secret for the session");
+    }
+
+    #[test]
+    fn request_secret_via_internal_path_returns_placeholder_without_raw_value() {
+        use crate::runtime::internal_tool_permissions::execute_internal_tool_request;
+        use puffer_provider_registry::{AuthStore, ProviderRegistry};
+        use puffer_resources::LoadedResources;
+        use puffer_tools::internal_permissions::InternalToolExecutionRequest;
+        use puffer_tools::ToolRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _secret_env = secret_test_env(dir.path());
+        let mut state = temp_state(dir.path());
+        let paths = ConfigPaths::discover(dir.path());
+        ensure_workspace_dirs(&paths).unwrap();
+        let vault = SecretVault::open(SecretVault::default_path(&paths.user_config_dir)).unwrap();
+        vault
+            .put(SecretUpsert {
+                id: None,
+                label: "Demo".to_string(),
+                description: None,
+                value: "raw-secret".to_string(),
+                username: Some("demo@example.com".to_string()),
+                origin: Some("https://example.com/login".to_string()),
+                source: "manual".to_string(),
+            })
+            .unwrap();
+
+        let resources = LoadedResources::default();
+        let registry = ToolRegistry::from_resources(&resources);
+        let providers = ProviderRegistry::new();
+        let auth_store = AuthStore::default();
+        let discovery = puffer_media::ExactMediaDiscoveryCache::empty();
+
+        let response = with_permission_prompt_handler(
+            |_| PermissionPromptAction::AllowOnce,
+            || {
+                execute_internal_tool_request(
+                    &mut state,
+                    &resources,
+                    &registry,
+                    &providers,
+                    &auth_store,
+                    &discovery,
+                    dir.path(),
+                    InternalToolExecutionRequest {
+                        tool_id: "request-secret".to_string(),
+                        input: json!({"action": "request", "label": "Demo"}),
+                    },
+                )
+            },
+        );
+
+        assert!(response.success, "reason: {:?}", response.reason);
+        let output = response.output.unwrap_or_default();
+        assert!(output.contains("PUFFER_SECRET_"));
+        assert!(output.contains("demo@example.com"));
+        assert!(output.contains("https://example.com/login"));
+        assert!(!output.contains("raw-secret"));
+    }
+
+    /// Drives one RequestSecret call through the cross-process internal-tool
+    /// entry point, returning the broker response.
+    fn call_internal_request_secret(
+        state: &mut AppState,
+        cwd: &Path,
+        input: Value,
+    ) -> puffer_tools::internal_permissions::InternalToolExecutionResponse {
+        use crate::runtime::internal_tool_permissions::execute_internal_tool_request;
+        use puffer_provider_registry::{AuthStore, ProviderRegistry};
+        use puffer_resources::LoadedResources;
+        use puffer_tools::internal_permissions::InternalToolExecutionRequest;
+        use puffer_tools::ToolRegistry;
+
+        let resources = LoadedResources::default();
+        let registry = ToolRegistry::from_resources(&resources);
+        let providers = ProviderRegistry::new();
+        let auth_store = AuthStore::default();
+        let discovery = puffer_media::ExactMediaDiscoveryCache::empty();
+        execute_internal_tool_request(
+            state,
+            &resources,
+            &registry,
+            &providers,
+            &auth_store,
+            &discovery,
+            cwd,
+            InternalToolExecutionRequest {
+                tool_id: "request-secret".to_string(),
+                input,
+            },
+        )
+    }
+
+    fn open_test_vault(cwd: &Path) -> SecretVault {
+        let paths = ConfigPaths::discover(cwd);
+        ensure_workspace_dirs(&paths).unwrap();
+        SecretVault::open(SecretVault::default_path(&paths.user_config_dir)).unwrap()
+    }
+
+    // Usability: `search` over the internal path returns non-secret metadata and
+    // never a placeholder or raw value, and needs no approval prompt.
+    #[test]
+    fn request_secret_internal_search_returns_metadata_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let _secret_env = secret_test_env(dir.path());
+        let mut state = temp_state(dir.path());
+        open_test_vault(dir.path())
+            .put(SecretUpsert {
+                id: None,
+                label: "Deploy token".to_string(),
+                description: Some("production deploy token".to_string()),
+                value: "raw-deploy".to_string(),
+                username: None,
+                origin: Some("https://deploy.example".to_string()),
+                source: "manual".to_string(),
+            })
+            .unwrap();
+
+        let response =
+            call_internal_request_secret(&mut state, dir.path(), json!({"action": "search", "query": "production"}));
+
+        assert!(response.success, "reason: {:?}", response.reason);
+        let output = response.output.unwrap_or_default();
+        assert!(output.contains("Deploy token"));
+        assert!(!output.contains("raw-deploy"));
+        assert!(!output.contains("PUFFER_SECRET_"));
+    }
+
+    // Usability: `collect` over the internal path prompts, stores the typed value,
+    // and returns only a placeholder (never the raw value).
+    #[test]
+    fn request_secret_internal_collect_stores_and_masks() {
+        use crate::runtime::UserQuestionPromptResponse;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _secret_env = secret_test_env(dir.path());
+        let mut state = temp_state(dir.path());
+
+        let response = with_user_question_prompt_handler(
+            |request| {
+                let question = request.questions[0]["question"].as_str().unwrap().to_string();
+                UserQuestionPromptResponse {
+                    answers: serde_json::Map::from_iter([(question, json!("collected-raw-value"))]),
+                    annotations: serde_json::Map::new(),
+                }
+            },
+            || {
+                call_internal_request_secret(
+                    &mut state,
+                    dir.path(),
+                    json!({"action": "collect", "name": "Collected", "prompt": "Enter it"}),
+                )
+            },
+        );
+
+        assert!(response.success, "reason: {:?}", response.reason);
+        let output = response.output.unwrap_or_default();
+        assert!(output.contains("PUFFER_SECRET_"));
+        assert!(!output.contains("collected-raw-value"));
+        // The value is actually persisted and retrievable.
+        assert_eq!(
+            open_test_vault(dir.path()).reveal("Collected").unwrap().value,
+            "collected-raw-value"
+        );
+    }
+
+    // Security (Fix A): a child-injected `id` on a `create` over the internal path
+    // must NOT overwrite an existing secret; create must insert a new record only.
+    #[test]
+    fn request_secret_internal_create_ignores_injected_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let _secret_env = secret_test_env(dir.path());
+        let mut state = temp_state(dir.path());
+        let victim = open_test_vault(dir.path())
+            .put(SecretUpsert {
+                id: None,
+                label: "Victim".to_string(),
+                description: None,
+                value: "victim-value".to_string(),
+                username: None,
+                origin: None,
+                source: "manual".to_string(),
+            })
+            .unwrap();
+        let token = register_masked_secret(&state, "attacker-value".to_string()).unwrap();
+
+        let response = with_permission_prompt_handler(
+            |_| PermissionPromptAction::AllowOnce,
+            || {
+                call_internal_request_secret(
+                    &mut state,
+                    dir.path(),
+                    json!({
+                        "action": "create",
+                        "id": victim.id,
+                        "name": "Innocuous",
+                        "value": token,
+                    }),
+                )
+            },
+        );
+
+        assert!(response.success, "reason: {:?}", response.reason);
+        let vault = open_test_vault(dir.path());
+        // The victim secret is untouched (its id was dropped before the write).
+        assert_eq!(vault.reveal("Victim").unwrap().value, "victim-value");
+        // A brand-new secret was inserted instead.
+        assert_eq!(vault.reveal("Innocuous").unwrap().value, "attacker-value");
     }
 }

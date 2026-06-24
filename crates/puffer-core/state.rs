@@ -196,30 +196,6 @@ impl SessionGoal {
     }
 }
 
-/// Tracks which encrypted user secrets may be requested during this session.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SecretAccessState {
-    allow_all: bool,
-    allowed_secret_ids: HashSet<String>,
-}
-
-impl SecretAccessState {
-    /// Returns whether the session has approval for the given secret id.
-    pub(crate) fn allows(&self, secret_id: &str) -> bool {
-        self.allow_all || self.allowed_secret_ids.contains(secret_id)
-    }
-
-    /// Grants session approval for one encrypted secret id.
-    pub(crate) fn allow_secret(&mut self, secret_id: impl Into<String>) {
-        self.allowed_secret_ids.insert(secret_id.into());
-    }
-
-    /// Grants session approval for every encrypted secret.
-    pub(crate) fn allow_all(&mut self) {
-        self.allow_all = true;
-    }
-}
-
 /// Stores the mutable session and UI state for one interactive Puffer run.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -335,8 +311,6 @@ pub struct AppState {
     pub(crate) secret_values: Arc<Mutex<HashMap<String, String>>>,
     /// Masked `PUFFER_SECRET_...` placeholders resolved before tool execution.
     pub(crate) masked_secrets: Arc<Mutex<HashMap<String, String>>>,
-    /// Session-scoped approvals for persistent encrypted secrets.
-    pub(crate) secret_access_state: SecretAccessState,
     /// Trusted exact media discovery entries available to workflow tools.
     pub(crate) exact_media_discovery_cache: Option<ExactMediaDiscoveryCache>,
 }
@@ -457,7 +431,6 @@ impl AppState {
             )),
             secret_values: Arc::new(Mutex::new(HashMap::new())),
             masked_secrets: Arc::new(Mutex::new(HashMap::new())),
-            secret_access_state: SecretAccessState::default(),
             exact_media_discovery_cache: None,
         }
     }
@@ -1134,6 +1107,31 @@ impl AppState {
     /// Grants all tool permissions for the current session.
     pub fn grant_all_tools_for_session(&mut self) {
         self.session_permission_state.set_allow_all_tools(true);
+    }
+
+    /// Returns whether the session already approved access to this secret id.
+    ///
+    /// Backed by the unified session permission grants (there is no separate
+    /// secret-approval store). The check runs against a canonical secret id the
+    /// vault has already resolved, so per-secret granularity is preserved.
+    pub(crate) fn secret_session_granted(&self, secret_id: &str) -> bool {
+        self.session_permission_state
+            .grants()
+            .secret_granted(secret_id)
+    }
+
+    /// Grants session access to one encrypted secret id.
+    pub(crate) fn grant_secret_for_session(&mut self, secret_id: impl Into<String>) {
+        self.session_permission_state
+            .grants_mut()
+            .grant_secret(secret_id);
+    }
+
+    /// Grants session access to every encrypted secret.
+    pub(crate) fn grant_all_secrets_for_session(&mut self) {
+        self.session_permission_state
+            .grants_mut()
+            .grant_all_secrets();
     }
 
     pub(crate) fn native_structured_output_key(

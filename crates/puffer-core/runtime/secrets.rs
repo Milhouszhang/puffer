@@ -7,12 +7,22 @@ const MASK_PREFIX: &str = "PUFFER_SECRET_";
 
 /// Registers a raw secret value and returns its model-visible placeholder.
 pub(crate) fn register_masked_secret(state: &AppState, value: String) -> Result<String> {
-    let token = format!("{MASK_PREFIX}{}", Uuid::new_v4().simple());
-    state
+    let mut secrets = state
         .masked_secrets
         .lock()
-        .map_err(|_| anyhow::anyhow!("masked secret store lock poisoned"))?
-        .insert(token.clone(), value);
+        .map_err(|_| anyhow::anyhow!("masked secret store lock poisoned"))?;
+    // Reuse the existing placeholder for an identical value. Without this, a
+    // caller that repeatedly requests the same secret (e.g. a connector looping
+    // `request-secret` after an allow-all) would grow the store unbounded and
+    // slow every later redaction/expansion scan.
+    if let Some(token) = secrets
+        .iter()
+        .find_map(|(token, existing)| (existing == &value).then(|| token.clone()))
+    {
+        return Ok(token);
+    }
+    let token = format!("{MASK_PREFIX}{}", Uuid::new_v4().simple());
+    secrets.insert(token.clone(), value);
     Ok(token)
 }
 
@@ -150,6 +160,23 @@ mod tests {
                 note: None,
             },
         )
+    }
+
+    #[test]
+    fn register_masked_secret_reuses_token_for_identical_value() {
+        let state = temp_state();
+        let first = register_masked_secret(&state, "same-value".to_string()).unwrap();
+        let second = register_masked_secret(&state, "same-value".to_string()).unwrap();
+        let other = register_masked_secret(&state, "other-value".to_string()).unwrap();
+        // Identical values reuse one placeholder (bounds the store under repeated
+        // requests); distinct values get distinct placeholders.
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert_eq!(
+            state.masked_secrets.lock().unwrap().len(),
+            2,
+            "identical values must not create duplicate store entries"
+        );
     }
 
     #[test]

@@ -61,10 +61,16 @@ pub(crate) fn execute_internal_tool_request(
     ) {
         Ok(output) => InternalToolExecutionResponse::success(output),
         Err(error) => {
-            let reason = format!("{error:#}");
+            // Redact raw secret values from error reasons and diagnostics before
+            // they cross the broker back to the child. Inputs are expanded to raw
+            // values before execution (for non-RequestSecret tools), so a tool
+            // error that embeds offending input could otherwise leak plaintext.
+            // Mirrors the redaction the main tool executor applies to tool errors.
+            let reason = crate::runtime::secrets::redact_known_secrets(state, &format!("{error:#}"));
             if let Some(diagnostic) = puffer_media::media_failure_diagnostic(&error) {
                 let fallback_reason = reason.clone();
                 let value = serde_json::to_value(diagnostic)
+                    .map(|value| crate::runtime::secrets::redact_json_value(state, &value))
                     .unwrap_or_else(|_| serde_json::json!({ "error": fallback_reason }));
                 InternalToolExecutionResponse::failure_with_diagnostic(reason, value)
             } else {
@@ -103,44 +109,94 @@ fn execute_internal_tool_request_result(
                 .unwrap_or_else(|| "permission denied".to_string())
         );
     }
-    let workflow_tool = match canonical_tool_name(&request.tool_id).as_str() {
-        "email" => "Email",
-        "requestuserbrowseraction" => "requestuserbrowseraction",
-        "telegram" => "Telegram",
-        "imagegeneration" => {
-            return crate::runtime::claude_tools::workflow::image_generation::execute_image_generation(
+    let canonical = canonical_tool_name(&request.tool_id);
+    // Expand `PUFFER_SECRET_...` placeholders in the child's input so internal
+    // tools can consume a secret the agent already requested, without the raw
+    // value ever leaving the parent process. RequestSecret is exempt: it manages
+    // placeholders itself (its `create` action requires the value to stay a
+    // single placeholder), mirroring `preserves_secret_placeholders` in the main
+    // tool executor.
+    let input = if canonical == "requestsecret" {
+        request.input
+    } else {
+        crate::runtime::secrets::expand_secret_placeholders(state, &request.input)?
+    };
+    let output = match canonical.as_str() {
+        "requestsecret" => {
+            crate::runtime::claude_tools::workflow::request_secret::execute_request_secret(
                 state,
                 cwd,
-                request.input,
+                sanitize_internal_request_secret_input(input),
+            )?
+        }
+        "email" => {
+            crate::runtime::claude_tools::execute_workflow_tool(
+                state, resources, cwd, "Email", input, None,
+            )?
+        }
+        "requestuserbrowseraction" => crate::runtime::claude_tools::execute_workflow_tool(
+            state,
+            resources,
+            cwd,
+            "requestuserbrowseraction",
+            input,
+            None,
+        )?,
+        "telegram" => crate::runtime::claude_tools::execute_workflow_tool(
+            state, resources, cwd, "Telegram", input, None,
+        )?,
+        "imagegeneration" => {
+            crate::runtime::claude_tools::workflow::image_generation::execute_image_generation(
+                state,
+                cwd,
+                input,
                 Some(crate::runtime::claude_tools::workflow::image_generation::ImageGenerationMediaContext {
                     providers,
                     auth_store,
                     discovery_cache,
                 }),
-            );
+            )?
         }
         "videogeneration" => {
-            return crate::runtime::claude_tools::workflow::video_generation::execute_video_generation(
+            crate::runtime::claude_tools::workflow::video_generation::execute_video_generation(
                 state,
                 cwd,
-                request.input,
+                input,
                 Some(crate::runtime::claude_tools::workflow::video_generation::VideoGenerationMediaContext {
                     providers,
                     auth_store,
                     discovery_cache,
                 }),
-            );
+            )?
         }
         other => anyhow::bail!("unknown internal executable tool `{other}`"),
     };
-    crate::runtime::claude_tools::execute_workflow_tool(
-        state,
-        resources,
-        cwd,
-        workflow_tool,
-        request.input,
-        None,
-    )
+    // Redact any raw secret value that surfaced in the result before it crosses
+    // the broker back to the child process.
+    Ok(crate::runtime::secrets::redact_known_secrets(state, &output))
+}
+
+/// Sanitizes RequestSecret input arriving over the cross-process broker.
+///
+/// A child may not target an arbitrary existing secret id on a write: the broker
+/// passes the child's raw JSON straight through, so a `create`/`collect` carrying
+/// an injected `id` would overwrite that record in place behind an approval
+/// prompt that only shows the (child-chosen) label. Dropping `id` for writes
+/// forces inserts, never silent overwrites. Reveal/search still honor `id` as a
+/// selector.
+fn sanitize_internal_request_secret_input(mut input: Value) -> Value {
+    if let Some(object) = input.as_object_mut() {
+        let action = object
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("request")
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(action.as_str(), "create" | "collect") {
+            object.remove("id");
+        }
+    }
+    input
 }
 
 fn redacted_internal_permission_input(tool_id: &str, mut input: Value) -> Value {
@@ -193,6 +249,11 @@ fn resolve_internal_tool_permission_result(
 ) -> anyhow::Result<InternalToolPermissionResponse> {
     match canonical_tool_name(&request.tool_id).as_str() {
         "browser" => resolve_browser_permission(state, resources, registry, cwd, request.input),
+        // RequestSecret runs its own per-secret approval prompt inside execution
+        // (it needs the vault-resolved secret id, which the preflight does not
+        // have), so the preflight allows it through to avoid a double prompt. No
+        // secret is revealed without a matching execution request.
+        "requestsecret" => Ok(InternalToolPermissionResponse::allow()),
         "email"
         | "imagegeneration"
         | "requestuserbrowseraction"

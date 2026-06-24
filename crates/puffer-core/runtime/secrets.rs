@@ -63,9 +63,13 @@ pub(crate) fn expand_secret_placeholder_value(state: &AppState, text: &str) -> R
 
 /// Redacts raw secret values from text using their registered placeholders.
 pub(crate) fn redact_known_secrets(state: &AppState, text: &str) -> String {
-    let Ok(secrets) = state.masked_secrets.lock() else {
-        return text.to_string();
-    };
+    // Recover the data even if the lock is poisoned: a poisoned mutex still holds
+    // valid entries, and returning the text unredacted would fail open and leak
+    // raw secret values. Redaction must never fail open.
+    let secrets = state
+        .masked_secrets
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut pairs = secrets
         .iter()
         .filter(|(_, secret)| !secret.is_empty())

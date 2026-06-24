@@ -123,10 +123,15 @@ fn execute_internal_tool_request_result(
     };
     let output = match canonical.as_str() {
         "requestsecret" => {
-            crate::runtime::claude_tools::workflow::request_secret::execute_request_secret(
+            // Insert-only: a connector over the broker may create/collect new
+            // secrets but must never overwrite an existing one (the parent vault
+            // refuses an overwrite rather than replacing it behind a prompt that
+            // only shows the child-chosen label).
+            crate::runtime::claude_tools::workflow::request_secret::execute_request_secret_with_policy(
                 state,
                 cwd,
-                sanitize_internal_request_secret_input(input),
+                input,
+                crate::runtime::claude_tools::workflow::request_secret::SecretWritePolicy::InsertOnly,
             )?
         }
         "email" => {
@@ -174,29 +179,6 @@ fn execute_internal_tool_request_result(
     // Redact any raw secret value that surfaced in the result before it crosses
     // the broker back to the child process.
     Ok(crate::runtime::secrets::redact_known_secrets(state, &output))
-}
-
-/// Sanitizes RequestSecret input arriving over the cross-process broker.
-///
-/// A child may not target an arbitrary existing secret id on a write: the broker
-/// passes the child's raw JSON straight through, so a `create`/`collect` carrying
-/// an injected `id` would overwrite that record in place behind an approval
-/// prompt that only shows the (child-chosen) label. Dropping `id` for writes
-/// forces inserts, never silent overwrites. Reveal/search still honor `id` as a
-/// selector.
-fn sanitize_internal_request_secret_input(mut input: Value) -> Value {
-    if let Some(object) = input.as_object_mut() {
-        let action = object
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("request")
-            .trim()
-            .to_ascii_lowercase();
-        if matches!(action.as_str(), "create" | "collect") {
-            object.remove("id");
-        }
-    }
-    input
 }
 
 fn redacted_internal_permission_input(tool_id: &str, mut input: Value) -> Value {

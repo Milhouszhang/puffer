@@ -14,7 +14,7 @@ pub struct InternalCliToolDescriptor {
 const BROWSER_ALIASES: &[&str] = &["browser"];
 const EMAIL_ALIASES: &[&str] = &["email"];
 const IMAGE_GENERATION_ALIASES: &[&str] = &["imagegen"];
-const REQUEST_SECRET_ALIASES: &[&str] = &["request-secret", "request_secret"];
+const REQUEST_SECRET_ALIASES: &[&str] = &["request_secret"];
 const SLACK_ALIASES: &[&str] = &["slack"];
 const TELEGRAM_ALIASES: &[&str] = &["telegram"];
 const VIDEO_GENERATION_ALIASES: &[&str] = &["videogen"];

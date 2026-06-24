@@ -40,8 +40,29 @@ struct RequestSecretInput {
     prompt: Option<String>,
 }
 
-/// Searches, creates, or requests one encrypted user secret.
+/// Controls whether a secret write (create/collect) may overwrite an existing
+/// record. The in-process agent path allows it; the cross-process broker path
+/// uses insert-only so a connector cannot silently clobber a stored secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretWritePolicy {
+    AllowOverwrite,
+    InsertOnly,
+}
+
+/// Searches, creates, or requests one encrypted user secret (in-process agent
+/// path: writes may overwrite an existing record).
 pub fn execute_request_secret(state: &mut AppState, cwd: &Path, input: Value) -> Result<String> {
+    execute_request_secret_with_policy(state, cwd, input, SecretWritePolicy::AllowOverwrite)
+}
+
+/// Same as [`execute_request_secret`] but with an explicit write policy, so the
+/// internal-tool broker path can require insert-only writes.
+pub fn execute_request_secret_with_policy(
+    state: &mut AppState,
+    cwd: &Path,
+    input: Value,
+    write_policy: SecretWritePolicy,
+) -> Result<String> {
     let parsed = parse_request_secret_input(input)?;
     let action = parsed
         .action
@@ -56,8 +77,8 @@ pub fn execute_request_secret(state: &mut AppState, cwd: &Path, input: Value) ->
     match action.as_str() {
         "request" | "get" | "reveal" => request_secret(state, vault, parsed),
         "search" | "list" => search_secrets(vault, parsed),
-        "create" => create_secret(state, vault, parsed),
-        "collect" => collect_secret(state, vault, parsed),
+        "create" => create_secret(state, vault, parsed, write_policy),
+        "collect" => collect_secret(state, vault, parsed, write_policy),
         other => bail!("unsupported RequestSecret action `{other}`"),
     }
 }
@@ -188,10 +209,23 @@ fn push_search_hint(parts: &mut Vec<String>, value: Option<&str>) {
     }
 }
 
+/// Writes a secret honoring the caller's overwrite policy.
+fn put_secret(
+    vault: &SecretVault,
+    write_policy: SecretWritePolicy,
+    upsert: SecretUpsert,
+) -> Result<SecretSummary> {
+    match write_policy {
+        SecretWritePolicy::AllowOverwrite => vault.put(upsert),
+        SecretWritePolicy::InsertOnly => vault.put_insert_only(upsert),
+    }
+}
+
 fn create_secret(
     state: &AppState,
     vault: SecretVault,
     parsed: RequestSecretInput,
+    write_policy: SecretWritePolicy,
 ) -> Result<String> {
     let label = parsed
         .label
@@ -213,7 +247,7 @@ fn create_secret(
         | PermissionPromptAction::AllowAllSession => {}
         PermissionPromptAction::Deny => bail!("permission denied by user"),
     }
-    let summary = vault.put(SecretUpsert {
+    let summary = put_secret(&vault, write_policy, SecretUpsert {
         id: parsed.id,
         label,
         description: parsed.description,
@@ -232,6 +266,7 @@ fn collect_secret(
     state: &mut AppState,
     vault: SecretVault,
     parsed: RequestSecretInput,
+    write_policy: SecretWritePolicy,
 ) -> Result<String> {
     let label = parsed
         .label
@@ -250,7 +285,7 @@ fn collect_secret(
     })
     .context("RequestSecret collect requires an active user question prompt")?;
     let value = collect_secret_answer(&response, &question)?;
-    let summary = vault.put(SecretUpsert {
+    let summary = put_secret(&vault, write_policy, SecretUpsert {
         id: parsed.id,
         label,
         description: parsed.description,
@@ -965,13 +1000,46 @@ mod tests {
         );
     }
 
-    // Security (Fix A): a child-injected `id` on a `create` over the internal path
-    // must NOT overwrite an existing secret; create must insert a new record only.
+    // Security (Fix A): writes over the internal path are insert-only. A child can
+    // create a new secret, but cannot overwrite an existing one — neither by an
+    // injected `id` nor by reusing the label of a prior agent-created secret.
     #[test]
-    fn request_secret_internal_create_ignores_injected_id() {
+    fn request_secret_internal_create_is_insert_only() {
         let dir = tempfile::tempdir().unwrap();
         let _secret_env = secret_test_env(dir.path());
         let mut state = temp_state(dir.path());
+
+        // First create inserts a new secret.
+        let token1 = register_masked_secret(&state, "value-1".to_string()).unwrap();
+        let first = with_permission_prompt_handler(
+            |_| PermissionPromptAction::AllowOnce,
+            || {
+                call_internal_request_secret(
+                    &mut state,
+                    dir.path(),
+                    json!({"action": "create", "name": "Token", "value": token1}),
+                )
+            },
+        );
+        assert!(first.success, "reason: {:?}", first.reason);
+        assert_eq!(open_test_vault(dir.path()).reveal("Token").unwrap().value, "value-1");
+
+        // A second create reusing the same label is refused, value unchanged.
+        let token2 = register_masked_secret(&state, "value-2".to_string()).unwrap();
+        let second = with_permission_prompt_handler(
+            |_| PermissionPromptAction::AllowOnce,
+            || {
+                call_internal_request_secret(
+                    &mut state,
+                    dir.path(),
+                    json!({"action": "create", "name": "Token", "value": token2}),
+                )
+            },
+        );
+        assert!(!second.success, "overwrite by label must be refused");
+        assert_eq!(open_test_vault(dir.path()).reveal("Token").unwrap().value, "value-1");
+
+        // An injected id targeting an existing secret is also refused.
         let victim = open_test_vault(dir.path())
             .put(SecretUpsert {
                 id: None,
@@ -983,29 +1051,18 @@ mod tests {
                 source: "manual".to_string(),
             })
             .unwrap();
-        let token = register_masked_secret(&state, "attacker-value".to_string()).unwrap();
-
-        let response = with_permission_prompt_handler(
+        let token3 = register_masked_secret(&state, "value-3".to_string()).unwrap();
+        let third = with_permission_prompt_handler(
             |_| PermissionPromptAction::AllowOnce,
             || {
                 call_internal_request_secret(
                     &mut state,
                     dir.path(),
-                    json!({
-                        "action": "create",
-                        "id": victim.id,
-                        "name": "Innocuous",
-                        "value": token,
-                    }),
+                    json!({"action": "create", "id": victim.id, "name": "Other", "value": token3}),
                 )
             },
         );
-
-        assert!(response.success, "reason: {:?}", response.reason);
-        let vault = open_test_vault(dir.path());
-        // The victim secret is untouched (its id was dropped before the write).
-        assert_eq!(vault.reveal("Victim").unwrap().value, "victim-value");
-        // A brand-new secret was inserted instead.
-        assert_eq!(vault.reveal("Innocuous").unwrap().value, "attacker-value");
+        assert!(!third.success, "overwrite by injected id must be refused");
+        assert_eq!(open_test_vault(dir.path()).reveal("Victim").unwrap().value, "victim-value");
     }
 }

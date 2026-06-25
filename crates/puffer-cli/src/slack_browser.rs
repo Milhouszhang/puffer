@@ -359,6 +359,51 @@ pub(crate) fn process_sidebar_poll(
     events
 }
 
+pub(crate) fn process_active_drain(
+    parsed: &Value,
+    conn: &str,
+    platform: &str,
+    self_id: &str,
+    seen: &mut SeenState,
+) -> (String, Vec<Event>) {
+    use crate::slack_browser_script::{conversation_type_for, parse_active_drain};
+    let (channel_id, msgs) = parse_active_drain(parsed);
+    if channel_id.is_empty() {
+        return (String::new(), Vec::new());
+    }
+
+    let conv_type = conversation_type_for(&channel_id);
+    let mut newly_seen = BTreeSet::new();
+    let mut events = Vec::new();
+    for m in &msgs {
+        let key = active_dedup_key(conn, &channel_id, &m.ts);
+        newly_seen.insert(key.clone());
+        if should_emit(seen, &key) {
+            let is_outgoing = !self_id.is_empty() && m.sender_id == self_id;
+            events.push(build_message_event(
+                platform,
+                &channel_id,
+                "",
+                conv_type,
+                "",
+                &m.sender_id,
+                &m.text,
+                is_outgoing,
+                false,
+                false,
+                "active",
+                &m.ts,
+                &key,
+            ));
+        }
+    }
+    if !newly_seen.is_empty() || seen.initialized {
+        seen.seen.extend(newly_seen);
+        seen.initialized = true;
+    }
+    (channel_id, events)
+}
+
 fn active_dedup_key(conn: &str, channel_id: &str, ts: &str) -> String {
     format!("{conn}:{channel_id}:{ts}")
 }
@@ -496,6 +541,63 @@ mod emit_tests {
         seen.initialized = true;
         assert!(should_emit(&seen, &active_dedup_key("c1", "C1", "2.2"))); // new post-init
         assert!(!should_emit(&seen, &key)); // already seen
+    }
+}
+
+#[cfg(test)]
+mod active_drain_tests {
+    use super::*;
+
+    fn drain(channel: &str, items: serde_json::Value) -> Value {
+        serde_json::json!({"channel_id": channel, "items": items})
+    }
+
+    #[test]
+    fn no_channel_open_no_events() {
+        let p = drain("", serde_json::json!([{"ts":"1.1","sender_id":"U1","text":"x"}]));
+        let mut seen = SeenState::default();
+        let (c, ev) = process_active_drain(&p, "c", "slack-browser", "U1", &mut seen);
+        assert!(c.is_empty());
+        assert!(ev.is_empty());
+        assert!(!seen.initialized);
+    }
+
+    #[test]
+    fn first_poll_seeds_no_emit() {
+        let p = drain("C1", serde_json::json!([{"ts":"1718000000.000100","sender_id":"U2","text":"hello"}]));
+        let mut seen = SeenState::default();
+        let (c, ev) = process_active_drain(&p, "c", "slack-browser", "U1", &mut seen);
+        assert_eq!(c, "C1");
+        assert!(ev.is_empty());
+        assert!(seen.initialized);
+        assert!(seen.seen.contains("c:C1:1718000000.000100"));
+    }
+
+    #[test]
+    fn second_poll_emits_with_direction() {
+        let p = drain("C1", serde_json::json!([
+            {"ts":"1718000000.000200","sender_id":"U1","text":"my reply"},
+            {"ts":"1718000000.000300","sender_id":"U2","text":"their msg"}
+        ]));
+        let mut seen = SeenState { initialized: true, seen: Default::default() };
+        let (c, ev) = process_active_drain(&p, "c", "slack-browser", "U1", &mut seen);
+        assert_eq!(c, "C1");
+        assert_eq!(ev.len(), 2);
+        // U1 == self_id → outgoing
+        assert_eq!(ev[0].payload["is_outgoing"], true);
+        assert_eq!(ev[0].payload["sender_id"], "U1");
+        assert_eq!(ev[0].payload["source"], "active");
+        // U2 != self → incoming
+        assert_eq!(ev[1].payload["is_outgoing"], false);
+    }
+
+    #[test]
+    fn unknown_self_id_never_outgoing() {
+        let p = drain("C1", serde_json::json!([{"ts":"1718000000.000400","sender_id":"U1","text":"x"}]));
+        let mut seen = SeenState { initialized: true, seen: Default::default() };
+        let (_c, ev) = process_active_drain(&p, "c", "slack-browser", "", &mut seen);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].payload["is_outgoing"], false); // empty self_id: never guess outgoing
     }
 }
 

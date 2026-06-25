@@ -1,8 +1,161 @@
 //! JS snippets + pure parsers for the Slack browser connector.
 //! Selectors are confirmed by the Phase 0 spike; keep ALL of them here.
 
-// Placeholder JS — real selectors land in Task 7 after the spike.
-pub(crate) const SLACK_SIDEBAR_SCRIPT: &str = r#"(() => JSON.stringify({ loaded: false, rows: [] }))()"#;
+// SELECTORS BELOW ARE BEST-EFFORT FROM SLACK data-qa HOOKS — NOT YET LIVE-VALIDATED (see spec §3, live-test task).
+
+/// Returns `{ loggedIn: bool, href: string }`.
+/// `loggedIn` is true when the URL path is under `/client/<TeamId>/…` (matches
+/// `/\/client\/T[A-Z0-9]+/`), a client-shell hook is present in the DOM, and the
+/// page is NOT on a sign-in path (`/signin`, `/get-started`, `/workspace-signin`).
+pub(crate) const SLACK_LOGIN_MARKER_JS: &str = r#"(() => {
+  const p = location.pathname;
+  const onClientPath = /\/client\/T[A-Z0-9]+/.test(p);
+  const onSigninPath = /\/(signin|get-started|workspace-signin)(\/|$)/i.test(p);
+  const shellPresent = !!(
+    document.querySelector('[data-qa="message_input"]') ||
+    document.querySelector('[data-qa="slack_kit_list"]') ||
+    document.querySelector('[data-qa="workspace-drawer"]')
+  );
+  const loggedIn = onClientPath && shellPresent && !onSigninPath;
+  return JSON.stringify({ loggedIn, href: location.href });
+})()"#;
+
+/// Returns `{ self_id: string }`.
+/// Best-effort: tries Slack's boot-data globals first, then the sidebar profile
+/// hook, then falls back to `""`. Every access is wrapped in try/catch.
+pub(crate) const SLACK_SELF_ID_JS: &str = r#"(() => {
+  let self_id = '';
+  try { if (window.TS && TS.model && TS.model.user && TS.model.user.id) self_id = TS.model.user.id; } catch(e) {}
+  if (!self_id) { try { if (window.boot_data && boot_data.user_id) self_id = boot_data.user_id; } catch(e) {} }
+  if (!self_id) {
+    try {
+      const el = document.querySelector('[data-qa="current-user-customstatus-section"]') ||
+                 document.querySelector('[data-qa="user-button"]');
+      if (el) {
+        const m = (el.getAttribute('href') || el.getAttribute('data-user-id') || '').match(/U[A-Z0-9]+/);
+        if (m) self_id = m[0];
+      }
+    } catch(e) {}
+  }
+  return JSON.stringify({ self_id });
+})()"#;
+
+/// Returns `{ loaded: bool, rows: [{ channel_id, name, unread, mention }] }`.
+/// `loaded` = true when the sidebar shell hook (`[data-qa="slack_kit_list"]` or
+/// `[data-qa="channel_sidebar"]`) is present in the DOM.
+/// Rows are read from `[data-qa^="channel_sidebar_name_"]` elements; `channel_id`
+/// is the suffix after the prefix (e.g. `C…`/`D…`/`G…`); `unread`/`mention` are
+/// best-effort from unread-class and badge descendant selectors on the enclosing row.
+pub(crate) const SLACK_SIDEBAR_SCRIPT: &str = r#"(() => {
+  const loaded = !!(
+    document.querySelector('[data-qa="slack_kit_list"]') ||
+    document.querySelector('[data-qa="channel_sidebar"]')
+  );
+  const PREFIX = 'channel_sidebar_name_';
+  const nameEls = Array.from(document.querySelectorAll('[data-qa^="' + PREFIX + '"]'));
+  const rows = nameEls.map(el => {
+    const qa = el.getAttribute('data-qa') || '';
+    const channel_id = qa.startsWith(PREFIX) ? qa.slice(PREFIX.length) : '';
+    if (!channel_id) return null;
+    const name = (el.textContent || '').trim();
+    // Walk up to find the enclosing channel row container.
+    let row = el;
+    for (let i = 0; i < 6; i++) {
+      if (!row.parentElement) break;
+      row = row.parentElement;
+      if (row.getAttribute('data-qa') && row.getAttribute('data-qa').includes('channel_sidebar_item')) break;
+    }
+    const unread = !!(
+      row.querySelector('[data-qa*="unread"]') ||
+      row.querySelector('[class*="unread" i]')
+    );
+    const mentionEl = row.querySelector('[data-qa*="badge"]') || row.querySelector('[data-qa*="mention"]');
+    const mention = mentionEl ? parseInt((mentionEl.textContent || '').trim(), 10) > 0 : false;
+    return { channel_id, name, unread, mention };
+  }).filter(r => r !== null && r.channel_id);
+  return JSON.stringify({ loaded, rows });
+})()"#;
+
+/// Installs an idempotent MutationObserver that records Slack message containers
+/// into `window.__cap`. Guard: re-running is a no-op when `window.__capObs` is set.
+/// Each captured item: `{ ts, sender_id, text }`.
+/// - `ts`: prefers raw dotted ts from `data-ts`/`id`; falls back to permalink
+///   `/archives/<chan>/p<digits>` normalised to `<10digits>.<6digits>`.
+/// - `sender_id`: from sender `<a>` href matching `/team/(U[A-Z0-9]+)`.
+/// - `text`: `[data-qa="message-text"]` textContent trimmed, capped at 2000 chars.
+pub(crate) const SLACK_OBSERVER_INSTALL_JS: &str = r#"(() => {
+  window.__cap = window.__cap || [];
+  if (window.__capObs) return JSON.stringify({ status: 'already', seeded: window.__cap.length });
+  const seen = new Set();
+
+  function normTs(raw) {
+    // raw is either "1234567890.123456" (good) or a permalink p-form raw string
+    if (/^\d+\.\d+$/.test(raw)) return raw;
+    // permalink form: p1234567890123456 — 16 digits; split at 10
+    const m = raw.match(/^p?(\d{10})(\d{6})$/);
+    if (m) return m[1] + '.' + m[2];
+    return raw;
+  }
+
+  function extractTs(el) {
+    // 1. data-ts attribute (most reliable)
+    const dt = el.getAttribute('data-ts');
+    if (dt && /\d/.test(dt)) return normTs(dt);
+    // 2. id attribute (e.g. "1718000000.000200")
+    const id = el.id || '';
+    if (/^\d+\.\d+$/.test(id)) return id;
+    // 3. permalink anchor href
+    const a = el.querySelector('a[href*="/archives/"]');
+    if (a) {
+      const m = (a.getAttribute('href') || '').match(/\/p(\d{16})/);
+      if (m) return normTs('p' + m[1]);
+    }
+    return '';
+  }
+
+  function record(el) {
+    if (!el || !el.matches) return;
+    if (!el.matches('[data-qa="message_container"]') &&
+        !el.querySelector('[data-qa="message_container"]')) return;
+    const container = el.matches('[data-qa="message_container"]') ? el
+      : el.querySelector('[data-qa="message_container"]');
+    if (!container) return;
+    const ts = extractTs(container);
+    if (!ts || seen.has(ts)) return;
+    seen.add(ts);
+    const senderLink = container.querySelector('a[href*="/team/U"]');
+    const senderMatch = senderLink ? (senderLink.getAttribute('href') || '').match(/\/team\/(U[A-Z0-9]+)/) : null;
+    const sender_id = senderMatch ? senderMatch[1] : '';
+    const textEl = container.querySelector('[data-qa="message-text"]');
+    const text = textEl ? (textEl.textContent || '').trim().slice(0, 2000) : '';
+    window.__cap.push({ ts, sender_id, text });
+  }
+
+  // Seed existing nodes
+  document.querySelectorAll('[data-qa="message_container"]').forEach(record);
+
+  window.__capObs = new MutationObserver(muts => {
+    for (const m of muts) {
+      for (const n of m.addedNodes) {
+        if (n.nodeType !== 1) continue;
+        record(n);
+        if (n.querySelectorAll) n.querySelectorAll('[data-qa="message_container"]').forEach(record);
+      }
+    }
+  });
+  window.__capObs.observe(document.body, { childList: true, subtree: true });
+  return JSON.stringify({ status: 'installed', seeded: window.__cap.length });
+})()"#;
+
+/// Returns and CLEARS `window.__cap`.
+/// `channel_id` is read from the URL pathname: `/client/<TeamId>/(<ChannelId>)`.
+pub(crate) const SLACK_OBSERVER_DRAIN_JS: &str = r#"(() => {
+  const cap = window.__cap || [];
+  window.__cap = [];
+  const m = location.pathname.match(/\/client\/T[A-Z0-9]+\/([A-Z0-9]+)/i);
+  const channel_id = m ? m[1] : '';
+  return JSON.stringify({ channel_id, items: cap });
+})()"#;
 
 pub(crate) fn sidebar_loaded(result: &serde_json::Value) -> bool {
     result.get("loaded").and_then(|v| v.as_bool()).unwrap_or(false)

@@ -5,6 +5,7 @@ use super::permission_prompt::{
     build_permission_prompt_request, prompt_for_permission, BrowserPermissionPromptSource,
     PermissionPromptAction,
 };
+use super::tool_executor::PermissionOutcome;
 use crate::permissions::acl::{append_allow_all_rule, append_allow_browser_rule};
 use crate::permissions::browser_grants::{suggested_browser_grant_scope, BrowserGrantScopeKind};
 use crate::permissions::browser_target::browser_permission_context_for_tool;
@@ -23,6 +24,253 @@ use puffer_tools::internal_permissions::{
 use puffer_tools::{ToolDefinition, ToolRegistry};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+
+/// Snapshot of the three media tool permission decisions resolved before parallel dispatch.
+#[derive(Clone, Copy)]
+pub(crate) struct MediaPermissionSnapshot {
+    pub image: ToolPermissionBehavior,
+    pub video: ToolPermissionBehavior,
+    pub capabilities: ToolPermissionBehavior,
+}
+
+impl MediaPermissionSnapshot {
+    /// Promotes each media kind the batch demands to `Allow` when `authorize`
+    /// approves it. `authorize(tool_id)` is the injected permission check
+    /// (`true` = approved). Pure aside from the injected closure.
+    fn authorize_media_batch(&mut self, commands: &[&str], mut authorize: impl FnMut(&str) -> bool) {
+        let demand = batch_media_demand(commands, self);
+        if demand.is_empty() {
+            return;
+        }
+        if demand.image && authorize("image-generation") {
+            self.image = ToolPermissionBehavior::Allow;
+        }
+        if demand.video && authorize("video-generation") {
+            self.video = ToolPermissionBehavior::Allow;
+        }
+    }
+}
+
+/// Shared-ref context for executing media tools from parallel workers (no &mut AppState).
+pub(crate) struct MediaCapabilityContext<'a> {
+    pub permissions: MediaPermissionSnapshot,
+    pub image_settings: Option<&'a puffer_config::MediaGenerationConfig>,
+    pub video_settings: Option<&'a puffer_config::MediaGenerationConfig>,
+    pub providers: &'a ProviderRegistry,
+    pub auth_store: &'a AuthStore,
+    pub discovery_cache: &'a ExactMediaDiscoveryCache,
+    pub process_store: Option<
+        &'a std::sync::Arc<std::sync::Mutex<crate::runtime::process_store::ProcessStore>>,
+    >,
+}
+
+/// Owned media-capability data captured from `AppState` before a parallel batch
+/// enters `thread::scope`. Borrow it into a [`MediaCapabilityContext`] per call
+/// site with [`Self::context`]; the owned value must outlive the scope.
+pub(crate) struct MediaCapabilitySnapshot {
+    permissions: MediaPermissionSnapshot,
+    image_settings: Option<puffer_config::MediaGenerationConfig>,
+    video_settings: Option<puffer_config::MediaGenerationConfig>,
+    discovery_cache: ExactMediaDiscoveryCache,
+    process_store: std::sync::Arc<std::sync::Mutex<crate::runtime::process_store::ProcessStore>>,
+}
+
+impl MediaCapabilitySnapshot {
+    /// Captures the media-capability inputs from `state` once. Reads only shared
+    /// state (config, discovery cache, process store) plus the permission policy,
+    /// so it never needs `&mut AppState`.
+    pub(crate) fn capture(
+        cwd: &Path,
+        resources: &LoadedResources,
+        state: &AppState,
+        registry: &ToolRegistry,
+    ) -> anyhow::Result<Self> {
+        let perm_ctx = crate::permissions::load_runtime_permission_context_with_inputs(
+            cwd,
+            resources,
+            state,
+            crate::permissions::RuntimePermissionInputs::default(),
+        )?;
+        Ok(Self {
+            permissions: resolve_media_permission_snapshot(&perm_ctx, registry),
+            image_settings: state.config.media.image.clone(),
+            video_settings: state.config.media.video.clone(),
+            discovery_cache: state
+                .exact_media_discovery_cache
+                .clone()
+                .unwrap_or_else(ExactMediaDiscoveryCache::empty),
+            process_store: state.process_store.clone(),
+        })
+    }
+
+    /// Borrows this snapshot, together with the shared provider/auth registries,
+    /// into a context the parallel workers share.
+    pub(crate) fn context<'a>(
+        &'a self,
+        providers: &'a ProviderRegistry,
+        auth_store: &'a AuthStore,
+    ) -> MediaCapabilityContext<'a> {
+        MediaCapabilityContext {
+            permissions: self.permissions,
+            image_settings: self.image_settings.as_ref(),
+            video_settings: self.video_settings.as_ref(),
+            providers,
+            auth_store,
+            discovery_cache: &self.discovery_cache,
+            process_store: Some(&self.process_store),
+        }
+    }
+
+    /// Prompts once per demanded media kind (reusing `resolve_internal_tool_permission`,
+    /// which loads the permission context, prompts on `Ask`, and persists the session
+    /// grant on "Always allow"), upgrading this batch's snapshot on approval. Runs on the
+    /// main thread before `thread::scope`; the `&mut AppState` borrow ends before workers
+    /// capture shared refs.
+    pub(crate) fn authorize_media_batch(
+        &mut self,
+        state: &mut AppState,
+        resources: &LoadedResources,
+        registry: &ToolRegistry,
+        cwd: &Path,
+        commands: &[&str],
+    ) {
+        self.permissions.authorize_media_batch(commands, |tool_id| {
+            resolve_internal_tool_permission(
+                state,
+                resources,
+                registry,
+                cwd,
+                InternalToolPermissionRequest {
+                    tool_id: tool_id.to_string(),
+                    input: Value::Null,
+                },
+            )
+            .is_allowed()
+        });
+    }
+}
+
+/// Runs the parallel-batch media authorization gate for a backend whose tool
+/// calls expose their Bash command via `bash_command` (which returns `None` for
+/// non-Bash calls). Collects the command of every *permitted* Bash call, then
+/// prompts once per demanded-and-`Ask` media kind, upgrading `snapshot` in place.
+/// Backend-agnostic: each backend supplies only the per-call command extractor,
+/// so the gate flow and the `&mut AppState` borrow contract live in one place.
+pub(in crate::runtime) fn authorize_parallel_media_batch<T>(
+    snapshot: &mut MediaCapabilitySnapshot,
+    state: &mut AppState,
+    resources: &LoadedResources,
+    registry: &ToolRegistry,
+    cwd: &Path,
+    tool_calls: &[T],
+    permissions: &[PermissionOutcome],
+    bash_command: impl Fn(&T) -> Option<String>,
+) {
+    let commands: Vec<String> = tool_calls
+        .iter()
+        .zip(permissions)
+        .filter(|(_, outcome)| matches!(outcome, PermissionOutcome::Allowed(_)))
+        .filter_map(|(call, _)| bash_command(call))
+        .collect();
+    let command_refs: Vec<&str> = commands.iter().map(String::as_str).collect();
+    snapshot.authorize_media_batch(state, resources, registry, cwd, &command_refs);
+}
+
+/// Resolves the three media tool permission decisions once, before parallel dispatch.
+pub(crate) fn resolve_media_permission_snapshot(
+    perm_ctx: &crate::permissions::RuntimePermissionContext,
+    registry: &ToolRegistry,
+) -> MediaPermissionSnapshot {
+    let behavior = |tool_id: &str| {
+        registry
+            .internal_definition(tool_id)
+            .map(|def| {
+                perm_ctx
+                    .decision_for_tool_call(def, &serde_json::Value::Null)
+                    .behavior
+            })
+            .unwrap_or(ToolPermissionBehavior::Deny)
+    };
+    MediaPermissionSnapshot {
+        image: behavior("image-generation"),
+        video: behavior("video-generation"),
+        // media-capabilities is always allowed (see resolve_internal_tool_permission_result)
+        capabilities: ToolPermissionBehavior::Allow,
+    }
+}
+
+/// Executes a media internal tool with shared references only (no &mut AppState),
+/// for use from parallel workers. A non-media request fails with an instruction to
+/// run it as a single command; a media request whose kind was not approved for this
+/// batch fails with guidance to approve the prompt (see [`run_media_tool`]).
+pub(crate) fn execute_media_internal_tool(
+    ctx: &MediaCapabilityContext<'_>,
+    cwd: &std::path::Path,
+    request: InternalToolExecutionRequest,
+) -> InternalToolExecutionResponse {
+    use crate::runtime::claude_tools::workflow::{image_generation, media_capabilities, video_generation};
+    let canonical = canonical_tool_name(&request.tool_id);
+    match canonical.as_str() {
+        "imagegeneration" => run_media_tool(ctx.permissions.image, &canonical, || {
+            image_generation::execute_image_generation(
+                ctx.image_settings,
+                cwd,
+                request.input,
+                Some(image_generation::ImageGenerationMediaContext {
+                    providers: ctx.providers,
+                    auth_store: ctx.auth_store,
+                    discovery_cache: ctx.discovery_cache,
+                }),
+            )
+        }),
+        "videogeneration" => run_media_tool(ctx.permissions.video, &canonical, || {
+            video_generation::execute_video_generation(
+                ctx.video_settings,
+                cwd,
+                request.input,
+                Some(video_generation::VideoGenerationMediaContext {
+                    providers: ctx.providers,
+                    auth_store: ctx.auth_store,
+                    discovery_cache: ctx.discovery_cache,
+                }),
+            )
+        }),
+        "mediacapabilities" => run_media_tool(ctx.permissions.capabilities, &canonical, || {
+            media_capabilities::execute_media_capabilities(
+                ctx.providers,
+                ctx.auth_store,
+                ctx.discovery_cache,
+                request.input,
+            )
+        }),
+        other => InternalToolExecutionResponse::failure(format!(
+            "internal tool `{other}` is not available in a parallel batch; run it as a single command"
+        )),
+    }
+}
+
+/// Runs a media tool only when its pre-resolved permission is `Allow`, mapping
+/// the result (and any diagnostic) into a wire response. When the kind was not
+/// approved for this batch, short-circuits with guidance to approve the one-shot
+/// prompt (or enable "Always allow").
+fn run_media_tool(
+    behavior: ToolPermissionBehavior,
+    canonical: &str,
+    run: impl FnOnce() -> anyhow::Result<String>,
+) -> InternalToolExecutionResponse {
+    if !matches!(behavior, ToolPermissionBehavior::Allow) {
+        let label = match canonical {
+            "imagegeneration" => "Image generation",
+            "videogeneration" => "Video generation",
+            other => other,
+        };
+        return InternalToolExecutionResponse::failure(format!(
+            "{label} was not approved for this batch; \
+             approve it once when prompted, or enable Always allow"
+        ));
+    }
+    internal_tool_execution_response(run())
+}
 
 /// Resolves one structured permission request from a first-party internal tool.
 pub(crate) fn resolve_internal_tool_permission(
@@ -49,7 +297,7 @@ pub(crate) fn execute_internal_tool_request(
     cwd: &Path,
     request: InternalToolExecutionRequest,
 ) -> InternalToolExecutionResponse {
-    match execute_internal_tool_request_result(
+    internal_tool_execution_response(execute_internal_tool_request_result(
         state,
         resources,
         registry,
@@ -58,7 +306,15 @@ pub(crate) fn execute_internal_tool_request(
         discovery_cache,
         cwd,
         request,
-    ) {
+    ))
+}
+
+/// Maps an internal media tool result into a wire response, preserving media
+/// failure diagnostics. Shared by the serial and parallel execution paths.
+fn internal_tool_execution_response(
+    result: anyhow::Result<String>,
+) -> InternalToolExecutionResponse {
+    match result {
         Ok(output) => InternalToolExecutionResponse::success(output),
         Err(error) => {
             let reason = format!("{error:#}");
@@ -109,7 +365,7 @@ fn execute_internal_tool_request_result(
         "telegram" => "Telegram",
         "imagegeneration" => {
             return crate::runtime::claude_tools::workflow::image_generation::execute_image_generation(
-                state,
+                state.config.media.image.as_ref(),
                 cwd,
                 request.input,
                 Some(crate::runtime::claude_tools::workflow::image_generation::ImageGenerationMediaContext {
@@ -121,7 +377,7 @@ fn execute_internal_tool_request_result(
         }
         "videogeneration" => {
             return crate::runtime::claude_tools::workflow::video_generation::execute_video_generation(
-                state,
+                state.config.media.video.as_ref(),
                 cwd,
                 request.input,
                 Some(crate::runtime::claude_tools::workflow::video_generation::VideoGenerationMediaContext {
@@ -129,6 +385,14 @@ fn execute_internal_tool_request_result(
                     auth_store,
                     discovery_cache,
                 }),
+            );
+        }
+        "mediacapabilities" => {
+            return crate::runtime::claude_tools::workflow::media_capabilities::execute_media_capabilities(
+                providers,
+                auth_store,
+                discovery_cache,
+                request.input,
             );
         }
         other => anyhow::bail!("unknown internal executable tool `{other}`"),
@@ -193,6 +457,7 @@ fn resolve_internal_tool_permission_result(
 ) -> anyhow::Result<InternalToolPermissionResponse> {
     match canonical_tool_name(&request.tool_id).as_str() {
         "browser" => resolve_browser_permission(state, resources, registry, cwd, request.input),
+        "mediacapabilities" => Ok(InternalToolPermissionResponse::allow()),
         "email"
         | "imagegeneration"
         | "requestuserbrowseraction"
@@ -421,20 +686,54 @@ fn browser_definition(registry: &ToolRegistry) -> Option<&ToolDefinition> {
         .or_else(|| registry.internal_definition("browser"))
 }
 
+/// Which media kinds a parallel batch wants to run that are still pending approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct MediaDemand {
+    image: bool,
+    video: bool,
+}
+
+impl MediaDemand {
+    fn is_empty(&self) -> bool {
+        !self.image && !self.video
+    }
+}
+
+/// Classifies a batch's Bash commands and returns which media kinds are both
+/// invoked and still `Ask` in `perms`. Already-`Allow` kinds need no prompt;
+/// `Deny` kinds are never promoted. Reuses the canonical parser so detection
+/// matches how generated-media outputs are recognized elsewhere.
+fn batch_media_demand(commands: &[&str], perms: &MediaPermissionSnapshot) -> MediaDemand {
+    use puffer_media::GeneratedMediaInternalCommandKind as Kind;
+    let mut demand = MediaDemand::default();
+    for command in commands {
+        match puffer_media::generated_media_internal_command_kind(command) {
+            Some(Kind::Image) if perms.image == ToolPermissionBehavior::Ask => demand.image = true,
+            Some(Kind::Video) if perms.video == ToolPermissionBehavior::Ask => demand.video = true,
+            _ => {}
+        }
+    }
+    demand
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexmap::IndexMap;
     use puffer_config::MediaGenerationConfig;
     use puffer_provider_registry::{
-        AuthMode, AuthStore, Axis, AxisRole, ControlKind, MediaExecutionDescriptor,
-        MediaExecutionKind, MediaKindDescriptor, MediaModelDescriptor, MediaOperation,
-        ModelDescriptor, ProviderDescriptor, ProviderMediaDescriptor, ProviderRegistry, Variant,
-        Variants, WireType,
+        AuthMode, AuthStore, Axis, AxisRole, ControlKind, MediaBatchDescriptor,
+        MediaExecutionDescriptor, MediaExecutionKind, MediaKindDescriptor, MediaMap,
+        MediaModelDescriptor, MediaOperation, MediaSizeMap, ModelDescriptor, ProviderDescriptor,
+        ProviderMediaDescriptor, ProviderRegistry, Variant, Variants, WireType,
     };
     use puffer_resources::{LoadedItem, SourceInfo, SourceKind, ToolSpec};
     use puffer_session_store::SessionMetadata;
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::thread;
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -599,5 +898,320 @@ mod tests {
             models: Vec::<ModelDescriptor>::new(),
         });
         registry
+    }
+
+    // ── helpers shared by the media_internal_tool_* tests ──────────────────
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut buffer = [0_u8; 8192];
+        let size = stream.read(&mut buffer).expect("read request");
+        String::from_utf8_lossy(&buffer[..size]).to_string()
+    }
+
+    fn spawn_image_generation_server() -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request");
+            let request_text = read_http_request(&mut stream);
+            let body = json!({
+                "data": [{"b64_json": "aW1hZ2UtYnl0ZXM="}]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).expect("response");
+            request_text
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn registry_with_provider(base_url: String) -> ProviderRegistry {
+        let mut registry = ProviderRegistry::new();
+        registry.register(ProviderDescriptor {
+            id: "exact-provider".to_string(),
+            display_name: "Exact Provider".to_string(),
+            base_url,
+            default_api: "openai-responses".to_string(),
+            auth_modes: vec![AuthMode::ApiKey],
+            headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            chat_completions_path: None,
+            discovery: None,
+            media: Some(ProviderMediaDescriptor {
+                image: Some(MediaKindDescriptor {
+                    discovery: None,
+                    execution: Some(MediaExecutionDescriptor {
+                        adapter: MediaExecutionKind::ImagesJson,
+                        base_url: None,
+                        path: "/custom/images".to_string(),
+                        batch: MediaBatchDescriptor::default(),
+                        prompt_format: Default::default(),
+                    }),
+                    models: vec![MediaModelDescriptor {
+                        id: "exact-image-model".to_string(),
+                        display_name: Some("Exact Image Model".to_string()),
+                        max_outputs: Some(9),
+                        execution: None,
+                        operations: vec![MediaOperation::Generate],
+                        axes: vec![
+                            Axis {
+                                id: "mode".to_string(),
+                                label: "Mode".to_string(),
+                                role: AxisRole::Param,
+                                control: ControlKind::Enum {
+                                    values: vec!["1K SD".to_string()],
+                                    default: "1K SD".to_string(),
+                                },
+                                request_field: None,
+                                wire_type: WireType::String,
+                            },
+                            Axis {
+                                id: "ratio".to_string(),
+                                label: "Ratio".to_string(),
+                                role: AxisRole::Param,
+                                control: ControlKind::Enum {
+                                    values: vec!["1:1".to_string(), "16:9".to_string()],
+                                    default: "1:1".to_string(),
+                                },
+                                request_field: None,
+                                wire_type: WireType::String,
+                            },
+                        ],
+                        variants: Variants::Single(Variant {
+                            model_id: "exact-image-model".to_string(),
+                            base_params: BTreeMap::from([
+                                ("quality".to_string(), "auto".to_string()),
+                                ("output_format".to_string(), "png".to_string()),
+                            ]),
+                        }),
+                        media_map: Some(MediaMap {
+                            ratio: None,
+                            size: Some(MediaSizeMap {
+                                field: "size".to_string(),
+                                values: BTreeMap::from([(
+                                    "1K SD".to_string(),
+                                    BTreeMap::from([
+                                        ("1:1".to_string(), Some("1024x1024".to_string())),
+                                        ("16:9".to_string(), Some("1536x1024".to_string())),
+                                    ]),
+                                )]),
+                            }),
+                        }),
+                    }],
+                }),
+                video: None,
+            }),
+            models: Vec::<ModelDescriptor>::new(),
+        });
+        registry
+    }
+
+    fn auth_store_with_key() -> AuthStore {
+        let mut auth_store = AuthStore::default();
+        auth_store.set_api_key("exact-provider", "sk-test");
+        auth_store
+    }
+
+    // ── Task-2 TDD tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn media_internal_tool_executes_image_when_allowed() {
+        let (base_url, _server) = spawn_image_generation_server();
+        let dir = tempfile::tempdir().unwrap();
+        let providers = registry_with_provider(base_url);
+        let auth_store = auth_store_with_key();
+        let cache = puffer_media::ExactMediaDiscoveryCache::empty();
+        let image_cfg = puffer_config::MediaGenerationConfig {
+            provider_id: "exact-provider".to_string(),
+            logical_model_id: "exact-image-model".to_string(),
+            selections: std::collections::BTreeMap::from([
+                ("mode".to_string(), "1K SD".to_string()),
+                ("ratio".to_string(), "1:1".to_string()),
+                ("output".to_string(), "1".to_string()),
+            ]),
+        };
+        let ctx = MediaCapabilityContext {
+            permissions: MediaPermissionSnapshot {
+                image: ToolPermissionBehavior::Allow,
+                video: ToolPermissionBehavior::Allow,
+                capabilities: ToolPermissionBehavior::Allow,
+            },
+            image_settings: Some(&image_cfg),
+            video_settings: None,
+            providers: &providers,
+            auth_store: &auth_store,
+            discovery_cache: &cache,
+            process_store: None,
+        };
+        let resp = execute_media_internal_tool(
+            &ctx,
+            dir.path(),
+            InternalToolExecutionRequest {
+                tool_id: "image-generation".to_string(),
+                input: serde_json::json!({"prompt": "draw a ship", "count": 1}),
+            },
+        );
+        assert!(resp.success, "expected success, got {:?}", resp.reason);
+    }
+
+    #[test]
+    fn media_internal_tool_denies_when_not_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let providers = puffer_provider_registry::ProviderRegistry::new();
+        let auth_store = puffer_provider_registry::AuthStore::default();
+        let cache = puffer_media::ExactMediaDiscoveryCache::empty();
+        let ctx = MediaCapabilityContext {
+            permissions: MediaPermissionSnapshot {
+                image: ToolPermissionBehavior::Ask,
+                video: ToolPermissionBehavior::Allow,
+                capabilities: ToolPermissionBehavior::Allow,
+            },
+            image_settings: None,
+            video_settings: None,
+            providers: &providers,
+            auth_store: &auth_store,
+            discovery_cache: &cache,
+            process_store: None,
+        };
+        let resp = execute_media_internal_tool(
+            &ctx,
+            dir.path(),
+            InternalToolExecutionRequest {
+                tool_id: "image-generation".to_string(),
+                input: serde_json::json!({"prompt": "x"}),
+            },
+        );
+        assert!(!resp.success);
+        assert!(resp.reason.unwrap().contains("not approved for this batch"));
+    }
+
+    #[test]
+    fn media_internal_tool_rejects_non_media_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let providers = puffer_provider_registry::ProviderRegistry::new();
+        let auth_store = puffer_provider_registry::AuthStore::default();
+        let cache = puffer_media::ExactMediaDiscoveryCache::empty();
+        let ctx = MediaCapabilityContext {
+            permissions: MediaPermissionSnapshot {
+                image: ToolPermissionBehavior::Allow,
+                video: ToolPermissionBehavior::Allow,
+                capabilities: ToolPermissionBehavior::Allow,
+            },
+            image_settings: None,
+            video_settings: None,
+            providers: &providers,
+            auth_store: &auth_store,
+            discovery_cache: &cache,
+            process_store: None,
+        };
+        let resp = execute_media_internal_tool(
+            &ctx,
+            dir.path(),
+            InternalToolExecutionRequest {
+                tool_id: "email".to_string(),
+                input: serde_json::json!({}),
+            },
+        );
+        assert!(!resp.success);
+        // Non-media internal tools genuinely aren't available in a parallel batch;
+        // this `other`-arm message is unchanged by the media failure-message fix.
+        assert!(resp.reason.unwrap().contains("not available in a parallel batch"));
+    }
+
+    fn snapshot_all_ask() -> MediaPermissionSnapshot {
+        MediaPermissionSnapshot {
+            image: ToolPermissionBehavior::Ask,
+            video: ToolPermissionBehavior::Ask,
+            capabilities: ToolPermissionBehavior::Allow,
+        }
+    }
+
+    #[test]
+    fn demand_detects_image_only() {
+        let d = batch_media_demand(&["imagegen '{\"prompt\":\"x\"}'"], &snapshot_all_ask());
+        assert!(d.image && !d.video);
+        assert!(!d.is_empty());
+    }
+
+    #[test]
+    fn demand_detects_video_only() {
+        let d = batch_media_demand(&["videogen '{\"prompt\":\"x\"}'"], &snapshot_all_ask());
+        assert!(d.video && !d.image);
+    }
+
+    #[test]
+    fn demand_detects_both_kinds_in_batch() {
+        let d = batch_media_demand(&["imagegen '{}'", "videogen '{}'"], &snapshot_all_ask());
+        assert!(d.image && d.video);
+    }
+
+    #[test]
+    fn demand_empty_for_non_media_batch() {
+        let d = batch_media_demand(&["ls -la", "grep foo bar.txt"], &snapshot_all_ask());
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn demand_excludes_already_allowed_kind() {
+        let mut perms = snapshot_all_ask();
+        perms.image = ToolPermissionBehavior::Allow;
+        let d = batch_media_demand(&["imagegen '{}'"], &perms);
+        assert!(!d.image, "already-Allow image needs no prompt");
+    }
+
+    #[test]
+    fn demand_excludes_denied_kind() {
+        let mut perms = snapshot_all_ask();
+        perms.video = ToolPermissionBehavior::Deny;
+        let d = batch_media_demand(&["videogen '{}'"], &perms);
+        assert!(!d.video, "never prompt to override an explicit Deny");
+    }
+
+    #[test]
+    fn demand_ignores_compound_media_command() {
+        // generated_media_internal_command_kind rejects unquoted ; | & — no classification.
+        let d = batch_media_demand(&["imagegen '{}' ; imagegen '{}'"], &snapshot_all_ask());
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn gate_upgrades_demanded_kind_when_authorized() {
+        let mut perms = snapshot_all_ask();
+        perms.authorize_media_batch(&["imagegen '{}'"], |_| true);
+        assert_eq!(perms.image, ToolPermissionBehavior::Allow);
+        assert_eq!(perms.video, ToolPermissionBehavior::Ask, "video not demanded → unchanged");
+    }
+
+    #[test]
+    fn gate_leaves_kind_when_denied() {
+        let mut perms = snapshot_all_ask();
+        perms.authorize_media_batch(&["imagegen '{}'"], |_| false);
+        assert_eq!(perms.image, ToolPermissionBehavior::Ask);
+    }
+
+    #[test]
+    fn gate_no_call_when_no_demand() {
+        let mut perms = snapshot_all_ask();
+        let mut calls = 0;
+        perms.authorize_media_batch(&["ls"], |_| {
+            calls += 1;
+            true
+        });
+        assert_eq!(calls, 0, "authorize never invoked without demand");
+        assert_eq!(perms.image, ToolPermissionBehavior::Ask);
+    }
+
+    #[test]
+    fn gate_upgrades_only_authorized_kind_in_mixed_batch() {
+        let mut perms = snapshot_all_ask();
+        perms.authorize_media_batch(&["imagegen '{}'", "videogen '{}'"], |tool_id| {
+            tool_id == "image-generation"
+        });
+        assert_eq!(perms.image, ToolPermissionBehavior::Allow);
+        assert_eq!(perms.video, ToolPermissionBehavior::Ask);
     }
 }

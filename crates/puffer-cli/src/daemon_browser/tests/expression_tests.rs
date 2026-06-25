@@ -5,7 +5,8 @@ use super::super::params::{parse_input_event, required_string_array};
 use super::super::ref_resolution::{
     checkable_state_expression, fill_expression, focus_expression,
     hosted_fill_focus_check_expression, in_frame_prepare_fill_fn, in_frame_readback_fn,
-    in_frame_select_fn, scroll_into_view_expression, select_expression, target_point_expression,
+    in_frame_select_fn, main_doc_focus_clear_expression, main_doc_readback_expression,
+    scroll_into_view_expression, select_expression, target_point_expression,
 };
 use super::super::screenshot::{
     collect_in_frame_field_nodes, field_nodes_to_refs, merge_action_snapshot,
@@ -725,4 +726,45 @@ fn merge_action_snapshot_falls_back_to_base_when_snapshot_is_not_an_object() {
     let base = json!({ "ok": true });
     let merged = merge_action_snapshot(base.clone(), json!("not-an-object"));
     assert_eq!(merged, base);
+}
+
+fn card_number_field_ref() -> BrowserElementRef {
+    BrowserElementRef {
+        ref_id: "@e7".to_string(),
+        role: "textbox".to_string(),
+        name: "Card number".to_string(),
+        tag: "input".to_string(),
+        href: None,
+        x: 120.0,
+        y: 240.0,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn main_doc_focus_clear_expression_verifies_focus_before_clearing() {
+    // The main-document keystroke fallback (#675) must, after the runtime's real
+    // mouse click, confirm focus actually landed on the resolved field (the #580
+    // guard so keystrokes can't leak elsewhere) and clear any residual before
+    // typing. It resolves the same editable element the fast fill path does.
+    let expression = main_doc_focus_clear_expression(&card_number_field_ref()).unwrap();
+    assert!(expression.contains("findTarget(refTarget)"));
+    assert!(expression.contains("input, textarea, [contenteditable=\"true\"]"));
+    assert!(expression.contains("document.activeElement === targetEl"));
+    assert!(expression.contains("focused"));
+    // The clear uses the native value-setter so a controlled input observes it.
+    assert!(expression.contains("Object.getOwnPropertyDescriptor(proto, 'value')"));
+}
+
+#[test]
+fn main_doc_readback_expression_reads_value_for_silent_failure_check() {
+    // After typing per-character keystrokes the fallback reads the value back so
+    // a guarded field that reverted even genuine keystrokes bails honestly
+    // instead of reporting a false success (#580/#675). Same readback for
+    // contenteditable fields (textContent) and value inputs.
+    let expression = main_doc_readback_expression(&card_number_field_ref()).unwrap();
+    assert!(expression.contains("findTarget(refTarget)"));
+    assert!(expression.contains("'value' in targetEl"));
+    assert!(expression.contains("targetEl.textContent"));
+    assert!(expression.contains("return { value }"));
 }

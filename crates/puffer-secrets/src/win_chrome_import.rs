@@ -15,6 +15,10 @@
 
 #![cfg(target_os = "windows")]
 
+use crate::win_chrome_args::{
+    normalize_vault_dir, parse_required_pid, ps_single_quote, validate_account_name,
+    validate_vault_dir,
+};
 use crate::{SecretUpsert, SecretVault};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -237,6 +241,27 @@ fn gcm_decrypt(key: &[u8; 32], value: &[u8]) -> Result<String> {
     Ok(String::from_utf8_lossy(&pt).into_owned())
 }
 
+/// Refuses to proceed if the vault directory is itself a reparse point. The
+/// per-file writes use `write_file_no_follow` (which only guards the LEAF
+/// component), so a same-user process pre-planting `.puffer` as a junction could
+/// otherwise redirect every SYSTEM-context vault write out of the profile. This
+/// catches the persistent-junction case; it is not a complete TOCTOU fix (a racer
+/// could plant after this check — a handle-relative write would fully close it).
+/// A not-yet-created dir is allowed (normal first run); any other stat failure
+/// fails closed rather than silently skipping the check.
+fn ensure_vault_dir_not_reparse(vault_dir: &str) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    match std::fs::symlink_metadata(std::path::Path::new(vault_dir)) {
+        Ok(meta) if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
+            bail!("refusing to import: vault directory is a reparse point");
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => bail!("refusing to import: cannot stat vault directory: {e}"),
+    }
+}
+
 /// The actual privileged import (SYSTEM context). Returns a human summary.
 fn do_import(user: &str, token_pid: u32, vault_dir: &str) -> Result<String> {
     let root = PathBuf::from(format!(
@@ -285,15 +310,21 @@ fn do_import(user: &str, token_pid: u32, vault_dir: &str) -> Result<String> {
     // ("Login Data For Account") — passwords saved to the Google account live in
     // the latter. Same schema + same os_crypt/ABE key; union the rows.
     let mut rows: Vec<(String, String, Vec<u8>)> = Vec::new();
-    for (i, name) in ["Default\\Login Data", "Default\\Login Data For Account"]
-        .iter()
-        .enumerate()
-    {
+    for name in ["Default\\Login Data", "Default\\Login Data For Account"] {
         let db = root.join(name);
         if !db.exists() {
             continue;
         }
-        let tmp = std::env::temp_dir().join(format!("puffer_logins_{i}.db"));
+        // Copy the locked SQLite store into a fresh, random, auto-cleaned temp
+        // directory (not a fixed shared-temp filename): the copy carries Chrome's
+        // encrypted credential rows, so it must not sit at a predictable path another
+        // process could read/squat, and it must be removed even on early return. The
+        // `conn` is dropped before `tmpdir` (reverse declaration order), so the file
+        // is closed before TempDir's Drop removes the directory.
+        let Ok(tmpdir) = tempfile::tempdir() else {
+            continue;
+        };
+        let tmp = tmpdir.path().join("logins.db");
         if std::fs::copy(&db, &tmp).is_err() {
             continue;
         }
@@ -306,8 +337,11 @@ fn do_import(user: &str, token_pid: u32, vault_dir: &str) -> Result<String> {
                 }
             }
         }
-        let _ = std::fs::remove_file(&tmp);
     }
+
+    // Defense-in-depth before this SYSTEM-context process writes inside the
+    // user-writable vault dir: refuse if the dir is itself a reparse point.
+    ensure_vault_dir_not_reparse(vault_dir)?;
 
     let path = SecretVault::default_path(std::path::Path::new(vault_dir));
     let vault = SecretVault::open(&path)?;
@@ -346,10 +380,56 @@ fn do_import(user: &str, token_pid: u32, vault_dir: &str) -> Result<String> {
     ))
 }
 
-fn result_path(user: &str) -> PathBuf {
+/// Per-user, per-run temp file the SYSTEM stage writes its (counts-only) result to
+/// and the parent stages read up the internal elevation hops. The PID keeps
+/// concurrent imports independent and the name non-fixed; the daemon does NOT trust
+/// this file — it reads the helper's stdout (see daemon_secrets) — so this only
+/// carries the result across the SYSTEM->elevated->user boundary that cannot pipe.
+fn result_path(user: &str, pid: u32) -> PathBuf {
     PathBuf::from(format!(
-        "C:\\Users\\{user}\\AppData\\Local\\Temp\\puffer_chrome_import.txt"
+        "C:\\Users\\{user}\\AppData\\Local\\Temp\\puffer_chrome_import_{pid}.txt"
     ))
+}
+
+/// Writes the SYSTEM-stage result line WITHOUT following a reparse point on the LEAF
+/// path component, failing if anything already exists at the path. The result file
+/// lives in the user's own (unprivileged-writable) Temp and this runs as SYSTEM, so
+/// a concurrent same-user process could otherwise pre-plant a junction /
+/// object-manager symlink at the predictable filename and redirect this privileged
+/// write to an arbitrary target — the classic Temp TOCTOU local-privilege-escalation.
+/// `create_new` fails if anything is already there and `FILE_FLAG_OPEN_REPARSE_POINT`
+/// never traverses a reparse point at the final component, so a racer can at most
+/// make the write fail (import reported as no-result), never redirect the leaf.
+/// (Caveat: this flag only guards the final component — a junction on an
+/// intermediate directory is not covered here; the standard Temp ancestors are not
+/// realistically re-plantable, unlike the vault dir which do_import checks directly.)
+fn write_result_no_follow(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    file.write_all(text.as_bytes())
+}
+
+/// Absolute path to a System32 tool, so the elevation path never resolves a
+/// security-sensitive helper (schtasks / powershell) through PATH or the CWD.
+/// The directory comes from the kernel via `GetSystemDirectoryW`, NOT from the
+/// `SystemRoot`/`windir` environment (which a same-user caller of the hidden
+/// subcommand could poison to redirect the helper to an attacker location).
+fn system32(tool: &str) -> String {
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260]; // MAX_PATH
+    let len = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    let dir = if len > 0 && len <= buf.len() {
+        String::from_utf16_lossy(&buf[..len])
+    } else {
+        "C:\\Windows\\System32".to_string()
+    };
+    format!("{dir}\\{tool}")
 }
 
 /// Entry point for the `puffer __win-chrome-import [args]` subcommand. `args` are
@@ -360,28 +440,42 @@ pub fn dispatch(args: &[String]) -> Result<()> {
         // SYSTEM stage: do the import, write the result for the parent to read.
         Some("--system") => {
             let user = args.get(1).cloned().unwrap_or_default();
-            let vault = args.get(2).cloned().unwrap_or_default();
-            let pid: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let vault = normalize_vault_dir(&args.get(2).cloned().unwrap_or_default());
+            let pid = parse_required_pid(args.get(3))?;
+            // This stage builds SYSTEM-context filesystem paths from these args, so
+            // validate them here too (the subcommand is directly invokable).
+            validate_account_name(&user)?;
+            validate_vault_dir(&vault)?;
             let result = do_import(&user, pid, &vault);
             let text = match &result {
                 Ok(s) => format!("CHROME_IMPORT_OK {s}"),
                 Err(e) => format!("CHROME_IMPORT_ERROR: {e:#}"),
             };
-            let _ = std::fs::write(result_path(&user), &text);
+            let _ = write_result_no_follow(&result_path(&user, pid), &text);
             result.map(|_| ())
         }
         // ADMIN stage (post-UAC): import via a transient SYSTEM task.
         Some("--elevated") => {
             let user = args.get(1).cloned().unwrap_or_default();
-            let vault = args.get(2).cloned().unwrap_or_default();
-            let pid = args.get(3).cloned().unwrap_or_default();
+            let vault = normalize_vault_dir(&args.get(2).cloned().unwrap_or_default());
+            // Require a real PID (rejecting missing/invalid/0) so it can never carry
+            // a metacharacter into the unquoted tail of the `/tr` action nor make the
+            // task name / result file predictable; validate user/vault before building
+            // the SYSTEM task command — don't trust the prior stage's argv (the hidden
+            // subcommand is directly callable).
+            let pid = parse_required_pid(args.get(3))?;
+            validate_account_name(&user)?;
+            validate_vault_dir(&vault)?;
             let tn = format!("PufferChromeImport_{pid}");
-            // Quote both {user} and {vault}: a username or vault path containing a
-            // space must stay a single argument in the SYSTEM-context task command.
+            // user/vault are double-quoted and, per validate_elevation_arg, cannot
+            // contain `"` (the only breakout of a double-quoted token); pid is a
+            // parsed integer; exe is our own absolute path. So no token can escape
+            // the task action string.
             let tr = format!("\"{exe}\" {SUBCOMMAND} --system \"{user}\" \"{vault}\" {pid}");
-            let out = result_path(&user);
+            let out = result_path(&user, pid);
             let _ = std::fs::remove_file(&out);
-            Command::new("schtasks")
+            let schtasks = system32("schtasks.exe");
+            Command::new(&schtasks)
                 .args([
                     "/create", "/tn", &tn, "/tr", &tr, "/sc", "once", "/st", "00:00", "/ru",
                     "SYSTEM", "/f",
@@ -389,7 +483,7 @@ pub fn dispatch(args: &[String]) -> Result<()> {
                 .creation_flags(CREATE_NO_WINDOW)
                 .status()
                 .context("schtasks /create")?;
-            Command::new("schtasks")
+            Command::new(&schtasks)
                 .args(["/run", "/tn", &tn])
                 .creation_flags(CREATE_NO_WINDOW)
                 .status()
@@ -401,7 +495,7 @@ pub fn dispatch(args: &[String]) -> Result<()> {
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = Command::new("schtasks")
+            let _ = Command::new(&schtasks)
                 .args(["/delete", "/tn", &tn, "/f"])
                 .creation_flags(CREATE_NO_WINDOW)
                 .status();
@@ -414,25 +508,36 @@ pub fn dispatch(args: &[String]) -> Result<()> {
         // USER stage (default): ask Windows to elevate (UAC) and wait.
         _ => {
             let user = std::env::var("USERNAME").unwrap_or_else(|_| "Administrator".into());
-            let vault = args
-                .iter()
-                .position(|a| a == "--vault-dir")
-                .and_then(|i| args.get(i + 1))
-                .cloned()
-                .or_else(|| std::env::var("PUFFER_VAULT_DIR").ok())
-                .unwrap_or_else(|| format!("C:\\Users\\{user}\\.puffer"));
+            let vault = normalize_vault_dir(
+                &args
+                    .iter()
+                    .position(|a| a == "--vault-dir")
+                    .and_then(|i| args.get(i + 1))
+                    .cloned()
+                    .or_else(|| std::env::var("PUFFER_VAULT_DIR").ok())
+                    .unwrap_or_else(|| format!("C:\\Users\\{user}\\.puffer")),
+            );
+            validate_account_name(&user)?;
+            validate_vault_dir(&vault)?;
             let pid = std::process::id();
             // Clear any stale result from a previous run BEFORE elevating: if the
             // user declines UAC (or PowerShell fails), the elevated stage never runs
             // and never rewrites this file, so a leftover "OK" must not be read as a
             // fresh success.
-            let result = result_path(&user);
+            let result = result_path(&user, pid);
             let _ = std::fs::remove_file(&result);
+            // Each interpolated value goes inside a PowerShell single-quoted string
+            // with embedded `'` doubled, so a username like `O'Brien` or a path with
+            // an apostrophe is a literal argument and cannot inject PowerShell.
             let ps = format!(
                 "Start-Process -Verb RunAs -WindowStyle Hidden -Wait -FilePath '{exe}' \
-                 -ArgumentList '{SUBCOMMAND}','--elevated','{user}','{vault}','{pid}'"
+                 -ArgumentList '{SUBCOMMAND}','--elevated','{user}','{vault}','{pid}'",
+                exe = ps_single_quote(&exe),
+                user = ps_single_quote(&user),
+                vault = ps_single_quote(&vault),
             );
-            Command::new("powershell")
+            let powershell = system32("WindowsPowerShell\\v1.0\\powershell.exe");
+            Command::new(&powershell)
                 .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
                 .creation_flags(CREATE_NO_WINDOW)
                 .status()
@@ -445,5 +550,50 @@ pub fn dispatch(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #5: System32 is resolved from the kernel (GetSystemDirectoryW), so the path
+    // is real and ends at the requested tool — not derived from %SystemRoot% env.
+    #[test]
+    fn system32_resolves_a_real_kernel_path() {
+        let cmd = system32("cmd.exe");
+        let lower = cmd.to_ascii_lowercase();
+        assert!(lower.ends_with("\\system32\\cmd.exe"), "unexpected path: {cmd}");
+        assert!(std::path::Path::new(&cmd).exists(), "cmd.exe should exist at {cmd}");
+        // Poisoning %SystemRoot% must NOT change the kernel-resolved path.
+        std::env::set_var("SystemRoot", "Z:\\attacker");
+        assert_eq!(system32("cmd.exe"), cmd, "SystemRoot env must not influence system32()");
+        std::env::remove_var("SystemRoot");
+    }
+
+    // #2: a junction planted as the vault dir is detected and refused; a normal dir
+    // is allowed; a not-yet-created dir is allowed (first run).
+    #[test]
+    fn vault_dir_reparse_guard_detects_a_junction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let normal = real.to_string_lossy().to_string();
+        // A plain directory is accepted.
+        assert!(ensure_vault_dir_not_reparse(&normal).is_ok());
+        // A not-yet-created directory is accepted (SecretVault::open creates it).
+        let missing = tmp.path().join("does-not-exist").to_string_lossy().to_string();
+        assert!(ensure_vault_dir_not_reparse(&missing).is_ok());
+        // Plant a junction (no admin needed) and confirm it is refused.
+        let link = tmp.path().join("junction");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J", &link.to_string_lossy(), &real.to_string_lossy()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .expect("run mklink");
+        assert!(status.success(), "mklink /J should succeed without admin");
+        let junction = link.to_string_lossy().to_string();
+        let verdict = ensure_vault_dir_not_reparse(&junction);
+        assert!(verdict.is_err(), "a junction vault dir must be refused, got {verdict:?}");
     }
 }

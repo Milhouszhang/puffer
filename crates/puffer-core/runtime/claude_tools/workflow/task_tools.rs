@@ -25,6 +25,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+const MONITOR_SOURCE_MESSAGES_LIMIT: usize = 8;
+
 /// Executes the live `TaskCreate` workflow tool.
 pub(super) fn execute_task_create(
     state: &mut AppState,
@@ -1603,6 +1605,9 @@ fn stamp_monitor_task_metadata_from_current_sources(
     if let Some(message_id) = source_message_id_from_stamp(&stamp) {
         metadata.insert("source_message_id".to_string(), Value::from(message_id));
     }
+    if let Some(source_messages) = source_messages_from_stamp(&stamp) {
+        metadata.insert("source_messages".to_string(), source_messages);
+    }
     apply_stamped_monitor_contract(metadata, contract)?;
     Ok(())
 }
@@ -2140,6 +2145,91 @@ fn source_message_id_from_stamp(stamp: &MonitorSourceStampContext) -> Option<i64
             .get("message")
             .and_then(|message| value_i64_field(message, &["id", "message_id", "messageId"]))
     })
+}
+
+fn source_messages_from_stamp(stamp: &MonitorSourceStampContext) -> Option<Value> {
+    if !stamp
+        .connector_slug
+        .as_deref()
+        .is_some_and(|slug| slug.contains("telegram"))
+        && !stamp.connection_slug.contains("telegram")
+    {
+        return None;
+    }
+
+    let mut messages = stamp
+        .payload
+        .get("conversation_context")
+        .and_then(|context| context.get("messages"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(current) = current_telegram_source_message_from_stamp(stamp) {
+        messages.push(current);
+    }
+    if messages.is_empty() {
+        return None;
+    }
+    let start = messages.len().saturating_sub(MONITOR_SOURCE_MESSAGES_LIMIT);
+    Some(Value::Array(messages.into_iter().skip(start).collect()))
+}
+
+fn current_telegram_source_message_from_stamp(stamp: &MonitorSourceStampContext) -> Option<Value> {
+    let text = stamp
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let payload = &stamp.payload;
+    let is_outgoing = value_bool_field(
+        payload,
+        &["is_outgoing", "isOutgoing", "outgoing", "from_me", "fromMe"],
+    ) || value_string_field(payload, &["direction"])
+        .is_some_and(|direction| direction.eq_ignore_ascii_case("outgoing"));
+    let direction = if is_outgoing { "outgoing" } else { "incoming" };
+    let from = if is_outgoing { "me" } else { "them" };
+    let sender_label = value_string_field(payload, &["sender_name", "senderName", "sender"])
+        .or_else(|| value_string_field(payload, &["chat_title", "chatTitle"]))
+        .unwrap_or_else(|| {
+            if is_outgoing {
+                "me".to_string()
+            } else {
+                "sender".to_string()
+            }
+        });
+    let sender_username =
+        value_string_field(payload, &["sender_username", "senderUsername", "username"]);
+    let chat_id = payload
+        .get("chat_id")
+        .or_else(|| payload.get("chatId"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let chat_title = value_string_field(payload, &["chat_title", "chatTitle"]);
+    let message_id = source_message_id_from_stamp(stamp);
+    let date_ms = value_i64_field(
+        payload,
+        &["date_ms", "dateMs", "event_date_ms", "eventDateMs"],
+    );
+
+    Some(json!({
+        "from": from,
+        "direction": direction,
+        "sender": {
+            "label": sender_label,
+            "username": sender_username,
+            "is_user": is_outgoing,
+        },
+        "chat": {
+            "id": chat_id,
+            "title": chat_title,
+        },
+        "message_id": message_id,
+        "date_ms": date_ms,
+        "ts": date_ms,
+        "reply_to": payload.get("reply_to").cloned().unwrap_or(Value::Null),
+        "text": text,
+        "is_outgoing": is_outgoing,
+    }))
 }
 
 fn copy_value_field(source: &Value, target: &mut Map<String, Value>, out_key: &str, keys: &[&str]) {
@@ -3338,8 +3428,28 @@ mod tests {
                 "chat_id": 42,
                 "chat_kind": "user",
                 "message_id": 6836,
+                "date_ms": 1_009,
+                "reply_to": {
+                    "kind": "message",
+                    "message_id": 6835
+                },
                 "sender_id": "8759047281",
-                "sender_username": "alice"
+                "sender_username": "alice",
+                "sender_name": "Alice",
+                "conversation_context": {
+                    "kind": "telegram_prior_messages",
+                    "scope": "same_chat_before_current_message",
+                    "messages": [
+                        { "from": "them", "direction": "incoming", "text": "prior 1", "date_ms": 1_001 },
+                        { "from": "me", "direction": "outgoing", "text": "在", "date_ms": 1_002, "reply_to": { "kind": "message", "message_id": 6801 } },
+                        { "from": "them", "direction": "incoming", "text": "prior 3", "date_ms": 1_003 },
+                        { "from": "me", "direction": "outgoing", "text": "prior 4", "date_ms": 1_004 },
+                        { "from": "them", "direction": "incoming", "text": "prior 5", "date_ms": 1_005 },
+                        { "from": "them", "direction": "incoming", "text": "prior 6", "date_ms": 1_006 },
+                        { "from": "them", "direction": "incoming", "text": "prior 7", "date_ms": 1_007 },
+                        { "from": "them", "direction": "incoming", "text": "prior 8", "date_ms": 1_008 }
+                    ]
+                }
             }),
         }]);
         configure_telegram_gate(
@@ -3385,6 +3495,20 @@ mod tests {
             metadata.pointer("/monitor_task_gate/decision"),
             Some(&json!("create_unknown"))
         );
+        let source_messages = metadata
+            .pointer("/source_messages")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(source_messages.len(), 8);
+        assert_eq!(source_messages[0]["text"], "在");
+        assert_eq!(source_messages[0]["direction"], "outgoing");
+        assert_eq!(source_messages[0]["reply_to"]["message_id"], 6801);
+        assert_eq!(source_messages[7]["text"], "What's the latest on WLF?");
+        assert_eq!(source_messages[7]["direction"], "incoming");
+        assert_eq!(source_messages[7]["sender"]["username"], "alice");
+        assert_eq!(source_messages[7]["chat"]["id"], 42);
+        assert_eq!(source_messages[7]["message_id"], 6836);
+        assert_eq!(source_messages[7]["reply_to"]["message_id"], 6835);
     }
 
     #[test]

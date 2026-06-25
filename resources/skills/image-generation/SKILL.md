@@ -17,5 +17,6 @@ Progress-only or promise-only replies are not completion: after activation, eith
 - Treat `--prompt` as literal text unless it names a workspace-relative file; prompt file paths should be passed through `--prompt`.
 - Use `--prompt-reference` only when the request supplies additional prompt context.
 - Use `--aspect`, `--purpose`, or `--retry-from-error-json` only when the request or retry context requires them.
+- To override the connected default, pass `--provider <id> --model <id>` together — both are required, or pass neither. Omit them to use the configured default provider/model.
 - If image generation fails or the media runtime is unavailable, report that plainly.
 - Do not hand-author SVG, ASCII art, placeholder files, or other substitutes and present them as generated images.

@@ -952,6 +952,7 @@ fn read_prior_telegram_context_messages(
                     "message_id": message_id,
                     "date_ms": date_ms,
                     "ts": date_ms,
+                    "reply_to": payload.get("reply_to").cloned().unwrap_or(Value::Null),
                     "text": text,
                 }),
             ));
@@ -1232,6 +1233,16 @@ fn value_i64_field(value: &Value, key: &str) -> Option<i64> {
     }
 }
 
+fn value_i64_any(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| value_i64_field(value, key))
+}
+
+fn value_bool_any(value: &Value, keys: &[&str]) -> bool {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
 /// Stamps the trigger's verbatim source grounding onto monitor tasks created
 /// for that envelope: the exact event text (`metadata.source_text`, plus
 /// `source_context.text`), the source message id (`metadata.source_message_id`,
@@ -1265,6 +1276,7 @@ fn record_monitor_source_text(paths: &ConfigPaths, trigger: &serde_json::Value) 
         .get("payload")
         .and_then(|payload| payload.get("conversation_context"))
         .cloned();
+    let source_messages = source_messages_from_monitor_trigger(trigger, text);
     let derived_source_context = derive_monitor_source_context_from_trigger(trigger);
     let path = monitor_task_store_path(paths);
     let raw = match std::fs::read_to_string(&path) {
@@ -1327,6 +1339,12 @@ fn record_monitor_source_text(paths: &ConfigPaths, trigger: &serde_json::Value) 
                 changed = true;
             }
         }
+        if let Some(source_messages) = source_messages.as_ref() {
+            if metadata.get("source_messages") != Some(source_messages) {
+                metadata.insert("source_messages".to_string(), source_messages.clone());
+                changed = true;
+            }
+        }
         if metadata.get("source_context").is_none() {
             if let Some(context) = derived_source_context.as_ref() {
                 metadata.insert("source_context".to_string(), context.clone());
@@ -1354,6 +1372,12 @@ fn record_monitor_source_text(paths: &ConfigPaths, trigger: &serde_json::Value) 
                         "message_id".to_string(),
                         serde_json::Value::from(message_id),
                     );
+                    changed = true;
+                }
+            }
+            if let Some(source_messages) = source_messages.as_ref() {
+                if context.get("source_messages") != Some(source_messages) {
+                    context.insert("source_messages".to_string(), source_messages.clone());
                     changed = true;
                 }
             }
@@ -1389,6 +1413,91 @@ fn record_monitor_source_text(paths: &ConfigPaths, trigger: &serde_json::Value) 
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
     Ok(())
+}
+
+fn source_messages_from_monitor_trigger(trigger: &Value, text: &str) -> Option<Value> {
+    let payload = trigger.get("payload")?;
+    let connector_slug = value_string(trigger, &["connector_slug", "connectorSlug"])
+        .or_else(|| value_string(payload, &["connector_slug", "connectorSlug", "platform"]))
+        .unwrap_or_default();
+    let connection_slug = value_string(
+        trigger,
+        &[
+            "connection_id",
+            "connectionId",
+            "connection_slug",
+            "connectionSlug",
+        ],
+    )
+    .or_else(|| value_string(payload, &["connection_slug", "connectionSlug"]))
+    .unwrap_or_default();
+    if !connector_slug.contains("telegram") && !connection_slug.contains("telegram") {
+        return None;
+    }
+
+    let mut messages = payload
+        .get("conversation_context")
+        .and_then(|context| context.get("messages"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(current) = current_telegram_source_message_from_trigger(payload, text) {
+        messages.push(current);
+    }
+    if messages.is_empty() {
+        return None;
+    }
+    let start = messages
+        .len()
+        .saturating_sub(TELEGRAM_CONVERSATION_CONTEXT_LIMIT);
+    Some(Value::Array(messages.into_iter().skip(start).collect()))
+}
+
+fn current_telegram_source_message_from_trigger(payload: &Value, text: &str) -> Option<Value> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let is_outgoing = value_bool_any(
+        payload,
+        &["is_outgoing", "isOutgoing", "outgoing", "from_me", "fromMe"],
+    ) || value_string(payload, &["direction"])
+        .is_some_and(|direction| direction.eq_ignore_ascii_case("outgoing"));
+    let direction = if is_outgoing { "outgoing" } else { "incoming" };
+    let from = if is_outgoing { "me" } else { "them" };
+    let sender_label = telegram_context_sender_label(payload, is_outgoing);
+    let sender_username = value_string(payload, &["sender_username", "senderUsername", "username"]);
+    let chat_id = payload
+        .get("chat_id")
+        .or_else(|| payload.get("chatId"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let chat_title = value_string(payload, &["chat_title", "chatTitle"]);
+    let message_id = value_i64_any(payload, &["message_id", "messageId"]);
+    let date_ms = value_i64_any(
+        payload,
+        &["date_ms", "dateMs", "event_date_ms", "eventDateMs"],
+    );
+
+    Some(json!({
+        "from": from,
+        "direction": direction,
+        "sender": {
+            "label": sender_label,
+            "username": sender_username,
+            "is_user": is_outgoing,
+        },
+        "chat": {
+            "id": chat_id,
+            "title": chat_title,
+        },
+        "message_id": message_id,
+        "date_ms": date_ms,
+        "ts": date_ms,
+        "reply_to": payload.get("reply_to").cloned().unwrap_or(Value::Null),
+        "text": text,
+        "is_outgoing": is_outgoing,
+    }))
 }
 
 fn derive_monitor_source_context_from_trigger(trigger: &Value) -> Option<Value> {
@@ -2567,9 +2676,15 @@ NO_TASK_DECISIONS:
         .unwrap();
         let trigger = json!({
             "envelope_id": "env-1",
+            "connection_id": "telegram-user",
+            "connector_slug": "telegram-login",
             "text": "线上支付回调失败率刚升到 18%，请在 16:00 前给结论。",
             "payload": {
+                "chat_id": 42,
                 "message_id": 6836,
+                "date_ms": 3_000,
+                "sender_name": "博阿 杜",
+                "sender_username": "bobo",
                 "conversation_context": {
                     "kind": "telegram_prior_messages",
                     "scope": "same_chat_before_current_message",
@@ -2584,7 +2699,11 @@ NO_TASK_DECISIONS:
                             "from": "me",
                             "direction": "outgoing",
                             "text": "我看一下，16:00 前回复",
-                            "date_ms": 2_000
+                            "date_ms": 2_000,
+                            "reply_to": {
+                                "kind": "message",
+                                "message_id": 6835
+                            }
                         }
                     ]
                 }
@@ -2616,6 +2735,21 @@ NO_TASK_DECISIONS:
         assert_eq!(
             tasks[0]["metadata"]["source_context"]["context_messages"][0]["text"],
             "刚刚的异常还在继续"
+        );
+        let source_messages = tasks[0]["metadata"]["source_messages"].as_array().unwrap();
+        assert_eq!(source_messages.len(), 3);
+        assert_eq!(source_messages[0]["text"], "刚刚的异常还在继续");
+        assert_eq!(source_messages[1]["direction"], "outgoing");
+        assert_eq!(source_messages[1]["text"], "我看一下，16:00 前回复");
+        assert_eq!(source_messages[1]["reply_to"]["message_id"], 6835);
+        assert_eq!(source_messages[2]["message_id"], 6836);
+        assert_eq!(
+            source_messages[2]["text"],
+            "线上支付回调失败率刚升到 18%，请在 16:00 前给结论。"
+        );
+        assert_eq!(
+            tasks[0]["metadata"]["source_context"]["source_messages"],
+            tasks[0]["metadata"]["source_messages"]
         );
         // …while a different envelope's task is untouched.
         assert!(tasks[1]["metadata"].get("source_text").is_none());

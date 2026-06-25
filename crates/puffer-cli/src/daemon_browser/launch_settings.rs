@@ -80,9 +80,9 @@ impl BrowserLaunchSettings {
         &self.seeds
     }
 
-    /// Creates launch settings with extension directories for command-line tests.
+    /// Creates launch settings with extension directories for tests.
     #[cfg(test)]
-    pub(super) fn with_extension_dirs(extension_dirs: Vec<PathBuf>) -> Self {
+    pub(crate) fn with_extension_dirs(extension_dirs: Vec<PathBuf>) -> Self {
         Self {
             extension_dirs,
             seeds: Vec::new(),

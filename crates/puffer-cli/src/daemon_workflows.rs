@@ -684,6 +684,7 @@ fn monitor_task_json(
             telegram_peer_avatars,
             telegram_peer_names
         ),
+        "source_messages": task_snapshot::monitor_source_messages(&task.metadata),
         "completion_policy": task_snapshot::monitor_completion_policy(&task.metadata),
         "source_state": task_snapshot::metadata_value(
             &task.metadata,
@@ -963,6 +964,82 @@ mod tests {
             "Deployment finished an hour ago."
         );
         assert_eq!(snapshot["monitor_task_error"], Value::Null);
+    }
+
+    #[test]
+    fn workflow_snapshot_monitor_tasks_include_telegram_source_messages() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::discover(tempdir.path());
+        let task_path = monitor_tasks_path(&paths);
+        std::fs::create_dir_all(task_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &task_path,
+            serde_json::to_string_pretty(&json!({
+                "tasks": [{
+                    "task_id": "monitor-world-cup",
+                    "subject": "回复世界杯今晚赛程",
+                    "description": "联系人发来今晚赛程请求。",
+                    "status": "pending",
+                    "metadata": {
+                        "_monitor": true,
+                        "monitor_connection": "telegram-user",
+                        "monitor_connector": "telegram-login",
+                        "source_text": "还有世界杯今晚的赛程",
+                        "source_message_id": 53970,
+                        "source_context": {
+                            "kind": "telegram_direct_message",
+                            "sender": { "name": "博阿 杜" },
+                            "context_messages": [
+                                { "from": "them", "direction": "incoming", "text": "在吗", "message_id": 53961 },
+                                { "from": "me", "direction": "outgoing", "text": "在", "message_id": 53962 },
+                                { "from": "me", "direction": "outgoing", "text": "今天怎么样", "message_id": 53963 },
+                                { "from": "them", "direction": "incoming", "text": "还行", "message_id": 53964 },
+                                { "from": "them", "direction": "incoming", "text": "跟我说下NVDA最近的财报情况", "message_id": 53965 },
+                                { "from": "me", "direction": "outgoing", "text": "汇报下明天杭州的天气", "message_id": 53967 },
+                                { "from": "me", "direction": "outgoing", "text": "还有世界杯今晚的赛程", "message_id": 53968 },
+                                { "from": "them", "direction": "incoming", "text": "汇报下明天杭州的天气", "message_id": 53969 }
+                            ]
+                        },
+                        "source_messages": [
+                            { "from": "me", "direction": "outgoing", "text": "在", "message_id": 53962 },
+                            { "from": "me", "direction": "outgoing", "text": "今天怎么样", "message_id": 53963 },
+                            { "from": "them", "direction": "incoming", "text": "还行", "message_id": 53964 },
+                            { "from": "them", "direction": "incoming", "text": "跟我说下NVDA最近的财报情况", "message_id": 53965 },
+                            { "from": "me", "direction": "outgoing", "text": "汇报下明天杭州的天气", "message_id": 53967 },
+                            { "from": "me", "direction": "outgoing", "text": "还有世界杯今晚的赛程", "message_id": 53968 },
+                            { "from": "them", "direction": "incoming", "text": "汇报下明天杭州的天气", "message_id": 53969 },
+                            { "from": "them", "direction": "incoming", "text": "还有世界杯今晚的赛程", "message_id": 53970 }
+                        ],
+                        "monitor": {
+                            "schema_version": 2,
+                            "kind": "telegram.reply",
+                            "source": {
+                                "connector_slug": "telegram-login",
+                                "connection_slug": "telegram-user",
+                                "message_id": 53970,
+                                "sender_name": "博阿 杜",
+                                "text": "还有世界杯今晚的赛程"
+                            },
+                            "action": { "type": "telegram_reply_draft" }
+                        }
+                    },
+                    "started_at_ms": 10,
+                    "updated_at_ms": 20
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let snapshot = handle_workflow_list(&paths).unwrap();
+        let tasks = snapshot["monitor_tasks"].as_array().unwrap();
+        let source_messages = tasks[0]["source_messages"].as_array().unwrap();
+
+        assert_eq!(source_messages.len(), 8);
+        assert_eq!(source_messages[0]["text"], "在");
+        assert_eq!(source_messages[0]["direction"], "outgoing");
+        assert_eq!(source_messages[7]["text"], "还有世界杯今晚的赛程");
+        assert_eq!(source_messages[7]["message_id"], 53970);
     }
 
     #[test]

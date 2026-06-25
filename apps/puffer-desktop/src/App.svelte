@@ -18,6 +18,7 @@
   import NewSessionModal from "./lib/screens/workspace/NewSessionModal.svelte";
   import WorkspacePicker from "./lib/screens/WorkspacePicker.svelte";
   import AgentDetail from "./lib/screens/agent/AgentDetail.svelte";
+  import { isAlreadyPersistedTool, persistedToolIdSet } from "./lib/screens/agent/timelineToolDedup";
   import Workflows from "./lib/screens/Workflows.svelte";
   import Tasks from "./lib/screens/Tasks.svelte";
   import Contacts from "./lib/screens/Contacts.svelte";
@@ -1999,7 +2000,7 @@
     for (const req of ev.requests) {
       if (isAskUserQuestionToolName(req.toolId)) continue;
       if (sendUserMessageText(req.toolId, req.input)) continue;
-      const id = liveToolId(ev.turnId, req.callId);
+      const id = liveToolId(req.callId);
       if (liveItems.some((item) => item.id === id)) continue;
       liveItems = appendCachedLiveItemForTurn(
         { ...cached, liveStreamItems: liveItems },
@@ -2053,7 +2054,7 @@
         liveItems = appendCachedLiveItem({ ...cached, liveStreamItems: liveItems }, payload);
         continue;
       }
-      const id = liveToolId(ev.turnId, inv.callId);
+      const id = liveToolId(inv.callId);
       const payload: TimelineItem = timelineItemWithTurnId({
         id,
         kind: "tool",
@@ -3857,9 +3858,13 @@
   ): TimelineItem[] {
     if (transient.length === 0) return persisted;
     const merged = [...persisted];
+    const persistedToolIds = persistedToolIdSet(persisted);
     let searchStart = 0;
     let pendingUnmatched: TimelineItem[] = [];
     for (const item of transient) {
+      // Tool cards share a `tool-{call_id}` id on both sides; if the persisted
+      // copy is already in `merged`, skip the transient one (order-independent).
+      if (isAlreadyPersistedTool(item, persistedToolIds)) continue;
       const matchIndex = findTransientMatchIndex(merged, item, searchStart);
       if (matchIndex < 0) {
         if (isTransientOrderingAnchor(item)) continue;
@@ -3891,10 +3896,21 @@
     pending: TimelineItem[]
   ): TimelineItem[] {
     pending = discardGeneratedMediaPreviewItems(pending);
+    const persistedToolIds = persistedToolIdSet(persisted);
     let searchStart = 0;
     let pendingUnmatched: TimelineItem[] = [];
     let anchored: TimelineItem[] = [];
     for (const item of pending) {
+      // Tool cards are matched by their shared `tool-{call_id}` id, not by a
+      // forward signature search: flush any pending anchor against this already
+      // persisted tool and drop it (so it is not kept as a duplicate live item).
+      if (isAlreadyPersistedTool(item, persistedToolIds)) {
+        if (pendingUnmatched.length > 0) {
+          anchored = [...anchored, ...pendingUnmatched, asTransientOrderingAnchor(item)];
+          pendingUnmatched = [];
+        }
+        continue;
+      }
       const matchIndex = findTransientMatchIndex(persisted, item, searchStart);
       if (matchIndex < 0) {
         pendingUnmatched = [...pendingUnmatched, item];
@@ -4111,8 +4127,10 @@
     return `live-question-${turnId}-${requestId}`;
   }
 
-  function liveToolId(turnId: string, callId: string): string {
-    return `live-tool-${turnId}-${callId}`;
+  // Must stay character-for-character identical to the daemon's persisted tool id
+  // (`tool-{call_id}` in desktop_api.rs) so live and persisted copies dedupe by id.
+  function liveToolId(callId: string): string {
+    return `tool-${callId}`;
   }
 
   function liveItemBelongsToTurn(item: TimelineItem, turnId: string): boolean {
@@ -4120,7 +4138,7 @@
       isStreamingAssistantForTurn(item, turnId) ||
       item.id === `live-complete-assistant-${turnId}` ||
       item.id === `live-error-turn-error-${turnId}` ||
-      item.id.startsWith(`live-tool-${turnId}-`) ||
+      (item.kind === "tool" && item.turnId === turnId) ||
       item.id.startsWith(`live-gate-${turnId}-`) ||
       item.id.startsWith(`live-perm-${turnId}-`) ||
       item.id.startsWith(`live-question-${turnId}-`)
@@ -4297,7 +4315,7 @@
         for (const req of ev.requests) {
           if (isAskUserQuestionToolName(req.toolId)) continue;
           if (sendUserMessageText(req.toolId, req.input)) continue;
-          const id = liveToolId(ev.turnId, req.callId);
+          const id = liveToolId(req.callId);
           if (liveStreamItems.some((x) => x.id === id)) continue;
           appendLiveForTurn(ev.turnId, {
             id,
@@ -4346,7 +4364,7 @@
             }
             continue;
           }
-          const id = liveToolId(ev.turnId, inv.callId);
+          const id = liveToolId(inv.callId);
           const existingIdx = liveStreamItems.findIndex((x) => x.id === id);
           if (!isProviderStreamInvocationMetadata(inv.metadata)) advancesStreamAttempt = true;
           const payload: TimelineItem = timelineItemWithTurnId({

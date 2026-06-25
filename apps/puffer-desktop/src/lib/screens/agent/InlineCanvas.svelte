@@ -3,6 +3,9 @@
   import { updateCanvasState } from "../../api/desktop";
   import CanvasSubmitButton from "./CanvasSubmitButton.svelte";
   import InlineCanvasNode from "./InlineCanvasNode.svelte";
+  import { initialValues } from "./inlineCanvasInitialValues";
+  import { hasMediaModelSelect, selectionComplete } from "./mediaModelSelect";
+  import { canRegenerate, regeneratePrompt, type SubmitState } from "./canvasRegenerate";
 
   type CanvasSpec = Record<string, unknown>;
   type Props = {
@@ -14,19 +17,27 @@
 
   let { spec, canvasId, sessionId, onSubmitCanvasState }: Props = $props();
 
-  let values = $state<Record<string, unknown>>({});
+  // Intentionally capture only the initial spec: a tool call's input is immutable,
+  // only the live object reference churns. Re-seeding here would wipe the async
+  // media defaults. Regenerate is a new call_id → new instance → natural re-init.
+  // svelte-ignore state_referenced_locally
+  let values = $state<Record<string, unknown>>(initialValues(spec));
   let saveState = $state<"idle" | "saving" | "saved" | "error">("idle");
-  let submitState = $state<"idle" | "submitting" | "submitted" | "error">("idle");
+  let submitState = $state<SubmitState>("idle");
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingPatch: Record<string, unknown> = {};
   let lastSubmittedSignature: string | null = null;
   let statusMessage = $state<string | null>(null);
   let destroyed = false;
   const canSubmitCanvas = $derived(Boolean(onSubmitCanvasState && sessionId && canvasId));
-
-  $effect(() => {
-    values = initialValues(spec);
-  });
+  // Deterministic gate: a mediaModelSelect canvas cannot submit until both models are chosen.
+  const mediaGateBlocks = $derived(hasMediaModelSelect(spec) && !selectionComplete(values));
+  const mediaGateMessage = "Select both an image and a video model to continue.";
+  let regenerating = $state(false);
+  const regenerable = $derived(spec.regenerable === true);
+  const regenerateEnabled = $derived(
+    canRegenerate({ regenerable, canSubmit: canSubmitCanvas, regenerating, submitState })
+  );
 
   $effect(() => {
     if (sessionId && canvasId && Object.keys(pendingPatch).length > 0 && !saveTimer) {
@@ -49,39 +60,6 @@
     return Array.isArray(spec.body)
       ? spec.body.filter((item): item is CanvasSpec => typeof item === "object" && item !== null)
       : [];
-  }
-
-  function initialValues(root: unknown): Record<string, unknown> {
-    const collected: Record<string, unknown> = {};
-    collectInitial(root, collected);
-    return collected;
-  }
-
-  function collectInitial(node: unknown, collected: Record<string, unknown>) {
-    if (Array.isArray(node)) {
-      node.forEach((item) => collectInitial(item, collected));
-      return;
-    }
-    if (typeof node !== "object" || node === null) return;
-    const record = node as CanvasSpec;
-    const type = typeof record.type === "string" ? record.type : "";
-    const id = typeof record.id === "string" ? record.id : "";
-    if (id && ["toggle", "singleSelect", "multiSelect", "slider", "barSelect", "textInput"].includes(type)) {
-      collected[id] = defaultValue(type, record);
-    }
-    collectInitial(record.children, collected);
-    collectInitial(record.body, collected);
-  }
-
-  function defaultValue(type: string, node: CanvasSpec): unknown {
-    if (node.value !== undefined) return node.value;
-    if (type === "toggle") return false;
-    if (type === "multiSelect") return [];
-    if (type === "slider") return typeof node.min === "number" ? node.min : 0;
-    if (type === "textInput") return "";
-    const options = Array.isArray(node.options) ? node.options : [];
-    const first = options.find((item) => typeof item === "object" && item !== null) as CanvasSpec | undefined;
-    return first?.id ?? first?.label ?? null;
   }
 
   function setValue(id: string, value: unknown) {
@@ -138,6 +116,32 @@
       if (destroyed) return;
       submitState = "error";
       statusMessage = "Unable to submit canvas choices.";
+    }
+  }
+
+  async function regenerateCanvas() {
+    if (!onSubmitCanvasState || !canvasId || !sessionId) return;
+    regenerating = true;
+    statusMessage = null;
+    // The draft is being discarded — drop any queued autosave instead of flushing it,
+    // and clear its save indicator so the old card doesn't show a stuck "saving"/"error".
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    pendingPatch = {};
+    saveState = "idle";
+    try {
+      const accepted = await onSubmitCanvasState(regeneratePrompt(canvasId));
+      if (destroyed) return;
+      if (accepted === false) {
+        statusMessage = "Could not reach the agent to regenerate. Try again.";
+      }
+    } catch {
+      if (destroyed) return;
+      statusMessage = "Unable to request a regenerated draft.";
+    } finally {
+      if (!destroyed) regenerating = false;
     }
   }
 
@@ -200,11 +204,21 @@
     {/each}
     {#if onSubmitCanvasState}
       <div class="inline-canvas-selection-actions">
+        {#if regenerable && canSubmitCanvas}
+          <button
+            type="button"
+            class="inline-canvas-regenerate"
+            onclick={regenerateCanvas}
+            disabled={!regenerateEnabled}
+          >
+            {regenerating ? "Regenerating…" : "Regenerate"}
+          </button>
+        {/if}
         <CanvasSubmitButton
           {saveState}
           {submitState}
-          disabled={!canSubmitCanvas}
-          message={statusMessage}
+          disabled={!canSubmitCanvas || mediaGateBlocks || regenerating}
+          message={statusMessage ?? (mediaGateBlocks ? mediaGateMessage : null)}
           onSubmit={submitCanvasState}
         />
       </div>
@@ -263,8 +277,26 @@
     padding: 12px 14px 14px;
   }
   .inline-canvas-selection-actions {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
     border-top: 1px solid var(--border);
     padding-top: 10px;
+  }
+  .inline-canvas-regenerate {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--foreground);
+    cursor: pointer;
+    font: inherit;
+    font-size: var(--pf-chat-meta-size);
+    font-weight: 600;
+    padding: 4px 10px;
+  }
+  .inline-canvas-regenerate:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
   }
   :global(.ic-section) {
     display: flex;
@@ -406,6 +438,11 @@
     gap: 6px;
     min-width: 0;
   }
+  :global(.ic-media-model-select) {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
   :global(.ic-toggle) {
     display: flex;
     align-items: center;
@@ -445,6 +482,128 @@
     color: var(--foreground);
     padding: 0 8px;
     font: inherit;
+  }
+  :global(.ic-textarea) {
+    width: 100%;
+    resize: vertical;
+    font: inherit;
+  }
+  :global(.ic-et-cell) {
+    width: 100%;
+    font: inherit;
+    border: 0;
+    background: transparent;
+  }
+  :global(.ic-et-actions) {
+    white-space: nowrap;
+  }
+  :global(.ic-et-cards) {
+    display: grid;
+    gap: 10px;
+  }
+  :global(.ic-et-card) {
+    display: grid;
+    gap: 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background: color-mix(in oklab, var(--card) 60%, transparent);
+  }
+  :global(.ic-et-card-head) {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  :global(.ic-et-card-title) {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    font-weight: 600;
+    border: 0;
+    background: transparent;
+    color: var(--foreground);
+    padding: 2px 0;
+  }
+  :global(.ic-et-card-fields) {
+    display: grid;
+    gap: 8px;
+  }
+  :global(.ic-et-card-field) {
+    display: grid;
+    gap: 3px;
+  }
+  :global(.ic-et-card-label) {
+    font-size: var(--pf-chat-meta-size);
+    text-transform: uppercase;
+    color: var(--muted-foreground);
+  }
+  :global(.ic-et-field) {
+    width: 100%;
+    resize: none;
+    overflow: hidden;
+    font: inherit;
+    line-height: 1.5;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--background);
+    color: var(--foreground);
+    padding: 6px 8px;
+  }
+  :global(.ic-media-picker) {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 8px;
+  }
+  :global(.ic-media-cell) {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 6px;
+    border: 2px solid transparent;
+    border-radius: 6px;
+  }
+  :global(.ic-media-cell.selected) {
+    border-color: var(--accent, #4a8);
+  }
+  :global(.ic-media-check) {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 1;
+    cursor: pointer;
+  }
+  :global(.ic-media-thumb) {
+    padding: 0;
+    border: none;
+    background: none;
+    cursor: zoom-in;
+  }
+  :global(.ic-media-thumb img),
+  :global(.ic-media-thumb video) {
+    width: 100%;
+    display: block;
+    border-radius: 4px;
+  }
+  :global(.ic-media-thumb:disabled) {
+    cursor: not-allowed;
+  }
+  :global(.ic-media-unavailable) {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    aspect-ratio: 1;
+    border-radius: 4px;
+    background: color-mix(in oklab, var(--muted) 40%, transparent);
+    color: var(--muted-foreground);
+    font-size: 12px;
+    text-align: center;
+  }
+  :global(.ic-media-name) {
+    font-size: 13px;
+    text-align: center;
   }
   :global(.ic-code) {
     margin: 0;

@@ -688,6 +688,35 @@ fn send_user_message_text(tool_id: &str, input: &str) -> Option<String> {
     Some(message)
 }
 
+/// Resolves browser launch settings, degrading to the empty default when
+/// staging fails so a captcha-extension staging error never blocks daemon
+/// startup (issue #670).
+///
+/// `BrowserLaunchSettings::from_config` stages bundled browser extensions (most
+/// notably the NopeCHA captcha extension) into a SHARED per-user dir. On a Bobo
+/// launch two stagers race for that dir — the native CEF host and the freshly
+/// spawned daemon — and before this guard a transient staging failure (e.g. the
+/// race deleting the destination mid-copy) propagated out of `DaemonState::load`
+/// via `?`. The daemon then exited before printing its handshake and Bobo
+/// surfaced a fatal "empty handshake line" startup dialog. The shared stage is
+/// now lock-serialized in `puffer-config`, but we additionally never let a
+/// staging error be fatal: on failure we log and start with no browser
+/// extensions so chat still comes up and the handshake is printed.
+fn browser_launch_settings_or_default(
+    result: Result<BrowserLaunchSettings>,
+) -> BrowserLaunchSettings {
+    match result {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!(
+                "puffer daemon: browser extension staging failed ({error:#}); \
+                 continuing without browser extensions"
+            );
+            BrowserLaunchSettings::default()
+        }
+    }
+}
+
 impl DaemonState {
     fn load(
         cwd: std::path::PathBuf,
@@ -698,7 +727,11 @@ impl DaemonState {
         yolo: bool,
     ) -> Result<Self> {
         let config = load_config(&paths)?;
-        let browser_launch_settings = BrowserLaunchSettings::from_config(&paths, &config)?;
+        // Browser extension staging (e.g. the NopeCHA captcha extension) must
+        // never block the daemon from coming up and printing its handshake.
+        // See `browser_launch_settings_or_default` for the rationale (#670).
+        let browser_launch_settings =
+            browser_launch_settings_or_default(BrowserLaunchSettings::from_config(&paths, &config));
         let (events, _rx) = broadcast::channel::<ServerEnvelope>(256);
         let browser_profile_root = paths.user_config_dir.join("browser-profiles");
         let ptys = Arc::new(PtyRegistry::new());
@@ -6789,8 +6822,9 @@ fn apply_daemon_yolo_mode(app_state: &mut AppState) {
 mod tests {
     use super::{
         append_ordered_turn_progress, apply_daemon_yolo_mode, apply_turn_model_override,
-        apply_turn_request_options, browser_permission_payload_json, browser_status_for_turn,
-        cancel_all_active_turns, connector_setup_connect_args, connector_setup_id, daemon_now_ms,
+        apply_turn_request_options, browser_launch_settings_or_default,
+        browser_permission_payload_json, browser_status_for_turn, cancel_all_active_turns,
+        connector_setup_connect_args, connector_setup_id, daemon_now_ms,
         desktop_latency_ms, file_media_mime_type, generated_video_handler,
         handle_create_file_media_access, handle_create_generated_video_access,
         handle_create_openai_realtime_client_secret, handle_create_session, handle_generate_media,
@@ -7398,6 +7432,38 @@ models: []
             .expect("daemon state")
     }
 
+    /// Issue #670: a captcha-extension staging failure must NOT be fatal to the
+    /// daemon. Previously `BrowserLaunchSettings::from_config(...)?` propagated
+    /// the error out of `DaemonState::load`, so `run_async` returned `Err`
+    /// before printing its handshake and Bobo showed a fatal "empty handshake
+    /// line" startup dialog. The fix routes that `Result` through
+    /// `browser_launch_settings_or_default`, which swallows the error and falls
+    /// back to empty (no-extension) settings so startup proceeds.
+    ///
+    /// Tested at the helper seam (not via `DaemonState::load`) because forcing a
+    /// real staging failure requires a revealed secret, and `SecretVault::open`
+    /// hits the macOS Keychain — unavailable/cancelled in headless CI. The
+    /// reproduction of the underlying ENOENT race lives in puffer-config's
+    /// `concurrent_staging_into_shared_root_never_errors`.
+    #[test]
+    fn browser_launch_settings_staging_error_is_non_fatal() {
+        use crate::daemon_browser::BrowserLaunchSettings;
+
+        // A staging error must degrade to default (empty) settings, not propagate.
+        let degraded = browser_launch_settings_or_default(Err(anyhow::anyhow!(
+            "copy extension file .../awscaptcha.js to .../awscaptcha.js: No such file or directory (os error 2)"
+        )));
+        assert_eq!(degraded, BrowserLaunchSettings::default());
+        assert!(degraded.extension_dirs().is_empty());
+
+        // The happy path is untouched: a successful settings value passes through.
+        let staged = BrowserLaunchSettings::with_extension_dirs(vec![std::path::PathBuf::from(
+            "/tmp/ext/nopecha",
+        )]);
+        let passthrough = browser_launch_settings_or_default(Ok(staged.clone()));
+        assert_eq!(passthrough, staged);
+    }
+
     fn insert_session_turn(state: &DaemonState, session_id: Uuid, turn_id: &str) {
         let cancel = CancelToken::new();
         let mut handle = empty_turn_handle(cancel);
@@ -7612,6 +7678,119 @@ models: []
             "live CLI tab must be visible through the chat-session lookup"
         );
         assert_eq!(context.url.as_deref(), Some("https://example.com/cart"));
+    }
+
+    /// Issue #667: the visible in-app BrowserPane lists/subscribes by chat
+    /// session UUID, but the Bash `browser` skill registers tabs under the
+    /// workspace-stable cli-browser id. The `browser_agent` "list" arm must fall
+    /// back to the CLI keyspace when the chat UUID owns no tabs (so the pane is
+    /// not blank), and must register an event bridge so later CLI tab-list
+    /// changes are mirrored onto `browser:<chat-uuid>:tabs` for live updates.
+    #[test]
+    fn browser_agent_list_falls_back_to_cli_keyspace_and_bridges_events() {
+        let _home_guard = PufferHomeEnvGuard::set();
+        let state = Arc::new(test_daemon_state());
+        let chat_root = Uuid::new_v4().to_string();
+
+        // A live CLI-browser tab opened by the Bash `browser` skill.
+        let cli_id =
+            crate::daemon_browser::default_cli_session_id(&state.paths).expect("cli session id");
+        state
+            .browsers
+            .test_record_tab(&cli_id, "t1", "https://example.com/cart", "Cart");
+
+        // The pane lists by its chat-session UUID, which owns no tabs of its own.
+        let listed: crate::daemon_browser::BrowserTabsState = serde_json::from_value(
+            crate::daemon_browser::handle_browser_agent(
+                &state,
+                &json!({ "action": "list", "sessionId": chat_root }),
+            )
+            .expect("browser_agent list"),
+        )
+        .expect("decode tabs state");
+        assert_eq!(
+            listed.tabs.len(),
+            1,
+            "pane list must surface the live CLI tab instead of a blank pane"
+        );
+        assert_eq!(listed.tabs[0].url, "https://example.com/cart");
+
+        // Listing also registered an event bridge cli_id -> chat_root. A
+        // subsequent CLI tab-list publish must mirror onto the pane's channel.
+        let mut events = state.event_sender().subscribe();
+        crate::daemon_browser::test_publish_tabs(&state, &cli_id);
+
+        let mut saw_chat_channel = false;
+        let mut saw_cli_channel = false;
+        while let Ok(env) = events.try_recv() {
+            if let ServerEnvelope::Event { event, payload } = env {
+                if event == format!("browser:{chat_root}:tabs") {
+                    saw_chat_channel = true;
+                    assert_eq!(
+                        payload["tabs"][0]["url"], "https://example.com/cart",
+                        "mirrored payload must carry the live CLI tab"
+                    );
+                } else if event == format!("browser:{cli_id}:tabs") {
+                    saw_cli_channel = true;
+                }
+            }
+        }
+        assert!(
+            saw_cli_channel,
+            "CLI keyspace always publishes its own channel"
+        );
+        assert!(
+            saw_chat_channel,
+            "bridged pane must receive mirrored CLI tab updates on its chat-uuid channel"
+        );
+    }
+
+    /// Precedence invariant (#667): when the chat-session UUID owns its own
+    /// typed-Browser tab, the list must return that tab and must NOT fall back
+    /// to (or bridge) the CLI keyspace.
+    #[test]
+    fn browser_agent_list_prefers_chat_own_tabs_over_cli_fallback() {
+        let _home_guard = PufferHomeEnvGuard::set();
+        let state = Arc::new(test_daemon_state());
+        let chat_root = Uuid::new_v4().to_string();
+
+        let cli_id =
+            crate::daemon_browser::default_cli_session_id(&state.paths).expect("cli session id");
+        state
+            .browsers
+            .test_record_tab(&cli_id, "t1", "https://cli.example/cart", "CLI");
+        // The chat session has its own tab (typed Browser tool path).
+        state
+            .browsers
+            .test_record_tab(&chat_root, "t1", "https://chat.example/own", "Own");
+
+        let listed: crate::daemon_browser::BrowserTabsState = serde_json::from_value(
+            crate::daemon_browser::handle_browser_agent(
+                &state,
+                &json!({ "action": "list", "sessionId": chat_root }),
+            )
+            .expect("browser_agent list"),
+        )
+        .expect("decode tabs state");
+        assert_eq!(listed.tabs.len(), 1);
+        assert_eq!(
+            listed.tabs[0].url, "https://chat.example/own",
+            "chat-session's own tab must win over the CLI fallback"
+        );
+
+        // No bridge should have been registered; a CLI publish must NOT leak
+        // onto the chat-uuid channel.
+        let mut events = state.event_sender().subscribe();
+        crate::daemon_browser::test_publish_tabs(&state, &cli_id);
+        while let Ok(env) = events.try_recv() {
+            if let ServerEnvelope::Event { event, .. } = env {
+                assert_ne!(
+                    event,
+                    format!("browser:{chat_root}:tabs"),
+                    "no bridge must exist when the chat session owns its tabs"
+                );
+            }
+        }
     }
 
     /// Issue #560: a restarted daemon has an empty tab registry, so a resumed
@@ -9394,6 +9573,9 @@ models: []
                         }
                     ],
                     "cached_at_ms": now_ms,
+                    // Must match puffer-provider-registry's CAPABILITY_SCHEMA_VERSION,
+                    // or the entry is treated as schema-stale and never applied.
+                    "capability_schema_version": 1,
                 }
             }
         });

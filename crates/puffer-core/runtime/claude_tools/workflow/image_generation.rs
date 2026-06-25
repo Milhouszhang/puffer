@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::AppState;
 use anyhow::{bail, Context, Result};
 use puffer_config::MediaGenerationConfig;
@@ -36,6 +37,10 @@ struct ImageGenerationInput {
     purpose: Option<String>,
     #[serde(default)]
     retry_from_error: Option<Value>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -74,19 +79,14 @@ struct ImageGenerationResult {
 
 /// Generates an image through the exact media runtime and returns artifact metadata.
 pub fn execute_image_generation(
-    state: &mut AppState,
+    image_settings: Option<&MediaGenerationConfig>,
     cwd: &Path,
     input: Value,
     media_context: Option<ImageGenerationMediaContext<'_>>,
 ) -> Result<String> {
     let parsed: ImageGenerationInput =
         serde_json::from_value(input).context("invalid ImageGeneration input")?;
-    let settings = state
-        .config
-        .media
-        .image
-        .as_ref()
-        .context("image media provider/model is not configured")?;
+    let settings = image_settings;
     let request = build_image_request(cwd, parsed, settings)?;
     let media_context = media_context.context("ImageGeneration media runtime is not configured")?;
     let generated = generate_exact_image_with_cache(
@@ -131,13 +131,13 @@ pub fn execute_image_generation(
 fn build_image_request(
     cwd: &Path,
     input: ImageGenerationInput,
-    settings: &MediaGenerationConfig,
+    settings: Option<&MediaGenerationConfig>,
 ) -> Result<ImageRequest> {
     let prompt = prompt_text(cwd, &input.prompt, input.prompt_reference.as_deref())?;
-    let (provider, model) = required_provider_model(settings)?;
     // Persisted axis selections; the runtime resolves them against the logical
     // model's axes/variants. The adapter is derived from the capability.
-    let mut parameters = settings.selections.clone();
+    let (provider, model, mut parameters) =
+        resolve_image_selection(input.provider.as_deref(), input.model.as_deref(), settings)?;
     apply_count_override(&mut parameters, input.count)?;
     apply_aspect_parameter(&mut parameters, input.aspect.as_deref())?;
     Ok(ImageRequest {
@@ -149,6 +149,26 @@ fn build_image_request(
         purpose: input.purpose,
         retry_from_error: input.retry_from_error,
     })
+}
+
+fn resolve_image_selection(
+    provider: Option<&str>,
+    model: Option<&str>,
+    settings: Option<&MediaGenerationConfig>,
+) -> Result<(String, String, BTreeMap<String, String>)> {
+    let provider = provider.map(str::trim).filter(|value| !value.is_empty());
+    let model = model.map(str::trim).filter(|value| !value.is_empty());
+    match (provider, model) {
+        (Some(provider), Some(model)) => {
+            Ok((provider.to_string(), model.to_string(), BTreeMap::new()))
+        }
+        (None, None) => {
+            let settings = settings.context("image media provider/model is not configured")?;
+            let (provider, model) = required_provider_model(settings)?;
+            Ok((provider, model, settings.selections.clone()))
+        }
+        _ => bail!("image generation requires both provider and model, or neither"),
+    }
 }
 
 fn required_provider_model(settings: &MediaGenerationConfig) -> Result<(String, String)> {
@@ -553,8 +573,10 @@ mod tests {
                     count: Some(count),
                     purpose: None,
                     retry_from_error: None,
+                    provider: None,
+                    model: None,
                 },
-                &image_settings(),
+                Some(&image_settings()),
             )
             .unwrap_err();
 
@@ -578,6 +600,71 @@ mod tests {
     }
 
     #[test]
+    fn input_provider_model_override_config_settings() {
+        let dir = tempdir().unwrap();
+        let request = build_image_request(
+            dir.path(),
+            ImageGenerationInput {
+                prompt: "draw a ship".to_string(),
+                prompt_reference: None,
+                aspect: None,
+                count: None,
+                purpose: None,
+                retry_from_error: None,
+                provider: Some("byteplus".to_string()),
+                model: Some("seedream".to_string()),
+            },
+            Some(&image_settings()),
+        )
+        .unwrap();
+        assert_eq!(request.provider, "byteplus");
+        assert_eq!(request.model, "seedream");
+    }
+
+    #[test]
+    fn missing_input_provider_model_falls_back_to_config() {
+        let dir = tempdir().unwrap();
+        let request = build_image_request(
+            dir.path(),
+            ImageGenerationInput {
+                prompt: "draw a ship".to_string(),
+                prompt_reference: None,
+                aspect: None,
+                count: None,
+                purpose: None,
+                retry_from_error: None,
+                provider: None,
+                model: None,
+            },
+            Some(&image_settings()),
+        )
+        .unwrap();
+        // image_settings() configures provider "openai"; confirm fallback.
+        assert_eq!(request.provider, "openai");
+    }
+
+    #[test]
+    fn no_input_and_no_config_is_an_error() {
+        let dir = tempdir().unwrap();
+        let error = build_image_request(
+            dir.path(),
+            ImageGenerationInput {
+                prompt: "draw a ship".to_string(),
+                prompt_reference: None,
+                aspect: None,
+                count: None,
+                purpose: None,
+                retry_from_error: None,
+                provider: None,
+                model: None,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not configured"));
+    }
+
+    #[test]
     fn builds_request_with_prompt_file() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("prompt.md"), "make a visual summary").unwrap();
@@ -591,8 +678,10 @@ mod tests {
                 count: None,
                 purpose: Some("test".to_string()),
                 retry_from_error: None,
+                provider: None,
+                model: None,
             },
-            &image_settings(),
+            Some(&image_settings()),
         )
         .unwrap();
 
@@ -621,8 +710,10 @@ mod tests {
                 count: None,
                 purpose: None,
                 retry_from_error: None,
+                provider: None,
+                model: None,
             },
-            &settings,
+            Some(&settings),
         )
         .unwrap();
 
@@ -653,8 +744,10 @@ mod tests {
                 count: Some(2),
                 purpose: None,
                 retry_from_error: None,
+                provider: None,
+                model: None,
             },
-            &settings,
+            Some(&settings),
         )
         .unwrap();
 
@@ -684,8 +777,10 @@ mod tests {
                 count: None,
                 purpose: None,
                 retry_from_error: None,
+                provider: None,
+                model: None,
             },
-            &settings,
+            Some(&settings),
         )
         .unwrap();
 
@@ -716,8 +811,10 @@ mod tests {
                 count: None,
                 purpose: None,
                 retry_from_error: None,
+                provider: None,
+                model: None,
             },
-            &settings,
+            Some(&settings),
         )
         .unwrap();
 
@@ -749,8 +846,10 @@ mod tests {
                 count: None,
                 purpose: None,
                 retry_from_error: None,
+                provider: None,
+                model: None,
             },
-            &settings,
+            Some(&settings),
         )
         .unwrap();
 
@@ -784,7 +883,7 @@ mod tests {
         );
 
         let error = execute_image_generation(
-            &mut state,
+            state.config.media.image.as_ref(),
             dir.path(),
             json!({"prompt": "draw a ship", "count": 1}),
             Some(ImageGenerationMediaContext {
@@ -821,7 +920,7 @@ mod tests {
         );
 
         let error = execute_image_generation(
-            &mut state,
+            state.config.media.image.as_ref(),
             dir.path(),
             json!({"prompt": "draw a ship", "count": 1}),
             Some(ImageGenerationMediaContext {
@@ -856,7 +955,7 @@ mod tests {
         );
 
         let output = execute_image_generation(
-            &mut state,
+            state.config.media.image.as_ref(),
             dir.path(),
             json!({
                 "prompt": "draw a ship",

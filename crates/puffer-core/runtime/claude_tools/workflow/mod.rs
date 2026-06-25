@@ -27,6 +27,7 @@ mod lsp_live;
 mod lsp_live_diagnostics;
 pub mod mcp_status;
 pub mod mcp_tool_call;
+pub mod media_capabilities;
 pub mod modal_action;
 pub mod monitor_action_draft;
 pub mod monitor_contract;

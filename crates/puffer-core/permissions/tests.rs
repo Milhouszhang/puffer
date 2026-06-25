@@ -288,6 +288,49 @@ fn config_reads_allow_but_writes_ask() {
 }
 
 #[test]
+fn telegram_reads_allow_but_auth_actions_ask() {
+    let context = runtime_context(
+        PermissionsSettings::default(),
+        SandboxSettings::from_mode("workspace-write"),
+        false,
+        None,
+        PathBuf::from("/tmp"),
+        Vec::new(),
+        SessionPermissionState::default(),
+    );
+    // The Telegram connector's read surface: the user already authorized the
+    // account in the Connectors UI, so reading their own chats/contacts must
+    // not pop a per-call approval (#699). The tool's yaml policy is `ask`.
+    let telegram = tool_definition("Telegram", "ask");
+    for action in ["list_peers", "search_peers", "list_messages", "search_messages"] {
+        let decision =
+            context.decision_for_tool_call(&telegram, &serde_json::json!({ "action": action }));
+        assert_eq!(
+            decision.behavior,
+            ToolPermissionBehavior::Allow,
+            "telegram read action `{action}` must not require approval"
+        );
+    }
+    // Account-setup actions are not reads of already-consented data, so they
+    // stay gated.
+    for action in [
+        "login_start",
+        "login_submit_code",
+        "login_submit_password",
+        "login_qr",
+        "import_desktop",
+    ] {
+        let decision =
+            context.decision_for_tool_call(&telegram, &serde_json::json!({ "action": action }));
+        assert_eq!(
+            decision.behavior,
+            ToolPermissionBehavior::Ask,
+            "telegram auth/setup action `{action}` must still require approval"
+        );
+    }
+}
+
+#[test]
 fn ask_user_question_runs_without_permission_gate() {
     let context = runtime_context(
         PermissionsSettings::default(),

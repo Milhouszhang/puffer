@@ -392,6 +392,32 @@ impl RuntimePermissionContext {
                 behavior: ToolPermissionBehavior::Allow,
                 reason: None,
             }),
+            "Telegram" => {
+                // The user authorizes the Telegram account once in the
+                // Connectors UI; reading their own chats/contacts afterwards
+                // must not pop a per-call approval (agentenv/monorepo#699) —
+                // redundant consent trains prompt-fatigue and erodes trust in
+                // the prompts that matter. This CLI has no send/write surface
+                // (outbound Telegram actions go through the human-gated monitor
+                // pipeline, not here), so only account-setup (login/import)
+                // actions stay gated.
+                let action = input.get("action").and_then(Value::as_str).unwrap_or_default();
+                let read_only = matches!(
+                    action,
+                    "list_peers" | "search_peers" | "list_messages" | "search_messages"
+                );
+                Some(if read_only {
+                    ToolPermissionDecision {
+                        behavior: ToolPermissionBehavior::Allow,
+                        reason: None,
+                    }
+                } else {
+                    ToolPermissionDecision {
+                        behavior: ToolPermissionBehavior::Ask,
+                        reason: Some("Telegram account setup requires approval".to_string()),
+                    }
+                })
+            }
             _ => None,
         }
     }

@@ -312,6 +312,53 @@ fn sidebar_dedup_key(conn: &str, channel_id: &str, fp: &str) -> String {
     format!("{conn}:{channel_id}:{fp}")
 }
 
+pub(crate) fn process_sidebar_poll(
+    parsed: &Value,
+    conn: &str,
+    platform: &str,
+    seen: &mut SeenState,
+    active_channel_id: &str,
+) -> Vec<Event> {
+    use crate::slack_browser_script::{conversation_type_for, parse_sidebar_rows, sidebar_loaded};
+    if !sidebar_loaded(parsed) {
+        return Vec::new();
+    }
+
+    let rows = parse_sidebar_rows(parsed);
+    let mut newly_seen = BTreeSet::new();
+    let mut events = Vec::new();
+
+    for row in &rows {
+        let fp = fingerprint(&format!("{}:{}", row.unread, row.mention));
+        let key = sidebar_dedup_key(conn, &row.channel_id, &fp);
+        newly_seen.insert(key.clone());
+        if !active_channel_id.is_empty() && row.channel_id == active_channel_id {
+            continue;
+        }
+        if should_emit(seen, &key) {
+            events.push(build_message_event(
+                platform,
+                &row.channel_id,
+                &row.name,
+                conversation_type_for(&row.channel_id),
+                "",
+                "",
+                "",
+                false,
+                row.unread,
+                row.mention,
+                "sidebar",
+                "",
+                &key,
+            ));
+        }
+    }
+
+    seen.seen.extend(newly_seen);
+    seen.initialized = true;
+    events
+}
+
 fn active_dedup_key(conn: &str, channel_id: &str, ts: &str) -> String {
     format!("{conn}:{channel_id}:{ts}")
 }
@@ -360,6 +407,59 @@ fn build_message_event(
             "ts": ts,
             "receivedAtMs": now_ms(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod sidebar_poll_tests {
+    use super::*;
+
+    fn parsed(loaded: bool, rows: serde_json::Value) -> Value {
+        serde_json::json!({"loaded": loaded, "rows": rows})
+    }
+
+    #[test]
+    fn not_loaded_leaves_seen_uninitialized() {
+        let p = parsed(false, serde_json::json!([{"channel_id":"C1","name":"g","unread":true,"mention":false}]));
+        let mut seen = SeenState::default();
+        let ev = process_sidebar_poll(&p, "c", "slack-browser", &mut seen, "");
+        assert!(ev.is_empty());
+        assert!(!seen.initialized);
+        assert!(seen.seen.is_empty());
+    }
+
+    #[test]
+    fn first_loaded_poll_seeds_only() {
+        let p = parsed(true, serde_json::json!([{"channel_id":"C1","name":"g","unread":true,"mention":false}]));
+        let mut seen = SeenState::default();
+        let ev = process_sidebar_poll(&p, "c", "slack-browser", &mut seen, "");
+        assert!(ev.is_empty());
+        assert!(seen.initialized);
+        assert_eq!(seen.seen.len(), 1);
+    }
+
+    #[test]
+    fn post_init_emits_new_changed_row() {
+        let p = parsed(true, serde_json::json!([{"channel_id":"C2","name":"x","unread":true,"mention":true}]));
+        let mut seen = SeenState { initialized: true, seen: Default::default() };
+        let ev = process_sidebar_poll(&p, "c", "slack-browser", &mut seen, "");
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].payload["channel_id"], "C2");
+        assert_eq!(ev[0].payload["mention"], true);
+        assert_eq!(ev[0].payload["source"], "sidebar");
+        assert_eq!(ev[0].payload["conversation_type"], "channel");
+    }
+
+    #[test]
+    fn suppresses_active_channel_row() {
+        let p = parsed(true, serde_json::json!([
+            {"channel_id":"ACTIVE","name":"a","unread":true,"mention":false},
+            {"channel_id":"OTHER","name":"b","unread":true,"mention":false}
+        ]));
+        let mut seen = SeenState { initialized: true, seen: Default::default() };
+        let ev = process_sidebar_poll(&p, "c", "slack-browser", &mut seen, "ACTIVE");
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].payload["channel_id"], "OTHER");
     }
 }
 

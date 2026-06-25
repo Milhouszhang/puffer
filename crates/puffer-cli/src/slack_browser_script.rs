@@ -8,16 +8,18 @@
 /// `/\/client\/T[A-Z0-9]+/`), a client-shell hook is present in the DOM, and the
 /// page is NOT on a sign-in path (`/signin`, `/get-started`, `/workspace-signin`).
 pub(crate) const SLACK_LOGIN_MARKER_JS: &str = r#"(() => {
-  const p = location.pathname;
-  const onClientPath = /\/client\/T[A-Z0-9]+/.test(p);
-  const onSigninPath = /\/(signin|get-started|workspace-signin)(\/|$)/i.test(p);
-  const shellPresent = !!(
-    document.querySelector('[data-qa="message_input"]') ||
-    document.querySelector('[data-qa="slack_kit_list"]') ||
-    document.querySelector('[data-qa="workspace-drawer"]')
-  );
-  const loggedIn = onClientPath && shellPresent && !onSigninPath;
-  return JSON.stringify({ loggedIn, href: location.href });
+  try {
+    const p = location.pathname;
+    const onClientPath = /\/client\/T[A-Z0-9]+/.test(p);
+    const onSigninPath = /\/(signin|get-started|workspace-signin)(\/|$)/i.test(p);
+    const shellPresent = !!(
+      document.querySelector('[data-qa="message_input"]') ||
+      document.querySelector('[data-qa="slack_kit_list"]') ||
+      document.querySelector('[data-qa="workspace-drawer"]')
+    );
+    const loggedIn = onClientPath && shellPresent && !onSigninPath;
+    return JSON.stringify({ loggedIn, href: location.href });
+  } catch (e) { return JSON.stringify({ loggedIn: false, href: '' }); }
 })()"#;
 
 /// Returns `{ self_id: string }`.

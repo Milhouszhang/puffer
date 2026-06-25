@@ -258,6 +258,163 @@ fn handle_command(
     }
 }
 
+fn ensure_browser_daemon<'a>(
+    config: &SlackBrowserConfig,
+    handshake: &'a mut Option<crate::daemon::Handshake>,
+) -> Result<&'a crate::daemon::Handshake> {
+    if handshake.is_none() {
+        // Connect to the browser daemon for the connection's WORKSPACE, not the
+        // subscriber's cwd (the manifest dir) — otherwise we discover the wrong
+        // workspace and fail to find the already-running daemon. Mirrors gmail.
+        let workspace_root = config
+            .workspace_root
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let paths = ConfigPaths::discover(workspace_root);
+        eprintln!(
+            "slack-browser: browser_daemon_connect workspace_root={} user_config_dir={}",
+            paths.workspace_root.display(),
+            paths.user_config_dir.display()
+        );
+        *handshake = Some(crate::daemon_browser::ensure_daemon(&paths)?);
+    }
+    Ok(handshake.as_ref().expect("handshake populated above"))
+}
+
+fn poll_once(
+    env: &SubscriberEnv,
+    config: &SlackBrowserConfig,
+    seen: &mut SeenState,
+    handshake: &mut Option<crate::daemon::Handshake>,
+) -> Result<()> {
+    use crate::slack_browser_script::{
+        SLACK_OBSERVER_DRAIN_JS, SLACK_OBSERVER_INSTALL_JS, SLACK_SIDEBAR_SCRIPT,
+    };
+
+    let handshake_ref = ensure_browser_daemon(config, handshake)?;
+
+    let session_id = format!("slack-browser-{}", safe_session_part(&env.topic));
+
+    // Open (or reuse) the messenger tab.
+    crate::daemon_browser::send_daemon_request(
+        handshake_ref,
+        "browser_agent",
+        json!({
+            "action": "open",
+            "sessionId": session_id,
+            "tabId": "messenger",
+            "label": "Slack messenger",
+            "url": WEB_URL,
+            "width": BROWSER_WIDTH,
+            "height": BROWSER_HEIGHT,
+            "activate": false,
+            "background": true,
+        }),
+    )
+    .context("open Slack browser tab")?;
+
+    // ── Active pass (FIRST, best-effort) ────────────────────────────────────
+    // Transient evaluate errors must NOT abort the poll or block the sidebar
+    // pass. On any error or unparseable result we log a warning and default
+    // active_channel_id to "" and active_events to [].
+
+    // (1) Install observer (idempotent — re-installs after navigation).
+    if let Err(e) = crate::daemon_browser::send_daemon_request(
+        handshake_ref,
+        "browser_agent",
+        json!({
+            "action": "evaluate",
+            "sessionId": session_id,
+            "tabId": "messenger",
+            "width": BROWSER_WIDTH,
+            "height": BROWSER_HEIGHT,
+            "background": true,
+            "script": SLACK_OBSERVER_INSTALL_JS,
+        }),
+    ) {
+        eprintln!("slack-browser: active_pass_install_warn topic={} error={e:#} (continuing to sidebar pass)", env.topic);
+    }
+
+    // (2) Drain captured messages.
+    let drain_result = crate::daemon_browser::send_daemon_request(
+        handshake_ref,
+        "browser_agent",
+        json!({
+            "action": "evaluate",
+            "sessionId": session_id,
+            "tabId": "messenger",
+            "width": BROWSER_WIDTH,
+            "height": BROWSER_HEIGHT,
+            "background": true,
+            "script": SLACK_OBSERVER_DRAIN_JS,
+        }),
+    );
+
+    let (active_channel_id, active_events) = match drain_result {
+        Err(e) => {
+            eprintln!("slack-browser: active_pass_drain_warn topic={} error={e:#} (continuing to sidebar pass)", env.topic);
+            (String::new(), Vec::new())
+        }
+        Ok(drain_value) => {
+            let drain_raw = drain_value.get("value").cloned().unwrap_or(Value::Null);
+            let drain_parsed: Value = if let Some(s) = drain_raw.as_str() {
+                serde_json::from_str(s).unwrap_or(Value::Null)
+            } else {
+                drain_raw
+            };
+            process_active_drain(
+                &drain_parsed,
+                &config.connection,
+                CONNECTOR_SLUG,
+                &config.self_id,
+                seen,
+            )
+        }
+    };
+
+    let active_emitted = active_events.len();
+    for event in active_events {
+        emit_event(event)?;
+    }
+
+    // ── Sidebar pass ─────────────────────────────────────────────────────────
+    let sidebar_value = crate::daemon_browser::send_daemon_request(
+        handshake_ref,
+        "browser_agent",
+        json!({
+            "action": "evaluate",
+            "sessionId": session_id,
+            "tabId": "messenger",
+            "width": BROWSER_WIDTH,
+            "height": BROWSER_HEIGHT,
+            "background": true,
+            "script": SLACK_SIDEBAR_SCRIPT,
+        }),
+    )
+    .context("evaluate Slack sidebar script")?;
+
+    let raw_value = sidebar_value.get("value").cloned().unwrap_or(Value::Null);
+    let parsed: Value = if let Some(s) = raw_value.as_str() {
+        serde_json::from_str(s).unwrap_or(Value::Null)
+    } else {
+        raw_value
+    };
+
+    let sidebar_events =
+        process_sidebar_poll(&parsed, &config.connection, CONNECTOR_SLUG, seen, &active_channel_id);
+    let sidebar_emitted = sidebar_events.len();
+    for event in sidebar_events {
+        emit_event(event)?;
+    }
+
+    eprintln!(
+        "slack-browser: poll_complete topic={} active_channel_id={active_channel_id:?} emitted_active={active_emitted} emitted_sidebar={sidebar_emitted}",
+        env.topic,
+    );
+
+    Ok(())
+}
+
 pub(crate) async fn run_subscriber() -> anyhow::Result<()> {
     let env = SubscriberEnv::from_env();
     tokio::fs::create_dir_all(&env.state_dir)
@@ -289,15 +446,37 @@ pub(crate) async fn run_subscriber() -> anyhow::Result<()> {
             continue;
         };
 
-        // Skeleton: real poll_once lands in a later task.
-        wait_or_handle_command(
-            &env,
-            Some(&config),
-            &mut handshake,
-            &mut commands,
-            POLL_INTERVAL,
-        )
-        .await?;
+        let result = poll_once(&env, &config, &mut seen, &mut handshake);
+        match result {
+            Ok(()) => {
+                save_seen(&env.state_dir, &seen)?;
+                wait_or_handle_command(
+                    &env,
+                    Some(&config),
+                    &mut handshake,
+                    &mut commands,
+                    POLL_INTERVAL,
+                )
+                .await?;
+            }
+            Err(error) => {
+                handshake = None;
+                eprintln!("slack-browser: poll_loop_error topic={} error={error:#}", env.topic);
+                emit_control(
+                    &env.topic,
+                    "poll_error",
+                    json!({ "error": format!("{error:#}") }),
+                )?;
+                wait_or_handle_command(
+                    &env,
+                    Some(&config),
+                    &mut handshake,
+                    &mut commands,
+                    ERROR_BACKOFF,
+                )
+                .await?;
+            }
+        }
     }
 }
 

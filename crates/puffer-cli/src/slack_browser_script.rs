@@ -156,7 +156,16 @@ pub(crate) const SLACK_OBSERVER_DRAIN_JS: &str = r#"(() => {
   window.__cap = [];
   const m = location.pathname.match(/\/client\/T[A-Z0-9]+\/([A-Z0-9]+)/i);
   const channel_id = m ? m[1] : '';
-  return JSON.stringify({ channel_id, items: cap });
+  // Best-effort: the open conversation's display name from the header so active
+  // messages carry channel_name like sidebar rows do. data-qa hooks, NOT yet
+  // live-validated.
+  let channel_name = '';
+  try {
+    const h = document.querySelector(
+      '[data-qa="channel_name"], [data-qa="channel_header__channel_title"], [data-qa^="channel_header"] [data-qa="channel_name"]');
+    channel_name = h ? (h.textContent || '').trim() : '';
+  } catch (e) { channel_name = ''; }
+  return JSON.stringify({ channel_id, channel_name, items: cap });
 })()"#;
 
 pub(crate) fn sidebar_loaded(result: &serde_json::Value) -> bool {
@@ -203,8 +212,13 @@ pub(crate) fn is_message_ts(ts: &str) -> bool {
     }
 }
 
-pub(crate) fn parse_active_drain(result: &serde_json::Value) -> (String, Vec<ActiveMsg>) {
+pub(crate) fn parse_active_drain(result: &serde_json::Value) -> (String, String, Vec<ActiveMsg>) {
     let channel_id = result.get("channel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let channel_name = result
+        .get("channel_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let msgs = result.get("items").and_then(|v| v.as_array()).map(|items| {
         items.iter().filter_map(|m| {
             let ts = m.get("ts").and_then(|v| v.as_str()).unwrap_or("");
@@ -216,7 +230,7 @@ pub(crate) fn parse_active_drain(result: &serde_json::Value) -> (String, Vec<Act
             })
         }).collect()
     }).unwrap_or_default();
-    (channel_id, msgs)
+    (channel_id, channel_name, msgs)
 }
 
 pub(crate) fn conversation_type_for(channel_id: &str) -> &'static str {
@@ -275,13 +289,14 @@ mod parser_tests {
 
     #[test]
     fn parse_active_drain_drops_pending_ids() {
-        let result = json!({"channel_id": "C999", "items": [
+        let result = json!({"channel_id": "C999", "channel_name": "engineering", "items": [
             {"ts": "pending-xyz", "sender_id": "U1", "text": "sending"},
             {"ts": "1718000000.000200", "sender_id": "U1", "text": "sent"},
             {"ts": "1718000000.000300", "sender_id": "U2", "text": "reply"}
         ]});
-        let (chan, msgs) = parse_active_drain(&result);
+        let (chan, name, msgs) = parse_active_drain(&result);
         assert_eq!(chan, "C999");
+        assert_eq!(name, "engineering"); // channel name flows through from the drain
         assert_eq!(msgs.len(), 2); // pending dropped
         assert_eq!(msgs[0].ts, "1718000000.000200");
         assert_eq!(msgs[0].sender_id, "U1");

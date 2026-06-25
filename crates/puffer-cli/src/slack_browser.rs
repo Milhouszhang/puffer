@@ -546,7 +546,7 @@ pub(crate) fn process_active_drain(
     seen: &mut SeenState,
 ) -> (String, Vec<Event>) {
     use crate::slack_browser_script::{conversation_type_for, parse_active_drain};
-    let (channel_id, msgs) = parse_active_drain(parsed);
+    let (channel_id, channel_name, msgs) = parse_active_drain(parsed);
     if channel_id.is_empty() {
         return (String::new(), Vec::new());
     }
@@ -562,7 +562,7 @@ pub(crate) fn process_active_drain(
             events.push(build_message_event(
                 platform,
                 &channel_id,
-                "",
+                &channel_name,
                 conv_type,
                 "",
                 &m.sender_id,
@@ -728,7 +728,7 @@ mod active_drain_tests {
     use super::*;
 
     fn drain(channel: &str, items: serde_json::Value) -> Value {
-        serde_json::json!({"channel_id": channel, "items": items})
+        serde_json::json!({"channel_id": channel, "channel_name": "general", "items": items})
     }
 
     #[test]
@@ -766,6 +766,8 @@ mod active_drain_tests {
         assert_eq!(ev[0].payload["is_outgoing"], true);
         assert_eq!(ev[0].payload["sender_id"], "U1");
         assert_eq!(ev[0].payload["source"], "active");
+        // channel_name now flows onto active messages (option A)
+        assert_eq!(ev[0].payload["channel_name"], "general");
         // U2 != self → incoming
         assert_eq!(ev[1].payload["is_outgoing"], false);
     }

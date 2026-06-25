@@ -301,6 +301,104 @@ pub(crate) async fn run_subscriber() -> anyhow::Result<()> {
     }
 }
 
+fn fingerprint(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.trim().hash(&mut h);
+    format!("{:x}", h.finish())
+}
+
+fn sidebar_dedup_key(conn: &str, channel_id: &str, fp: &str) -> String {
+    format!("{conn}:{channel_id}:{fp}")
+}
+
+fn active_dedup_key(conn: &str, channel_id: &str, ts: &str) -> String {
+    format!("{conn}:{channel_id}:{ts}")
+}
+
+fn should_emit(seen: &SeenState, key: &str) -> bool {
+    if seen.seen.contains(key) {
+        return false;
+    }
+    seen.initialized
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_message_event(
+    platform: &str,
+    channel_id: &str,
+    channel_name: &str,
+    conversation_type: &str,
+    sender: &str,
+    sender_id: &str,
+    text: &str,
+    is_outgoing: bool,
+    unread: bool,
+    mention: bool,
+    source: &str,
+    ts: &str,
+    dedup_key: &str,
+) -> Event {
+    Event {
+        topic: platform.to_string(),
+        kind: "message".to_string(),
+        control: false,
+        dedup_key: Some(dedup_key.to_string()),
+        text: format!("{sender}\n{text}").trim().to_string(),
+        payload: json!({
+            "platform": platform,
+            "event_type": "message",
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "conversation_type": conversation_type,
+            "sender": sender,
+            "sender_id": sender_id,
+            "is_outgoing": is_outgoing,
+            "unread": unread,
+            "mention": mention,
+            "source": source,
+            "ts": ts,
+            "receivedAtMs": now_ms(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod emit_tests {
+    use super::*;
+
+    #[test]
+    fn event_payload_has_monitor_keys_and_no_is_outgoing_in_schema_fields() {
+        let ev = build_message_event(
+            "slack-browser", "C123", "general", "channel",
+            "Alice", "U999", "hi", true, false, false, "active", "1718000000.000100",
+            "conn1:C123:1718000000.000100",
+        );
+        assert_eq!(ev.kind, "message");
+        assert_eq!(ev.payload["platform"], "slack-browser");
+        assert_eq!(ev.payload["channel_id"], "C123");
+        assert_eq!(ev.payload["channel_name"], "general");
+        assert_eq!(ev.payload["conversation_type"], "channel");
+        assert_eq!(ev.payload["sender_id"], "U999");
+        assert_eq!(ev.payload["is_outgoing"], true);
+        assert_eq!(ev.payload["event_type"], "message");
+        assert_eq!(ev.payload["source"], "active");
+        assert_eq!(ev.payload["ts"], "1718000000.000100");
+        assert_eq!(ev.dedup_key.as_deref(), Some("conn1:C123:1718000000.000100"));
+    }
+
+    #[test]
+    fn first_poll_seeds_without_emitting() {
+        let mut seen = SeenState::default();
+        let key = active_dedup_key("c1", "C1", "1.1");
+        assert!(!should_emit(&seen, &key)); // pre-init: no emit
+        seen.seen.insert(key.clone());
+        seen.initialized = true;
+        assert!(should_emit(&seen, &active_dedup_key("c1", "C1", "2.2"))); // new post-init
+        assert!(!should_emit(&seen, &key)); // already seen
+    }
+}
+
 #[cfg(test)]
 mod config_tests {
     use super::*;

@@ -1,0 +1,13 @@
+manifest_version = 1
+id = "slack-browser"
+kind = "subscriber"
+topic = "slack-browser"
+display_name = "Slack Browser"
+
+# Hidden subcommand baked into the puffer binary. Drives the Slack web client
+# through the daemon CEF browser and emits newly observed messages as ndjson.
+[run]
+cmd = ["puffer", "__subscriber", "slack-browser"]
+
+[state]
+dir = "state"

@@ -241,6 +241,13 @@ fn slack_react(
                 .unwrap_or("unknown")
         );
     }
+    if !result.get("picked").and_then(Value::as_bool).unwrap_or(false) {
+        anyhow::bail!(
+            "slack react: emoji picker did not open or emoji not placed (ts={}, emoji={})",
+            fields.message_ts,
+            fields.emoji
+        );
+    }
     Ok(json!({
         "action": action,
         "completed": true,
@@ -284,9 +291,14 @@ fn evaluate_slack_script(
         } else {
             result
         };
-        if result.get("ok").and_then(Value::as_bool).unwrap_or(false) || Instant::now() >= deadline
-        {
+        if result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
             return Ok(result);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "slack action script did not complete within timeout; last daemon response: {}",
+                result
+            );
         }
         std::thread::sleep(SLACK_EVALUATE_INTERVAL);
     }

@@ -36,14 +36,19 @@ pub(crate) const LARK_FEED_SCRIPT: &str = r#"(() => {
     const txt = (sel) => { const e = c.querySelector(sel); return e ? (e.textContent || '').trim() : ''; };
     // name/preview live under hashed classes; read by structural role via a11y where possible,
     // else fall back to the card's text lines. Keep selectors resilient: prefer [class*="a11y" i].
-    const name = txt('[class*="a11y" i][class*="name" i]') || txt('[aria-label]') || '';
+    const mainEl = c.querySelector('.a11y_feed_card_main');
+    const nameCands = mainEl
+      ? Array.from(mainEl.querySelectorAll('div,span')).filter(d => d.children.length === 0 && (d.textContent || '').trim())
+      : [];
+    const name = nameCands.length ? nameCands[0].textContent.trim() : '';
     const preview = (c.textContent || '').replace(name, '').trim().slice(0, 200);
     const unread = !!c.querySelector('[class*="badge" i]');
     const outgoing = /^you[:：]/i.test(preview);
-    const ctText = (c.textContent || '');
-    const conversation_type = /\bBOT\b|机器人/.test(ctText) ? 'bot'
-      : /\bExternal\b|外部/.test(ctText) ? 'external'
-      : /\bOfficial\b|官方/.test(ctText) ? 'official'
+    const tagEl = c.querySelector('.ud__tag');
+    const tagTxt = tagEl ? (tagEl.textContent || '').trim() : '';
+    const conversation_type = /BOT|机器人/i.test(tagTxt) ? 'bot'
+      : /External|外部/i.test(tagTxt) ? 'external'
+      : /Official|官方/i.test(tagTxt) ? 'official'
       : 'person';
     return { chat_id, name, preview, unread, outgoing, conversation_type };
   }).filter(r => r.chat_id);
@@ -103,7 +108,10 @@ pub(crate) const LARK_OBSERVER_INSTALL_JS: &str = r#"(() => {
     const cls = (el.className || '').toString();
     const dir = cls.includes('message-not-self') ? 'in' : (cls.includes('message-self') ? 'out' : '?');
     const t = el.querySelector('.message-text');
-    window.__cap.push({id, dir, pos: el.getAttribute('data-position'), text: t ? (t.textContent||'').trim().slice(0,2000) : ''});
+    let body = t ? (t.textContent || '').trim() : '';
+    body = body.replace(/\s*(Show More|展开|收起)\s*$/i, '').trim();
+    if (!body) { const card = el.querySelector('[class*="title" i]'); body = card ? (card.textContent||'').trim() : ''; }
+    window.__cap.push({id, dir, pos: el.getAttribute('data-position'), text: body.slice(0,2000)});
   };
   document.querySelectorAll('.js-message-item').forEach(record);
   window.__capObs = new MutationObserver(muts => {
@@ -123,7 +131,7 @@ pub(crate) const LARK_OBSERVER_DRAIN_JS: &str = r#"(() => {
   const cap = window.__cap || [];
   window.__cap = [];
   const active = document.querySelector('[data-feed-active="true"]');
-  const chat_id = active ? (active.getAttribute('data-feed-id') || '') : '';
+  const chat_id = active ? (active.closest('[data-feed-id]')?.getAttribute('data-feed-id') || '') : '';
   return JSON.stringify({ chat_id, items: cap });
 })()"#;
 
@@ -166,6 +174,16 @@ mod active_tests {
         assert!(is_snowflake_id("7652607780750119026"));
         assert!(!is_snowflake_id("gApEI0EY3S"));   // optimistic temp id
         assert!(!is_snowflake_id("123"));
+    }
+
+    #[test]
+    fn parse_drain_keeps_chat_id() {
+        let result = serde_json::json!({"chat_id":"7649938091766976625","items":[
+            {"id":"7655572480429396079","dir":"out","text":"hi"}
+        ]});
+        let (chat, msgs) = parse_active_drain(&result);
+        assert_eq!(chat, "7649938091766976625");
+        assert_eq!(msgs.len(), 1);
     }
 
     #[test]
@@ -226,6 +244,16 @@ mod feed_tests {
         assert!(rows[0].unread);
         assert_eq!(rows[1].chat_id, "7650335261468921967");
         assert!(rows[1].is_outgoing);
+    }
+
+    #[test]
+    fn parses_name_from_json() {
+        let result = serde_json::json!({"rows": [
+            {"chat_id": "7649938091766976625", "name": "Lark Welcome Group", "preview": "x",
+             "unread": false, "outgoing": false, "conversation_type": "person"}
+        ]});
+        let rows = parse_feed_rows(&result);
+        assert_eq!(rows[0].name, "Lark Welcome Group");
     }
 
     #[test]

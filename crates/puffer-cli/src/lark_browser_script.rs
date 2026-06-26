@@ -125,8 +125,9 @@ pub(crate) const LARK_OBSERVER_INSTALL_JS: &str = r#"(() => {
   return JSON.stringify({status:'installed', seeded: window.__cap.length});
 })()"#;
 
-/// Returns and CLEARS window.__cap (drain). The active chat id is read from the
-/// feed card marked `[data-feed-active="true"]`.
+/// Returns and CLEARS window.__cap (drain). The active chat id is read by finding
+/// `[data-feed-active="true"]` (on the inner card item) and climbing to its nearest
+/// `[data-feed-id]` ancestor, which carries the chat id.
 pub(crate) const LARK_OBSERVER_DRAIN_JS: &str = r#"(() => {
   const cap = window.__cap || [];
   window.__cap = [];

@@ -6,7 +6,7 @@ mod monitor_rule_tests {
     use crate::self_gate::{DropAllSelfGate, SelfMessageGate};
     use crate::spec::{ActionSpec, TaggedFilterSpec, WorkflowBindingSpec};
     use crate::{
-        compile_event_field_rule, EventField, EventFieldRule, EventFieldType, EventOperator,
+        compile_event_field_rule, validate_event_schema, EventField, EventFieldRule, EventFieldType, EventOperator,
         EventSchema,
     };
     use puffer_subscriber_runtime::{Event, EventEnvelope};
@@ -320,6 +320,18 @@ mod monitor_rule_tests {
                 "lark-bot",
                 bundled_connector_schema("lark-bot"),
                 15,
+            ),
+            (
+                "lark-browser",
+                "lark-browser",
+                bundled_schema("lark-browser"),
+                12,
+            ),
+            (
+                "feishu-browser",
+                "feishu-browser",
+                bundled_schema("feishu-browser"),
+                12,
             ),
         ]
     }
@@ -749,7 +761,9 @@ mod monitor_rule_tests {
         assert_eq!(per_connector["telegram-bot"], 7);
         assert_eq!(per_connector["lark-login"], 15);
         assert_eq!(per_connector["lark-bot"], 15);
-        assert_eq!(cases.len(), 106);
+        assert_eq!(per_connector["lark-browser"], 12);
+        assert_eq!(per_connector["feishu-browser"], 12);
+        assert_eq!(cases.len(), 130);
 
         let mut mode_template_count = 0;
         let mut expected_actions = 0;
@@ -827,8 +841,8 @@ mod monitor_rule_tests {
             }
         }
 
-        assert_eq!(mode_template_count, 212);
-        assert_eq!(expected_actions, 208);
+        assert_eq!(mode_template_count, 260);
+        assert_eq!(expected_actions, 256);
         assert_eq!(recording.topics.lock().unwrap().len(), expected_actions);
     }
 
@@ -863,5 +877,49 @@ mod monitor_rule_tests {
             process_envelope_result(&envelope, &store, None, &dispatcher, &classifier, None, &drop_all_gate());
         assert!(passed.matched);
         assert_eq!(passed.acted, 1);
+    }
+
+    #[test]
+    fn lark_browser_schemas_list_event_type_and_message_fields() {
+        let lark = bundled_schema("lark-browser");
+        let feishu = bundled_schema("feishu-browser");
+        // both brands declare the same fields
+        assert_eq!(lark.fields, feishu.fields, "lark and feishu schemas must match");
+        // exactly the five declared filter fields, in order
+        let paths: Vec<&str> = lark.fields.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["event_type", "sender", "chat_id", "unread", "conversation_type"]);
+        // event_type only declares the one source the connector actually emits
+        // (the sub-app sources — calendar/task/approval/doc/mail — aren't built,
+        // so listing them would offer filter values that never match)
+        let et = lark.fields.iter().find(|f| f.path == "event_type").unwrap();
+        assert_eq!(et.field_type, EventFieldType::Enum);
+        let values: Vec<&str> = et.values.iter().filter_map(|v| v.value.as_str()).collect();
+        assert_eq!(values, vec!["message"]);
+        // conversation_type only lists the values the feed capture can produce;
+        // external/official were dropped (the card text never renders those tags)
+        let ct = lark.fields.iter().find(|f| f.path == "conversation_type").unwrap();
+        assert_eq!(ct.field_type, EventFieldType::Enum);
+        let ctv: Vec<&str> = ct.values.iter().filter_map(|v| v.value.as_str()).collect();
+        assert_eq!(ctv, vec!["person", "bot"]);
+        // unread is a boolean field
+        let unread = lark.fields.iter().find(|f| f.path == "unread").unwrap();
+        assert_eq!(unread.field_type, EventFieldType::Boolean);
+        // schema validates and every declared field compiles into a filter rule
+        validate_event_schema(&lark).unwrap();
+        for field in &lark.fields {
+            for op in &field.operators {
+                let rule = EventFieldRule {
+                    field: field.path.clone(),
+                    operator: *op,
+                    value: field
+                        .values
+                        .first()
+                        .map(|v| v.value.clone())
+                        .or_else(|| Some(serde_json::json!("x"))),
+                };
+                compile_event_field_rule(&lark, &rule)
+                    .unwrap_or_else(|e| panic!("{} {:?}: {e}", field.path, op));
+            }
+        }
     }
 }

@@ -400,6 +400,48 @@ pub(super) fn hosted_fill_point_expression() -> &'static str {
 })()"#
 }
 
+/// Builds the script that — after the runtime has clicked the resolved
+/// main-document field with a real mouse press — verifies focus actually landed
+/// on it (the only #580 guard before sending keystrokes that would otherwise
+/// leak into whatever holds focus) and clears any residual value so the
+/// per-character keystroke typing replaces rather than appends. Used by the
+/// main-document keystroke fallback (#675), the counterpart of
+/// [`in_frame_prepare_fill_fn`] for fields the top document CAN resolve.
+/// Returns `{ focused, tag }`.
+pub(super) fn main_doc_focus_clear_expression(target: &BrowserElementRef) -> Result<String> {
+    ref_script(
+        target,
+        r#"  const targetEl = refElement.closest('input, textarea, [contenteditable="true"]') || refElement;
+  const focused = document.activeElement === targetEl;
+  if (focused && 'value' in targetEl) {
+    const proto = targetEl instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (descriptor && descriptor.set) { descriptor.set.call(targetEl, ''); } else { targetEl.value = ''; }
+    targetEl.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+  } else if (focused && targetEl.isContentEditable) {
+    targetEl.textContent = '';
+    targetEl.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+  }
+  return { focused, tag: targetEl.tagName };
+"#,
+    )
+}
+
+/// Builds the script that re-reads a resolved main-document field's value back
+/// after the keystroke fallback typed into it. Mirrors [`in_frame_readback_fn`]
+/// for a field the top document can resolve, so a guarded input that reverted
+/// even genuine keystrokes is caught and the fill bails honestly (#580/#675)
+/// instead of reporting a false success. Returns `{ value }`.
+pub(super) fn main_doc_readback_expression(target: &BrowserElementRef) -> Result<String> {
+    ref_script(
+        target,
+        r#"  const targetEl = refElement.closest('input, textarea, [contenteditable="true"]') || refElement;
+  const value = ('value' in targetEl) ? String(targetEl.value ?? '') : String(targetEl.textContent ?? '');
+  return { value };
+"#,
+    )
+}
+
 /// `Runtime.callFunctionOn` body, run on a node resolved INSIDE a cross-origin
 /// payment iframe (#656). Confirms focus actually landed on this field — the
 /// only #580 guard available cross-origin — then clears any existing content so

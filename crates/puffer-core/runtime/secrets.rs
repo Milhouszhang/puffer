@@ -26,6 +26,19 @@ pub(crate) fn register_masked_secret(state: &AppState, value: String) -> Result<
     Ok(token)
 }
 
+/// Returns whether any string inside a JSON tree contains a Puffer secret
+/// placeholder. Used by the parallel internal-tool batch path, which has no
+/// `&AppState` to expand placeholders, to detect secret-bearing input and route
+/// it back to the serial path instead of forwarding a literal placeholder.
+pub(crate) fn contains_secret_placeholder(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains(MASK_PREFIX),
+        Value::Array(items) => items.iter().any(contains_secret_placeholder),
+        Value::Object(map) => map.values().any(contains_secret_placeholder),
+        _ => false,
+    }
+}
+
 /// Replaces known secret placeholders inside a JSON tool input tree.
 pub(crate) fn expand_secret_placeholders(state: &AppState, value: &Value) -> Result<Value> {
     match value {

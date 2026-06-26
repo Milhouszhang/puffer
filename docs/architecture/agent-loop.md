@@ -219,7 +219,7 @@ Migration acceptance criteria:
 
 ## Remaining gaps vs pi-mono (deferred)
 
-| | pi-mono | puffer (after this PR) | Status |
+| | pi-mono | puffer | Status |
 |---|---|---|---|
 | Δ1 Tool execution location | agent loop | agent_loop | ✅ |
 | Δ2 Provider shape | stateless `(model, ctx, opts) → events` | per-prompt session with 4 methods | ✅ |
@@ -272,9 +272,6 @@ crates/puffer-core/runtime/
 
 ## References
 
-- Pi-mono agent loop:
-  `/Users/rand/Downloads/cc/pi-mono/packages/agent/src/agent-loop.ts`
-- Pi-mono API registry:
-  `/Users/rand/Downloads/cc/pi-mono/packages/ai/src/api-registry.ts`
-- This PR: `n-WN/unify-provider-agent-loop`
 - PR #64: <https://github.com/berabuddies/puffer/pull/64>
+- Original comparative design source: pi-mono's `packages/agent/src/agent-loop.ts`
+  and `packages/ai/src/api-registry.ts`.

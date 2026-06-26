@@ -15,123 +15,42 @@ Match Claude Code behavior where it matters for coding workflows, while:
 
 ## Current Workspace
 
-The repo is a Cargo workspace with these main crates and component crates:
+`Cargo.toml` is the source of truth for workspace membership. Keep broad crate
+categories in mind instead of relying on a copied list:
 
-- `puffer-cli`
-  Top-level CLI, auth commands, session commands, and interactive entrypoint.
-- `puffer-config`
-  Config discovery and layered config loading.
-- `puffer-connector-core`
-  Shared connector runtime, conversation/session mapping, commands, splitting,
-  and retry helpers.
-- `puffer-connector-discord`
-  Discord bot gateway connector.
-- `puffer-connector-email`
-  IMAP/SMTP email connector.
-- `puffer-connector-matrix`
-  Matrix room connector.
-- `puffer-connector-slack`
-  Slack Socket Mode connector.
-- `puffer-connector-telegram`
-  Telegram bot connector.
-- `puffer-core`
-  Command registry, app state, slash-command dispatch, and provider execution.
-- `puffer-observability`
-  Optional OTLP/HTTP tracing with conservative redaction defaults.
-- `puffer-provider-openai`
-  OpenAI auth and request helpers.
-- `puffer-provider-registry`
-  Provider descriptors, auth storage, and provider provenance.
-- `puffer-resources`
-  Bundled/user/workspace resources: prompts, tools, skills, plugins, MCP, IDE, mascot metadata.
-- `puffer-session-store`
-  Session metadata, transcript events, listing, load, and fork support.
-- `puffer-subscriber-email`
-  Out-of-process email subscriber.
-- `puffer-subscriber-runtime`
-  Subscriber manifest, process supervision, command, and event bus runtime.
-- `puffer-subscriber-telegram-user`
-  Out-of-process Telegram personal-account subscriber.
-- `puffer-subscriptions`
-  Subscription specs, event routing, classifiers, and action dispatch.
-- `puffer-test-support`
-  Test helpers for commands, terminal output, temp workspaces, and tmux probing.
-- `puffer-tools`
-  Tool schemas, registry, built-in tools, and execution backends.
-- `puffer-transport-anthropic`
-  Anthropic auth, fingerprinting, attribution block generation, and request building.
-- `puffer-tui`
-  Ratatui/Crossterm interactive UI.
-- `puffer-workflow`
-  Native workflow definitions, validation, cron scheduling, DAG execution, and
-  run storage.
+- CLI/daemon/UI: `puffer-cli`, `puffer-tui`
+- Core runtime: `puffer-core`, `puffer-tools`, `puffer-resources`,
+  `puffer-session-store`, `puffer-workflow`, `puffer-config`
+- Provider/runner layers: `puffer-transport-anthropic`,
+  `puffer-provider-openai`, `puffer-provider-registry`, `puffer-runner-*`,
+  `puffer-tool-runner`
+- Connector/subscriber stack: `puffer-connector-*`, `puffer-subscriber-*`,
+  `puffer-subscriptions`, `puffer-slack`
+- Support/security/media: `puffer-test-support`, `puffer-observability`,
+  `puffer-logging`, `puffer-media`, `puffer-secrets`,
+  `puffer-skill-evolution`, `puffer-mcp-oauth`
 
-## Hard Repo Constraints
+See `README.md` and `docs/README.md` for the current repo map and docs index.
 
-- Every public Rust function must have a docstring.
-- No Rust source file may exceed 1000 lines.
+## Repo Guardrails
+
 - Use ASCII unless there is an existing reason not to.
-- Keep modules small and purpose-specific.
-- Prefer stable, typed Rust APIs over stringly-typed plumbing.
+- Keep modules small and purpose-specific. Large files exist today, so use
+  `scripts/report-large-files.sh` as a risk report and call out touched large
+  files in PRs.
+- Prefer stable, typed Rust APIs over stringly typed plumbing, especially across
+  daemon RPC, resource manifests, permissions, and connector action contracts.
+- Keep slash-command docs generated from
+  `crates/puffer-core/command/registry.rs`; run
+  `scripts/check-slash-commands.sh` after changing the command registry.
+- For docs changes, run `scripts/check-doc-links.sh`.
 
 ## Supported Slash Commands
 
-The current supported command surface is intended to include:
-
-- `/add-dir`
-- `/agents`
-- `/branch`
-- `/btw`
-- `/buddy`
-- `/clear`
-- `/color`
-- `/compact`
-- `/config`
-- `/context`
-- `/copy`
-- `/cost`
-- `/diff`
-- `/doctor`
-- `/effort`
-- `/exit`
-- `/export`
-- `/fast`
-- `/help`
-- `/hooks`
-- `/ide`
-- `/init`
-- `/keybindings`
-- `/login`
-- `/logout`
-- `/mcp`
-- `/memory`
-- `/model`
-- `/night`
-- `/permissions`
-- `/plan`
-- `/plugin`
-- `/pr-comments`
-- `/reload-plugins`
-- `/remote-control`
-- `/remote-env`
-- `/rename`
-- `/resume`
-- `/rewind`
-- `/review`
-- `/sandbox`
-- `/security-review`
-- `/session`
-- `/skills`
-- `/status`
-- `/statusline`
-- `/tasks`
-- `/terminal-setup`
-- `/theme`
-- `/usage`
-- `/vim`
-- `/skill:<name>`
-
-Aliases live in `puffer-core`.
+The built-in slash-command surface is generated from
+`crates/puffer-core/command/registry.rs` and documented in
+`docs/reference/slash-commands.md`. Do not maintain command lists by hand in
+multiple files.
 
 ## Out of Scope
 
@@ -210,6 +129,34 @@ Current metadata includes:
 - `note`
 
 Do not replace this with opaque storage.
+
+## Monitor / TaskCreate Guardrails
+
+The monitor/triage subsystem (inbound connector events → monitor tasks → human-approved
+replies/actions) enforces behavioral rules at runtime. These are correctness/safety boundaries, not
+style. Full design: `docs/architecture/monitor-pipeline.md`.
+
+- **Outward actions are human-gated.** A triage/action turn only DRAFTS (`MonitorActionDraft`, or
+  legacy `MonitorReplyDraft`) — it writes a `pending_action`/`pending_reply` and stops. A human
+  approves the draft in the desktop UI; only then does the daemon send the Telegram reply / create
+  the Gmail draft / RSVP the Calendar invite, via the `task_monitor_action_execute` RPC. Never push
+  an outward effect from an agent turn (no connector send tool, no `MonitorReplySend`, no
+  `TaskUpdate status:completed` to force a send). `task_monitor_complete` refuses human-gated tasks.
+- **`TaskCreate` skip is success, not failure.** A `{success:true, skipped:true, reason}` result
+  means the server gate intentionally suppressed the task (already handled in Telegram, duplicate,
+  untrusted source). Do not retry by mutating source metadata.
+- **Source provenance is server-owned.** Create a monitor task only from the *current* workflow /
+  digest trigger envelope. Do not create tasks from `conversation_context` history, and do not write
+  `monitor_connection`, `monitor_connector`, `monitor_envelope_id`, `chat_id`, `source_context`,
+  `monitor`, `pending_action`, or other source/delivery metadata — the daemon stamps these from the
+  selected current envelope. `TaskUpdate` must not mutate them.
+- **Conversation context is for disambiguation only.** Bounded recent history attached to triage is
+  to interpret short/referential messages; it is never a task source and never overrides current
+  source values.
+- **Same chat/contact ≠ duplicate.** A new question, topic change, or separate request from the same
+  sender is a new task even when another task from that sender is still pending.
+- **Trace/diagnostics are metadata-only** (sender/chat ids, stage ids, decisions, a short text
+  preview) — never full message bodies. This is a privacy boundary; do not widen it.
 
 ## TUI Direction
 

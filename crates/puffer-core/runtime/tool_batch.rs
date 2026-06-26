@@ -80,6 +80,52 @@ pub(super) fn execute_tool_batch(
         )?);
     }
 
+    // Media-capability snapshot for parallel Bash workers, captured only when the
+    // batch contains a permitted Bash call (avoids a permission-file read on
+    // Bash-free batches). The owned snapshot is declared before `thread::scope`
+    // so it outlives the worker closures.
+    let has_permitted_bash = tool_calls.iter().enumerate().any(|(i, tc)| {
+        tc.tool_id == "Bash" && matches!(permissions[i], PermissionOutcome::Allowed(_))
+    });
+    let mut media_snapshot = if has_permitted_bash {
+        Some(
+            crate::runtime::internal_tool_permissions::MediaCapabilitySnapshot::capture(
+                cwd,
+                inputs.resources,
+                inputs.state,
+                inputs.registry,
+            )?,
+        )
+    } else {
+        None
+    };
+    // Media authorization gate: detect which media kinds this batch's permitted
+    // Bash calls demand and prompt once per kind here, on the main thread. The
+    // `&mut inputs.state` borrow must end before `provider_context` takes its
+    // long-lived immutable borrow of `inputs.state` (captured by the workers),
+    // so the gate runs before that point.
+    if let Some(snapshot) = media_snapshot.as_mut() {
+        crate::runtime::internal_tool_permissions::authorize_parallel_media_batch(
+            snapshot,
+            inputs.state,
+            inputs.resources,
+            inputs.registry,
+            cwd,
+            tool_calls,
+            &permissions,
+            |tc| {
+                if tc.tool_id != "Bash" {
+                    return None;
+                }
+                serde_json::from_str::<Value>(&tc.input)
+                    .ok()?
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            },
+        );
+    }
+
     let session_id = inputs.state.session.id;
     let provider_context = backend_to_provider_context(
         session.tool_execution_backend(),
@@ -90,6 +136,15 @@ pub(super) fn execute_tool_batch(
     // touch `inputs.state` (no `&mut AppState` across spawn boundaries).
     // `Arc<dyn ToolRunner>` is `Send + Sync` and clones cheaply.
     let runner = inputs.state.tool_runner.clone();
+
+    // Borrow the (possibly upgraded) snapshot into the shared worker context.
+    // `context()` reborrows `inputs.auth_store` (`&mut`) as `&` — NLL ends the
+    // `&mut` borrow first — and neither field touches `inputs.state`, so this
+    // coexists with `provider_context`'s immutable borrow.
+    let media_ctx = media_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.context(inputs.providers, inputs.auth_store));
+    let media_ctx_ref = media_ctx.as_ref();
 
     let mut results: Vec<Option<(String, bool, bool, Value)>> = vec![None; tool_calls.len()];
 
@@ -192,6 +247,7 @@ pub(super) fn execute_tool_batch(
                         registry,
                         provider_context_ref,
                         &runner_clone,
+                        media_ctx_ref,
                     ) {
                         Ok(exec) => {
                             let terminate = extract_terminate(&exec.output.metadata);

@@ -5,6 +5,8 @@ allowed-tools:
   - Bash
   - Read
   - Write
+  - Canvas
+  - CanvasState
 user-invocable: true
 disable-model-invocation: false
 requires-action: true
@@ -19,50 +21,206 @@ rewrite, summarize, or brainstorm a script do NOT trigger this skill unless the 
 asks to produce the drama. Progress-only or promise-only replies are not completion:
 after starting, either drive the pipeline or report the concrete blocker plainly.
 
+## Gating mechanism (confirm each authored stage before spending credits)
+
+Each stage that authors content (script, storyboard, character images, per-shot
+results, final order) is gated through the existing `Canvas`/`CanvasState` tools so
+the user reviews and edits a draft before you act on it. The mechanism uses no new
+infrastructure — it is render → end-turn → re-entry → read-back:
+
+- In a desktop inline environment, render the draft with `Canvas`, using
+  `canvasId` = `canvas-drama-<slug>-stage<N>` (N = the stage number; `<slug>` is just a
+  cosmetic label — the backend assigns the real canvasId). Then **end the
+  current turn** — do NOT busy-wait or poll inside the skill.
+- The user edits the Canvas and submits; submission automatically starts a new turn.
+  That new turn **first** calls `CanvasState` with the same `canvasId` to read back the
+  confirmed `values`, then writes artifacts and advances to the next stage.
+- **Non-desktop environment** (no inline submit / no turn re-trigger): degrade to
+  text-based per-stage confirmation, stating plainly that there is no visual gating in
+  this environment.
+- Never call `imagegen`/`videogen` and never advance on draft values before the
+  confirmation for that stage has been read back.
+
 ## Pipeline (run in order; skip any stage whose inputs the prompt already supplies)
 
-Pick a short kebab slug `<id>` from the drama title. Put project files under
-`.puffer/media/drama/<id>/`. Generated image/video artifacts are written by the tools
-to `.puffer/media/images|videos/` — you only reference them, never relocate them.
+Form the drama `<id>` as `<slug>-<session8>`, where `<slug>` is a short kebab slug of
+the drama title and `<session8>` is the first 8 characters of the session id (the
+`sessionId` field returned by every `CanvasState` read-back — first available after the
+Stage 0 read-back). The `<session8>` suffix is what makes each run land in a **fresh**
+directory; without it, re-running a similar prompt collides with an earlier run's files
+and the manifest write fails. Project files go under `.puffer/media/drama/<id>/`.
 
-1. **Script.** If the prompt already contains a script (or names a script file), use it.
-   Otherwise write one yourself and save it to `.puffer/media/drama/<id>/script.md`.
+**Mint `<id>` exactly once** — when you first create `.puffer/media/drama/<id>/` (the
+Stage 0 manifest write, which happens after the Stage 0 read-back) — then reuse that
+**exact** `<id>` verbatim for every later stage, recovering it from your own earlier
+writes in the conversation. Never re-derive a bare title slug, and never write into a
+pre-existing drama directory. (Same session asked for a second drama → append `-2`,
+`-3`, ….) Generated image/video artifacts are written by the tools to
+`.puffer/media/images|videos/` — you only reference them, never relocate them.
 
-2. **Storyboard.** If the prompt already contains a shot breakdown, use it. Otherwise
-   break the script into ordered shots (aim for a handful; one beat per shot). Give each
-   shot a stable lowercase id (`shot-001`, `shot-002`, …) and record: subject, action,
-   scene, lighting, camera, style, target duration (seconds), which characters appear,
-   and any stability constraints. These fields become the video prompt — richer shots
-   yield better clips. Save to `.puffer/media/drama/<id>/storyboard.md`.
+0. **Models (gate before any credit-consuming stage).** Confirm the image and video
+   provider/model up front. Both are mandatory.
+
+   Render `Canvas` with `canvasId = canvas-drama-<slug>-stage0` whose body is a single
+   `mediaModelSelect` node:
+
+   ```json
+   { "type": "Canvas", "canvasId": "canvas-drama-<slug>-stage0",
+     "spec": { "title": "Models", "body": [ { "type": "mediaModelSelect" } ] } }
+   ```
+
+   The node is self-populating: it fetches the connected image/video capabilities itself,
+   seeds each dropdown from the currently-saved global media defaults, renders an in-place
+   "connect a provider in Settings" prompt for any kind with no connected provider, and on
+   confirmation persists the choice back to the global media settings. Do **not** fetch
+   capabilities, build options, or branch on empty lists yourself. Then **end the turn**.
+
+   In the next turn read back with `CanvasState` (same canvasId): `values` carries
+   `{imgProvider,imgModel,vidProvider,vidModel}`. **Validate**: if `imgModel` or `vidModel` is empty,
+   stop and report that both image and video models must be selected (direct the user to Settings if a
+   kind has no provider). Record the four values in `manifest.json` for Stages 3/4 — this
+   manifest write first creates `.puffer/media/drama/<id>/`, so this is where you mint
+   `<id> = <slug>-<session8>` using the `sessionId` from this read-back.
+
+1. **Script.** If the prompt already contains a script (or names a script file), use it
+   directly (no gate needed). Otherwise draft one, then gate it: render
+   `Canvas` with `canvasId = canvas-drama-<slug>-stage1` and spec
+   `{title:"Script draft",body:[{type:"textarea",id:"script",rows:14,value:"<draft>"}]}`
+   The spec is exactly this — the canvas title is the only heading. Do **not** add a
+   `summary`, do **not** wrap the textarea in a `card`, and do **not** set `regenerable`;
+   the script draft textarea shows directly with only a Submit action. Then end the turn.
+   In the next turn read it back with `CanvasState` (same canvasId)
+   and save `values.script` to `.puffer/media/drama/<id>/script.md`.
+
+2. **Storyboard.** If the prompt already contains a shot breakdown, use it directly.
+   Otherwise break the script into ordered shots (aim for a handful; one beat per shot).
+   Give each shot a stable lowercase id (`shot-001`, `shot-002`, …) and record: subject,
+   action, scene, lighting, camera, style, target duration (seconds), which characters
+   appear, and any stability constraints. These fields become the video prompt — richer
+   shots yield better clips.
+
+   Gate the draft: render `Canvas` with `canvasId = canvas-drama-<slug>-stage2` and spec
+   `{title:"Storyboard",body:[{type:"editableTable",id:"storyboard",layout:"cards",columns:["shotId","subject","action","duration","characters"],rows:<draft shots>}]}`
+   (`layout:"cards"` renders one card per shot with column 0 = shotId as the card
+   title and the rest as labeled wrapping fields — the editableTable sits directly in
+   `body`). Do **not** wrap it in a `card` and do **not** set `regenerable`. Then end
+   the turn. In the next
+   turn read it back with `CanvasState`: `values` for the editableTable id
+   `"storyboard"` is the confirmed 2D array. In one shot, write
+   `.puffer/media/drama/<id>/storyboard.md` (a markdown table of the confirmed rows) and
+   seed `manifest.json`'s `shots[]` — column 0 is the `shotId`, the remaining columns
+   become the shot's prompt fields.
 
 3. **Character images (reference for video).** Scan the prompt for image references that
    are `https://` or `asset://` URLs.
    - If present, use those URLs directly as `--image-reference` in stage 4. Do NOT
      generate images.
-   - If absent and the user wants character-consistent shots, generate each character
-     once with `imagegen --prompt "<character sheet>" --count 1`. Make the character art
-     stylized / non-photorealistic (cartoon, 3D render, illustration): image-to-video
-     providers (e.g. BytePlus) reject photoreal real-person images on moderation. Read
-     the tool result's `remoteSourceUrl` for that artifact (same key the video tool uses):
-       - If `remoteSourceUrl` is present, use it as `--image-reference` in stage 4.
-       - If `remoteSourceUrl` is absent, stop and report that the configured image
-         provider does not produce a referenceable URL, so image-to-video is unavailable.
-         Do NOT silently fall back to text-to-video.
+   - If absent and the user wants character-consistent shots, **generate one image per character,
+     in parallel**: collect the distinct character names from the confirmed storyboard's
+     `characters` column, and emit the per-character `imagegen` calls **together in a single
+     turn** so the backend runs them concurrently (one approval unblocks the whole batch).
+     Cap each turn at **5** `imagegen` calls; if there are more than 5 characters, send
+     successive turns of ≤5 (e.g. 7 characters → 5 then 2). Still exactly one `imagegen` per
+     character — never fold two characters into one call.
+
+     **Square is carried by the prompt — never pass `--aspect`.** The reference image must
+     read as square, but different image models support different ratio knobs and some
+     reject any explicit ratio. Do **not** probe model capabilities and do **not** pass
+     `--aspect` at all; squareness is carried entirely by the mandatory square clause in the
+     per-character prompt below. This keeps every character a plain built-in `imagegen` call
+     that works on any connected image model, with no capability lookup in front of it.
+
+     **Style anchor (compose once, reuse verbatim).** Before generating, write a single
+     shared style phrase describing the drama's overall look (medium, rendering, palette,
+     line/lighting), derived from the storyboard's `style` field — e.g.
+     `"flat 2D anime illustration, soft cel shading, muted warm palette, clean outlines"`.
+     Prepend this **exact same** phrase to every character's prompt; it is the anchor that
+     keeps the whole cast in one consistent style. Do not vary it per character.
+
+     **Per-character prompt template** — for each character build:
+     `<style anchor>, square 1:1 composition with equal width and height, full-body
+     head-to-toe front view of <character + appearance>, standing, centered, plain
+     pure-white background, even studio lighting, no text, no letters, no watermark, no
+     logo, no captions` — then run:
+     `imagegen --prompt "<that prompt>" --count 1 --provider <imgProvider> --model <imgModel>`.
+     The `square 1:1` / white-background / full-body / no-text clauses are mandatory in
+     every prompt and are the **sole** source of squareness — never add `--aspect`. One
+     call → one character → one image; the N (≤5 per turn) calls go out together as one
+     parallel batch, and you read every result back after the batch returns.
+     Never combine multiple characters into one image. Make each character stylized /
+     non-photorealistic (cartoon, 3D render, illustration): image-to-video providers
+     (e.g. BytePlus) reject photoreal real-person images on moderation. For each image read
+     the tool result's `remoteSourceUrl` (same key the video tool uses):
+       - If `remoteSourceUrl` is present, record it under that character in `manifest.json`
+         `characterRefs` (`{ "<character>": "<url>" }`) and use it as that character's
+         `--image-reference` in stage 4.
+       - If a character's `imagegen` failed or its `remoteSourceUrl` is absent **while other
+         characters in the batch did get one**, that single character has no usable reference:
+         record no `characterRefs` entry for it and let it fall back to text-to-video for the
+         shots it appears in (Stage 4). The other characters proceed normally — one failure
+         never aborts the batch.
+       - If **no** character in the whole cast produced a `remoteSourceUrl`, that is the
+         configured image provider not producing referenceable URLs at all — stop and report
+         that image-to-video is unavailable. Do NOT silently degrade the entire cast to
+         text-to-video; the user chose an image model on purpose.
    - If absent and consistency is not required, run text-to-video in stage 4.
 
-4. **Per-shot video.** For each shot in storyboard order, run one `videogen` command:
-   - `videogen --prompt "<shot visual + action>"`
-   - Add `--image-reference <url>` once per `https://`/`asset://` reference the shot uses;
-     keep order stable and refer to them as image 1, image 2, … in the prompt.
-   - Each `videogen` call blocks until that clip is finished (the tool polls the provider
-     to completion), so set an explicit long Bash timeout within the current Bash cap —
-     budget per shot, not for the whole drama. One call → one finished clip.
-   - Read `path` from the tool result and record it into the manifest (see below).
+   When you have generated the per-character images for **all** chunks (not after each
+   chunk), gate the choice once: render `Canvas` with
+   `canvasId = canvas-drama-<slug>-stage3` and `title:"Character image"`, whose `body` is a
+   single `mediaPicker` with no wrapping card: `{type:"mediaPicker", id:"pick", multi:true,
+   value:[<every item id>], items:[{id,url,label,description}, …]}` — one item per character.
+   Set `url` to that character's `remoteSourceUrl` (or its asset url on desktop), `label` to
+   the character name only, and `description` to that character's sheet description. `value`
+   lists every item id, so all characters are checked by default. Then end the turn. In the
+   next turn read it back with `CanvasState`: `pick` is the array of checked item ids; map
+   each back to its character via `characterRefs`. Checked characters' urls become stage 4
+   `--image-reference`s; any unchecked character falls back to text-to-video for the shots it
+   appears in. There is no Regenerate toggle — to redo a character, generate it again and
+   re-render this canvas.
 
-5. **Compose.** Stitch the successful shot clips in storyboard order with ffmpeg. First
+4. **Per-shot video.** Generate the shots **in parallel**: emit a chunk's `videogen` calls
+   **together in a single turn** so the backend runs them concurrently (one approval unblocks
+   the batch). Cap each turn at **5** `videogen` calls; more than 5 shots → successive turns
+   of ≤5 (e.g. 12 shots → 5, 5, 2). Generation order does not matter here — the final play
+   order is confirmed in Stage 5. Build one `videogen` command per shot:
+   - `videogen --prompt "<shot visual + action>" --provider <vidProvider> --model <vidModel>`
+   - Add `--image-reference <url>` for each character in that shot's `characters` column that
+     has a checked `characterRefs` url; keep order stable and refer to them as image 1,
+     image 2, … in the prompt. A shot whose characters are all unchecked or unavailable runs
+     text-to-video.
+   - Each `videogen` call polls its clip to completion in its own parallel worker, so a chunk
+     finishes in roughly the slowest single clip's time, not the sum. Set an explicit long
+     Bash timeout within the current Bash cap on **each** call, sized for the slowest single
+     clip — never for the whole drama. One call → one finished clip.
+   - Read `path` from the tool result and record it into the manifest (see below).
+   - After **all** shot chunks have finished (not after each chunk), gate the keep/drop
+     selection once (mirroring stage 3):
+     render `Canvas` with `canvasId = canvas-drama-<slug>-stage4` and
+     `title:"Per-shot video"`, whose `body` is a single `mediaPicker` with no wrapping
+     card: `{type:"mediaPicker", id:"shots", multi:true, value:[<every succeeded shotId>],
+     items:[{id,kind:"video",path,label,description}, …]}` — one item per SUCCEEDED shot.
+     Set `id` and `label` to the shotId, `kind` to `"video"`, `path` to that clip's
+     workspace path from the manifest, and `description` to the shot's prompt summary.
+     `value` lists every succeeded shotId, so all clips are checked by default. Then end
+     the turn. In the next turn read it back with `CanvasState`: `shots` is the array of
+     checked shotIds — these are the clips kept for composition; unchecked shots are
+     dropped. There is no retry — to redo a shot, re-run its `videogen` and re-render this
+     canvas (same as stage 3's redo note). A shot whose `videogen` failed is not added as a
+     tile; report failed shots plainly in turn text (see Failure contracts).
+
+5. **Compose.** Before composing, gate the final order and mux mode: render `Canvas` with
+   `canvasId = canvas-drama-<slug>-stage5`, a `card` containing an `editableTable`
+   (`id:"order"`, `columns: ["shotId"]`, `rows` = the stage-4-kept clips in current order —
+   the user confirms/reorders) and a `singleSelect` (`id:"mux"`, options `copy` /
+   `re-encode`), then end the turn. In the next turn read it back with `CanvasState`:
+   compose in the confirmed `values.order`, preferring stream-copy unless `values.mux` is
+   `re-encode`.
+
+   Stitch the successful shot clips in the confirmed order with ffmpeg. First
    probe ffmpeg: `command -v ffmpeg`. If missing, stop and report — do not fake a file.
-   Include only shots whose video succeeded; if none succeeded, skip composition and
-   report. Build the concat list with single-quote escaping (each clip line is
+   Include only the stage-4-kept clips (the confirmed `values.order`); if none were
+   kept, skip composition and report. Build the concat list with single-quote escaping (each clip line is
    `file '<path>'`, with any `'` in the path written as `'\''`). Prefer stream-copy
    (clips from the same provider share codec/params); only if concat-copy fails with a
    codec/params mismatch, retry with a re-encode:
@@ -99,6 +257,27 @@ not a schema'd artifact:
 
 ## Failure contracts (never paper over)
 
+- If a kind has no connected provider, the Stage 0 node shows an in-place "connect a provider in
+  Settings" prompt and that model stays empty; on read-back, stop and tell the user to connect a
+  provider for that kind in Settings — never fall back to text-to-video or to config defaults.
+- If `imgModel` or `vidModel` is empty on read-back, stop and report that both image and video models
+  must be selected before continuing.
+- Never pass `--aspect` to `imagegen`; squareness comes only from the prompt's square
+  clause. This sidesteps "axis ratio value not allowed" / "ratio not mapped" rejections on
+  models that only support their own default ratio. If an image still comes back slightly
+  non-square, that is acceptable for a reference frame — do not retry with a ratio flag.
+- A parallel media batch (Stage 3 images or Stage 4 videos) raises the media approval
+  **once** for the whole turn. Choose **Always allow** when first prompted so later chunks
+  run with no further prompt; "Approve once" only covers the current turn, so each chunk
+  re-prompts. A trailing chunk of a single call uses the normal single-command path and may
+  prompt on its own unless Always allow was chosen — this is expected, not an error.
+- Do not advance any gated stage on draft values — wait for the stage's confirmation to
+  be read back first.
+- If `CanvasState` returns no value for a gated stage (the user did not submit), report
+  "no confirmation received" and stop; do not fall back to the draft.
+- In a non-desktop environment (no Canvas / no inline submit), degrade to text-based
+  per-stage confirmation — including provider/model — and say so plainly; do not skip the
+  confirmation.
 - If a chosen video provider is Relaydance (prompt-only) and the user wants image
   references, report that the configured provider does not support image references.
 - If ffmpeg is unavailable or composition fails, report it plainly and keep the

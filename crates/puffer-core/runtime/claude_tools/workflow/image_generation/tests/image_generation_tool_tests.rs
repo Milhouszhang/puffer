@@ -21,7 +21,7 @@ fn execute_uses_exact_media_context_for_configured_model() {
     );
 
     let output = execute_image_generation(
-        &mut state,
+        state.config.media.image.as_ref(),
         dir.path(),
         json!({"prompt": "draw a ship", "count": 1}),
         Some(ImageGenerationMediaContext {

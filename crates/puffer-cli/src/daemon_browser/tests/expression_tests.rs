@@ -5,17 +5,18 @@ use super::super::params::{parse_input_event, required_string_array};
 use super::super::ref_resolution::{
     checkable_state_expression, fill_expression, focus_expression,
     hosted_fill_focus_check_expression, in_frame_prepare_fill_fn, in_frame_readback_fn,
-    in_frame_select_fn, scroll_into_view_expression, select_expression, target_point_expression,
+    in_frame_select_fn, main_doc_focus_clear_expression, main_doc_readback_expression,
+    scroll_into_view_expression, select_expression, target_point_expression,
 };
 use super::super::screenshot::{
-    collect_in_frame_field_nodes, field_nodes_to_refs, parse_agent_screenshot_options,
-    parse_capture_screenshot_response, payment_frame_ids_from_tree, snapshot_expression,
-    BrowserElementRef, BrowserScreenshotFormat,
+    collect_in_frame_field_nodes, field_nodes_to_refs, merge_action_snapshot,
+    parse_agent_screenshot_options, parse_capture_screenshot_response, payment_frame_ids_from_tree,
+    snapshot_expression, BrowserElementRef, BrowserScreenshotFormat, POST_ACTION_INSTRUCTION,
 };
 use super::super::selection::parse_copy_selection_response;
 use super::super::upload::parse_upload_handle_response;
 use super::super::{parse_cdp_call_response, parse_evaluation_response, BrowserInputEvent};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 #[test]
@@ -676,4 +677,94 @@ fn field_nodes_to_refs_builds_addressable_refs_with_quad_centers() {
     assert_eq!(card.role, "textbox");
     assert_eq!(card.x, 410.0);
     assert_eq!(card.y, 398.0);
+}
+
+#[test]
+fn merge_action_snapshot_preserves_action_fields_over_snapshot() {
+    // The in-frame fill path (#656) returns mode/note alongside ok; the fused
+    // post-action snapshot must not clobber the action's own report.
+    let base = json!({ "ok": true, "mode": "inFrame", "note": "typed into card field" });
+    let snapshot = json!({
+        "url": "https://shop.example/checkout",
+        "title": "Checkout",
+        "text": "Card number",
+        "elements": [
+            { "ref": "@e1", "role": "textbox", "name": "Card", "tag": "input", "href": null, "x": 1.0, "y": 2.0 }
+        ],
+        "instruction": "Refs are fresh and stay valid until the page changes."
+    });
+
+    let merged = merge_action_snapshot(base, snapshot);
+
+    // The action's own report wins on conflict and survives intact.
+    assert_eq!(merged.get("ok").and_then(Value::as_bool), Some(true));
+    assert_eq!(merged.get("mode").and_then(Value::as_str), Some("inFrame"));
+    assert_eq!(
+        merged.get("note").and_then(Value::as_str),
+        Some("typed into card field")
+    );
+    // The resulting page state and refreshed refs are carried through.
+    assert_eq!(
+        merged.get("url").and_then(Value::as_str),
+        Some("https://shop.example/checkout")
+    );
+    assert_eq!(
+        merged.pointer("/elements/0/ref").and_then(Value::as_str),
+        Some("@e1")
+    );
+    // The generic snapshot instruction is swapped for the post-action guidance.
+    assert_eq!(
+        merged.get("instruction").and_then(Value::as_str),
+        Some(POST_ACTION_INSTRUCTION)
+    );
+}
+
+#[test]
+fn merge_action_snapshot_falls_back_to_base_when_snapshot_is_not_an_object() {
+    // agent_snapshot always returns an object; if that ever changes, the action's
+    // own result must be returned rather than dropped.
+    let base = json!({ "ok": true });
+    let merged = merge_action_snapshot(base.clone(), json!("not-an-object"));
+    assert_eq!(merged, base);
+}
+
+fn card_number_field_ref() -> BrowserElementRef {
+    BrowserElementRef {
+        ref_id: "@e7".to_string(),
+        role: "textbox".to_string(),
+        name: "Card number".to_string(),
+        tag: "input".to_string(),
+        href: None,
+        x: 120.0,
+        y: 240.0,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn main_doc_focus_clear_expression_verifies_focus_before_clearing() {
+    // The main-document keystroke fallback (#675) must, after the runtime's real
+    // mouse click, confirm focus actually landed on the resolved field (the #580
+    // guard so keystrokes can't leak elsewhere) and clear any residual before
+    // typing. It resolves the same editable element the fast fill path does.
+    let expression = main_doc_focus_clear_expression(&card_number_field_ref()).unwrap();
+    assert!(expression.contains("findTarget(refTarget)"));
+    assert!(expression.contains("input, textarea, [contenteditable=\"true\"]"));
+    assert!(expression.contains("document.activeElement === targetEl"));
+    assert!(expression.contains("focused"));
+    // The clear uses the native value-setter so a controlled input observes it.
+    assert!(expression.contains("Object.getOwnPropertyDescriptor(proto, 'value')"));
+}
+
+#[test]
+fn main_doc_readback_expression_reads_value_for_silent_failure_check() {
+    // After typing per-character keystrokes the fallback reads the value back so
+    // a guarded field that reverted even genuine keystrokes bails honestly
+    // instead of reporting a false success (#580/#675). Same readback for
+    // contenteditable fields (textContent) and value inputs.
+    let expression = main_doc_readback_expression(&card_number_field_ref()).unwrap();
+    assert!(expression.contains("findTarget(refTarget)"));
+    assert!(expression.contains("'value' in targetEl"));
+    assert!(expression.contains("targetEl.textContent"));
+    assert!(expression.contains("return { value }"));
 }

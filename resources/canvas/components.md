@@ -79,6 +79,15 @@ the key in `CanvasState.values`.
 - purpose: one choice from a short option set.
 - use_when: the options are mutually exclusive.
 
+### dependentSelect `{id,label?,dependsOn,options:[{id,label,group}],value?,help?}`
+- purpose: a single-choice dropdown whose options are filtered by another select's value.
+- use_when: a second choice depends on a first (e.g. model depends on provider). Pair it with a
+  `singleSelect` whose `id` equals this node's `dependsOn`; each option's `group` is the parent value
+  it belongs to.
+- avoid_when: the choice is independent → use `singleSelect`.
+- writes back: the chosen option `id` (a string). When the parent changes, the value auto-resets to
+  the first option in the new group.
+
 ### multiSelect `{id,label,options:[{id,label}],value?:string[],help?}`
 - purpose: several independent choices from a short option set.
 - use_when: the user may select more than one area, file, filter, or action.
@@ -95,6 +104,44 @@ the key in `CanvasState.values`.
 - purpose: a short free-form value.
 - avoid_when: collecting secrets or long text; use dedicated secret/user input
   tools instead.
+
+### textarea `{id,label?,placeholder?,rows?,value?}`
+- purpose: multiline free-form text editing (a script draft, a long prompt).
+- use_when: the value spans multiple lines and the user should review/edit it inline.
+- avoid_when: a one-line value → use `textInput`.
+- writes back: a string (the edited text).
+
+### editableTable `{id,columns,rows,label?}`
+- purpose: an editable grid the user can edit cell-by-cell plus add, remove, and
+  reorder rows.
+- use_when: the user confirms/edits a list of structured rows (e.g. a storyboard
+  of shots) before the agent acts on it.
+- avoid_when: read-only records → use `table`.
+- writes back: a 2D array (`rows`) reflecting the final edits and order.
+
+### mediaPicker `{id,items:[{id,kind?,url?,path?,label?,description?}],multi?,value?}`
+- purpose: pick from a grid of images or videos.
+- use_when: the user selects one (or, with `multi:true`, several) generated
+  candidate images or video clips.
+- item kind: `kind` is `"image"` (default) or `"video"` — explicit, never
+  inferred from the URL/extension. Image items carry a directly-loadable `url`;
+  video items carry a workspace-relative `path` (the frontend mints a streaming
+  access URL itself, so this works for every provider, including local-only ones).
+- preview: on desktop, clicking an item opens a preview. Image items show the
+  enlarged image; video items play the clip with controls. The grid thumbnail of
+  a video item is its first frame. Each preview also shows that item's
+  `description` (centered).
+- writes back: single → the chosen item `id`; multi → an array of selected ids.
+
+### mediaModelSelect `{}`
+- purpose: pick the image-gen and video-gen provider/model for a run.
+- use_when: gating the media model choice before any credit-consuming generation (short-drama Stage 0).
+- self-populating: takes no `id` and no `options`. It fetches the connected image/video capabilities
+  itself, seeds each dropdown from the saved global media defaults, shows an in-place "connect a
+  provider in Settings" prompt for any kind with no connected provider, and persists the confirmed
+  choice back to the global media settings.
+- writes back: four fixed keys — `imgProvider`, `imgModel`, `vidProvider`, `vidModel`. Submit is
+  gated until both `imgModel` and `vidModel` are chosen.
 
 ## Evidence + rich (carry the proof)
 ### finding

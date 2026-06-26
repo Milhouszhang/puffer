@@ -1281,7 +1281,7 @@ fn timeline_items(session_store: &SessionStore, record: &SessionRecord) -> Vec<T
                 if let Some(text) = send_user_message_text(tool_id, input) {
                     flush_pending_assistant(&mut items, &mut pending_assistant);
                     items.push(TimelineItemDto::AssistantMessage {
-                        id: format!("timeline-{index}-{call_id}-message"),
+                        id: format!("tool-{call_id}-message"),
                         text,
                         attachments: std::mem::take(&mut pending_generated_attachments),
                         turn_id: current_turn_id.clone(),
@@ -1292,7 +1292,7 @@ fn timeline_items(session_store: &SessionStore, record: &SessionRecord) -> Vec<T
                 let status = if *success { "ok" } else { "error" };
                 let summary = summarize_tool_input(tool_id, input);
                 items.push(TimelineItemDto::ToolCall {
-                    id: format!("timeline-{index}-{call_id}"),
+                    id: format!("tool-{call_id}"),
                     tool_id: tool_id.clone(),
                     status: status.to_string(),
                     summary: summary.clone(),
@@ -1306,7 +1306,7 @@ fn timeline_items(session_store: &SessionStore, record: &SessionRecord) -> Vec<T
                 });
                 if let Some(text) = lambda_gate_timeline_text(metadata, tool_id) {
                     items.push(TimelineItemDto::SystemMessage {
-                        id: format!("timeline-{index}-{call_id}-lambda-gate"),
+                        id: format!("tool-{call_id}-lambda-gate"),
                         text,
                         turn_id: current_turn_id.clone(),
                         actor: actor.clone(),
@@ -1314,7 +1314,7 @@ fn timeline_items(session_store: &SessionStore, record: &SessionRecord) -> Vec<T
                 }
                 if let Some((state, reason)) = permission_state(output) {
                     items.push(TimelineItemDto::PermissionDialog {
-                        id: format!("timeline-{index}-{call_id}-permission"),
+                        id: format!("tool-{call_id}-permission"),
                         tool_id: tool_id.clone(),
                         state: state.to_string(),
                         summary,
@@ -2463,6 +2463,70 @@ mod tests {
             }
             other => panic!("expected lambda gate system event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_invocation_ids_use_call_id_scheme() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![TranscriptEvent::ToolInvocation {
+                call_id: "call-1".to_string(),
+                tool_id: "LambdaHostCall".to_string(),
+                input: "{}".to_string(),
+                output: "Permission required: approve gh_pr_view".to_string(),
+                success: true,
+                metadata: Some(json!({
+                    "lambda_skill": {
+                        "event": "host_call_admitted",
+                        "host_tool": "gh_pr_view",
+                        "host_args": {"number": 42},
+                        "concrete_tool": "Bash",
+                        "concrete_input": {"command": "gh pr view 42"}
+                    }
+                })),
+                actor: None,
+                subject: None,
+            }]),
+        );
+
+        assert_eq!(items.len(), 3);
+        let TimelineItemDto::ToolCall { id, .. } = &items[0] else {
+            panic!("expected tool call, got {:?}", items[0]);
+        };
+        assert_eq!(id, "tool-call-1");
+        let TimelineItemDto::SystemMessage { id, .. } = &items[1] else {
+            panic!("expected lambda gate system message, got {:?}", items[1]);
+        };
+        assert_eq!(id, "tool-call-1-lambda-gate");
+        let TimelineItemDto::PermissionDialog { id, .. } = &items[2] else {
+            panic!("expected permission dialog, got {:?}", items[2]);
+        };
+        assert_eq!(id, "tool-call-1-permission");
+    }
+
+    #[test]
+    fn send_user_message_item_id_uses_call_id_scheme() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![TranscriptEvent::ToolInvocation {
+                call_id: "call-msg-1".to_string(),
+                tool_id: "SendUserMessage".to_string(),
+                input: r#"{"message":"Starting Phase 1.","status":"normal"}"#.to_string(),
+                output: "{}".to_string(),
+                success: true,
+                metadata: None,
+                actor: None,
+                subject: None,
+            }]),
+        );
+
+        assert_eq!(items.len(), 1);
+        let TimelineItemDto::AssistantMessage { id, .. } = &items[0] else {
+            panic!("expected assistant message, got {:?}", items[0]);
+        };
+        assert_eq!(id, "tool-call-msg-1-message");
     }
 
     #[test]

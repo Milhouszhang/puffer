@@ -361,12 +361,54 @@ pub(crate) fn execute_tool(
     }
 }
 
+/// Runs a parallel-batch `Bash` in-process with its own internal-tool broker so
+/// that subprocess media tools (imagegen/videogen) can call back and execute
+/// concurrently. The broker handler is media-only and uses shared references.
+pub(crate) fn execute_parallel_bash_with_media_broker(
+    definition: &ToolDefinition,
+    cwd: &Path,
+    session_id: &Uuid,
+    args: Value,
+    media_ctx: &super::internal_tool_permissions::MediaCapabilityContext<'_>,
+) -> Result<ToolExecutionResult> {
+    let mut handler = |request: bash_internal_permissions::InternalToolBrokerRequest| match request {
+        bash_internal_permissions::InternalToolBrokerRequest::Execution(req) => {
+            bash_internal_permissions::InternalToolBrokerResponse::Execution(
+                super::internal_tool_permissions::execute_media_internal_tool(media_ctx, cwd, req),
+            )
+        }
+        bash_internal_permissions::InternalToolBrokerRequest::Permission(_) => {
+            bash_internal_permissions::InternalToolBrokerResponse::Permission(
+                puffer_tools::internal_permissions::InternalToolPermissionResponse::deny(
+                    "internal tool permission is not available in a parallel batch; run it as a single command",
+                ),
+            )
+        }
+    };
+    let execution = bash::execute_from_value_with_internal_permissions(
+        cwd,
+        session_id,
+        args,
+        media_ctx.process_store,
+        Some(&mut handler),
+    )?;
+    let output = serde_json::to_string_pretty(&execution.output)
+        .context("failed to serialize Bash output")?;
+    Ok(tool_result(definition, execution.success, output))
+}
+
 /// Executes a parallel-safe tool without `&mut AppState`.
 ///
 /// This handles only tools identified by `is_parallel_safe_tool()` and
 /// replicates the corresponding match arms from `execute_tool`. All data
 /// needed is passed by value/reference; no mutable application state is
 /// touched, enabling concurrent execution via `std::thread::scope`.
+///
+/// `Bash` is special-cased: it runs in-process with its own media broker via
+/// [`execute_parallel_bash_with_media_broker`] (so subprocess imagegen/videogen
+/// can call back), never through the broker-less runner. `media_ctx` is the
+/// shared media-capability context the caller builds when the batch contains a
+/// permitted Bash; it is `None` for Bash-free batches.
 ///
 /// For tools in `runner_adapter::is_runner_supported(...)` (currently
 /// `Glob | Grep | WebFetch` in the parallel path), execution is routed through the supplied
@@ -382,11 +424,22 @@ pub(crate) fn execute_parallel_tool(
     filesystem_policy: &FilesystemPermissionPolicy,
     session_id: &Uuid,
     input: Value,
-    resources: &LoadedResources,
+    _resources: &LoadedResources,
     registry: &ToolRegistry,
     provider_context: &ProviderToolContext<'_>,
     runner: &Arc<dyn ToolRunner>,
+    media_ctx: Option<&super::internal_tool_permissions::MediaCapabilityContext<'_>>,
 ) -> Result<ToolExecutionResult> {
+    if definition.id == "Bash" {
+        // The caller builds the media context whenever a permitted Bash is in the
+        // batch, so this is always present here; guard rather than panic.
+        let media_ctx = media_ctx.ok_or_else(|| {
+            anyhow::anyhow!("parallel Bash dispatched without a media-capability context")
+        })?;
+        return execute_parallel_bash_with_media_broker(
+            definition, cwd, session_id, input, media_ctx,
+        );
+    }
     if runner_adapter::is_runner_supported(definition.id.as_str()) {
         let request = RunnerToolRequest {
             tool_id: definition.id.clone(),
@@ -824,8 +877,8 @@ fn execute_workflow_tool_with_media_context(
         "CronCreate" => workflow::cron_create::execute_cron_create(state, cwd, input),
         "CronDelete" => workflow::cron_delete::execute_cron_delete(state, cwd, input),
         "CronList" => workflow::cron_list::execute_cron_list(state, cwd, input),
-        "Email" => workflow::email_configure::execute_email(state, cwd, input),
-        "EmailConfigure" => workflow::email_configure::execute_email_configure(state, cwd, input),
+        "Email" => workflow::email_configure::execute_email(cwd, input),
+        "EmailConfigure" => workflow::email_configure::execute_email_configure(cwd, input),
         "EnterPlanMode" => workflow::enter_plan_mode::execute_enter_plan_mode(state, cwd, input),
         "EnterWorktree" => workflow::enter_worktree::execute_enter_worktree(state, cwd, input),
         "ExitPlanMode" => workflow::exit_plan_mode::execute_exit_plan_mode(state, cwd, input),
@@ -835,13 +888,13 @@ fn execute_workflow_tool_with_media_context(
         "update_goal" => workflow::goal::execute_update_goal(state, cwd, input),
         "HttpRequest" => workflow::http_request::execute_http_request(state, cwd, input),
         "ImageGeneration" => workflow::image_generation::execute_image_generation(
-            state,
+            state.config.media.image.as_ref(),
             cwd,
             input,
             image_media_context,
         ),
         "VideoGeneration" => workflow::video_generation::execute_video_generation(
-            state,
+            state.config.media.video.as_ref(),
             cwd,
             input,
             video_media_context,
@@ -852,6 +905,9 @@ fn execute_workflow_tool_with_media_context(
         "McpToolCall" => workflow::mcp_tool_call::execute_mcp_tool_call(state, cwd, input),
         "McpStatus" => workflow::mcp_status::execute_mcp_status(state, cwd, input),
         "ModalAction" => workflow::modal_action::execute_modal_action(state, cwd, input),
+        "MonitorActionDraft" => {
+            workflow::monitor_action_draft::execute_monitor_action_draft(state, cwd, input)
+        }
         "MonitorReplyDraft" => {
             workflow::monitor_reply_draft::execute_monitor_reply_draft(state, cwd, input)
         }
@@ -920,22 +976,22 @@ fn execute_workflow_tool_with_media_context(
         "TaskUpdate" => workflow::task_update::execute_task_update(state, cwd, input),
         "TeamCreate" => workflow::team_create::execute_team_create(state, cwd, input),
         "TeamDelete" => workflow::team_delete::execute_team_delete(state, cwd, input),
-        "Telegram" => workflow::telegram_login::execute_telegram(state, cwd, input),
+        "Telegram" => workflow::telegram_login::execute_telegram(cwd, input),
         "TelegramImportDesktop" => {
-            workflow::telegram_login::execute_telegram_import_desktop(state, cwd, input)
+            workflow::telegram_login::execute_telegram_import_desktop(cwd, input)
         }
-        "TelegramLoginQr" => workflow::telegram_login::execute_telegram_login_qr(state, cwd, input),
+        "TelegramLoginQr" => workflow::telegram_login::execute_telegram_login_qr(cwd, input),
         "TelegramLoginQrWait" => {
-            workflow::telegram_login::execute_telegram_login_qr_wait(state, cwd, input)
+            workflow::telegram_login::execute_telegram_login_qr_wait(cwd, input)
         }
         "TelegramLoginStart" => {
-            workflow::telegram_login::execute_telegram_login_start(state, cwd, input)
+            workflow::telegram_login::execute_telegram_login_start(cwd, input)
         }
         "TelegramLoginSubmitCode" => {
-            workflow::telegram_login::execute_telegram_login_submit_code(state, cwd, input)
+            workflow::telegram_login::execute_telegram_login_submit_code(cwd, input)
         }
         "TelegramLoginSubmitPassword" => {
-            workflow::telegram_login::execute_telegram_login_submit_password(state, cwd, input)
+            workflow::telegram_login::execute_telegram_login_submit_password(cwd, input)
         }
         "LambdaInternal" => workflow::lambda_internal::execute_lambda_internal(state, cwd, input),
         "TodoWrite" => workflow::todo_write::execute_todo_write(state, cwd, input),

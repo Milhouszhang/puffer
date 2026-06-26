@@ -84,9 +84,52 @@ pub fn is_op_reference(value: &str) -> bool {
     value.trim_start().starts_with(OP_REFERENCE_PREFIX)
 }
 
+/// Returns the first existing absolute path among `candidates`, else `fallback`.
+/// Used to pin privileged tool spawns to trusted install locations rather than
+/// resolving a bare program name through the daemon's inherited PATH (where an
+/// attacker-planted binary earlier on PATH could run in its place).
+fn resolve_tool(candidates: &[&str], fallback: &str) -> String {
+    candidates
+        .iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .map(|path| (*path).to_string())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Resolves the `op` CLI to an absolute path in a trusted (non-user-writable)
+/// install location. `op` reads/lists every login and resolves `op://` references,
+/// so a binary named `op` planted earlier on PATH would directly harvest the
+/// plaintext secrets being imported — hence we never invoke it by bare name.
+/// Falls back to `op` only when no known install location exists.
+fn op_bin() -> String {
+    #[cfg(target_os = "macos")]
+    let candidates: &[&str] = &["/opt/homebrew/bin/op", "/usr/local/bin/op", "/usr/bin/op"];
+    #[cfg(target_os = "linux")]
+    let candidates: &[&str] = &["/usr/bin/op", "/usr/local/bin/op", "/snap/bin/op"];
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let candidates: &[&str] = &[];
+
+    #[cfg(target_os = "windows")]
+    {
+        // winget installs op under Program Files. Check the standard locations
+        // DIRECTLY rather than trusting the spoofable %ProgramFiles% env var (a
+        // same-user caller could point it at an attacker-controlled op.exe). A
+        // non-standard install drive just falls through to the bare-name PATH lookup.
+        for path in [
+            "C:\\Program Files\\1Password CLI\\op.exe",
+            "C:\\Program Files (x86)\\1Password CLI\\op.exe",
+        ] {
+            if std::path::Path::new(path).exists() {
+                return path.to_string();
+            }
+        }
+    }
+    resolve_tool(candidates, "op")
+}
+
 /// Reports whether the 1Password CLI (`op`) is available on this machine.
 pub fn op_cli_available() -> bool {
-    Command::new("op")
+    Command::new(op_bin())
         .arg("--version")
         .output()
         .map(|output| output.status.success())
@@ -99,7 +142,7 @@ pub fn op_cli_available() -> bool {
 /// authorized with Touch ID at the moment of sync — so the user never has to
 /// hunt for or paste a token.
 pub fn op_authorized() -> bool {
-    std::env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_some() || op_has_connected_account("op")
+    std::env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_some() || op_has_connected_account(&op_bin())
 }
 
 /// Returns `Ok(())` when 1Password access is set up, otherwise an actionable
@@ -156,7 +199,10 @@ fn install_op_cli() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     let mut cmd = {
-        let mut c = Command::new("brew");
+        // Pin brew to its standard prefix so a planted `brew` on PATH can't run as
+        // the user during auto-install.
+        let brew = resolve_tool(&["/opt/homebrew/bin/brew", "/usr/local/bin/brew"], "brew");
+        let mut c = Command::new(brew);
         // Run non-interactively (no tty): skip the slow auto-update and don't
         // fail on the user's pre-existing untrusted third-party taps.
         c.args(["install", "--cask", "1password-cli"])
@@ -168,7 +214,16 @@ fn install_op_cli() -> Result<()> {
     };
     #[cfg(target_os = "windows")]
     let mut cmd = {
-        let mut c = Command::new("winget");
+        // Resolve winget to the per-user WindowsApps alias by absolute path (only
+        // the same user can write there) instead of trusting PATH ordering.
+        let winget = std::env::var_os("LOCALAPPDATA")
+            .map(|local| {
+                std::path::Path::new(&local).join("Microsoft\\WindowsApps\\winget.exe")
+            })
+            .filter(|path| path.exists())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "winget".to_string());
+        let mut c = Command::new(winget);
         c.args([
             "install", "--id", "AgileBits.1Password.CLI", "-e", "--silent",
             "--accept-source-agreements", "--accept-package-agreements",
@@ -204,7 +259,8 @@ fn install_op_cli() -> Result<()> {
 pub fn launch_onepassword_app() -> bool {
     #[cfg(target_os = "macos")]
     {
-        Command::new("open")
+        // `open` is always at /usr/bin/open on macOS — use the absolute path.
+        Command::new("/usr/bin/open")
             .args(["-a", "1Password"])
             .status()
             .map(|status| status.success())
@@ -219,7 +275,21 @@ pub fn launch_onepassword_app() -> bool {
         if !onepassword_app_installed() {
             return false;
         }
-        Command::new("cmd")
+        // Resolve System32 from the kernel (GetSystemDirectoryW), not the
+        // %SystemRoot% env var, so a same-user caller cannot redirect cmd.exe by
+        // poisoning the environment (consistent with the Chrome elevation hardening).
+        let cmd_exe = {
+            use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+            let mut buf = [0u16; 260]; // MAX_PATH
+            let len = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
+            let dir = if len > 0 && len <= buf.len() {
+                String::from_utf16_lossy(&buf[..len])
+            } else {
+                "C:\\Windows\\System32".to_string()
+            };
+            format!("{dir}\\cmd.exe")
+        };
+        Command::new(cmd_exe)
             .args(["/C", "start", "", "onepassword://"])
             .status()
             .map(|status| status.success())
@@ -227,7 +297,11 @@ pub fn launch_onepassword_app() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        Command::new("1password")
+        let onepassword = resolve_tool(
+            &["/opt/1Password/1password", "/usr/bin/1password"],
+            "1password",
+        );
+        Command::new(onepassword)
             .spawn()
             .map(|_| true)
             .unwrap_or(false)
@@ -286,7 +360,7 @@ fn op_has_connected_account(op_bin: &str) -> bool {
 
 /// Resolves a `op://vault/item/field` reference to its live value via `op read`.
 pub fn resolve_op_reference(reference: &str) -> Result<String> {
-    resolve_with("op", reference)
+    resolve_with(&op_bin(), reference)
 }
 
 /// Resolution core parameterized by the CLI binary, for testing with a fake `op`.
@@ -347,7 +421,7 @@ pub struct ResolvedLogin {
 /// and reported, NOT fatal — so one bad item can't discard the whole import.
 /// A failure to even *list* the items still aborts (nothing to import).
 pub fn import_resolved_logins() -> Result<(Vec<ResolvedLogin>, Vec<String>)> {
-    import_resolved_with("op")
+    import_resolved_with(&op_bin())
 }
 
 fn import_resolved_with(op_bin: &str) -> Result<(Vec<ResolvedLogin>, Vec<String>)> {
@@ -528,6 +602,31 @@ fn primary_url(item: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #6: op_bin must NOT trust the spoofable %ProgramFiles% env to locate op.exe.
+    // Regression test: plant a real op.exe and point %ProgramFiles% at it. The
+    // PRE-FIX code read that env var and `.exists()`-checked it, so it WOULD return
+    // this attacker path; the fixed op_bin (hardcoded standard paths) must not.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn op_bin_ignores_program_files_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let planted = tmp.path().join("1Password CLI").join("op.exe");
+        std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+        std::fs::write(&planted, b"fake op").unwrap();
+        std::env::set_var("ProgramFiles", tmp.path());
+        let resolved = op_bin();
+        std::env::remove_var("ProgramFiles");
+        assert_ne!(
+            resolved,
+            planted.to_string_lossy(),
+            "op_bin resolved op.exe from the poisoned %ProgramFiles% — env must be ignored"
+        );
+        assert!(
+            !resolved.starts_with(&*tmp.path().to_string_lossy()),
+            "op_bin used %ProgramFiles%, got {resolved}"
+        );
+    }
 
     #[test]
     fn recognizes_op_references() {

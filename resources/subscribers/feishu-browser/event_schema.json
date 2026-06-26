@@ -1,16 +1,50 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "lark-browser message event",
-  "type": "object",
-  "properties": {
-    "platform": { "type": "string", "enum": ["lark-browser", "feishu-browser"] },
-    "brand": { "type": "string", "enum": ["lark", "feishu"] },
-    "chat_id": { "type": "string" },
-    "message_id": { "type": "string" },
-    "sender": { "type": "string" },
-    "is_outgoing": { "type": "boolean" },
-    "source": { "type": "string", "enum": ["feed", "active"] },
-    "receivedAtMs": { "type": "number" }
-  },
-  "required": ["platform", "chat_id", "is_outgoing"]
+  "version": 1,
+  "event_source": "lark-browser",
+  "text_fields": [
+    { "path": "sender", "label": "Sender" }
+  ],
+  "fields": [
+    {
+      "path": "event_type",
+      "label": "Source type",
+      "type": "enum",
+      "operators": ["equals"],
+      "values": [
+        { "value": "message", "label": "消息" }
+      ]
+    },
+    {
+      "path": "sender",
+      "label": "Sender",
+      "type": "string",
+      "operators": ["contains", "equals", "matches"]
+    },
+    {
+      "path": "chat_id",
+      "label": "Chat id",
+      "type": "string",
+      "operators": ["equals"]
+    },
+    {
+      "path": "unread",
+      "label": "Unread",
+      "type": "boolean",
+      "operators": ["equals"],
+      "values": [
+        { "value": true, "label": "是" },
+        { "value": false, "label": "否" }
+      ]
+    },
+    {
+      "path": "conversation_type",
+      "label": "Conversation type",
+      "type": "enum",
+      "operators": ["equals"],
+      "values": [
+        { "value": "person", "label": "真人" },
+        { "value": "bot", "label": "机器人" }
+      ]
+    }
+  ]
 }

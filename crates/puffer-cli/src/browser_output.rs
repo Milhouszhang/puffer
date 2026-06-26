@@ -28,6 +28,9 @@ pub(crate) fn print_execution_result(session_id: &str, execution: &BrowserExecut
             }
         }
         BrowserPrintKind::Ok => println!("{}", ok_message(execution.action)),
+        BrowserPrintKind::ActionSnapshot => {
+            print_action_snapshot_result(execution.action, &execution.result)?
+        }
     }
     Ok(())
 }
@@ -92,6 +95,9 @@ pub(crate) enum BrowserPrintKind {
     Screenshot,
     Value,
     Ok,
+    /// A mutating action whose result carries a fused post-action snapshot (#646):
+    /// print the action confirmation, then the resulting page state.
+    ActionSnapshot,
 }
 
 fn print_tabs_state(session_id: &str, tabs: &BrowserTabsState) {
@@ -145,6 +151,42 @@ fn print_screenshot_result(session_id: &str, result: &Value) -> Result<()> {
     println!("session: {session_id}");
     print!("{}", render_screenshot_body(&screenshot));
     Ok(())
+}
+
+/// Prints a mutating action's confirmation followed by its fused post-action
+/// snapshot (#646), so the page state after the action is visible without a
+/// separate `snapshot` command.
+fn print_action_snapshot_result(action: &str, result: &Value) -> Result<()> {
+    print!("{}", render_action_snapshot_body(action, result)?);
+    Ok(())
+}
+
+/// Renders the CLI body for a mutating action: its confirmation line, any
+/// hosted/in-frame fill `note` (#633/#656 — its verification guidance must reach
+/// an agent that reads CLI output, not only `--json`), then the fused post-action
+/// snapshot. Degrades to just the confirmation line when the daemon attached no
+/// snapshot (an older daemon, or a best-effort snapshot that could not be
+/// captured).
+pub(crate) fn render_action_snapshot_body(action: &str, result: &Value) -> Result<String> {
+    let mut body = String::new();
+    body.push_str(ok_message(action));
+    body.push('\n');
+    if let Some(note) = result
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+    {
+        body.push_str("note: ");
+        body.push_str(note);
+        body.push('\n');
+    }
+    if result.get("url").is_some() && result.get("elements").is_some() {
+        let snapshot = normalize_snapshot_result(result.clone())?;
+        body.push('\n');
+        body.push_str(&render_snapshot_body(&snapshot));
+    }
+    Ok(body)
 }
 
 pub(crate) fn render_snapshot_body(snapshot: &BrowserSnapshotOutput) -> String {

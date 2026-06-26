@@ -2,6 +2,7 @@
 
 mod binding_delete;
 mod connection_delete;
+mod monitor_action_execute;
 mod monitor_create;
 mod monitor_history;
 mod monitor_ignore_result;
@@ -19,6 +20,7 @@ mod telegram_diagnostics;
 
 pub(crate) use binding_delete::handle_workflow_binding_delete;
 pub(crate) use connection_delete::handle_workflow_connection_delete;
+pub(crate) use monitor_action_execute::handle_monitor_action_execute;
 pub(crate) use monitor_create::handle_monitor_create;
 pub(crate) use monitor_history::handle_monitor_history_list;
 pub(crate) use monitor_memory::handle_monitor_memory_save;
@@ -668,6 +670,11 @@ fn monitor_task_json(
         "ignored": monitor_metadata_bool(&task.metadata, "ignored"),
         "actions": monitor_actions(&task.metadata),
         "possible_ignore_reasons": monitor_ignore_reasons(&task.metadata),
+        "monitor": task_snapshot::metadata_value(
+            &task.metadata,
+            &["monitor"],
+            &[]
+        ),
         // Human-gated reply review state. `monitor_tasks[]` is what bobo's
         // Home feed renders, so the pending draft must surface HERE — adding
         // it only to `task_snapshot::task_json` (the `tasks[]` array) leaves
@@ -677,6 +684,7 @@ fn monitor_task_json(
             telegram_peer_avatars,
             telegram_peer_names
         ),
+        "source_messages": task_snapshot::monitor_source_messages(&task.metadata),
         "completion_policy": task_snapshot::monitor_completion_policy(&task.metadata),
         "source_state": task_snapshot::metadata_value(
             &task.metadata,
@@ -687,6 +695,11 @@ fn monitor_task_json(
             &task.metadata,
             &["monitor_task_gate", "monitorTaskGate"],
             &["task_gate", "taskGate"]
+        ),
+        "pending_action": task_snapshot::metadata_value(
+            &task.metadata,
+            &["pending_action", "pendingAction"],
+            &["pending_action", "pendingAction"]
         ),
         "pending_reply": task_snapshot::metadata_value(
             &task.metadata,
@@ -951,6 +964,174 @@ mod tests {
             "Deployment finished an hour ago."
         );
         assert_eq!(snapshot["monitor_task_error"], Value::Null);
+    }
+
+    #[test]
+    fn workflow_snapshot_monitor_tasks_include_telegram_source_messages() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::discover(tempdir.path());
+        let task_path = monitor_tasks_path(&paths);
+        std::fs::create_dir_all(task_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &task_path,
+            serde_json::to_string_pretty(&json!({
+                "tasks": [{
+                    "task_id": "monitor-world-cup",
+                    "subject": "回复世界杯今晚赛程",
+                    "description": "联系人发来今晚赛程请求。",
+                    "status": "pending",
+                    "metadata": {
+                        "_monitor": true,
+                        "monitor_connection": "telegram-user",
+                        "monitor_connector": "telegram-login",
+                        "source_text": "还有世界杯今晚的赛程",
+                        "source_message_id": 53970,
+                        "source_context": {
+                            "kind": "telegram_direct_message",
+                            "sender": { "name": "博阿 杜" },
+                            "context_messages": [
+                                { "from": "them", "direction": "incoming", "text": "在吗", "message_id": 53961 },
+                                { "from": "me", "direction": "outgoing", "text": "在", "message_id": 53962 },
+                                { "from": "me", "direction": "outgoing", "text": "今天怎么样", "message_id": 53963 },
+                                { "from": "them", "direction": "incoming", "text": "还行", "message_id": 53964 },
+                                { "from": "them", "direction": "incoming", "text": "跟我说下NVDA最近的财报情况", "message_id": 53965 },
+                                { "from": "me", "direction": "outgoing", "text": "汇报下明天杭州的天气", "message_id": 53967 },
+                                { "from": "me", "direction": "outgoing", "text": "还有世界杯今晚的赛程", "message_id": 53968 },
+                                { "from": "them", "direction": "incoming", "text": "汇报下明天杭州的天气", "message_id": 53969 }
+                            ]
+                        },
+                        "source_messages": [
+                            { "from": "me", "direction": "outgoing", "text": "在", "message_id": 53962 },
+                            { "from": "me", "direction": "outgoing", "text": "今天怎么样", "message_id": 53963 },
+                            { "from": "them", "direction": "incoming", "text": "还行", "message_id": 53964 },
+                            { "from": "them", "direction": "incoming", "text": "跟我说下NVDA最近的财报情况", "message_id": 53965 },
+                            { "from": "me", "direction": "outgoing", "text": "汇报下明天杭州的天气", "message_id": 53967 },
+                            { "from": "me", "direction": "outgoing", "text": "还有世界杯今晚的赛程", "message_id": 53968 },
+                            { "from": "them", "direction": "incoming", "text": "汇报下明天杭州的天气", "message_id": 53969 },
+                            { "from": "them", "direction": "incoming", "text": "还有世界杯今晚的赛程", "message_id": 53970 }
+                        ],
+                        "monitor": {
+                            "schema_version": 2,
+                            "kind": "telegram.reply",
+                            "source": {
+                                "connector_slug": "telegram-login",
+                                "connection_slug": "telegram-user",
+                                "message_id": 53970,
+                                "sender_name": "博阿 杜",
+                                "text": "还有世界杯今晚的赛程"
+                            },
+                            "action": { "type": "telegram_reply_draft" }
+                        }
+                    },
+                    "started_at_ms": 10,
+                    "updated_at_ms": 20
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let snapshot = handle_workflow_list(&paths).unwrap();
+        let tasks = snapshot["monitor_tasks"].as_array().unwrap();
+        let source_messages = tasks[0]["source_messages"].as_array().unwrap();
+
+        assert_eq!(source_messages.len(), 8);
+        assert_eq!(source_messages[0]["text"], "在");
+        assert_eq!(source_messages[0]["direction"], "outgoing");
+        assert_eq!(source_messages[7]["text"], "还有世界杯今晚的赛程");
+        assert_eq!(source_messages[7]["message_id"], 53970);
+    }
+
+    #[test]
+    fn workflow_snapshot_uses_typed_monitor_context_for_gmail_tasks() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::discover(tempdir.path());
+        let task_path = monitor_tasks_path(&paths);
+        std::fs::create_dir_all(task_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &task_path,
+            serde_json::to_string_pretty(&json!({
+                "tasks": [
+                    {
+                        "task_id": "monitor-gmail-1",
+                        "subject": "Confirm next week's meeting",
+                        "description": "Reply to the Gmail thread with available times.",
+                        "status": "pending",
+                        "metadata": {
+                            "_monitor": true,
+                            "monitor_connection": "gmail-browser",
+                            "monitor_connector": "gmail-browser",
+                            "monitor_memory_path": "/tmp/gmail-browser.md",
+                            "source_context": {
+                                "kind": "telegram_direct_message",
+                                "delivery_target": {
+                                    "type": "telegram_chat",
+                                    "chat_id": "999"
+                                }
+                            },
+                            "monitor": {
+                                "schema_version": 2,
+                                "kind": "gmail.reply",
+                                "source_hash": "sha256:b8e1bc99df97a47171b03fd10a708fb4c8220f8ae5cbe59e5c6ce4005cc847b2",
+                                "source": {
+                                    "connector_slug": "gmail-browser",
+                                    "connection_slug": "gmail-browser",
+                                    "account": "winterfell0614@gmail.com",
+                                    "thread_id": "thread-123",
+                                    "message_id": "message-123",
+                                    "from": {
+                                        "name": "Fu Xiangyu",
+                                        "email": "fuxiangyu@example.com"
+                                    }
+                                },
+                                "action": {
+                                    "type": "gmail_reply_draft",
+                                    "approval": "draft_then_create_gmail_draft"
+                                }
+                            },
+                            "pending_action": {
+                                "id": "draft-monitor-gmail-1-1",
+                                "type": "gmail_reply_draft",
+                                "status": "draft_ready",
+                                "version": 1,
+                                "agent_draft_text": "How about Tuesday afternoon?"
+                            }
+                        },
+                        "started_at_ms": 10,
+                        "updated_at_ms": 20
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let snapshot = handle_workflow_list(&paths).unwrap();
+        let monitor_tasks = snapshot["monitor_tasks"].as_array().unwrap();
+        let task_rows = snapshot["tasks"].as_array().unwrap();
+        let task_row = task_rows
+            .iter()
+            .find(|task| task["task_id"] == "monitor-gmail-1")
+            .expect("monitor task row");
+
+        assert_eq!(monitor_tasks[0]["monitor"]["kind"], "gmail.reply");
+        assert_eq!(monitor_tasks[0]["source_context"]["kind"], "gmail_message");
+        assert_eq!(
+            monitor_tasks[0]["source_context"]["delivery_target"]["type"],
+            "gmail_thread"
+        );
+        assert_eq!(
+            monitor_tasks[0]["source_context"]["sender"]["email"],
+            "fuxiangyu@example.com"
+        );
+        assert_eq!(
+            monitor_tasks[0]["pending_action"]["type"],
+            "gmail_reply_draft"
+        );
+
+        assert_eq!(task_row["monitor"]["kind"], "gmail.reply");
+        assert_eq!(task_row["source_context"]["kind"], "gmail_message");
+        assert_eq!(task_row["pending_action"]["type"], "gmail_reply_draft");
     }
 
     #[test]

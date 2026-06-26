@@ -45,16 +45,25 @@ Workflow:
    - `browser open https://example.com --label docs --width 1280 --height 900` opens or reuses a managed browser tab.
    - `browser tab new https://example.com --label scratch` forces a fresh tab.
    - `browser tab focus t1` switches the active agent-facing tab handle.
-   - Treat DOM readiness plus a fresh snapshot as the default page-ready signal.
-     Do not wait for full network idle unless the user explicitly asks to debug
-     network quiescence or a page-specific workflow requires all background
-     requests to stop.
+   - Treat DOM readiness as the page-ready signal; a single snapshot is enough to
+     start working. Do not wait for full network idle unless the user explicitly
+     asks to debug network quiescence or a page-specific workflow requires all
+     background requests to stop.
 
-3. Snapshot before interacting.
-   - `browser snapshot --tab-id t1` returns visible text and fresh refs like `@e1`.
-   - Refs are scoped to the tab and the latest snapshot. Re-snapshot after navigation, form submits, reloads, or dynamic page updates.
+3. Snapshot once to get your bearings.
+   - `browser snapshot --tab-id t1` returns the visible text and fresh refs like `@e1`.
+   - One snapshot lists every interactive ref currently in the viewport — enough to
+     plan a whole form or section. You do not need to snapshot before each field.
+   - Refs stay valid until the page changes. Re-snapshot only after a navigation or
+     when an action reports the page changed — not after every action (see step 5).
 
-4. Act on refs.
+4. Act on refs in batches, and trust the result.
+   - Fill or click every field in a form section back-to-back from the same
+     snapshot, then move on — do not snapshot between fields.
+   - Each action returns its result: many actions report the resulting page state
+     (current url, title, and refs); read that returned state to decide your next
+     move instead of taking a separate snapshot. When an action returns only a
+     brief success confirmation, trust it — a silent success means it worked.
    - `browser click @e3 --tab-id t1` clicks an element from the latest snapshot.
    - `browser focus @e3 --tab-id t1` focuses an element without clicking it.
    - `browser fill @e5 "hello" --tab-id t1` replaces text in an editable control. Use this for known final values in email, username, password, search, and address fields.
@@ -65,8 +74,24 @@ Workflow:
    - `browser check @e7 --tab-id t1` and `browser uncheck @e7 --tab-id t1` toggle checkbox-like controls.
    - `browser press Enter --tab-id t1` sends a key.
 
-5. Verify with another snapshot.
-   Use a new snapshot after each action that could change the page. Prefer refs over brittle coordinates and prefer the current tab id or label over positional assumptions.
+5. Snapshot again only when the page actually changed.
+   - Take a fresh snapshot after a navigation, a form submit that loads a new step,
+     or a reload — so you get fresh refs for the new content. An action result that
+     reports a new url/page is your cue.
+   - Do NOT re-snapshot to "verify" an in-place fill, click, check, or selection
+     that already returned success.
+   - If a later action fails because a ref is missing or has moved — the page
+     changed on its own after an earlier action (async validation, a revealed or
+     removed field) — take one fresh snapshot and continue from the new refs.
+     Never reuse a ref id from an earlier snapshot once the page has changed.
+   - Do NOT scroll up and down repeatedly to hunt for an element. The snapshot
+     lists the refs in the current viewport; if a control like a "Pay" or
+     "Continue" button is not among them, scroll once toward where it belongs
+     (usually the bottom of the form) and snapshot once — never loop
+     scroll+snapshot. Use `browser scroll-into-view @e5` to center a ref you
+     already have.
+   - Prefer refs over brittle coordinates, and prefer the current tab id or label
+     over positional assumptions.
 
 Global options:
 

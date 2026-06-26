@@ -11,8 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use grammers_client::types::{Chat, Message};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::warn;
 
+use crate::reply::reply_header_payload;
 use crate::state::SkillEnv;
 
 const CACHE_VERSION: u32 = 1;
@@ -57,6 +59,8 @@ pub struct TelegramHistoryMessage {
     pub sender_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<Value>,
     pub text: String,
 }
 
@@ -69,6 +73,8 @@ pub struct TelegramHistoryContextMessage {
     pub message_id: i32,
     pub date_ms: i64,
     pub ts: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<Value>,
     pub text: String,
 }
 
@@ -205,6 +211,7 @@ impl TelegramHistoryCache {
                 .as_ref()
                 .map(chat_display_name)
                 .and_then(|name| nonempty(&name)),
+            reply_to: reply_header_payload(message.reply_header()),
             text,
         };
         self.merge_message(
@@ -379,6 +386,7 @@ fn context_message_from_cache(
         message_id: message.message_id,
         date_ms: message.date_ms,
         ts: message.date_ms,
+        reply_to: message.reply_to,
         text: message.text,
     }
 }
@@ -488,6 +496,12 @@ mod tests {
                     date_ms: i64::from(id) * 100,
                     is_outgoing: id == 2,
                     sender_name: Some(if id == 2 { "Me" } else { "Chaofan" }.to_string()),
+                    reply_to: (id == 2).then(|| {
+                        serde_json::json!({
+                            "kind": "message",
+                            "message_id": 1,
+                        })
+                    }),
                     text: format!("message {id}"),
                     ..Default::default()
                 },
@@ -512,6 +526,13 @@ mod tests {
             vec!["message 2", "message 3"]
         );
         assert_eq!(context[0].from, "me");
+        assert_eq!(
+            context[0]
+                .reply_to
+                .as_ref()
+                .and_then(|reply_to| { reply_to.get("message_id").and_then(Value::as_i64) }),
+            Some(1)
+        );
         assert_eq!(context[1].from, "them");
     }
 

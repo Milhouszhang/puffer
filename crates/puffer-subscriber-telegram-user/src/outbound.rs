@@ -13,8 +13,10 @@ use serde_json::json;
 
 use crate::activity_state::record_agent_send_activity;
 use crate::events::emit_control;
+use crate::history_cache::{TelegramHistoryCache, TelegramHistoryMessage};
 use crate::peers::resolve_peer;
 use crate::polls::{hex_encode, resolve_poll_options};
+use crate::reply::reply_header_payload;
 use crate::state::SkillEnv;
 
 /// Resolves `peer` and sends text and optional attachments through Telegram.
@@ -259,6 +261,7 @@ fn record_sent_message_activity(
     message: &grammers_client::types::Message,
     reply_to: Option<i32>,
 ) {
+    record_sent_message_history(env, resolved, message, reply_to);
     if let Err(error) = record_agent_send_activity(
         env,
         resolved.id(),
@@ -272,6 +275,70 @@ fn record_sent_message_activity(
             %error,
             "failed to record Telegram agent send in activity state"
         );
+    }
+}
+
+fn record_sent_message_history(
+    env: &SkillEnv,
+    resolved: &Chat,
+    message: &grammers_client::types::Message,
+    reply_to: Option<i32>,
+) {
+    let Some(text) = nonempty_string(message.text()) else {
+        return;
+    };
+    let original = TelegramHistoryCache::load(env).unwrap_or_default();
+    let mut cache = original.clone();
+    let sender = message.sender();
+    let chat_title = nonempty_string(&resolved.name());
+    let chat_username = resolved.username().and_then(nonempty_string);
+    let reply_to_payload = reply_header_payload(message.reply_header()).or_else(|| {
+        reply_to.map(|message_id| {
+            json!({
+                "kind": "message",
+                "message_id": message_id,
+            })
+        })
+    });
+    cache.merge_message(
+        resolved.id(),
+        "user",
+        chat_title,
+        chat_username,
+        TelegramHistoryMessage {
+            message_id: message.id(),
+            date_ms: message.date().timestamp_millis(),
+            is_outgoing: true,
+            sender_id: sender.as_ref().map(Chat::id),
+            sender_username: sender
+                .as_ref()
+                .and_then(|sender| sender.username())
+                .and_then(nonempty_string),
+            sender_name: sender
+                .as_ref()
+                .map(|sender| sender.name().to_string())
+                .and_then(|name| nonempty_string(&name)),
+            reply_to: reply_to_payload,
+            text,
+        },
+        cache.limit_per_chat,
+    );
+    if let Err(error) = cache.save_if_changed(env, &original) {
+        tracing::warn!(
+            chat = %resolved.id(),
+            message_id = message.id(),
+            %error,
+            "failed to record Telegram sent message in history cache"
+        );
+    }
+}
+
+fn nonempty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
     }
 }
 

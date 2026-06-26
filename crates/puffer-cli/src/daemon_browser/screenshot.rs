@@ -4,15 +4,38 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::params::optional_u32;
 use super::{BrowserRegistry, BrowserSession};
 
 const SNAPSHOT_INSTRUCTION: &str =
-    "Refs are fresh for this snapshot. Re-snapshot after navigation or dynamic page changes.";
+    "Refs are fresh and stay valid until the page changes. Re-snapshot only after a navigation \
+     or a reported page change — not to confirm an action that already succeeded.";
 const ANNOTATED_SCREENSHOT_INSTRUCTION: &str =
     "Refs are fresh for this annotated screenshot. Re-annotate or re-snapshot after navigation or dynamic page changes.";
 const SCREENSHOT_OVERLAY_ID: &str = "__puffer_screenshot_overlay__";
+
+/// Instruction returned with a fused post-action snapshot (#646): a mutating
+/// action hands back the resulting page state so the agent acts on it without a
+/// standalone `snapshot` round-trip, which dominated checkout latency.
+pub(super) const POST_ACTION_INSTRUCTION: &str =
+    "Page state after your action, with refreshed refs. Decide your next step from this instead \
+     of taking a separate snapshot to confirm. Snapshot again only after a navigation or a \
+     further page change.";
+
+/// Grace window to let a navigation a click/submit may have triggered start
+/// (`Page.frameNavigated` flips `loading` true, which can arrive a little after
+/// the action returns) before snapshotting. A click that does not navigate is
+/// snapshotted as soon as this elapses.
+const POST_ACTION_SETTLE_MS: u64 = 250;
+/// Poll interval while watching for a triggered navigation to start.
+const POST_ACTION_SETTLE_POLL_MS: u64 = 25;
+/// Upper bound on waiting for a started navigation to reach DOM-ready before
+/// snapshotting anyway. Bounded so a slow or hung navigation never stalls the
+/// action — a still-loading page is snapshotted as-is and the agent re-checks.
+const POST_ACTION_LOAD_TIMEOUT_MS: u64 = 5_000;
 
 /// Element reference captured from the last agent browser snapshot.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -527,6 +550,37 @@ impl BrowserRegistry {
         }))
     }
 
+    /// Captures a post-action snapshot and merges it under `base`, so a mutating
+    /// browser action returns the resulting page state inline (#646). The agent
+    /// reads what changed from the action result and skips the standalone
+    /// `snapshot` round-trip that dominated checkout latency.
+    ///
+    /// `settle` first waits briefly for a navigation the action may have
+    /// triggered (a submit or "Continue" click) to reach DOM-ready, so the
+    /// snapshot reflects the new page rather than the old one. Best-effort
+    /// throughout: a settle timeout or snapshot failure degrades to returning
+    /// `base` unchanged — a mutating action must never fail because its courtesy
+    /// snapshot did.
+    pub(super) fn post_action_snapshot(
+        &self,
+        backend_session_id: &str,
+        base: Value,
+        settle: bool,
+    ) -> Value {
+        if settle {
+            if let Ok(session) = self.get(backend_session_id) {
+                settle_after_action(&session);
+            }
+        }
+        match self.agent_snapshot(backend_session_id) {
+            Ok(snapshot) => merge_action_snapshot(base, snapshot),
+            Err(error) => {
+                tracing::debug!(target: "puffer::browser", %error, "post-action snapshot skipped");
+                base
+            }
+        }
+    }
+
     /// Captures one still screenshot, optionally with fresh `@eN` annotations.
     pub(super) fn agent_screenshot(
         &self,
@@ -581,6 +635,58 @@ impl BrowserRegistry {
 fn capture_snapshot(session: &BrowserSession) -> Result<BrowserSnapshot> {
     let snapshot_value = session.evaluate(snapshot_expression().to_string())?.value;
     serde_json::from_value(snapshot_value).context("decode browser snapshot")
+}
+
+/// Best-effort settle for a navigation a mutating action may have triggered.
+/// Polls briefly for the load to START — a top-frame navigation flips the tab's
+/// `loading` flag true via `Page.frameNavigated`, which can arrive a little after
+/// the action returns — and, if one does, waits for it to reach DOM-ready before
+/// the caller snapshots. A click that does not navigate falls through after the
+/// short grace window and is snapshotted as-is. Never fails the action: a load
+/// that does not settle within the bound is logged and snapshotted mid-flight.
+fn settle_after_action(session: &BrowserSession) {
+    let grace = Duration::from_millis(POST_ACTION_SETTLE_MS);
+    let start = Instant::now();
+    let mut navigating = session.state().loading;
+    while !navigating && start.elapsed() < grace {
+        thread::sleep(Duration::from_millis(POST_ACTION_SETTLE_POLL_MS));
+        navigating = session.state().loading;
+    }
+    if navigating {
+        if let Err(error) =
+            session.wait_for_load(Duration::from_millis(POST_ACTION_LOAD_TIMEOUT_MS))
+        {
+            tracing::debug!(
+                target: "puffer::browser",
+                %error,
+                "post-action navigation did not settle in time; snapshotting current page"
+            );
+        }
+    }
+}
+
+/// Merges a fused post-action snapshot under an action's own result fields. The
+/// snapshot (`url`/`title`/`text`/`elements`) carries the page state and the
+/// refreshed refs; `base`'s fields (`ok`, plus any `mode`/`note` from a hosted
+/// or in-frame fill) win on conflict so the action's own report is preserved.
+/// The snapshot's `instruction` is replaced with the post-action guidance.
+pub(super) fn merge_action_snapshot(base: Value, snapshot: Value) -> Value {
+    let mut merged = snapshot;
+    let Some(object) = merged.as_object_mut() else {
+        // `agent_snapshot` always returns an object; if that ever changes, keep
+        // the action's own result rather than dropping it.
+        return base;
+    };
+    object.insert(
+        "instruction".to_string(),
+        Value::String(POST_ACTION_INSTRUCTION.to_string()),
+    );
+    if let Some(base_object) = base.as_object() {
+        for (key, value) in base_object {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    merged
 }
 
 fn parse_screenshot_format(raw: Option<&str>) -> Result<BrowserScreenshotFormat> {

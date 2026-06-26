@@ -78,6 +78,13 @@ pub use runtime::mcp_discovery;
 pub use runtime::quota::{QuotaError, QuotaErrorKind, QUOTA_EXIT_CODE};
 pub use runtime::resource_watcher;
 pub use runtime::resource_watcher::ResourceWatcher;
+
+pub mod monitor_contract {
+    pub use crate::runtime::claude_tools::workflow::monitor_contract::{
+        display_source_context, monitor_contract_hash, parse_monitor_contract, MonitorContract,
+        MonitorTaskKind, MONITOR_SCHEMA_VERSION,
+    };
+}
 pub use runtime::subscription_manager;
 pub use runtime::teammate_loop;
 pub use runtime::{
@@ -106,13 +113,28 @@ pub use runtime::{
     TurnUsageReport, UserQuestionPromptRequest, UserQuestionPromptResponse,
 };
 pub use runtime::{install_observability, observability_handle};
-pub use state::{AppState, MessageRole, RenderedMessage, TaskRecord, TaskStatus};
+pub use state::{
+    AppState, MessageRole, MonitorSourceStampContext, MonitorTaskCreateGateContext,
+    RenderedAttachment, RenderedMessage, TaskRecord, TaskStatus,
+};
 
 use anyhow::Result;
 use puffer_provider_registry::{AuthStore, ProviderRegistry};
 use puffer_resources::LoadedResources;
 use puffer_session_store::{SessionStore, SessionSummary};
 use std::path::Path;
+
+/// Applies an interactive Canvas state patch for a live daemon bridge.
+pub fn apply_canvas_state_patch(
+    cwd: &Path,
+    session_id: &str,
+    canvas_id: &str,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    runtime::claude_tools::workflow::canvas::apply_canvas_state_patch(
+        cwd, session_id, canvas_id, patch,
+    )
+}
 
 /// Executes a standalone LSP query against the configured workspace language servers.
 pub fn execute_lsp_query(

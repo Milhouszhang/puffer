@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const KEY_BYTES: usize = 32;
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "Puffer Code Secrets";
+#[cfg(target_os = "macos")]
 const KEYCHAIN_ACCOUNT: &str = "puffer-code";
 const OVERRIDE_KEY_ENV: &str = "PUFFER_SECRET_STORE_KEY";
 
@@ -101,7 +103,10 @@ fn load_or_create_file_key(store_path: &Path) -> Result<[u8; KEY_BYTES]> {
             .with_context(|| format!("create fallback key dir {}", parent.display()))?;
     }
     let key = random_key();
-    fs::write(&key_path, BASE64.encode(key))
+    // Reparse-safe create (Windows): the Chrome v20 import may create this key file
+    // as SYSTEM inside the user-writable vault dir, so it must not follow a reparse
+    // point a same-user process planted at the path. No-op difference elsewhere.
+    crate::write_file_no_follow(&key_path, BASE64.encode(key).as_bytes())
         .with_context(|| format!("write fallback secret key {}", key_path.display()))?;
     set_private_permissions(&key_path);
     Ok(key)

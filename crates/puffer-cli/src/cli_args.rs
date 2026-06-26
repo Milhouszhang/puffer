@@ -1,5 +1,5 @@
 use crate::browser_args::BrowserArgs;
-use crate::media_internal_tools::{ImageGenerationArgs, VideoGenerationArgs};
+use crate::media_internal_tools::{ImageGenerationArgs, MediaCapabilitiesArgs, VideoGenerationArgs};
 use crate::non_interactive::NonInteractiveArgs;
 use crate::subscriber_tool_args::{EmailArgs, SlackArgs, TelegramArgs};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -126,6 +126,12 @@ pub(crate) enum Command {
     Tool {
         #[command(subcommand)]
         command: ToolCommand,
+    },
+    /// Internal: self-elevating Windows Chrome v20 import stages. Hidden.
+    #[command(hide = true, name = "__win-chrome-import")]
+    WinChromeImport {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Resume a stored session in the TUI.
     #[command(hide = true)]
@@ -274,6 +280,9 @@ pub(crate) enum InternalToolCommand {
     /// Generate images through the parent media runtime.
     #[command(name = "image-generation", alias = "imagegen")]
     ImageGeneration(#[command(flatten)] ImageGenerationArgs),
+    /// List connected image/video generation providers and models.
+    #[command(name = "media-capabilities", alias = "mediacaps")]
+    MediaCapabilities(#[command(flatten)] MediaCapabilitiesArgs),
     /// Log in to Slack or look up Slack conversations through the parent runtime.
     Slack(#[command(flatten)] SlackArgs),
     /// Log in to Telegram or look up Telegram peers through the parent runtime.

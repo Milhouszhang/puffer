@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
+use puffer_core::monitor_contract::{display_source_context, parse_monitor_contract};
 use puffer_subscriptions::normalize_contact_id;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -205,8 +206,15 @@ fn task_json(task: TaskSnapshotRecord, source: &str, scope: &str, scope_label: &
             &["monitor_envelope_id", "monitorEnvelopeId"],
             &["envelope_id", "envelopeId"]
         ),
+        "monitor": metadata_value(&task.metadata, &["monitor"], &[]),
         "source_context": monitor_source_context(&task.metadata),
+        "source_messages": monitor_source_messages(&task.metadata),
         "completion_policy": monitor_completion_policy(&task.metadata),
+        "pending_action": metadata_value(
+            &task.metadata,
+            &["pending_action", "pendingAction"],
+            &["pending_action", "pendingAction"]
+        ),
         "pending_reply": metadata_value(
             &task.metadata,
             &["pending_reply", "pendingReply"],
@@ -360,6 +368,131 @@ pub(super) fn metadata_value(
         })
 }
 
+pub(super) fn monitor_source_messages(metadata: &Map<String, Value>) -> Option<Value> {
+    if let Some(messages) = metadata_value(metadata, &["source_messages", "sourceMessages"], &[])
+        .and_then(trim_source_message_array)
+    {
+        return Some(messages);
+    }
+
+    let source_context = metadata
+        .get("source_context")
+        .or_else(|| metadata.get("sourceContext"));
+    let mut messages = Vec::new();
+    if let Some(context) = source_context {
+        append_message_array(
+            &mut messages,
+            context
+                .get("source_messages")
+                .or_else(|| context.get("sourceMessages")),
+        );
+        append_message_array(
+            &mut messages,
+            context
+                .get("context_messages")
+                .or_else(|| context.get("contextMessages")),
+        );
+        append_message_array(
+            &mut messages,
+            context
+                .get("conversation_context")
+                .and_then(|conversation_context| conversation_context.get("messages")),
+        );
+    }
+    if messages.is_empty() {
+        return None;
+    }
+
+    if let Some(current) = current_source_message(metadata, source_context) {
+        if !message_array_contains_current(&messages, &current) {
+            messages.push(current);
+        }
+    }
+    let start = messages.len().saturating_sub(8);
+    Some(Value::Array(messages.into_iter().skip(start).collect()))
+}
+
+fn trim_source_message_array(value: Value) -> Option<Value> {
+    let messages = value.as_array()?.clone();
+    if messages.is_empty() {
+        return None;
+    }
+    let start = messages.len().saturating_sub(8);
+    Some(Value::Array(messages.into_iter().skip(start).collect()))
+}
+
+fn append_message_array(messages: &mut Vec<Value>, raw: Option<&Value>) {
+    let Some(raw_messages) = raw.and_then(Value::as_array) else {
+        return;
+    };
+    messages.extend(raw_messages.iter().cloned());
+}
+
+fn current_source_message(
+    metadata: &Map<String, Value>,
+    source_context: Option<&Value>,
+) -> Option<Value> {
+    let text = metadata_string(metadata, &["source_text", "sourceText"], &[]).or_else(|| {
+        source_context
+            .and_then(|context| context.get("text"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })?;
+    let message_id = metadata_number_i64(metadata, &["source_message_id", "sourceMessageId"])
+        .or_else(|| {
+            source_context
+                .and_then(|context| {
+                    context
+                        .get("message_id")
+                        .or_else(|| context.get("messageId"))
+                })
+                .and_then(number_i64)
+        });
+    let sender = source_context
+        .and_then(|context| context.get("sender"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    Some(json!({
+        "from": "them",
+        "direction": "incoming",
+        "sender": sender,
+        "message_id": message_id,
+        "text": text,
+    }))
+}
+
+fn message_array_contains_current(messages: &[Value], current: &Value) -> bool {
+    let current_text = current.get("text").and_then(Value::as_str);
+    let current_message_id = current.get("message_id").and_then(number_i64);
+    messages.iter().any(|message| {
+        let same_message_id = current_message_id
+            .zip(message.get("message_id").and_then(number_i64))
+            .is_some_and(|(left, right)| left == right);
+        let same_text = current_text
+            .zip(message.get("text").and_then(Value::as_str))
+            .is_some_and(|(left, right)| left == right);
+        same_message_id || same_text
+    })
+}
+
+fn metadata_number_i64(metadata: &Map<String, Value>, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| metadata.get(*key).and_then(number_i64))
+}
+
+fn number_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
+        Value::String(value) => value.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
 fn monitor_actions(metadata: &Map<String, Value>) -> Vec<Value> {
     metadata
         .get("actions")
@@ -386,6 +519,9 @@ fn monitor_actions(metadata: &Map<String, Value>) -> Vec<Value> {
 }
 
 pub(super) fn monitor_source_context(metadata: &Map<String, Value>) -> Option<Value> {
+    if let Some(contract) = parse_monitor_contract(metadata).ok().flatten() {
+        return with_verbatim_source_text(metadata, Some(display_source_context(&contract)));
+    }
     let context = metadata
         .get("source_context")
         .or_else(|| metadata.get("sourceContext"))
@@ -988,5 +1124,81 @@ mod tests {
             monitor_task["source_context"]["delivery_target"]["chat_kind"],
             "group"
         );
+    }
+
+    #[test]
+    fn task_context_promotes_legacy_telegram_context_messages_to_source_messages() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::discover(tempdir.path());
+        let workflow = workflow_root(&paths);
+        std::fs::create_dir_all(&workflow).unwrap();
+        std::fs::write(
+            workflow.join("monitor_tasks.json"),
+            serde_json::to_string_pretty(&json!({
+                "tasks": [{
+                    "task_id": "monitor-f1",
+                    "subject": "简报今年 F1 的竞争格局",
+                    "description": "联系人要求简报今年 F1 的竞争格局。",
+                    "status": "pending",
+                    "metadata": {
+                        "_monitor": true,
+                        "monitor_connection": "telegram-user",
+                        "monitor_connector": "telegram-login",
+                        "monitor_envelope_id": "env-f1",
+                        "source_text": "简报下今年F1的竞争格局",
+                        "source_message_id": 53953,
+                        "source_context": {
+                            "kind": "telegram_direct_message",
+                            "sender": { "name": "博阿 杜" },
+                            "context_messages": [
+                                { "from": "them", "direction": "incoming", "text": "old 1", "message_id": 1 },
+                                { "from": "them", "direction": "incoming", "text": "old 2", "message_id": 2 },
+                                { "from": "them", "direction": "incoming", "text": "old 3", "message_id": 3 },
+                                { "from": "them", "direction": "incoming", "text": "old 4", "message_id": 4 },
+                                { "from": "them", "direction": "incoming", "text": "old 5", "message_id": 5 },
+                                { "from": "them", "direction": "incoming", "text": "old 6", "message_id": 6 },
+                                { "from": "them", "direction": "incoming", "text": "在吗", "message_id": 53950 },
+                                { "from": "me", "direction": "outgoing", "text": "在", "message_id": 53952 }
+                            ]
+                        },
+                        "monitor": {
+                            "schema_version": 2,
+                            "kind": "telegram.reply",
+                            "source": {
+                                "connector_slug": "telegram-login",
+                                "connection_slug": "telegram-user",
+                                "chat_id": 8759047281_i64,
+                                "chat_kind": "user",
+                                "message_id": 53953,
+                                "sender_name": "博阿 杜",
+                                "text": "简报下今年F1的竞争格局"
+                            },
+                            "action": {
+                                "type": "telegram_reply_draft",
+                                "approval": "draft_then_send"
+                            }
+                        }
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut snapshot = json!({});
+        add_task_context(&paths, &mut snapshot);
+        let tasks = snapshot["tasks"].as_array().unwrap();
+        let monitor_task = tasks
+            .iter()
+            .find(|task| task["task_id"] == "monitor-f1")
+            .unwrap();
+        let source_messages = monitor_task["source_messages"].as_array().unwrap();
+
+        assert_eq!(source_messages.len(), 8);
+        assert_eq!(source_messages[0]["text"], "old 2");
+        assert_eq!(source_messages[6]["text"], "在");
+        assert_eq!(source_messages[6]["direction"], "outgoing");
+        assert_eq!(source_messages[7]["text"], "简报下今年F1的竞争格局");
+        assert_eq!(source_messages[7]["message_id"], 53953);
     }
 }

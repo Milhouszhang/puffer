@@ -63,8 +63,8 @@ use puffer_provider_registry::{
 };
 use puffer_resources::{load_resources, LoadedResources, McpServerSpec};
 use puffer_session_store::{
-    MessageActor, SessionMetadata, SessionStore, StoredAttachment, TranscriptEvent,
-    TurnBoundaryState,
+    MessageActor, SessionMetadata, SessionStore, StoredAttachment, StoredAttachmentKind,
+    TranscriptEvent, TurnBoundaryState,
 };
 use puffer_transport_anthropic::{
     parse_authorization_input as parse_anthropic_authorization_input, ANTHROPIC_API_BASE_URL,
@@ -570,8 +570,151 @@ struct TurnProgress {
     assistant_text_retry_checkpoint: usize,
     tool_invocations: Vec<ToolInvocation>,
     tool_invocations_retry_checkpoint: usize,
+    ordered_items: Vec<TurnProgressItem>,
+    ordered_items_retry_checkpoint: usize,
     pending_tool_calls: Vec<ToolCallRequest>,
     persisted_on_cancel: bool,
+}
+
+enum TurnProgressItem {
+    AssistantText(String),
+    PendingToolCall(ToolCallRequest),
+    ToolInvocation(ToolInvocation),
+}
+
+impl TurnProgress {
+    fn record_text_delta(&mut self, delta: &str) {
+        self.assistant_text.push_str(delta);
+        match self.ordered_items.last_mut() {
+            Some(TurnProgressItem::AssistantText(text)) => text.push_str(delta),
+            _ => self
+                .ordered_items
+                .push(TurnProgressItem::AssistantText(delta.to_string())),
+        }
+    }
+
+    fn record_tool_invocations(&mut self, invocations: Vec<ToolInvocation>) {
+        for invocation in invocations {
+            self.tool_invocations.push(invocation.clone());
+            let pending_index = self
+                .pending_tool_calls
+                .iter()
+                .position(|request| request.call_id == invocation.call_id);
+            if let Some(index) = pending_index {
+                self.pending_tool_calls.remove(index);
+            }
+            if let Some(text) = send_user_message_text(&invocation.tool_id, &invocation.input) {
+                if let Some(index) = self.pending_tool_item_index(&invocation.call_id) {
+                    self.ordered_items[index] = TurnProgressItem::AssistantText(text);
+                } else {
+                    self.push_ordered_assistant_text(text);
+                }
+                continue;
+            }
+            let ordered_index = self.ordered_items.iter().position(|item| {
+                matches!(
+                    item,
+                    TurnProgressItem::PendingToolCall(request)
+                        if request.call_id == invocation.call_id
+                )
+            });
+            if let Some(index) = ordered_index {
+                self.ordered_items[index] = TurnProgressItem::ToolInvocation(invocation);
+            } else {
+                self.ordered_items
+                    .push(TurnProgressItem::ToolInvocation(invocation));
+            }
+        }
+    }
+
+    fn record_tool_call_requests(&mut self, requests: Vec<ToolCallRequest>) {
+        for request in requests {
+            self.pending_tool_calls.push(request.clone());
+            self.ordered_items
+                .push(TurnProgressItem::PendingToolCall(request));
+        }
+    }
+
+    fn pending_tool_item_index(&self, call_id: &str) -> Option<usize> {
+        self.ordered_items.iter().position(|item| {
+            matches!(
+                item,
+                TurnProgressItem::PendingToolCall(request) if request.call_id == call_id
+            )
+        })
+    }
+
+    fn push_ordered_assistant_text(&mut self, text: String) {
+        match self.ordered_items.last_mut() {
+            Some(TurnProgressItem::AssistantText(existing)) => existing.push_str(&text),
+            _ => self
+                .ordered_items
+                .push(TurnProgressItem::AssistantText(text)),
+        }
+    }
+
+    fn checkpoint_stream_attempt(&mut self) {
+        self.assistant_text_retry_checkpoint = self.assistant_text.len();
+        self.tool_invocations_retry_checkpoint = self.tool_invocations.len();
+        self.ordered_items_retry_checkpoint = self.ordered_items.len();
+    }
+
+    fn reset_to_retry_checkpoint(&mut self) {
+        let checkpoint = self
+            .assistant_text_retry_checkpoint
+            .min(self.assistant_text.len());
+        self.assistant_text.truncate(checkpoint);
+        let tool_checkpoint = self
+            .tool_invocations_retry_checkpoint
+            .min(self.tool_invocations.len());
+        self.tool_invocations.truncate(tool_checkpoint);
+        let ordered_checkpoint = self
+            .ordered_items_retry_checkpoint
+            .min(self.ordered_items.len());
+        self.ordered_items.truncate(ordered_checkpoint);
+        self.pending_tool_calls.clear();
+    }
+}
+
+fn send_user_message_text(tool_id: &str, input: &str) -> Option<String> {
+    if !matches!(tool_id, "SendUserMessage" | "Brief") {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(input).ok()?;
+    let message = parsed.get("message")?.as_str()?.to_string();
+    if message.trim().is_empty() {
+        return None;
+    }
+    Some(message)
+}
+
+/// Resolves browser launch settings, degrading to the empty default when
+/// staging fails so a captcha-extension staging error never blocks daemon
+/// startup (issue #670).
+///
+/// `BrowserLaunchSettings::from_config` stages bundled browser extensions (most
+/// notably the NopeCHA captcha extension) into a SHARED per-user dir. On a Bobo
+/// launch two stagers race for that dir — the native CEF host and the freshly
+/// spawned daemon — and before this guard a transient staging failure (e.g. the
+/// race deleting the destination mid-copy) propagated out of `DaemonState::load`
+/// via `?`. The daemon then exited before printing its handshake and Bobo
+/// surfaced a fatal "empty handshake line" startup dialog. The shared stage is
+/// now lock-serialized in `puffer-config`, but we additionally never let a
+/// staging error be fatal: on failure we log and start with no browser
+/// extensions so chat still comes up and the handshake is printed.
+fn browser_launch_settings_or_default(
+    result: Result<BrowserLaunchSettings>,
+) -> BrowserLaunchSettings {
+    match result {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!(
+                "puffer daemon: browser extension staging failed ({error:#}); \
+                 continuing without browser extensions"
+            );
+            BrowserLaunchSettings::default()
+        }
+    }
 }
 
 impl DaemonState {
@@ -584,7 +727,11 @@ impl DaemonState {
         yolo: bool,
     ) -> Result<Self> {
         let config = load_config(&paths)?;
-        let browser_launch_settings = BrowserLaunchSettings::from_config(&paths, &config)?;
+        // Browser extension staging (e.g. the NopeCHA captcha extension) must
+        // never block the daemon from coming up and printing its handshake.
+        // See `browser_launch_settings_or_default` for the rationale (#670).
+        let browser_launch_settings =
+            browser_launch_settings_or_default(BrowserLaunchSettings::from_config(&paths, &config));
         let (events, _rx) = broadcast::channel::<ServerEnvelope>(256);
         let browser_profile_root = paths.user_config_dir.join("browser-profiles");
         let ptys = Arc::new(PtyRegistry::new());
@@ -1365,6 +1512,13 @@ async fn dispatch_request(
         "import_chrome_secrets" => {
             respond!(detached!(|s| handle_import_chrome_secrets(&s)))
         }
+        "import_browser_secrets" => {
+            respond!(detached!(|s, p| handle_import_browser_secrets(&s, &p)))
+        }
+        "list_secret_sources" => respond!(handle_list_secret_sources()),
+        "import_onepassword_export" => {
+            respond!(detached!(|s, p| handle_import_onepassword_export(&s, &p)))
+        }
         "test_proxy" => respond!(detached!(|s, p| handle_test_proxy(&s, &p))),
         "create_openai_realtime_client_secret" => {
             respond!(detached!(|s, p| {
@@ -1442,6 +1596,7 @@ async fn dispatch_request(
         "browser_agent" => respond!(detached!(|s, p| {
             crate::daemon_browser::handle_browser_agent(&s, &p)
         })),
+        "canvas_state_update" => respond!(detached!(|s, p| handle_canvas_state_update(&s, &p))),
         "local_model_status" => {
             respond!(detached!(|s, p| handle_local_model_status(&s, &p)))
         }
@@ -1474,11 +1629,20 @@ async fn dispatch_request(
         "monitor_reply_send" | "task_monitor_reply_send" => respond!(
             crate::daemon_workflows::handle_monitor_reply_send(&state.paths, &params)
         ),
+        "monitor_action_execute" | "task_monitor_action_execute" => respond!(
+            crate::daemon_workflows::handle_monitor_action_execute(&state.paths, &params)
+        ),
         "monitor_memory_save" | "task_monitor_memory_save" => respond!(
             crate::daemon_workflows::handle_monitor_memory_save(&state.paths, &params)
         ),
         "monitor_history_list" | "task_monitor_history_list" => respond!(
             crate::daemon_workflows::handle_monitor_history_list(&state.paths, &params)
+        ),
+        "monitor_trace_list" | "task_monitor_trace_list" => respond!(
+            crate::daemon_workflows::handle_monitor_trace_list(&state.paths, &params)
+        ),
+        "telegram_diagnostics_export" | "task_telegram_diagnostics_export" => respond!(
+            crate::daemon_workflows::handle_telegram_diagnostics_export(&state.paths, &params)
         ),
         "workflow_binding_delete" => respond!(
             crate::daemon_workflows::handle_workflow_binding_delete(&state.paths, &params)
@@ -1623,6 +1787,30 @@ async fn dispatch_request(
 // ---------------------------------------------------------------------------
 // RPC handlers — blocking work runs in a tokio::task::spawn_blocking closure.
 // ---------------------------------------------------------------------------
+
+fn handle_canvas_state_update(state: &DaemonState, params: &Value) -> Result<Value> {
+    let session_id = params
+        .get("sessionId")
+        .or_else(|| params.get("session_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("canvas_state_update requires sessionId"))?;
+    let canvas_id = params
+        .get("canvasId")
+        .or_else(|| params.get("canvas_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("canvas_state_update requires canvasId"))?;
+    let patch = params
+        .get("patch")
+        .ok_or_else(|| anyhow::anyhow!("canvas_state_update requires patch"))?;
+    let session_store = SessionStore::from_paths(&state.paths)?;
+    let cwd = desktop_api::load_session_cwd(&session_store, session_id)?;
+    let updated = puffer_core::apply_canvas_state_patch(&cwd, session_id, canvas_id, patch)?;
+    Ok(json!({
+        "ok": true,
+        "canvasId": canvas_id,
+        "updatedAtMs": updated.get("updatedAtMs").cloned().unwrap_or(Value::Null)
+    }))
+}
 
 fn handle_list_grouped_sessions(state: &DaemonState) -> Result<Value> {
     let session_store = SessionStore::from_paths(&state.paths)?;
@@ -2086,6 +2274,36 @@ fn first_telegram_account_slug(root: &std::path::Path) -> Option<String> {
 
 fn handle_import_chrome_secrets(state: &DaemonState) -> Result<Value> {
     let report = crate::daemon_secrets::import_chrome_secrets(state.config_paths())?;
+    let settings = handle_load_settings_snapshot(state)?;
+    Ok(json!({
+        "settings": settings,
+        "report": report,
+    }))
+}
+
+fn handle_import_browser_secrets(state: &DaemonState, params: &Value) -> Result<Value> {
+    let source = params
+        .get("source")
+        .and_then(|value| value.as_str())
+        .context("import_browser_secrets requires a `source`")?;
+    let report = crate::daemon_secrets::import_browser_secrets(state.config_paths(), source)?;
+    let settings = handle_load_settings_snapshot(state)?;
+    Ok(json!({
+        "settings": settings,
+        "report": report,
+    }))
+}
+
+fn handle_list_secret_sources() -> Result<Value> {
+    Ok(json!({ "sources": crate::daemon_secrets::list_secret_sources() }))
+}
+
+fn handle_import_onepassword_export(state: &DaemonState, params: &Value) -> Result<Value> {
+    let path = params
+        .get("path")
+        .and_then(|value| value.as_str())
+        .context("import_onepassword_export requires a `path`")?;
+    let report = crate::daemon_secrets::import_onepassword_export(state.config_paths(), path)?;
     let settings = handle_load_settings_snapshot(state)?;
     Ok(json!({
         "settings": settings,
@@ -4211,62 +4429,89 @@ fn persist_cancelled_turn_progress(
     session_uuid: Uuid,
     progress: &Arc<Mutex<TurnProgress>>,
 ) -> Result<()> {
-    let (assistant_text, tool_invocations, pending_tool_calls) = {
+    let ordered_items = {
         let mut progress = progress.lock().unwrap();
         if progress.persisted_on_cancel {
             return Ok(());
         }
         progress.persisted_on_cancel = true;
-        (
-            std::mem::take(&mut progress.assistant_text),
-            std::mem::take(&mut progress.tool_invocations),
-            std::mem::take(&mut progress.pending_tool_calls),
-        )
+        std::mem::take(&mut progress.ordered_items)
     };
 
-    if !assistant_text.is_empty() {
-        session_store.append_event(
-            session_uuid,
-            TranscriptEvent::AssistantMessage {
-                text: assistant_text,
-                actor: None,
-            },
-        )?;
-    }
-    for invocation in tool_invocations {
-        session_store.append_event(
-            session_uuid,
-            TranscriptEvent::ToolInvocation {
-                call_id: invocation.call_id,
-                tool_id: invocation.tool_id,
-                input: invocation.input,
-                output: invocation.output,
-                success: invocation.success,
-                metadata: (!invocation.metadata.is_null()).then_some(invocation.metadata),
-                actor: None,
-                subject: None,
-            },
-        )?;
-    }
-    for request in pending_tool_calls {
-        session_store.append_event(
-            session_uuid,
-            TranscriptEvent::ToolInvocation {
-                call_id: request.call_id,
-                tool_id: request.tool_id,
-                input: request.input,
-                output: CANCELLED_TURN_MESSAGE.to_string(),
-                success: false,
-                metadata: Some(json!({
-                    "cancelled": true,
-                    "reason": "interrupted_by_user"
-                })),
-                actor: None,
-                subject: None,
-            },
-        )?;
-    }
+    append_ordered_turn_progress(
+        session_store,
+        session_uuid,
+        ordered_items,
+        None,
+        |_| None,
+        true,
+    )?;
     Ok(())
+}
+
+fn append_ordered_turn_progress(
+    session_store: &SessionStore,
+    session_uuid: Uuid,
+    ordered_items: Vec<TurnProgressItem>,
+    actor: Option<MessageActor>,
+    subject_for_tool: impl Fn(&ToolInvocation) -> Option<MessageActor>,
+    fail_pending_tools: bool,
+) -> Result<String> {
+    let mut assistant_text = String::new();
+    for item in ordered_items {
+        match item {
+            TurnProgressItem::AssistantText(text) => {
+                assistant_text.push_str(&text);
+                if !text.is_empty() {
+                    session_store.append_event(
+                        session_uuid,
+                        TranscriptEvent::AssistantMessage {
+                            text,
+                            actor: actor.clone(),
+                        },
+                    )?;
+                }
+            }
+            TurnProgressItem::ToolInvocation(invocation) => {
+                let subject = subject_for_tool(&invocation);
+                session_store.append_event(
+                    session_uuid,
+                    TranscriptEvent::ToolInvocation {
+                        call_id: invocation.call_id,
+                        tool_id: invocation.tool_id,
+                        input: invocation.input,
+                        output: invocation.output,
+                        success: invocation.success,
+                        metadata: (!invocation.metadata.is_null()).then_some(invocation.metadata),
+                        actor: actor.clone(),
+                        subject,
+                    },
+                )?;
+            }
+            TurnProgressItem::PendingToolCall(request) => {
+                if !fail_pending_tools {
+                    continue;
+                }
+                session_store.append_event(
+                    session_uuid,
+                    TranscriptEvent::ToolInvocation {
+                        call_id: request.call_id,
+                        tool_id: request.tool_id,
+                        input: request.input,
+                        output: CANCELLED_TURN_MESSAGE.to_string(),
+                        success: false,
+                        metadata: Some(json!({
+                            "cancelled": true,
+                            "reason": "interrupted_by_user"
+                        })),
+                        actor: actor.clone(),
+                        subject: None,
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(assistant_text)
 }
 
 // ---------------------------------------------------------------------------
@@ -4514,6 +4759,8 @@ fn turn_browser_tab_context(
 }
 
 const MONITOR_REPLY_ACTION_PROMPT_SCOPE: &str = "monitor-reply-action";
+const MONITOR_GMAIL_ACTION_PROMPT_SCOPE: &str = "monitor-gmail-action";
+const MONITOR_TELEGRAM_ACTION_PROMPT_SCOPE: &str = "monitor-telegram-action";
 const MONITOR_ACTION_PROMPT_PREFIX: &str = "Act on monitored task ";
 
 #[derive(Clone, Debug)]
@@ -4535,6 +4782,9 @@ fn resolve_monitor_reply_turn_scope(
         if monitor_action_task_id_param(params).is_some() {
             anyhow::bail!("monitorActionTaskId requires a monitor action prompt");
         }
+        if monitor_action_kind_param(params).is_some() {
+            anyhow::bail!("monitorActionKind requires a monitor action prompt");
+        }
         return resolve_existing_monitor_reply_session_scope(state, session_id, turn_id);
     };
     let Some(explicit_task_id) = monitor_action_task_id_param(params) else {
@@ -4547,12 +4797,53 @@ fn resolve_monitor_reply_turn_scope(
     }
 
     let task = load_monitor_task_for_scope(&state.paths, &prompt_task_id)?;
-    if !monitor_task_is_human_gated(&task) {
-        return Ok(None);
+    let stored_kind = monitor_task_kind(&task);
+    if stored_kind.is_some() && monitor_action_kind_param(params).is_none() {
+        anyhow::bail!("typed monitor action prompt requires matching monitorActionKind");
     }
-    if !monitor_task_has_delivery_target(&task) {
-        anyhow::bail!("monitor task `{prompt_task_id}` is missing a source delivery target");
+    if let (Some(explicit_kind), Some(stored_kind)) =
+        (monitor_action_kind_param(params), stored_kind.as_deref())
+    {
+        if explicit_kind != stored_kind {
+            anyhow::bail!(
+                "monitorActionKind `{explicit_kind}` does not match monitor task kind `{stored_kind}`"
+            );
+        }
     }
+    let prompt_tool_scope = match stored_kind.as_deref() {
+        Some("gmail.reply") => {
+            if monitor_task_is_terminal(&task) {
+                return Ok(None);
+            }
+            if !monitor_task_has_gmail_thread_target(&task) {
+                anyhow::bail!("monitor task `{prompt_task_id}` is missing a Gmail thread target");
+            }
+            MONITOR_GMAIL_ACTION_PROMPT_SCOPE
+        }
+        Some("telegram.reply") => {
+            if monitor_task_is_terminal(&task) {
+                return Ok(None);
+            }
+            if !monitor_task_has_delivery_target(&task) {
+                anyhow::bail!(
+                    "monitor task `{prompt_task_id}` is missing a source delivery target"
+                );
+            }
+            MONITOR_TELEGRAM_ACTION_PROMPT_SCOPE
+        }
+        Some(kind) if kind != "telegram.reply" => return Ok(None),
+        _ => {
+            if !monitor_task_is_human_gated(&task) {
+                return Ok(None);
+            }
+            if !monitor_task_has_delivery_target(&task) {
+                anyhow::bail!(
+                    "monitor task `{prompt_task_id}` is missing a source delivery target"
+                );
+            }
+            MONITOR_REPLY_ACTION_PROMPT_SCOPE
+        }
+    };
     state
         .monitor_reply_sessions
         .lock()
@@ -4563,7 +4854,7 @@ fn resolve_monitor_reply_turn_scope(
         task_id: prompt_task_id,
         session_id: session_id.to_string(),
         turn_id: turn_id.to_string(),
-        prompt_tool_scope: MONITOR_REPLY_ACTION_PROMPT_SCOPE,
+        prompt_tool_scope,
     }))
 }
 
@@ -4603,7 +4894,7 @@ fn resolve_existing_monitor_reply_session_scope(
             return Ok(None);
         }
     };
-    if monitor_task_is_terminal(&task) || !monitor_task_is_human_gated(&task) {
+    if monitor_task_is_terminal(&task) {
         state
             .monitor_reply_sessions
             .lock()
@@ -4611,15 +4902,48 @@ fn resolve_existing_monitor_reply_session_scope(
             .remove(session_id);
         return Ok(None);
     }
-    if !monitor_task_has_delivery_target(&task) {
-        anyhow::bail!("monitor task `{task_id}` is missing a source delivery target");
-    }
+    let prompt_tool_scope = match monitor_task_kind(&task).as_deref() {
+        Some("gmail.reply") => {
+            if !monitor_task_has_gmail_thread_target(&task) {
+                anyhow::bail!("monitor task `{task_id}` is missing a Gmail thread target");
+            }
+            MONITOR_GMAIL_ACTION_PROMPT_SCOPE
+        }
+        Some("telegram.reply") => {
+            if !monitor_task_has_delivery_target(&task) {
+                anyhow::bail!("monitor task `{task_id}` is missing a source delivery target");
+            }
+            MONITOR_TELEGRAM_ACTION_PROMPT_SCOPE
+        }
+        Some(kind) if kind != "telegram.reply" => {
+            state
+                .monitor_reply_sessions
+                .lock()
+                .unwrap()
+                .remove(session_id);
+            return Ok(None);
+        }
+        _ => {
+            if !monitor_task_is_human_gated(&task) {
+                state
+                    .monitor_reply_sessions
+                    .lock()
+                    .unwrap()
+                    .remove(session_id);
+                return Ok(None);
+            }
+            if !monitor_task_has_delivery_target(&task) {
+                anyhow::bail!("monitor task `{task_id}` is missing a source delivery target");
+            }
+            MONITOR_REPLY_ACTION_PROMPT_SCOPE
+        }
+    };
 
     Ok(Some(MonitorReplyTurnScope {
         task_id,
         session_id: session_id.to_string(),
         turn_id: turn_id.to_string(),
-        prompt_tool_scope: MONITOR_REPLY_ACTION_PROMPT_SCOPE,
+        prompt_tool_scope,
     }))
 }
 
@@ -4659,6 +4983,35 @@ fn monitor_action_task_id_param(params: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .and_then(non_empty_str)
         .map(ToString::to_string)
+}
+
+fn monitor_action_kind_param(params: &Value) -> Option<String> {
+    params
+        .get("monitorActionKind")
+        .or_else(|| params.get("monitor_action_kind"))
+        .and_then(Value::as_str)
+        .and_then(non_empty_str)
+        .map(ToString::to_string)
+}
+
+fn monitor_task_kind(task: &Value) -> Option<String> {
+    task.get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("monitor"))
+        .and_then(Value::as_object)
+        .and_then(|monitor| {
+            let schema_version = monitor
+                .get("schema_version")
+                .or_else(|| monitor.get("schemaVersion"))
+                .and_then(Value::as_u64)?;
+            (schema_version == 2).then(|| {
+                monitor
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .and_then(non_empty_str)
+                    .map(ToString::to_string)
+            })?
+        })
 }
 
 fn load_monitor_task_for_scope(paths: &ConfigPaths, task_id: &str) -> Result<Value> {
@@ -4717,6 +5070,8 @@ fn monitor_task_has_delivery_target(task: &Value) -> bool {
         .or_else(|| task.pointer("/metadata/sourceContext/deliveryTarget/chatId"))
         .or_else(|| task.pointer("/metadata/sourceContext/deliveryTarget/chat_id"))
         .or_else(|| task.pointer("/metadata/source_context/deliveryTarget/chatId"))
+        .or_else(|| task.pointer("/metadata/monitor/source/chat_id"))
+        .or_else(|| task.pointer("/metadata/monitor/source/chatId"))
         .and_then(value_to_non_empty_string)
         .is_some()
         || task
@@ -4729,6 +5084,15 @@ fn monitor_task_has_delivery_target(task: &Value) -> bool {
                 .or_else(|| task.pointer("/metadata/chatId"))
                 .and_then(value_to_non_empty_string)
                 .is_some()
+}
+
+fn monitor_task_has_gmail_thread_target(task: &Value) -> bool {
+    monitor_task_kind(task).as_deref() == Some("gmail.reply")
+        && task
+            .pointer("/metadata/monitor/source/thread_id")
+            .or_else(|| task.pointer("/metadata/monitor/source/threadId"))
+            .and_then(value_to_non_empty_string)
+            .is_some()
 }
 
 fn monitor_task_is_terminal(task: &Value) -> bool {
@@ -5094,27 +5458,50 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 .append_event(session_uuid, app_state.snapshot_event());
         }
 
-        // Materialize uploaded attachments to agent-readable temp paths and
-        // build the model-facing message that references them. The persisted
-        // transcript event below keeps the original text so the UI is
-        // unchanged; `model_input` must be used at BOTH push_message and the
-        // turn call so `transcript_to_items` dedups to a single user message.
-        // `push_message` stores `model_input` in the in-memory `app_state`, so
-        // the path-annotated text (not the UI text) is what later continuation
-        // turns re-send as history — intentional and benign: the `/tmp` paths
-        // are deterministic and never rendered in the UI, which always replays
-        // the original `UserMessage` event.
-        let materialized = crate::attachment_bridge::materialize_attachments(
+        // File attachments still receive temp path hints for Read. Image
+        // attachments stay as metadata here and hydrate to transient data URLs
+        // on AppState below.
+        let file_attachments = staged_attachments_for_thread
+            .iter()
+            .filter(|attachment| attachment.kind == StoredAttachmentKind::File)
+            .cloned()
+            .collect::<Vec<_>>();
+        let materialized_files = crate::attachment_bridge::materialize_attachments(
             &inputs.session_store,
             session_uuid,
-            &staged_attachments_for_thread,
+            &file_attachments,
         );
         let model_input =
-            crate::attachment_bridge::build_model_input(&message_for_thread, &materialized);
+            crate::attachment_bridge::build_model_input(&message_for_thread, &materialized_files);
+
+        app_state.push_user_message_with_attachments(
+            model_input.clone(),
+            staged_attachments_for_thread
+                .iter()
+                .cloned()
+                .map(puffer_core::RenderedAttachment::from_stored)
+                .collect(),
+        );
+        if let Err(err) = crate::attachment_bridge::hydrate_model_image_urls(
+            &mut app_state,
+            &inputs.session_store,
+            session_uuid,
+        ) {
+            publish_turn_error_event(
+                &setup_state,
+                &channel_thread,
+                &session_id_for_thread,
+                &turn_id_thread,
+                format!("{err:#}"),
+                None,
+                Some("attachment-hydration"),
+            );
+            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+            return;
+        }
 
         // Persist the user message before the turn starts so a crash
         // doesn't silently drop it.
-        app_state.push_message(MessageRole::User, model_input.clone());
         if !user_prompt_persisted_thread.swap(true, Ordering::SeqCst) {
             let _ = inputs.session_store.append_event(
                 session_uuid,
@@ -5147,7 +5534,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
             }
             let payload = match event {
                 TurnStreamEvent::TextDelta(delta) => {
-                    ev_progress.lock().unwrap().assistant_text.push_str(&delta);
+                    ev_progress.lock().unwrap().record_text_delta(&delta);
                     json!({"type": "text-delta", "turnId": ev_turn, "delta": delta})
                 }
                 TurnStreamEvent::ThinkingDelta(delta) => {
@@ -5157,8 +5544,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     ev_progress
                         .lock()
                         .unwrap()
-                        .pending_tool_calls
-                        .extend(reqs.clone());
+                        .record_tool_call_requests(reqs.clone());
                     json!({
                         "type": "tool-calls-requested",
                         "turnId": ev_turn,
@@ -5175,18 +5561,9 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                         let advances_stream_attempt = invs
                             .iter()
                             .any(|invocation| !invocation.is_provider_stream_invocation());
-                        let completed = invs
-                            .iter()
-                            .filter(|invocation| !invocation.is_provider_stream_invocation())
-                            .count()
-                            .min(progress.pending_tool_calls.len());
-                        progress.pending_tool_calls.drain(0..completed);
-                        progress.tool_invocations.extend(invs.clone());
+                        progress.record_tool_invocations(invs.clone());
                         if advances_stream_attempt {
-                            progress.assistant_text_retry_checkpoint =
-                                progress.assistant_text.len();
-                            progress.tool_invocations_retry_checkpoint =
-                                progress.tool_invocations.len();
+                            progress.checkpoint_stream_attempt();
                         }
                     }
                     let mut before_gates = Vec::new();
@@ -5269,15 +5646,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     kind,
                 } => {
                     let mut progress = ev_progress.lock().unwrap();
-                    let checkpoint = progress
-                        .assistant_text_retry_checkpoint
-                        .min(progress.assistant_text.len());
-                    progress.assistant_text.truncate(checkpoint);
-                    let tool_checkpoint = progress
-                        .tool_invocations_retry_checkpoint
-                        .min(progress.tool_invocations.len());
-                    progress.tool_invocations.truncate(tool_checkpoint);
-                    progress.pending_tool_calls.clear();
+                    progress.reset_to_retry_checkpoint();
                     json!({
                         "type": "retry-attempt",
                         "turnId": ev_turn,
@@ -5387,30 +5756,33 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                         .remove(&turn_id_thread);
                     return;
                 }
-                for inv in &turn.tool_invocations {
-                    let _ = inputs.session_store.append_event(
-                        session_uuid,
-                        TranscriptEvent::ToolInvocation {
-                            call_id: inv.call_id.clone(),
-                            tool_id: inv.tool_id.clone(),
-                            input: inv.input.clone(),
-                            output: inv.output.clone(),
-                            success: inv.success,
-                            metadata: (!inv.metadata.is_null()).then(|| inv.metadata.clone()),
-                            actor: Some(stream_actor.clone()),
-                            subject: app_state.tool_subject_actor(&inv.tool_id, &inv.output),
-                        },
-                    );
-                }
                 if !turn.assistant_text.is_empty() {
                     app_state.push_message(MessageRole::Assistant, turn.assistant_text.clone());
-                    let _ = inputs.session_store.append_event(
-                        session_uuid,
-                        TranscriptEvent::AssistantMessage {
-                            text: turn.assistant_text.clone(),
-                            actor: Some(stream_actor.clone()),
-                        },
-                    );
+                }
+                let ordered_items = {
+                    let mut progress = progress_thread.lock().unwrap();
+                    progress.persisted_on_cancel = true;
+                    std::mem::take(&mut progress.ordered_items)
+                };
+                let persisted_text = append_ordered_turn_progress(
+                    &inputs.session_store,
+                    session_uuid,
+                    ordered_items,
+                    Some(stream_actor.clone()),
+                    |inv| app_state.tool_subject_actor(&inv.tool_id, &inv.output),
+                    false,
+                )
+                .unwrap_or_default();
+                if let Some(missing_text) = turn.assistant_text.strip_prefix(&persisted_text) {
+                    if !missing_text.is_empty() {
+                        let _ = inputs.session_store.append_event(
+                            session_uuid,
+                            TranscriptEvent::AssistantMessage {
+                                text: missing_text.to_string(),
+                                actor: Some(stream_actor.clone()),
+                            },
+                        );
+                    }
                 }
                 for trace in &turn.reflection_traces {
                     let _ = inputs.session_store.append_trace_event(
@@ -5854,6 +6226,45 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
 
         if crate::daemon_gmail_browser_setup::connect_args_are_gmail_browser(&connect_args) {
             let outcome = crate::daemon_gmail_browser_setup::execute_gmail_browser_setup(
+                setup_state.clone(),
+                channel_thread.clone(),
+                turn_id_thread.clone(),
+                connect_args.clone(),
+                next_req_id.clone(),
+                pending_questions.clone(),
+                cancel_thread.clone(),
+            );
+            match outcome {
+                Ok(assistant_text) => {
+                    setup_state.publish_event(ServerEnvelope::Event {
+                        event: channel_thread.clone(),
+                        payload: json!({
+                            "type": "turn-complete",
+                            "turnId": turn_id_thread.clone(),
+                            "assistantText": assistant_text,
+                        }),
+                    });
+                }
+                Err(error) => {
+                    if !(cancel_thread.is_cancelled()
+                        && cancel_reported_thread.load(Ordering::SeqCst))
+                    {
+                        publish_sessionless_turn_error_event(
+                            &setup_state,
+                            &channel_thread,
+                            &turn_id_thread,
+                            format!("{error:#}"),
+                            None,
+                        );
+                    }
+                }
+            }
+            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+            return;
+        }
+
+        if crate::daemon_lark_browser_setup::connect_args_are_lark_browser(&connect_args) {
+            let outcome = crate::daemon_lark_browser_setup::execute_lark_browser_setup(
                 setup_state.clone(),
                 channel_thread.clone(),
                 turn_id_thread.clone(),
@@ -6445,24 +6856,27 @@ fn apply_daemon_yolo_mode(app_state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_daemon_yolo_mode, apply_turn_model_override, apply_turn_request_options,
+        append_ordered_turn_progress, apply_daemon_yolo_mode, apply_turn_model_override,
+        apply_turn_request_options, browser_launch_settings_or_default,
         browser_permission_payload_json, browser_status_for_turn, cancel_all_active_turns,
-        connector_setup_connect_args, connector_setup_id, daemon_now_ms, desktop_latency_ms,
-        file_media_mime_type, generated_video_handler, handle_create_file_media_access,
-        handle_create_generated_video_access, handle_create_openai_realtime_client_secret,
-        handle_create_session, handle_generate_media, handle_import_external_credential,
-        handle_list_lambda_skill_libraries, handle_list_media_capabilities,
-        handle_list_permissions, handle_list_provider_models, handle_load_session_detail,
-        handle_local_model_status, handle_login_with_api_key, handle_logout_provider,
-        handle_read_generated_media_preview, handle_remove_lambda_skill_library,
-        handle_save_lambda_skill_library, handle_save_permissions, handle_save_proxy_settings,
-        handle_set_lambda_skill_approval, handle_set_lambda_skill_enabled, handle_update_config,
-        model_descriptor_dto, parse_single_byte_range, permission_review_payload_json,
+        connector_setup_connect_args, connector_setup_id, daemon_now_ms,
+        desktop_latency_ms, file_media_mime_type, generated_video_handler,
+        handle_create_file_media_access, handle_create_generated_video_access,
+        handle_create_openai_realtime_client_secret, handle_create_session, handle_generate_media,
+        handle_import_external_credential, handle_list_lambda_skill_libraries,
+        handle_list_media_capabilities, handle_list_permissions, handle_list_provider_models,
+        handle_load_session_detail, handle_local_model_status, handle_login_with_api_key,
+        handle_logout_provider, handle_read_generated_media_preview,
+        handle_remove_lambda_skill_library, handle_save_lambda_skill_library,
+        handle_save_permissions, handle_save_proxy_settings, handle_set_lambda_skill_approval,
+        handle_set_lambda_skill_enabled, handle_update_config, model_descriptor_dto,
+        parse_single_byte_range, permission_review_payload_json,
         realtime_session_config_from_params, report_cancelled_turn, requires_explicit_subscription,
         resolve_create_session_model_id, run_off_runtime, session_used_browser_tool,
         start_connector_setup_turn, turn_browser_tab_context, CancelToken, ConnectionGuard,
         DaemonState, GenerateMediaArtifactResult, GenerateMediaResult, GeneratedVideoRangeError,
-        GeneratedVideoTicket, ServerEnvelope, TurnHandle, TurnProgress, TurnRequestOptions,
+        GeneratedVideoTicket, ServerEnvelope, TurnHandle, TurnProgress, TurnProgressItem,
+        TurnRequestOptions,
     };
     use axum::{
         extract::{Path as AxumPath, State},
@@ -7053,6 +7467,38 @@ models: []
             .expect("daemon state")
     }
 
+    /// Issue #670: a captcha-extension staging failure must NOT be fatal to the
+    /// daemon. Previously `BrowserLaunchSettings::from_config(...)?` propagated
+    /// the error out of `DaemonState::load`, so `run_async` returned `Err`
+    /// before printing its handshake and Bobo showed a fatal "empty handshake
+    /// line" startup dialog. The fix routes that `Result` through
+    /// `browser_launch_settings_or_default`, which swallows the error and falls
+    /// back to empty (no-extension) settings so startup proceeds.
+    ///
+    /// Tested at the helper seam (not via `DaemonState::load`) because forcing a
+    /// real staging failure requires a revealed secret, and `SecretVault::open`
+    /// hits the macOS Keychain — unavailable/cancelled in headless CI. The
+    /// reproduction of the underlying ENOENT race lives in puffer-config's
+    /// `concurrent_staging_into_shared_root_never_errors`.
+    #[test]
+    fn browser_launch_settings_staging_error_is_non_fatal() {
+        use crate::daemon_browser::BrowserLaunchSettings;
+
+        // A staging error must degrade to default (empty) settings, not propagate.
+        let degraded = browser_launch_settings_or_default(Err(anyhow::anyhow!(
+            "copy extension file .../awscaptcha.js to .../awscaptcha.js: No such file or directory (os error 2)"
+        )));
+        assert_eq!(degraded, BrowserLaunchSettings::default());
+        assert!(degraded.extension_dirs().is_empty());
+
+        // The happy path is untouched: a successful settings value passes through.
+        let staged = BrowserLaunchSettings::with_extension_dirs(vec![std::path::PathBuf::from(
+            "/tmp/ext/nopecha",
+        )]);
+        let passthrough = browser_launch_settings_or_default(Ok(staged.clone()));
+        assert_eq!(passthrough, staged);
+    }
+
     fn insert_session_turn(state: &DaemonState, session_id: Uuid, turn_id: &str) {
         let cancel = CancelToken::new();
         let mut handle = empty_turn_handle(cancel);
@@ -7267,6 +7713,119 @@ models: []
             "live CLI tab must be visible through the chat-session lookup"
         );
         assert_eq!(context.url.as_deref(), Some("https://example.com/cart"));
+    }
+
+    /// Issue #667: the visible in-app BrowserPane lists/subscribes by chat
+    /// session UUID, but the Bash `browser` skill registers tabs under the
+    /// workspace-stable cli-browser id. The `browser_agent` "list" arm must fall
+    /// back to the CLI keyspace when the chat UUID owns no tabs (so the pane is
+    /// not blank), and must register an event bridge so later CLI tab-list
+    /// changes are mirrored onto `browser:<chat-uuid>:tabs` for live updates.
+    #[test]
+    fn browser_agent_list_falls_back_to_cli_keyspace_and_bridges_events() {
+        let _home_guard = PufferHomeEnvGuard::set();
+        let state = Arc::new(test_daemon_state());
+        let chat_root = Uuid::new_v4().to_string();
+
+        // A live CLI-browser tab opened by the Bash `browser` skill.
+        let cli_id =
+            crate::daemon_browser::default_cli_session_id(&state.paths).expect("cli session id");
+        state
+            .browsers
+            .test_record_tab(&cli_id, "t1", "https://example.com/cart", "Cart");
+
+        // The pane lists by its chat-session UUID, which owns no tabs of its own.
+        let listed: crate::daemon_browser::BrowserTabsState = serde_json::from_value(
+            crate::daemon_browser::handle_browser_agent(
+                &state,
+                &json!({ "action": "list", "sessionId": chat_root }),
+            )
+            .expect("browser_agent list"),
+        )
+        .expect("decode tabs state");
+        assert_eq!(
+            listed.tabs.len(),
+            1,
+            "pane list must surface the live CLI tab instead of a blank pane"
+        );
+        assert_eq!(listed.tabs[0].url, "https://example.com/cart");
+
+        // Listing also registered an event bridge cli_id -> chat_root. A
+        // subsequent CLI tab-list publish must mirror onto the pane's channel.
+        let mut events = state.event_sender().subscribe();
+        crate::daemon_browser::test_publish_tabs(&state, &cli_id);
+
+        let mut saw_chat_channel = false;
+        let mut saw_cli_channel = false;
+        while let Ok(env) = events.try_recv() {
+            if let ServerEnvelope::Event { event, payload } = env {
+                if event == format!("browser:{chat_root}:tabs") {
+                    saw_chat_channel = true;
+                    assert_eq!(
+                        payload["tabs"][0]["url"], "https://example.com/cart",
+                        "mirrored payload must carry the live CLI tab"
+                    );
+                } else if event == format!("browser:{cli_id}:tabs") {
+                    saw_cli_channel = true;
+                }
+            }
+        }
+        assert!(
+            saw_cli_channel,
+            "CLI keyspace always publishes its own channel"
+        );
+        assert!(
+            saw_chat_channel,
+            "bridged pane must receive mirrored CLI tab updates on its chat-uuid channel"
+        );
+    }
+
+    /// Precedence invariant (#667): when the chat-session UUID owns its own
+    /// typed-Browser tab, the list must return that tab and must NOT fall back
+    /// to (or bridge) the CLI keyspace.
+    #[test]
+    fn browser_agent_list_prefers_chat_own_tabs_over_cli_fallback() {
+        let _home_guard = PufferHomeEnvGuard::set();
+        let state = Arc::new(test_daemon_state());
+        let chat_root = Uuid::new_v4().to_string();
+
+        let cli_id =
+            crate::daemon_browser::default_cli_session_id(&state.paths).expect("cli session id");
+        state
+            .browsers
+            .test_record_tab(&cli_id, "t1", "https://cli.example/cart", "CLI");
+        // The chat session has its own tab (typed Browser tool path).
+        state
+            .browsers
+            .test_record_tab(&chat_root, "t1", "https://chat.example/own", "Own");
+
+        let listed: crate::daemon_browser::BrowserTabsState = serde_json::from_value(
+            crate::daemon_browser::handle_browser_agent(
+                &state,
+                &json!({ "action": "list", "sessionId": chat_root }),
+            )
+            .expect("browser_agent list"),
+        )
+        .expect("decode tabs state");
+        assert_eq!(listed.tabs.len(), 1);
+        assert_eq!(
+            listed.tabs[0].url, "https://chat.example/own",
+            "chat-session's own tab must win over the CLI fallback"
+        );
+
+        // No bridge should have been registered; a CLI publish must NOT leak
+        // onto the chat-uuid channel.
+        let mut events = state.event_sender().subscribe();
+        crate::daemon_browser::test_publish_tabs(&state, &cli_id);
+        while let Ok(env) = events.try_recv() {
+            if let ServerEnvelope::Event { event, .. } = env {
+                assert_ne!(
+                    event,
+                    format!("browser:{chat_root}:tabs"),
+                    "no bridge must exist when the chat session owns its tabs"
+                );
+            }
+        }
     }
 
     /// Issue #560: a restarted daemon has an empty tab registry, so a resumed
@@ -8714,7 +9273,7 @@ models: []
     }
 
     #[test]
-    fn report_cancelled_turn_persists_streamed_progress_before_interrupt() {
+    fn report_cancelled_turn_persists_streamed_progress_chronologically() {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace_root = temp.path().join("workspace");
         let paths = ConfigPaths {
@@ -8737,26 +9296,24 @@ models: []
             false,
         )
         .expect("daemon state");
-        let progress = Arc::new(Mutex::new(TurnProgress {
-            assistant_text: "partial answer".to_string(),
-            assistant_text_retry_checkpoint: 0,
-            tool_invocations: vec![ToolInvocation {
-                call_id: "call-done".to_string(),
-                tool_id: "Bash".to_string(),
-                input: "{\"command\":\"pwd\"}".to_string(),
-                output: "/tmp\n".to_string(),
-                success: true,
-                metadata: serde_json::Value::Null,
-                terminate: false,
-            }],
-            tool_invocations_retry_checkpoint: 0,
-            pending_tool_calls: vec![ToolCallRequest {
-                call_id: "call-pending".to_string(),
-                tool_id: "Bash".to_string(),
-                input: "{\"command\":\"sleep 10\"}".to_string(),
-            }],
-            persisted_on_cancel: false,
-        }));
+        let mut progress_state = TurnProgress::default();
+        progress_state.record_text_delta("partial answer");
+        progress_state.record_tool_invocations(vec![ToolInvocation {
+            call_id: "call-done".to_string(),
+            tool_id: "Bash".to_string(),
+            input: "{\"command\":\"pwd\"}".to_string(),
+            output: "/tmp\n".to_string(),
+            success: true,
+            metadata: serde_json::Value::Null,
+            terminate: false,
+        }]);
+        progress_state.record_text_delta(" after tool");
+        progress_state.record_tool_call_requests(vec![ToolCallRequest {
+            call_id: "call-pending".to_string(),
+            tool_id: "Bash".to_string(),
+            input: "{\"command\":\"sleep 10\"}".to_string(),
+        }]);
+        let progress = Arc::new(Mutex::new(progress_state));
         let cancel_reported = AtomicBool::new(false);
         let user_prompt_persisted = AtomicBool::new(false);
 
@@ -8820,6 +9377,16 @@ models: []
                 )
             })
             .expect("cancelled pending tool");
+        let post_tool_assistant_index = record
+            .events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    TranscriptEvent::AssistantMessage { text, .. } if text == " after tool"
+                )
+            })
+            .expect("post-tool assistant progress");
         let interrupt_index = record
             .events
             .iter()
@@ -8832,8 +9399,188 @@ models: []
             .expect("interrupt");
         assert!(user_index < assistant_index);
         assert!(assistant_index < done_tool_index);
-        assert!(done_tool_index < pending_tool_index);
+        assert!(done_tool_index < post_tool_assistant_index);
+        assert!(post_tool_assistant_index < pending_tool_index);
         assert!(pending_tool_index < interrupt_index);
+    }
+
+    #[test]
+    fn ordered_turn_progress_persists_text_around_tools() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let paths = ConfigPaths {
+            workspace_root: workspace_root.clone(),
+            workspace_config_dir: workspace_root.join(".puffer"),
+            user_config_dir: temp.path().join("home").join(".puffer"),
+            builtin_resources_dir: workspace_root.join("resources"),
+        };
+        ensure_workspace_dirs(&paths).expect("workspace dirs");
+        let store = SessionStore::from_paths(&paths).expect("store");
+        let session_id = store
+            .create_session(workspace_root)
+            .expect("create session")
+            .id;
+        let items = vec![
+            TurnProgressItem::AssistantText("before tool".to_string()),
+            TurnProgressItem::ToolInvocation(ToolInvocation {
+                call_id: "call-1".to_string(),
+                tool_id: "Sleep".to_string(),
+                input: "{\"duration_ms\":20000}".to_string(),
+                output: "done".to_string(),
+                success: true,
+                metadata: serde_json::Value::Null,
+                terminate: false,
+            }),
+            TurnProgressItem::AssistantText("after tool".to_string()),
+        ];
+
+        let persisted_text =
+            append_ordered_turn_progress(&store, session_id, items, None, |_| None, true)
+                .expect("append ordered progress");
+        let record = store.load_session(session_id).expect("load session");
+
+        assert_eq!(persisted_text, "before toolafter tool");
+        assert!(matches!(
+            &record.events[0],
+            TranscriptEvent::AssistantMessage { text, .. } if text == "before tool"
+        ));
+        assert!(matches!(
+            &record.events[1],
+            TranscriptEvent::ToolInvocation { tool_id, .. } if tool_id == "Sleep"
+        ));
+        assert!(matches!(
+            &record.events[2],
+            TranscriptEvent::AssistantMessage { text, .. } if text == "after tool"
+        ));
+    }
+
+    #[test]
+    fn ordered_turn_progress_uses_tool_request_position() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let paths = ConfigPaths {
+            workspace_root: workspace_root.clone(),
+            workspace_config_dir: workspace_root.join(".puffer"),
+            user_config_dir: temp.path().join("home").join(".puffer"),
+            builtin_resources_dir: workspace_root.join("resources"),
+        };
+        ensure_workspace_dirs(&paths).expect("workspace dirs");
+        let store = SessionStore::from_paths(&paths).expect("store");
+        let session_id = store
+            .create_session(workspace_root)
+            .expect("create session")
+            .id;
+        let mut progress = TurnProgress::default();
+        progress.record_text_delta("before sleep");
+        progress.record_tool_call_requests(vec![ToolCallRequest {
+            call_id: "call-1".to_string(),
+            tool_id: "Sleep".to_string(),
+            input: "{\"duration_ms\":20000}".to_string(),
+        }]);
+        progress.record_text_delta(" after request");
+        progress.record_tool_invocations(vec![ToolInvocation {
+            call_id: "call-1".to_string(),
+            tool_id: "Sleep".to_string(),
+            input: "{\"duration_ms\":20000}".to_string(),
+            output: "done".to_string(),
+            success: true,
+            metadata: serde_json::Value::Null,
+            terminate: false,
+        }]);
+
+        append_ordered_turn_progress(
+            &store,
+            session_id,
+            progress.ordered_items,
+            None,
+            |_| None,
+            true,
+        )
+        .expect("append ordered progress");
+        let record = store.load_session(session_id).expect("load session");
+
+        assert!(matches!(
+            &record.events[0],
+            TranscriptEvent::AssistantMessage { text, .. } if text == "before sleep"
+        ));
+        assert!(matches!(
+            &record.events[1],
+            TranscriptEvent::ToolInvocation { tool_id, .. } if tool_id == "Sleep"
+        ));
+        assert!(matches!(
+            &record.events[2],
+            TranscriptEvent::AssistantMessage { text, .. } if text == " after request"
+        ));
+    }
+
+    #[test]
+    fn ordered_turn_progress_renders_send_user_message_as_text() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let paths = ConfigPaths {
+            workspace_root: workspace_root.clone(),
+            workspace_config_dir: workspace_root.join(".puffer"),
+            user_config_dir: temp.path().join("home").join(".puffer"),
+            builtin_resources_dir: workspace_root.join("resources"),
+        };
+        ensure_workspace_dirs(&paths).expect("workspace dirs");
+        let store = SessionStore::from_paths(&paths).expect("store");
+        let session_id = store
+            .create_session(workspace_root)
+            .expect("create session")
+            .id;
+        let mut progress = TurnProgress::default();
+        progress.record_tool_call_requests(vec![
+            ToolCallRequest {
+                call_id: "call-message".to_string(),
+                tool_id: "SendUserMessage".to_string(),
+                input: r#"{"message":"Phase 1 starting."}"#.to_string(),
+            },
+            ToolCallRequest {
+                call_id: "call-sleep".to_string(),
+                tool_id: "Sleep".to_string(),
+                input: r#"{"duration_ms":20000}"#.to_string(),
+            },
+        ]);
+        progress.record_tool_invocations(vec![ToolInvocation {
+            call_id: "call-message".to_string(),
+            tool_id: "SendUserMessage".to_string(),
+            input: r#"{"message":"Phase 1 starting."}"#.to_string(),
+            output: "{}".to_string(),
+            success: true,
+            metadata: serde_json::Value::Null,
+            terminate: false,
+        }]);
+        progress.record_tool_invocations(vec![ToolInvocation {
+            call_id: "call-sleep".to_string(),
+            tool_id: "Sleep".to_string(),
+            input: r#"{"duration_ms":20000}"#.to_string(),
+            output: "done".to_string(),
+            success: true,
+            metadata: serde_json::Value::Null,
+            terminate: false,
+        }]);
+
+        append_ordered_turn_progress(
+            &store,
+            session_id,
+            progress.ordered_items,
+            None,
+            |_| None,
+            true,
+        )
+        .expect("append ordered progress");
+        let record = store.load_session(session_id).expect("load session");
+
+        assert_eq!(record.events.len(), 2);
+        assert!(matches!(
+            &record.events[0],
+            TranscriptEvent::AssistantMessage { text, .. } if text == "Phase 1 starting."
+        ));
+        assert!(matches!(
+            &record.events[1],
+            TranscriptEvent::ToolInvocation { tool_id, .. } if tool_id == "Sleep"
+        ));
     }
 
     /// Writes a single discovered model into the discovery cache file
@@ -8861,6 +9608,9 @@ models: []
                         }
                     ],
                     "cached_at_ms": now_ms,
+                    // Must match puffer-provider-registry's CAPABILITY_SCHEMA_VERSION,
+                    // or the entry is treated as schema-stale and never applied.
+                    "capability_schema_version": 1,
                 }
             }
         });

@@ -18,6 +18,7 @@
   import NewSessionModal from "./lib/screens/workspace/NewSessionModal.svelte";
   import WorkspacePicker from "./lib/screens/WorkspacePicker.svelte";
   import AgentDetail from "./lib/screens/agent/AgentDetail.svelte";
+  import { isAlreadyPersistedTool, persistedToolIdSet } from "./lib/screens/agent/timelineToolDedup";
   import Workflows from "./lib/screens/Workflows.svelte";
   import Tasks from "./lib/screens/Tasks.svelte";
   import Contacts from "./lib/screens/Contacts.svelte";
@@ -2003,7 +2004,8 @@
     let liveItems = cached.liveStreamItems;
     for (const req of ev.requests) {
       if (isAskUserQuestionToolName(req.toolId)) continue;
-      const id = liveToolId(ev.turnId, req.callId);
+      if (sendUserMessageText(req.toolId, req.input)) continue;
+      const id = liveToolId(req.callId);
       if (liveItems.some((item) => item.id === id)) continue;
       liveItems = appendCachedLiveItemForTurn(
         { ...cached, liveStreamItems: liveItems },
@@ -2042,7 +2044,22 @@
     let advancesStreamAttempt = false;
     for (const inv of ev.invocations) {
       if (isAskUserQuestionToolName(inv.toolId)) continue;
-      const id = liveToolId(ev.turnId, inv.callId);
+      const assistantText = sendUserMessageText(inv.toolId, inv.input);
+      if (assistantText) {
+        const id = liveAssistantMessageId(ev.turnId, inv.callId);
+        const payload: TimelineItem = timelineItemWithTurnId({
+          id,
+          kind: "assistant",
+          title: "Assistant",
+          summary: assistantText,
+          body: assistantText,
+          meta: [],
+          actor: ev.actor ?? null
+        }, ev.turnId);
+        liveItems = appendCachedLiveItem({ ...cached, liveStreamItems: liveItems }, payload);
+        continue;
+      }
+      const id = liveToolId(inv.callId);
       const payload: TimelineItem = timelineItemWithTurnId({
         id,
         kind: "tool",
@@ -3694,6 +3711,19 @@
     return normalizedToolName(value) === "askuserquestion";
   }
 
+  function sendUserMessageText(toolId: string, inputText: string): string | null {
+    const normalized = normalizedToolName(toolId);
+    if (normalized !== "sendusermessage" && normalized !== "brief") return null;
+    const input = safeParseJson(inputText);
+    const message = input?.message;
+    if (typeof message !== "string" || !message.trim()) return null;
+    return message;
+  }
+
+  function liveAssistantMessageId(turnId: string, callId: string): string {
+    return `live-assistant-message-${turnId}-${callId}`;
+  }
+
   function normalizedGateKey(value: string | null | undefined): string {
     return (value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
   }
@@ -3833,9 +3863,13 @@
   ): TimelineItem[] {
     if (transient.length === 0) return persisted;
     const merged = [...persisted];
+    const persistedToolIds = persistedToolIdSet(persisted);
     let searchStart = 0;
     let pendingUnmatched: TimelineItem[] = [];
     for (const item of transient) {
+      // Tool cards share a `tool-{call_id}` id on both sides; if the persisted
+      // copy is already in `merged`, skip the transient one (order-independent).
+      if (isAlreadyPersistedTool(item, persistedToolIds)) continue;
       const matchIndex = findTransientMatchIndex(merged, item, searchStart);
       if (matchIndex < 0) {
         if (isTransientOrderingAnchor(item)) continue;
@@ -3867,10 +3901,21 @@
     pending: TimelineItem[]
   ): TimelineItem[] {
     pending = discardGeneratedMediaPreviewItems(pending);
+    const persistedToolIds = persistedToolIdSet(persisted);
     let searchStart = 0;
     let pendingUnmatched: TimelineItem[] = [];
     let anchored: TimelineItem[] = [];
     for (const item of pending) {
+      // Tool cards are matched by their shared `tool-{call_id}` id, not by a
+      // forward signature search: flush any pending anchor against this already
+      // persisted tool and drop it (so it is not kept as a duplicate live item).
+      if (isAlreadyPersistedTool(item, persistedToolIds)) {
+        if (pendingUnmatched.length > 0) {
+          anchored = [...anchored, ...pendingUnmatched, asTransientOrderingAnchor(item)];
+          pendingUnmatched = [];
+        }
+        continue;
+      }
       const matchIndex = findTransientMatchIndex(persisted, item, searchStart);
       if (matchIndex < 0) {
         pendingUnmatched = [...pendingUnmatched, item];
@@ -4087,8 +4132,10 @@
     return `live-question-${turnId}-${requestId}`;
   }
 
-  function liveToolId(turnId: string, callId: string): string {
-    return `live-tool-${turnId}-${callId}`;
+  // Must stay character-for-character identical to the daemon's persisted tool id
+  // (`tool-{call_id}` in desktop_api.rs) so live and persisted copies dedupe by id.
+  function liveToolId(callId: string): string {
+    return `tool-${callId}`;
   }
 
   function liveItemBelongsToTurn(item: TimelineItem, turnId: string): boolean {
@@ -4096,7 +4143,7 @@
       isStreamingAssistantForTurn(item, turnId) ||
       item.id === `live-complete-assistant-${turnId}` ||
       item.id === `live-error-turn-error-${turnId}` ||
-      item.id.startsWith(`live-tool-${turnId}-`) ||
+      (item.kind === "tool" && item.turnId === turnId) ||
       item.id.startsWith(`live-gate-${turnId}-`) ||
       item.id.startsWith(`live-perm-${turnId}-`) ||
       item.id.startsWith(`live-question-${turnId}-`)
@@ -4272,7 +4319,8 @@
         // turn does not replace a previous live card while transcript reloads.
         for (const req of ev.requests) {
           if (isAskUserQuestionToolName(req.toolId)) continue;
-          const id = liveToolId(ev.turnId, req.callId);
+          if (sendUserMessageText(req.toolId, req.input)) continue;
+          const id = liveToolId(req.callId);
           if (liveStreamItems.some((x) => x.id === id)) continue;
           appendLiveForTurn(ev.turnId, {
             id,
@@ -4296,7 +4344,32 @@
         let advancesStreamAttempt = false;
         for (const inv of ev.invocations) {
           if (isAskUserQuestionToolName(inv.toolId)) continue;
-          const id = liveToolId(ev.turnId, inv.callId);
+          const assistantText = sendUserMessageText(inv.toolId, inv.input);
+          if (assistantText) {
+            const id = liveAssistantMessageId(ev.turnId, inv.callId);
+            const payload: TimelineItem = timelineItemWithTurnId({
+              id,
+              kind: "assistant",
+              title: "Assistant",
+              summary: assistantText,
+              body: assistantText,
+              meta: [],
+              actor: ev.actor ?? null
+            }, ev.turnId);
+            const existingIdx = liveStreamItems.findIndex((x) => x.id === id);
+            if (existingIdx >= 0) {
+              const stamped = withLiveTimestamp(payload, liveStreamItems[existingIdx]);
+              liveStreamItems = [
+                ...liveStreamItems.slice(0, existingIdx),
+                stamped,
+                ...liveStreamItems.slice(existingIdx + 1)
+              ];
+            } else {
+              appendLiveForTurn(ev.turnId, payload);
+            }
+            continue;
+          }
+          const id = liveToolId(inv.callId);
           const existingIdx = liveStreamItems.findIndex((x) => x.id === id);
           if (!isProviderStreamInvocationMetadata(inv.metadata)) advancesStreamAttempt = true;
           const payload: TimelineItem = timelineItemWithTurnId({

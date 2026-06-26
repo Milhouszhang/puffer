@@ -1602,6 +1602,12 @@ export class FakeDaemon {
         return this.deleteSecret(request.params);
       case "import_chrome_secrets":
         return this.importChromeSecrets();
+      case "import_browser_secrets":
+        return this.importBrowserSecrets(request.params);
+      case "list_secret_sources":
+        return { sources: this.secretSources() };
+      case "import_onepassword_export":
+        return this.importBrowserSecrets({ source: "1password" });
       case "test_proxy":
         return this.testProxy(request.params);
       case "list_permissions":
@@ -2577,16 +2583,30 @@ export class FakeDaemon {
   }
 
   private importChromeSecrets(): JsonRecord {
+    return this.importBrowserSecrets({ source: "chrome" });
+  }
+
+  private secretSources(): JsonRecord[] {
+    return [
+      { id: "chrome", label: "Chrome", available: true },
+      { id: "firefox", label: "Firefox", available: false },
+      { id: "1password", label: "1Password", available: false }
+    ];
+  }
+
+  private importBrowserSecrets(params: JsonRecord | undefined): JsonRecord {
+    const source = typeof params?.source === "string" ? params.source : "chrome";
+    const label = source === "chrome" ? "Chrome" : source;
     const now = Date.now();
     this.secrets = [
       ...this.secrets,
       {
-        id: `sec_chrome_${now}`,
-        label: "Chrome developer@example.com @ example.test",
+        id: `sec_${source}_${now}`,
+        label: `${label} developer@example.com @ example.test`,
         description: "example.test",
         username: "developer@example.com",
         origin: "https://example.test",
-        source: "chrome",
+        source,
         createdAtMs: now,
         updatedAtMs: now
       }
@@ -2767,6 +2787,7 @@ export class FakeDaemon {
         storeFile: "/tmp/home/.puffer/secrets.json",
         keySource: "local-key-file",
         chromeImportSupported: true,
+        sources: this.secretSources(),
         items: this.secrets.map((secret) => ({ ...secret }))
       },
       browserProfiles: []

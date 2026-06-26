@@ -11,9 +11,12 @@ use grammers_tl_types as tl;
 use puffer_subscriber_runtime::{SendMediaAttachment, SendMediaKind};
 use serde_json::json;
 
+use crate::activity_state::record_agent_send_activity;
 use crate::events::emit_control;
+use crate::history_cache::{TelegramHistoryCache, TelegramHistoryMessage};
 use crate::peers::resolve_peer;
 use crate::polls::{hex_encode, resolve_poll_options};
+use crate::reply::reply_header_payload;
 use crate::state::SkillEnv;
 
 /// Resolves `peer` and sends text and optional attachments through Telegram.
@@ -104,13 +107,15 @@ async fn send_text(
 ) -> anyhow::Result<()> {
     let message = InputMessage::text(text).reply_to(reply_to);
     match client.send_message(resolved.clone(), message).await {
-        Ok(_) => {
+        Ok(sent) => {
+            record_sent_message_activity(env, resolved, &sent, reply_to);
             emit_control(
                 &env.topic,
                 "send_complete",
                 json!({
                     "peer": peer,
                     "chat_id": resolved.id(),
+                    "message_id": sent.id(),
                     "reply_to": reply_to,
                     "bytes": text.len(),
                     "media_count": 0,
@@ -150,8 +155,9 @@ async fn send_single_media(
         }
     };
     match client.send_message(resolved.clone(), message).await {
-        Ok(_) => {
-            emit_send_complete(env, peer, resolved, text, reply_to, 1)?;
+        Ok(sent) => {
+            record_sent_message_activity(env, resolved, &sent, reply_to);
+            emit_send_complete(env, peer, resolved, text, reply_to, 1, vec![sent.id()])?;
         }
         Err(error) => {
             emit_control(
@@ -196,8 +202,24 @@ async fn send_album(
         }
     }
     match client.send_album(resolved.clone(), medias).await {
-        Ok(_) => {
-            emit_send_complete(env, peer, resolved, text, reply_to, attachments.len())?;
+        Ok(sent) => {
+            let messages = sent.iter().filter_map(|message| message.as_ref());
+            let message_ids = messages
+                .clone()
+                .map(|message| message.id())
+                .collect::<Vec<_>>();
+            for message in messages {
+                record_sent_message_activity(env, resolved, message, reply_to);
+            }
+            emit_send_complete(
+                env,
+                peer,
+                resolved,
+                text,
+                reply_to,
+                attachments.len(),
+                message_ids,
+            )?;
         }
         Err(error) => {
             emit_control(
@@ -217,6 +239,7 @@ fn emit_send_complete(
     text: &str,
     reply_to: Option<i32>,
     media_count: usize,
+    message_ids: Vec<i32>,
 ) -> anyhow::Result<()> {
     emit_control(
         &env.topic,
@@ -224,11 +247,99 @@ fn emit_send_complete(
         json!({
             "peer": peer,
             "chat_id": resolved.id(),
+            "message_ids": message_ids,
             "reply_to": reply_to,
             "bytes": text.len(),
             "media_count": media_count,
         }),
     )
+}
+
+fn record_sent_message_activity(
+    env: &SkillEnv,
+    resolved: &Chat,
+    message: &grammers_client::types::Message,
+    reply_to: Option<i32>,
+) {
+    record_sent_message_history(env, resolved, message, reply_to);
+    if let Err(error) = record_agent_send_activity(
+        env,
+        resolved.id(),
+        i64::from(message.id()),
+        reply_to.map(i64::from),
+        message.date().timestamp_millis(),
+    ) {
+        tracing::warn!(
+            chat = %resolved.id(),
+            message_id = message.id(),
+            %error,
+            "failed to record Telegram agent send in activity state"
+        );
+    }
+}
+
+fn record_sent_message_history(
+    env: &SkillEnv,
+    resolved: &Chat,
+    message: &grammers_client::types::Message,
+    reply_to: Option<i32>,
+) {
+    let Some(text) = nonempty_string(message.text()) else {
+        return;
+    };
+    let original = TelegramHistoryCache::load(env).unwrap_or_default();
+    let mut cache = original.clone();
+    let sender = message.sender();
+    let chat_title = nonempty_string(&resolved.name());
+    let chat_username = resolved.username().and_then(nonempty_string);
+    let reply_to_payload = reply_header_payload(message.reply_header()).or_else(|| {
+        reply_to.map(|message_id| {
+            json!({
+                "kind": "message",
+                "message_id": message_id,
+            })
+        })
+    });
+    cache.merge_message(
+        resolved.id(),
+        "user",
+        chat_title,
+        chat_username,
+        TelegramHistoryMessage {
+            message_id: message.id(),
+            date_ms: message.date().timestamp_millis(),
+            is_outgoing: true,
+            sender_id: sender.as_ref().map(Chat::id),
+            sender_username: sender
+                .as_ref()
+                .and_then(|sender| sender.username())
+                .and_then(nonempty_string),
+            sender_name: sender
+                .as_ref()
+                .map(|sender| sender.name().to_string())
+                .and_then(|name| nonempty_string(&name)),
+            reply_to: reply_to_payload,
+            text,
+        },
+        cache.limit_per_chat,
+    );
+    if let Err(error) = cache.save_if_changed(env, &original) {
+        tracing::warn!(
+            chat = %resolved.id(),
+            message_id = message.id(),
+            %error,
+            "failed to record Telegram sent message in history cache"
+        );
+    }
+}
+
+fn nonempty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 async fn input_message_for_attachment(

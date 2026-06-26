@@ -29,9 +29,9 @@ use crate::desktop_api_types::{
     DiffSummaryDto, DivergenceReportDto, ExternalCredentialDto, FolderGroupDto,
     MediaGenerationSettingsDto, MediaSettingsDto, NetworkProxySettingsDto, ProviderSummaryDto,
     RemoteSettingsDto, RepoActionResultDto, RepoPullRequestDto, RepoStatusDto, ResourceCountsDto,
-    SanitizedProxyEndpointDto, SecretSummaryDto, SecretsSettingsDto, SessionDetailDto,
-    SessionGroupsPageDto, SessionListItemDto, SettingsConfigDto, SettingsSessionSummaryDto,
-    SettingsSnapshotDto, SshHostSettingsDto, TimelineItemDto,
+    SanitizedProxyEndpointDto, SecretSummaryDto, SecretSourceDto, SecretsSettingsDto,
+    SessionDetailDto, SessionGroupsPageDto, SessionListItemDto, SettingsConfigDto,
+    SettingsSessionSummaryDto, SettingsSnapshotDto, SshHostSettingsDto, TimelineItemDto,
 };
 
 /// Runs one hidden desktop JSON command for SSH-backed desktop integrations.
@@ -643,10 +643,19 @@ fn secrets_settings_dto(paths: &ConfigPaths) -> Result<SecretsSettingsDto> {
         .into_iter()
         .map(secret_summary_dto)
         .collect::<Vec<_>>();
+    let sources = puffer_secrets::available_browser_sources()
+        .into_iter()
+        .map(|source| SecretSourceDto {
+            id: source.id,
+            label: source.label,
+            available: source.available,
+        })
+        .collect();
     Ok(SecretsSettingsDto {
         store_file: store_file.display().to_string(),
         key_source: secret_key_source().to_string(),
         chrome_import_supported: cfg!(target_os = "macos"),
+        sources,
         items,
     })
 }
@@ -1395,10 +1404,21 @@ fn timeline_items(session_store: &SessionStore, record: &SessionRecord) -> Vec<T
                 subject,
                 metadata,
             } => {
+                if let Some(text) = send_user_message_text(tool_id, input) {
+                    flush_pending_assistant(&mut items, &mut pending_assistant);
+                    items.push(TimelineItemDto::AssistantMessage {
+                        id: format!("tool-{call_id}-message"),
+                        text,
+                        attachments: std::mem::take(&mut pending_generated_attachments),
+                        turn_id: current_turn_id.clone(),
+                        actor: actor.clone(),
+                    });
+                    continue;
+                }
                 let status = if *success { "ok" } else { "error" };
                 let summary = summarize_tool_input(tool_id, input);
                 items.push(TimelineItemDto::ToolCall {
-                    id: format!("timeline-{index}-{call_id}"),
+                    id: format!("tool-{call_id}"),
                     tool_id: tool_id.clone(),
                     status: status.to_string(),
                     summary: summary.clone(),
@@ -1412,7 +1432,7 @@ fn timeline_items(session_store: &SessionStore, record: &SessionRecord) -> Vec<T
                 });
                 if let Some(text) = lambda_gate_timeline_text(metadata, tool_id) {
                     items.push(TimelineItemDto::SystemMessage {
-                        id: format!("timeline-{index}-{call_id}-lambda-gate"),
+                        id: format!("tool-{call_id}-lambda-gate"),
                         text,
                         turn_id: current_turn_id.clone(),
                         actor: actor.clone(),
@@ -1420,7 +1440,7 @@ fn timeline_items(session_store: &SessionStore, record: &SessionRecord) -> Vec<T
                 }
                 if let Some((state, reason)) = permission_state(output) {
                     items.push(TimelineItemDto::PermissionDialog {
-                        id: format!("timeline-{index}-{call_id}-permission"),
+                        id: format!("tool-{call_id}-permission"),
                         tool_id: tool_id.clone(),
                         state: state.to_string(),
                         summary,
@@ -1613,6 +1633,18 @@ fn lambda_gate_timeline_text(metadata: &Option<Value>, tool_id: &str) -> Option<
 
 fn compact_json_text(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn send_user_message_text(tool_id: &str, input: &str) -> Option<String> {
+    if !matches!(tool_id, "SendUserMessage" | "Brief") {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(input).ok()?;
+    let message = parsed.get("message")?.as_str()?.to_string();
+    if message.trim().is_empty() {
+        return None;
+    }
+    Some(message)
 }
 
 fn parse_system_message(
@@ -2119,6 +2151,7 @@ mod tests {
     use puffer_config::ConfigPaths;
     use puffer_session_store::{
         SessionMetadata, SessionRecord, SessionStore, TranscriptEvent, TranscriptRewrite,
+        TurnBoundaryState,
     };
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -2631,6 +2664,70 @@ mod tests {
     }
 
     #[test]
+    fn tool_invocation_ids_use_call_id_scheme() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![TranscriptEvent::ToolInvocation {
+                call_id: "call-1".to_string(),
+                tool_id: "LambdaHostCall".to_string(),
+                input: "{}".to_string(),
+                output: "Permission required: approve gh_pr_view".to_string(),
+                success: true,
+                metadata: Some(json!({
+                    "lambda_skill": {
+                        "event": "host_call_admitted",
+                        "host_tool": "gh_pr_view",
+                        "host_args": {"number": 42},
+                        "concrete_tool": "Bash",
+                        "concrete_input": {"command": "gh pr view 42"}
+                    }
+                })),
+                actor: None,
+                subject: None,
+            }]),
+        );
+
+        assert_eq!(items.len(), 3);
+        let TimelineItemDto::ToolCall { id, .. } = &items[0] else {
+            panic!("expected tool call, got {:?}", items[0]);
+        };
+        assert_eq!(id, "tool-call-1");
+        let TimelineItemDto::SystemMessage { id, .. } = &items[1] else {
+            panic!("expected lambda gate system message, got {:?}", items[1]);
+        };
+        assert_eq!(id, "tool-call-1-lambda-gate");
+        let TimelineItemDto::PermissionDialog { id, .. } = &items[2] else {
+            panic!("expected permission dialog, got {:?}", items[2]);
+        };
+        assert_eq!(id, "tool-call-1-permission");
+    }
+
+    #[test]
+    fn send_user_message_item_id_uses_call_id_scheme() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![TranscriptEvent::ToolInvocation {
+                call_id: "call-msg-1".to_string(),
+                tool_id: "SendUserMessage".to_string(),
+                input: r#"{"message":"Starting Phase 1.","status":"normal"}"#.to_string(),
+                output: "{}".to_string(),
+                success: true,
+                metadata: None,
+                actor: None,
+                subject: None,
+            }]),
+        );
+
+        assert_eq!(items.len(), 1);
+        let TimelineItemDto::AssistantMessage { id, .. } = &items[0] else {
+            panic!("expected assistant message, got {:?}", items[0]);
+        };
+        assert_eq!(id, "tool-call-msg-1-message");
+    }
+
+    #[test]
     fn timeline_places_persisted_tool_invocations_before_assistant_text() {
         let (_temp, store) = test_store();
         let items = timeline_items(
@@ -2692,6 +2789,42 @@ mod tests {
 
         let kinds = items.iter().map(item_kind).collect::<Vec<_>>();
         assert_eq!(kinds, vec!["user", "tool", "assistant"]);
+    }
+
+    #[test]
+    fn timeline_renders_send_user_message_as_assistant_text() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![
+                TranscriptEvent::TurnBoundary {
+                    turn_id: "turn-1".to_string(),
+                    state: TurnBoundaryState::Started,
+                },
+                TranscriptEvent::ToolInvocation {
+                    call_id: "call-msg-1".to_string(),
+                    tool_id: "SendUserMessage".to_string(),
+                    input: r#"{"message":"Starting Phase 1.","status":"normal"}"#.to_string(),
+                    output: "{}".to_string(),
+                    success: true,
+                    metadata: None,
+                    actor: None,
+                    subject: None,
+                },
+                TranscriptEvent::TurnBoundary {
+                    turn_id: "turn-1".to_string(),
+                    state: TurnBoundaryState::Finished,
+                },
+            ]),
+        );
+
+        let kinds = items.iter().map(item_kind).collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["assistant"]);
+        assert!(matches!(
+            &items[0],
+            TimelineItemDto::AssistantMessage { text, turn_id, .. }
+                if text == "Starting Phase 1." && turn_id.as_deref() == Some("turn-1")
+        ));
     }
 
     #[test]

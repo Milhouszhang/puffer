@@ -4,7 +4,8 @@ use crate::dtos::{
     BrowserCaptchaSettingsDto, BrowserCaptchaSolverDto, BrowserSettingsDto, ChatAttachmentDto,
     ChatAttachmentSourceDto, DiffSummaryDto, DivergenceReportDto, ExternalCredentialDto,
     FolderGroupDto, MediaCapabilityInfoDto, MediaGenerationSettingsDto, MediaSettingsDto,
-    ProviderSummaryDto, ResourceCountsDto, SecretSummaryDto, SecretsSettingsDto, SessionDetailDto,
+    ProviderSummaryDto, ResourceCountsDto, SecretSourceDto, SecretSummaryDto, SecretsSettingsDto,
+    SessionDetailDto,
     SessionListItemDto, SettingsConfigDto, SettingsSessionSummaryDto, SettingsSnapshotDto,
     TimelineItemDto,
 };
@@ -208,6 +209,39 @@ impl BackendState {
             }
             "import_chrome_secrets" => {
                 let report = self.secret_vault()?.import_chrome_saved_credentials()?;
+                serde_value(json!({
+                    "settings": self.load_settings_snapshot()?,
+                    "report": report,
+                }))
+            }
+            "import_browser_secrets" => {
+                let source_id = params
+                    .get("source")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow!("import_browser_secrets requires a `source`"))?;
+                let report = if source_id == "1password" {
+                    self.secret_vault()?.sync_onepassword_references()?
+                } else {
+                    let source = puffer_secrets::BrowserSource::from_id(source_id)
+                        .ok_or_else(|| anyhow!("unknown import source `{source_id}`"))?;
+                    self.secret_vault()?.sync_browser_source(source)?
+                };
+                serde_value(json!({
+                    "settings": self.load_settings_snapshot()?,
+                    "report": report,
+                }))
+            }
+            "list_secret_sources" => serde_value(json!({
+                "sources": puffer_secrets::available_browser_sources(),
+            })),
+            "import_onepassword_export" => {
+                let path = params
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow!("import_onepassword_export requires a `path`"))?;
+                let report = self
+                    .secret_vault()?
+                    .sync_onepassword_export(std::path::Path::new(path))?;
                 serde_value(json!({
                     "settings": self.load_settings_snapshot()?,
                     "report": report,
@@ -747,6 +781,14 @@ impl BackendState {
             store_file: store_file.display().to_string(),
             key_source: secret_key_source().to_string(),
             chrome_import_supported: cfg!(target_os = "macos"),
+            sources: puffer_secrets::available_browser_sources()
+                .into_iter()
+                .map(|source| SecretSourceDto {
+                    id: source.id,
+                    label: source.label,
+                    available: source.available,
+                })
+                .collect(),
             items: vault.list()?.into_iter().map(secret_summary).collect(),
         })
     }

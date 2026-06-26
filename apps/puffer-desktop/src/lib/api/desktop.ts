@@ -1097,6 +1097,54 @@ export async function importChromeSecrets(): Promise<ChromeSecretsImportResult> 
   });
 }
 
+/**
+ * Imports saved credentials from one source (chrome|firefox|1password).
+ * 1password imports every accessible vault.
+ */
+export async function importBrowserSecrets(
+  source: string
+): Promise<ChromeSecretsImportResult> {
+  const params = { source };
+  if (canReachDaemon()) {
+    const client = await ensureLocalDaemonClient();
+    return client.request<BackendChromeSecretsImportResult>("import_browser_secrets", params);
+  }
+  if (!canInvokeTauri()) {
+    return {
+      settings: mockSettingsSnapshot,
+      report: { imported: 0, skipped: 0, errors: [`${source} import requires the desktop backend.`] }
+    };
+  }
+  return invoke<BackendChromeSecretsImportResult>("backend_request", {
+    method: "import_browser_secrets",
+    params
+  });
+}
+
+/**
+ * Imports 1Password logins from a `.1pux` export file (no `op` CLI needed),
+ * every vault in the file.
+ */
+export async function importOnePasswordExport(
+  path: string
+): Promise<ChromeSecretsImportResult> {
+  const params = { path };
+  if (canReachDaemon()) {
+    const client = await ensureLocalDaemonClient();
+    return client.request<BackendChromeSecretsImportResult>("import_onepassword_export", params);
+  }
+  if (!canInvokeTauri()) {
+    return {
+      settings: mockSettingsSnapshot,
+      report: { imported: 0, skipped: 0, errors: ["1Password export import requires the desktop backend."] }
+    };
+  }
+  return invoke<BackendChromeSecretsImportResult>("backend_request", {
+    method: "import_onepassword_export",
+    params
+  });
+}
+
 export interface TelegramRelationshipReport {
   chatId: number;
   name: string;
@@ -1782,6 +1830,17 @@ export async function recoverStaleAgentTurn(
     retryAfterMs,
     ...options
   });
+}
+
+/** Persists an inline Canvas control update through the daemon so CanvasState
+ *  reads the same values as the generated browser page. */
+export async function updateCanvasState(
+  sessionId: string,
+  canvasId: string,
+  patch: Record<string, unknown>
+): Promise<{ ok?: boolean; canvasId?: string; updatedAtMs?: number }> {
+  const client = await ensureLocalDaemonClient();
+  return client.request("canvas_state_update", { sessionId, canvasId, patch });
 }
 
 /** Runs a slash command (e.g. `/connect <slug> <conn>`) through the

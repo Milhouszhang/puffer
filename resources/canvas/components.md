@@ -66,6 +66,83 @@ density and evidence over decoration.
 - use_when: a small matrix where relative intensity matters more than exact value.
 - props: `columns:[..]`, `rows:[{label, cells:[0..4]}]` (0 none → 4 critical).
 
+## Input
+Interactive nodes collect typed user choices that the agent can later read with
+`CanvasState`. Every interactive node MUST have a stable `id`; that id becomes
+the key in `CanvasState.values`.
+
+### toggle `{id,label,value?,help?}`
+- purpose: a binary yes/no or enabled/disabled choice.
+- use_when: the user should include/exclude one behavior.
+
+### singleSelect `{id,label,options:[{id,label}],value?,help?}`
+- purpose: one choice from a short option set.
+- use_when: the options are mutually exclusive.
+
+### dependentSelect `{id,label?,dependsOn,options:[{id,label,group}],value?,help?}`
+- purpose: a single-choice dropdown whose options are filtered by another select's value.
+- use_when: a second choice depends on a first (e.g. model depends on provider). Pair it with a
+  `singleSelect` whose `id` equals this node's `dependsOn`; each option's `group` is the parent value
+  it belongs to.
+- avoid_when: the choice is independent → use `singleSelect`.
+- writes back: the chosen option `id` (a string). When the parent changes, the value auto-resets to
+  the first option in the new group.
+
+### multiSelect `{id,label,options:[{id,label}],value?:string[],help?}`
+- purpose: several independent choices from a short option set.
+- use_when: the user may select more than one area, file, filter, or action.
+
+### barSelect `{id,label,options:[{id,label}],value?,help?}`
+- purpose: one choice that benefits from being displayed near comparative bars.
+- use_when: the user is choosing a ranked category rather than entering data.
+
+### slider `{id,label,min?,max?,step?,value?,help?}`
+- purpose: a numeric preference or threshold.
+- use_when: the exact number can be approximate and adjusted visually.
+
+### textInput `{id,label,placeholder?,value?,help?}`
+- purpose: a short free-form value.
+- avoid_when: collecting secrets or long text; use dedicated secret/user input
+  tools instead.
+
+### textarea `{id,label?,placeholder?,rows?,value?}`
+- purpose: multiline free-form text editing (a script draft, a long prompt).
+- use_when: the value spans multiple lines and the user should review/edit it inline.
+- avoid_when: a one-line value → use `textInput`.
+- writes back: a string (the edited text).
+
+### editableTable `{id,columns,rows,label?}`
+- purpose: an editable grid the user can edit cell-by-cell plus add, remove, and
+  reorder rows.
+- use_when: the user confirms/edits a list of structured rows (e.g. a storyboard
+  of shots) before the agent acts on it.
+- avoid_when: read-only records → use `table`.
+- writes back: a 2D array (`rows`) reflecting the final edits and order.
+
+### mediaPicker `{id,items:[{id,kind?,url?,path?,label?,description?}],multi?,value?}`
+- purpose: pick from a grid of images or videos.
+- use_when: the user selects one (or, with `multi:true`, several) generated
+  candidate images or video clips.
+- item kind: `kind` is `"image"` (default) or `"video"` — explicit, never
+  inferred from the URL/extension. Image items carry a directly-loadable `url`;
+  video items carry a workspace-relative `path` (the frontend mints a streaming
+  access URL itself, so this works for every provider, including local-only ones).
+- preview: on desktop, clicking an item opens a preview. Image items show the
+  enlarged image; video items play the clip with controls. The grid thumbnail of
+  a video item is its first frame. Each preview also shows that item's
+  `description` (centered).
+- writes back: single → the chosen item `id`; multi → an array of selected ids.
+
+### mediaModelSelect `{}`
+- purpose: pick the image-gen and video-gen provider/model for a run.
+- use_when: gating the media model choice before any credit-consuming generation (short-drama Stage 0).
+- self-populating: takes no `id` and no `options`. It fetches the connected image/video capabilities
+  itself, seeds each dropdown from the saved global media defaults, shows an in-place "connect a
+  provider in Settings" prompt for any kind with no connected provider, and persists the confirmed
+  choice back to the global media settings.
+- writes back: four fixed keys — `imgProvider`, `imgModel`, `vidProvider`, `vidModel`. Submit is
+  gated until both `imgModel` and `vidModel` are chosen.
+
 ## Evidence + rich (carry the proof)
 ### finding
 - purpose: one issue/observation that the reader may need to act on. The core

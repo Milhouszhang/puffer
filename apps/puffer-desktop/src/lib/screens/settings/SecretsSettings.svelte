@@ -1,6 +1,12 @@
 <script lang="ts">
   import Icon from "../../design/Icon.svelte";
-  import { deleteSecret, importChromeSecrets, saveSecret } from "../../api/desktop";
+  import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+  import {
+    deleteSecret,
+    importBrowserSecrets,
+    importOnePasswordExport,
+    saveSecret
+  } from "../../api/desktop";
   import type { SecretSummary, SettingsSnapshot } from "../../types";
 
   type Props = {
@@ -20,7 +26,9 @@
     origin: ""
   });
   let saving = $state(false);
-  let importing = $state(false);
+  // Shared "an import is running" marker, also used for the .1pux button via the
+  // `__1pux__` sentinel so only one import runs at a time.
+  let importingSource = $state<string | null>(null);
   let deletingId = $state<string | null>(null);
   let error = $state<string | null>(null);
   let saved = $state<string | null>(null);
@@ -39,7 +47,10 @@
   let visibleSecrets = $derived(filteredSecrets.slice(0, visibleSecretCount));
   let hasMoreSecrets = $derived(visibleSecrets.length < filteredSecrets.length);
   let remainingSecrets = $derived(Math.max(0, filteredSecrets.length - visibleSecrets.length));
-  let disabled = $derived(!props.daemonReachable || saving || importing || deletingId !== null);
+  let disabled = $derived(
+    !props.daemonReachable || saving || importingSource !== null || deletingId !== null
+  );
+  let importSources = $derived(props.snapshot?.secrets?.sources ?? []);
 
   $effect(() => {
     const nextKey = secretWindowKey(filteredSecrets, searchTerms);
@@ -65,6 +76,8 @@
 
   function sourceLabel(source: string): string {
     if (source === "chrome") return "Chrome";
+    if (source === "firefox") return "Firefox";
+    if (source === "1password") return "1Password";
     if (source === "manual") return "Manual";
     if (source === "agent") return "Agent";
     return source;
@@ -157,15 +170,15 @@
     }
   }
 
-  async function importFromChrome() {
-    if (disabled || !props.snapshot?.secrets?.chromeImportSupported) return;
-    importing = true;
+  async function importFromSource(sourceId: string) {
+    if (disabled) return;
+    importingSource = sourceId;
     error = null;
     saved = null;
     try {
-      const result = await importChromeSecrets();
+      const result = await importBrowserSecrets(sourceId);
       const { imported, skipped, errors } = result.report;
-      saved = `Synced ${imported} Chrome credential${imported === 1 ? "" : "s"}${
+      saved = `Synced ${imported} ${sourceLabel(sourceId)} credential${imported === 1 ? "" : "s"}${
         skipped ? `, skipped ${skipped}` : ""
       }.`;
       if (errors.length > 0) {
@@ -175,7 +188,44 @@
     } catch (e) {
       error = (e as Error).message ?? String(e);
     } finally {
-      importing = false;
+      importingSource = null;
+    }
+  }
+
+  // .1pux export-file import — same level as the other "Sync from ..." buttons:
+  // one click picks the file the 1Password app produced (File -> Export -> 1PUX)
+  // and imports every vault in it. No `op` CLI / app integration, no vault
+  // picker, and the source file is left in place (the user deletes it).
+  async function importOnePasswordExportFile() {
+    if (disabled) return;
+    error = null;
+    saved = null;
+    let path: string | null = null;
+    try {
+      const picked = await openFileDialog({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "1Password export", extensions: ["1pux"] }]
+      });
+      path = Array.isArray(picked) ? picked[0] : picked;
+    } catch (e) {
+      error = (e as Error).message ?? String(e);
+      return;
+    }
+    if (!path) return;
+    importingSource = "__1pux__";
+    try {
+      const result = await importOnePasswordExport(path);
+      const { imported, skipped, errors } = result.report;
+      saved = `Imported ${imported} 1Password credential${imported === 1 ? "" : "s"}${
+        skipped ? `, skipped ${skipped}` : ""
+      }.`;
+      if (errors.length > 0) error = errors.join("; ");
+      props.onRefresh();
+    } catch (e) {
+      error = (e as Error).message ?? String(e);
+    } finally {
+      importingSource = null;
     }
   }
 </script>
@@ -264,15 +314,35 @@
       </label>
     </div>
     <div class="pf-secrets-actions">
+      {#each importSources as src (src.id)}
+        <button
+          type="button"
+          class="sc-btn"
+          data-variant="outline"
+          data-size="sm"
+          disabled={disabled || !src.available}
+          title={src.available ? `Sync saved logins from ${src.label}` : `${src.label} not detected on this machine`}
+          onclick={() => importFromSource(src.id)}
+        >
+          <Icon name="key" size={12} />{importingSource === src.id
+            ? "Syncing..."
+            : src.id === "1password"
+              ? "Sync from 1Password"
+              : `Sync from ${src.label}`}
+        </button>
+      {/each}
       <button
         type="button"
         class="sc-btn"
         data-variant="outline"
         data-size="sm"
-        disabled={disabled || !props.snapshot?.secrets?.chromeImportSupported}
-        onclick={importFromChrome}
+        disabled={disabled}
+        title="Import a 1Password export file (File → Export → 1PUX in the app) — no 1Password CLI needed"
+        onclick={importOnePasswordExportFile}
       >
-        <Icon name="key" size={12} />{importing ? "Syncing..." : "Sync from Chrome"}
+        <Icon name="key" size={12} />{importingSource === "__1pux__"
+          ? "Syncing..."
+          : "Import 1Password export (.1pux)"}
       </button>
       <button
         type="button"

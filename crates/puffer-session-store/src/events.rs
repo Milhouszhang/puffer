@@ -249,6 +249,10 @@ pub enum TranscriptEvent {
         #[serde(default)]
         remote_session_status: Option<String>,
         #[serde(default)]
+        active_remote_runner_auth_token: Option<String>,
+        #[serde(default)]
+        active_remote_cwd: Option<String>,
+        #[serde(default)]
         active_team_name: Option<String>,
         statusline_enabled: bool,
         working_dirs: Vec<String>,

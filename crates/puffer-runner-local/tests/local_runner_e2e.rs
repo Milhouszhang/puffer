@@ -30,6 +30,7 @@ fn make_request_with_mode(
     input: serde_json::Value,
 ) -> ToolRequest {
     ToolRequest {
+        request_id: None,
         tool_id: tool_id.to_string(),
         cwd: cwd.to_path_buf(),
         working_dirs: Vec::new(),
@@ -240,9 +241,7 @@ fn partial_read_is_rejected_distinctly_from_not_read() {
         .expect_err("Edit after partial Read must still be rejected");
     assert_eq!(rejection, StalenessRejection::PartialRead);
     assert!(
-        rejection
-            .message()
-            .contains("partially")
+        rejection.message().contains("partially")
             || rejection.message().contains("offset")
             || rejection.message().contains("limit"),
         "PartialRead message must mention partial / offset / limit so the model knows what to do; got: {}",

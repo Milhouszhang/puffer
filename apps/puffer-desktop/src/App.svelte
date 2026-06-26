@@ -1282,6 +1282,11 @@
     settingsSnapshot = snapshot;
   }
 
+  function handleRemoteSettingsSaved(snapshot: SettingsSnapshot) {
+    settingsSnapshot = snapshot;
+    statusMessage = "Remote execution settings saved.";
+  }
+
   async function handleImportExternal(providerId: string, source: "claude" | "codex") {
     if (importBusyKey || authBusyProviderId) return;
     if (hasConnectedProvider(providerId)) {
@@ -4592,6 +4597,7 @@
             onImportExternal={(providerId, source) =>
               void handleImportExternal(providerId, source)}
             onRefresh={() => void refreshSettings()}
+            onRemoteSettingsSaved={handleRemoteSettingsSaved}
             onFinish={() => void finishOnboarding()}
           />
         </div>

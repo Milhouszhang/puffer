@@ -329,10 +329,7 @@ pub(super) fn execute_task_update(
     // metadata or other fields on an already-completed task.
     // This mirrors the daemon's human-approval path (handle_monitor_task_complete)
     // which also records completed_via as a top-level field.
-    if status_change
-        .as_ref()
-        .and_then(|sc| sc["to"].as_str())
-        == Some("completed")
+    if status_change.as_ref().and_then(|sc| sc["to"].as_str()) == Some("completed")
         && (tp == monitor_tasks_path(&store_cwd) || is_monitor_task_metadata(&task.metadata))
     {
         let via = parsed
@@ -2424,8 +2421,7 @@ mod tests {
 
         assert_eq!(task_json["status"], "completed");
         assert_eq!(
-            task_json["completed_via"],
-            "agent_report:incoming",
+            task_json["completed_via"], "agent_report:incoming",
             "incoming-direction completion must record the incoming label"
         );
     }
@@ -2475,8 +2471,7 @@ mod tests {
 
         assert_eq!(task_json["status"], "completed");
         assert_eq!(
-            task_json["completed_via"],
-            "reply",
+            task_json["completed_via"], "reply",
             "completed_via must not be clobbered by a metadata-only update on an already-completed task"
         );
     }

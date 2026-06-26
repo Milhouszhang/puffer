@@ -1976,7 +1976,7 @@
     const lowerName = child.toolName.toLowerCase();
     if (isTerminalActivity(child)) {
       const command = inputString(input, ["command"]) ?? child.summary ?? child.title ?? "";
-      return { name: "Shell", arg: valuePreview(command, 120) };
+      return { name: "Bash", arg: valuePreview(command, 120) };
     }
     if (lowerName === "read" || lowerName === "read_file") {
       const path = inputString(input, ["path", "file_path", "filePath"]);

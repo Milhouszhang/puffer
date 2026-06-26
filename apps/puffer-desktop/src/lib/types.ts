@@ -618,7 +618,67 @@ export type SettingsSnapshot = {
   providers: ProviderSummary[];
   browser: BrowserSettings;
   networkProxy: NetworkProxySettings;
+  remote: RemoteSettings;
   secrets: SecretsSettings;
+};
+
+export type RemoteSettings = {
+  defaultTarget: string | null;
+  sshHosts: SshHostSettings[];
+  agentenv: AgentEnvSettings | null;
+};
+
+export type SshHostSettings = {
+  id: string;
+  label: string;
+  target: string;
+  port: number | null;
+  cwd: string | null;
+  authSecretId: string | null;
+  hasAuthSecret: boolean;
+};
+
+export type AgentEnvSettings = {
+  enabled: boolean;
+  apiUrl: string;
+  runnerHost: string | null;
+  workspace: string | null;
+  credentialSecretId: string | null;
+  hasCredential: boolean;
+  authMethod: "api_key" | "access_token" | string;
+  defaults: AgentEnvSandboxDefaults;
+};
+
+export type AgentEnvSandboxDefaults = {
+  sandboxType: string;
+  image: string;
+  region: string | null;
+  cpuMillis: number | null;
+  memoryMb: number | null;
+  gpuCount: number | null;
+  gpuType: string | null;
+  maxLifetimeSeconds: number | null;
+};
+
+export type SaveRemoteSettingsInput = {
+  defaultTarget: string | null;
+  sshHosts: {
+    id: string;
+    label: string;
+    target: string;
+    port: number | null;
+    cwd: string | null;
+    authSecretId: string | null;
+  }[];
+  agentenv: {
+    enabled: boolean;
+    apiUrl: string;
+    runnerHost: string | null;
+    workspace: string | null;
+    credentialSecretId: string | null;
+    authMethod: "api_key" | "access_token";
+    defaults: AgentEnvSandboxDefaults;
+  } | null;
 };
 
 export type WorkflowTrigger =

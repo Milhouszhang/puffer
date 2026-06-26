@@ -34,6 +34,7 @@ pub mod powershell;
 pub mod process_control;
 pub mod recall;
 pub mod remember;
+pub mod remote_execution;
 pub mod request_secret;
 pub mod request_user_browser_action;
 pub mod secret_value;

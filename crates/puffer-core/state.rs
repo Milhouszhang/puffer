@@ -7,6 +7,7 @@ use crate::runtime::ReflectionConfig;
 use puffer_config::PufferConfig;
 use puffer_media::ExactMediaDiscoveryCache;
 use puffer_runner_api::ToolRunner;
+use puffer_runner_grpc::RemoteToolRunner;
 use puffer_session_store::{
     ClaudeReadSnapshotEvent, MessageActor, MessageActorKind, SessionMetadata, SessionRecord,
     TranscriptEvent, TranscriptRewrite,
@@ -193,6 +194,15 @@ impl SecretAccessState {
     }
 }
 
+/// Session-selected remote execution target. The actual runner bootstrap can
+/// swap `tool_runner` after this target is entered; keeping the selection here
+/// makes the model-visible `enter-remote` operation explicit and inspectable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActiveRemoteTarget {
+    pub kind: String,
+    pub id: String,
+}
+
 /// Stores the mutable session and UI state for one interactive Puffer run.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -219,6 +229,12 @@ pub struct AppState {
     pub remote_session_id: Option<String>,
     pub remote_session_url: Option<String>,
     pub remote_session_status: Option<String>,
+    /// Bearer token for the active remote runner. This is copied into the
+    /// session snapshot so desktop turn resume can reconnect authenticated
+    /// runners, and is cleared when the remote target is exited.
+    pub active_remote_runner_auth_token: Option<String>,
+    pub active_remote_target: Option<ActiveRemoteTarget>,
+    pub active_remote_cwd: Option<PathBuf>,
     pub active_team_name: Option<String>,
     pub current_actor: Option<MessageActor>,
     pub statusline_enabled: bool,
@@ -299,6 +315,7 @@ pub struct AppState {
     /// Defaults to a `LocalToolRunner`; tests and remote backends override
     /// it via [`AppState::with_tool_runner`].
     pub tool_runner: Arc<dyn ToolRunner>,
+    pub local_tool_runner: Option<Arc<dyn ToolRunner>>,
     /// In-memory store for interactive/background processes with PTY or pipe I/O.
     pub process_store: Arc<Mutex<crate::runtime::process_store::ProcessStore>>,
     /// Session-scoped secret handles prepared by verified Lambda Skill bridges.
@@ -372,6 +389,9 @@ impl AppState {
             remote_session_id: None,
             remote_session_url: None,
             remote_session_status: None,
+            active_remote_runner_auth_token: None,
+            active_remote_target: None,
+            active_remote_cwd: None,
             active_team_name: None,
             current_actor: None,
             statusline_enabled: true,
@@ -408,6 +428,7 @@ impl AppState {
             tasks: Vec::new(),
             next_task_id: 1,
             tool_runner: Arc::new(LocalToolRunner::new()),
+            local_tool_runner: None,
             process_store: Arc::new(Mutex::new(
                 crate::runtime::process_store::ProcessStore::default(),
             )),
@@ -435,8 +456,39 @@ impl AppState {
     /// backends; the default `AppState::new` already installs a local
     /// in-process runner.
     pub fn with_tool_runner(mut self, runner: Arc<dyn ToolRunner>) -> Self {
+        self.local_tool_runner = Some(self.tool_runner.clone());
         self.tool_runner = runner;
         self
+    }
+
+    fn restore_active_remote_runner_from_snapshot(&mut self) {
+        if self.remote_session_status.as_deref() != Some("connected") {
+            return;
+        }
+        let (Some(kind), Some(id), Some(endpoint)) = (
+            self.remote_environment.clone(),
+            self.remote_session_id.clone(),
+            self.remote_session_url.clone(),
+        ) else {
+            return;
+        };
+        match RemoteToolRunner::connect(&endpoint, self.active_remote_runner_auth_token.as_deref())
+        {
+            Ok(runner) => {
+                if self.local_tool_runner.is_none() {
+                    self.local_tool_runner = Some(self.tool_runner.clone());
+                }
+                self.tool_runner = Arc::new(runner);
+                self.active_remote_target = Some(ActiveRemoteTarget { kind, id });
+            }
+            Err(error) => {
+                eprintln!("puffer: failed to restore remote tool runner {endpoint}: {error}");
+                self.remote_session_status = Some("disconnected".to_string());
+                self.active_remote_runner_auth_token = None;
+                self.active_remote_target = None;
+                self.active_remote_cwd = None;
+            }
+        }
     }
 
     /// Sets trusted exact media discovery entries for workflow tool execution.
@@ -524,6 +576,8 @@ impl AppState {
                     remote_session_id,
                     remote_session_url,
                     remote_session_status,
+                    active_remote_runner_auth_token,
+                    active_remote_cwd,
                     active_team_name,
                     statusline_enabled,
                     working_dirs,
@@ -549,6 +603,9 @@ impl AppState {
                     state.remote_session_id = remote_session_id;
                     state.remote_session_url = remote_session_url;
                     state.remote_session_status = remote_session_status;
+                    state.active_remote_runner_auth_token = active_remote_runner_auth_token;
+                    state.active_remote_cwd = active_remote_cwd.map(PathBuf::from);
+                    state.restore_active_remote_runner_from_snapshot();
                     state.active_team_name = active_team_name;
                     state.statusline_enabled = statusline_enabled;
                     state.working_dirs = working_dirs.into_iter().map(Into::into).collect();
@@ -798,6 +855,11 @@ impl AppState {
             remote_session_id: self.remote_session_id.clone(),
             remote_session_url: self.remote_session_url.clone(),
             remote_session_status: self.remote_session_status.clone(),
+            active_remote_runner_auth_token: self.active_remote_runner_auth_token.clone(),
+            active_remote_cwd: self
+                .active_remote_cwd
+                .as_ref()
+                .map(|path| path.display().to_string()),
             active_team_name: self.active_team_name.clone(),
             statusline_enabled: self.statusline_enabled,
             working_dirs: self
@@ -1363,6 +1425,40 @@ mod tests {
             )
         );
         assert!(!restored.session_permission_state().has_browser_grant());
+    }
+
+    #[test]
+    fn session_restore_from_state_snapshot_restores_active_remote_target() {
+        let mut state = AppState::new(
+            PufferConfig::default(),
+            PathBuf::from("."),
+            sample_metadata(),
+        );
+        state.remote_environment = Some("agentenv".to_string());
+        state.remote_session_id = Some("manual-local-runner".to_string());
+        state.remote_session_url = Some("http://127.0.0.1:50051".to_string());
+        state.remote_session_status = Some("connected".to_string());
+        state.active_remote_runner_auth_token = Some("runner-token".to_string());
+        state.active_remote_cwd = Some(PathBuf::from("/tmp"));
+
+        let record = SessionRecord {
+            metadata: state.session.clone(),
+            events: vec![state.snapshot_event()],
+        };
+        let restored = AppState::from_session_record(PufferConfig::default(), record);
+
+        assert_eq!(
+            restored.active_remote_target,
+            Some(ActiveRemoteTarget {
+                kind: "agentenv".to_string(),
+                id: "manual-local-runner".to_string(),
+            })
+        );
+        assert_eq!(restored.active_remote_cwd, Some(PathBuf::from("/tmp")));
+        assert_eq!(
+            restored.active_remote_runner_auth_token.as_deref(),
+            Some("runner-token")
+        );
     }
 
     #[test]

@@ -64,6 +64,8 @@ pub(crate) fn load_settings_snapshot() -> Result<SettingsSnapshotDto> {
         .collect::<std::collections::BTreeSet<PathBuf>>()
         .len();
 
+    let provider_summaries = desktop_provider_summaries(&providers);
+
     Ok(SettingsSnapshotDto {
         workspace_root: paths.workspace_root.display().to_string(),
         workspace_config_file: paths.workspace_config_file().display().to_string(),
@@ -99,10 +101,31 @@ pub(crate) fn load_settings_snapshot() -> Result<SettingsSnapshotDto> {
             folder_groups,
         },
         auth: auth_statuses(&auth_store),
-        providers: providers.provider_entries().map(provider_summary).collect(),
+        providers: provider_summaries,
         browser: browser_settings(&paths, &config),
         secrets: secrets_settings(&paths)?,
     })
+}
+
+fn desktop_provider_summaries(providers: &ProviderRegistry) -> Vec<ProviderSummaryDto> {
+    let mut summaries: Vec<_> = providers.provider_entries().map(provider_summary).collect();
+    if !summaries.iter().any(|provider| provider.id == "puffer") {
+        summaries.insert(0, native_puffer_provider_summary());
+    }
+    summaries
+}
+
+fn native_puffer_provider_summary() -> ProviderSummaryDto {
+    ProviderSummaryDto {
+        id: "puffer".to_string(),
+        display_name: "Puffer".to_string(),
+        base_url: "local-cli://puffer".to_string(),
+        default_api: "cli".to_string(),
+        model_count: 1,
+        auth_modes: vec!["native".to_string()],
+        source_kind: "builtin".to_string(),
+        source_path: None,
+    }
 }
 
 fn browser_settings(

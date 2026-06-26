@@ -1,0 +1,169 @@
+id: RemoteExecution
+name: RemoteExecution
+aliases:
+  - remote-execution
+  - enter-remote
+description: |-
+  Manage configured SSH and AgentEnv remote execution targets.
+
+  Use action="status" or "list-targets" to inspect configured targets. Use
+  action="enter-remote" with targetType="ssh" and hostId, or targetType="agentenv"
+  and sandboxId, to select the active remote target for this session. For a
+  configured SSH host, enter-remote can start puffer-tool-runner over SSH and
+  connect through a local tunnel when runnerEndpoint is omitted. For AgentEnv,
+  enter-remote discovers an existing exposed runner endpoint, or exposes the
+  runner port when needed. Pass runnerEndpoint when connecting to an already
+  started puffer-tool-runner, AgentEnv exposed runner, or manually-created SSH
+  tunnel endpoint.
+
+  AgentEnv actions use the existing AgentEnv account configured in Settings >
+  Remote. Credentials are loaded from the encrypted Puffer secret vault and are
+  never returned in tool output.
+handler: runtime:workflow:remote_execution
+approval_policy: ask
+sandbox_policy: workspace-write
+input_schema:
+  type: object
+  properties:
+    action:
+      type: string
+      enum:
+        - status
+        - list-targets
+        - enter-remote
+        - exit-remote
+        - ssh:create-config
+        - ssh:delete-config
+        - agentenv:list-sandboxes
+        - agentenv:list-snapshots
+        - agentenv:get-snapshot
+        - agentenv:create-sandbox
+        - agentenv:terminate-sandbox
+        - agentenv:delete-sandbox
+        - agentenv:snapshot-sandbox
+        - agentenv:expose-port
+        - agentenv:list-ports
+      description: Remote-management operation to perform.
+    targetType:
+      type: string
+      enum:
+        - ssh
+        - agentenv
+      description: Target kind for enter-remote.
+    hostId:
+      type: string
+      description: SSH host id, or an AgentEnv sandbox id alias for enter-remote.
+    sandboxId:
+      type: string
+      description: AgentEnv sandbox id.
+    workspace:
+      type: string
+      description: Optional AgentEnv workspace id override.
+    name:
+      type: string
+      description: AgentEnv sandbox or snapshot name.
+    description:
+      type: string
+      description: AgentEnv sandbox description.
+    image:
+      type: string
+      description: AgentEnv image override for sandbox creation.
+    snapshotId:
+      type: string
+      description: AgentEnv snapshot id to start from.
+    cpuMillis:
+      type: integer
+      minimum: 0
+      description: AgentEnv CPU override in millis.
+    memoryMb:
+      type: integer
+      minimum: 0
+      description: AgentEnv memory override in MB.
+    gpuCount:
+      type: integer
+      minimum: 0
+      description: AgentEnv GPU count override.
+    gpuType:
+      type: string
+      description: AgentEnv GPU type override.
+    region:
+      type: string
+      description: AgentEnv allowed region override.
+    maxLifetimeSeconds:
+      type: integer
+      minimum: 0
+      description: AgentEnv max lifetime override.
+    port:
+      type: integer
+      minimum: 1
+      maximum: 65535
+      description: Container port for agentenv:expose-port and AgentEnv enter-remote runner discovery, or SSH port in ssh config. AgentEnv enter-remote defaults to 50051.
+    portType:
+      type: string
+      enum:
+        - tcp
+        - http
+        - ws
+      description: AgentEnv exposed port protocol.
+    withMemory:
+      type: boolean
+      description: Include memory when snapshotting a sandbox.
+    runnerEndpoint:
+      type: string
+      description: gRPC endpoint for the remote puffer-tool-runner, such as http://127.0.0.1:50051. Optional for configured SSH hosts.
+    runnerHost:
+      type: string
+      description: Public host or IP to combine with AgentEnv exposed host ports when enter-remote auto-discovers a runner endpoint.
+    runnerAuthToken:
+      type: string
+      description: Inline bearer token for the remote runner. Prefer runnerAuthSecretId when possible.
+    runnerAuthSecretId:
+      type: string
+      description: Puffer secret id containing the remote runner bearer token.
+    runnerCwd:
+      type: string
+      description: Working directory to send to the remote runner. SSH defaults to the configured host cwd when omitted.
+    waitForReady:
+      type: boolean
+      description: Whether enter-remote should ping the runner before switching tool execution. Defaults to true.
+    env:
+      type: object
+      description: Environment variables to pass when creating an AgentEnv sandbox. For puffer-runner images, runnerAuthToken is also mapped to MANAGED_AGENT_PUFFER_RUNNER_TOKEN.
+      additionalProperties:
+        type: string
+    ssh:
+      type: object
+      description: SSH host config for ssh:create-config.
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        target:
+          type: string
+          description: SSH target like user@example.com.
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        cwd:
+          type: string
+        authSecretId:
+          type: string
+          description: Existing Puffer secret id for SSH credential material.
+      required:
+        - id
+        - label
+        - target
+      additionalProperties: false
+  required:
+    - action
+  additionalProperties: false
+metadata:
+  may_spawn_processes: true
+  may_read_files: true
+  may_write_files: true
+display:
+  group: remote
+  title: RemoteExecution
+  show_in_status: true

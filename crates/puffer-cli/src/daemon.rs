@@ -115,8 +115,8 @@ use crate::desktop_api;
 use crate::desktop_api_types::{
     ExternalCredentialDto, FolderGroupDto, McpServerDto, MediaCapabilityAxisDto,
     MediaCapabilityInfoDto, ModelDescriptorDto, ProxyEndpointInputDto, ProxyTestResultDto,
-    RepoActionResultDto, RepoStatusDto, SaveProxySettingsParams, SessionDetailDto,
-    SettingsSnapshotDto, ThinkingOptionDto,
+    RepoActionResultDto, RepoStatusDto, SaveProxySettingsParams, SaveRemoteSettingsParams,
+    SessionDetailDto, SettingsSnapshotDto, ThinkingOptionDto,
 };
 
 const PROTOCOL_VERSION: &str = "1";
@@ -1321,6 +1321,7 @@ async fn dispatch_request(
             respond!(detached!(|s, p| handle_create_file_media_access(&s, &p)))
         }
         "save_proxy_settings" => respond!(detached!(|s, p| handle_save_proxy_settings(&s, &p))),
+        "save_remote_settings" => respond!(detached!(|s, p| handle_save_remote_settings(&s, &p))),
         "save_secret" => respond!(detached!(|s, p| handle_save_secret(&s, &p))),
         "delete_secret" => respond!(detached!(|s, p| handle_delete_secret(&s, &p))),
         "contacts_list" => {
@@ -2128,6 +2129,26 @@ fn handle_save_proxy_settings(state: &DaemonState, params: &Value) -> Result<Val
     Ok(serde_json::to_value(snapshot)?)
 }
 
+fn handle_save_remote_settings(state: &DaemonState, params: &Value) -> Result<Value> {
+    let input: SaveRemoteSettingsParams =
+        serde_json::from_value(params.clone()).context("invalid remote settings")?;
+    let mut config = state.config.lock().unwrap().clone();
+    config.remote = desktop_api::remote_config_from_settings(input);
+    save_user_config(&state.paths, &config).context("save user config")?;
+    reload_daemon_config(state)?;
+    let fresh = state.build_runtime_inputs()?;
+    let config = state.config.lock().unwrap().clone();
+    let snapshot: SettingsSnapshotDto = desktop_api::load_settings_snapshot(
+        &state.paths,
+        &config,
+        &fresh.resources,
+        &fresh.providers,
+        &fresh.auth_store,
+        &fresh.session_store,
+    )?;
+    Ok(serde_json::to_value(snapshot)?)
+}
+
 fn handle_test_proxy(state: &DaemonState, params: &Value) -> Result<Value> {
     let input: TestProxyParams =
         serde_json::from_value(params.clone()).context("invalid proxy test params")?;
@@ -2525,6 +2546,12 @@ fn handle_list_provider_models(state: &DaemonState, params: &Value) -> Result<Va
         .and_then(|v| v.as_str())
         .context("missing providerId")?;
     let provider_id = canonical_desktop_provider_id(requested_provider_id);
+    if provider_id == "puffer" {
+        return Ok(json!({
+            "providerId": provider_id,
+            "models": [native_puffer_model_descriptor()],
+        }));
+    }
     let mut inputs = state.build_runtime_inputs_without_discovery()?;
     let config = state.config.lock().unwrap().clone();
     let needs_fresh_discovery = inputs
@@ -2568,6 +2595,20 @@ fn handle_list_provider_models(state: &DaemonState, params: &Value) -> Result<Va
         .map(|model| model_descriptor_dto(family, model))
         .collect();
     Ok(json!({ "providerId": provider_id, "models": models }))
+}
+
+fn native_puffer_model_descriptor() -> Value {
+    json!({
+        "id": "default",
+        "displayName": "Default",
+        "provider": "puffer",
+        "api": "cli",
+        "contextWindow": 200000,
+        "maxOutputTokens": 8192,
+        "supportsReasoning": false,
+        "supportsTools": true,
+        "isDefault": true,
+    })
 }
 
 fn handle_list_media_capabilities(state: &DaemonState, params: &Value) -> Result<Value> {
@@ -3339,6 +3380,12 @@ fn resolve_create_session_routing(
     let inputs = state.build_runtime_inputs_without_discovery()?;
     if let Some(provider_id) = provider_id {
         let provider_id = canonical_desktop_provider_id(&provider_id);
+        if is_native_puffer_provider_id(&provider_id) {
+            return Ok(DesktopSessionRouting {
+                provider_id: Some(provider_id),
+                model_id: Some("default".to_string()),
+            });
+        }
         let provider = inputs
             .providers
             .provider(&provider_id)
@@ -6154,6 +6201,13 @@ impl TurnRequestOptions {
     }
 
     fn apply_session_routing(&mut self, routing: DesktopSessionRouting) {
+        if routing
+            .provider_id
+            .as_deref()
+            .is_some_and(is_native_puffer_provider_id)
+        {
+            return;
+        }
         if self.provider_id.is_none() {
             self.provider_id = routing
                 .provider_id
@@ -6230,6 +6284,9 @@ fn apply_turn_provider_selection(
     fast_mode: bool,
 ) -> Result<()> {
     let provider_id = canonical_desktop_provider_id(provider_id);
+    if is_native_puffer_provider_id(&provider_id) {
+        return Ok(());
+    }
     let provider = providers
         .provider(&provider_id)
         .with_context(|| format!("provider {provider_id} not found"))?;
@@ -6247,6 +6304,9 @@ fn apply_turn_model_selection(
     effort: &str,
     fast_mode: bool,
 ) -> Result<()> {
+    if provider_id.is_some_and(is_native_puffer_provider_id) {
+        return Ok(());
+    }
     let requested = if let Some(provider_id) = provider_id {
         let provider_id = canonical_desktop_provider_id(provider_id);
         let provider = providers
@@ -6268,6 +6328,13 @@ fn apply_turn_model_override_with_preferences(
     effort: &str,
     fast_mode: bool,
 ) -> Result<()> {
+    if requested
+        .split_once('/')
+        .is_some_and(|(provider_id, _)| is_native_puffer_provider_id(provider_id))
+        || is_native_puffer_provider_id(requested)
+    {
+        return Ok(());
+    }
     let (provider_id, model_id) = resolve_turn_model(providers, requested)?;
     apply_turn_model_preferences(app_state, &provider_id, &model_id, effort, fast_mode);
     Ok(())
@@ -6309,6 +6376,9 @@ fn resolve_turn_model(providers: &ProviderRegistry, requested: &str) -> Result<(
     let (provider_id, model_id) = if let Some((provider_id, model_id)) = requested.split_once('/') {
         let provider_id = canonical_desktop_provider_id(provider_id);
         let model_id = model_id.trim();
+        if is_native_puffer_provider_id(&provider_id) {
+            return Ok((provider_id, "default".to_string()));
+        }
         let provider = providers
             .provider(&provider_id)
             .with_context(|| format!("provider {provider_id} not found"))?;
@@ -6345,6 +6415,10 @@ fn canonical_desktop_provider_id(provider_id: &str) -> String {
         "openai" => "openai".to_string(),
         _ => trimmed.to_string(),
     }
+}
+
+fn is_native_puffer_provider_id(provider_id: &str) -> bool {
+    provider_id.trim().eq_ignore_ascii_case("puffer")
 }
 
 fn desktop_provider_ids_match(left: &str, right: &str) -> bool {

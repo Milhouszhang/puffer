@@ -134,9 +134,9 @@ pub(crate) fn install(
     builder = builder.with_connection_auth_checker(Arc::new(BuiltinConnectionAuthChecker {
         paths: paths.clone(),
     }));
-    builder = builder.with_self_gate(Arc::new(
-        crate::daemon_workflows::MonitorSelfGate::new(paths.clone()),
-    ));
+    builder = builder.with_self_gate(Arc::new(crate::daemon_workflows::MonitorSelfGate::new(
+        paths.clone(),
+    )));
     let manager = Arc::new(
         builder
             .build(handle)

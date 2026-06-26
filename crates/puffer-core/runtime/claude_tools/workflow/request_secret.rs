@@ -265,7 +265,9 @@ fn collect_secret_prompt(label: &str, prompt: Option<&str>) -> String {
         .unwrap_or_else(|| {
             format!("Enter the secret value to save as encrypted Puffer secret `{label}`.")
         });
-    format!("{prompt}\n\nPuffer will save this value as encrypted secret `{label}` and return only a placeholder to the agent.")
+    format!(
+        "{prompt}\n\nPuffer will save this value as encrypted secret `{label}` and return only a placeholder to the agent."
+    )
 }
 
 fn collect_secret_answer(response: &UserQuestionPromptResponse, question: &str) -> Result<String> {

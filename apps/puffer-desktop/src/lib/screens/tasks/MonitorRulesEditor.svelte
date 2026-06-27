@@ -74,6 +74,35 @@
   let excludeChips = $derived(monitorRuleChipsForMode(binding, "exclude", schema));
   let adding = $derived(openMode !== null && savingMode === openMode);
 
+  // Fetch the connector's chat list, retrying while the browser tab is still
+  // warming up (right after a connector starts, list_chats errors or returns
+  // empty until the messenger feed has loaded). Stale fetches are ignored via
+  // the fetchId guard.
+  async function fetchConnectorChats(slug: string, fetchId: number) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      if (fetchId !== dynamicOptionsFetchId) return;
+      try {
+        const chats = await loadLarkChats(slug);
+        if (fetchId !== dynamicOptionsFetchId) return;
+        if (chats.length > 0) {
+          dynamicOptions = chats.map((c) => ({ value: c.name, label: c.name }));
+          if (selectedValue === "") selectedValue = String(dynamicOptions[0].value);
+          dynamicOptionsLoading = false;
+          return;
+        }
+        // loaded but empty — connector may still be warming up; retry
+      } catch {
+        // transient (tab warming up) — retry
+        if (fetchId !== dynamicOptionsFetchId) return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    if (fetchId !== dynamicOptionsFetchId) return;
+    // Exhausted: leave the dropdown empty so the free-text fallback shows.
+    dynamicOptions = [];
+    dynamicOptionsLoading = false;
+  }
+
   // When the selected detail uses connector_chats, fetch options dynamically
   $effect(() => {
     const detail = selectedDetail;
@@ -85,20 +114,7 @@
     dynamicOptionsLoading = true;
     dynamicOptionsError = false;
     const fetchId = ++dynamicOptionsFetchId;
-    loadLarkChats(slug)
-      .then((chats) => {
-        if (fetchId !== dynamicOptionsFetchId) return;
-        dynamicOptions = chats.map((c) => ({ value: c.name, label: c.name }));
-        if (dynamicOptions.length > 0 && selectedValue === "") {
-          selectedValue = String(dynamicOptions[0].value);
-        }
-        dynamicOptionsLoading = false;
-      })
-      .catch(() => {
-        if (fetchId !== dynamicOptionsFetchId) return;
-        dynamicOptionsError = true;
-        dynamicOptionsLoading = false;
-      });
+    void fetchConnectorChats(slug, fetchId);
   });
 
   // Resolve the effective value options for the current detail:

@@ -19,6 +19,7 @@ export type MonitorRuleDetail = {
   values: MonitorRuleSchemaValue[];
   target: MonitorRuleDetailTarget;
   tone: string;
+  optionsSource?: string;
 };
 
 export type MonitorRuleChip = {
@@ -97,7 +98,8 @@ export function detailFromSchemaField(field: MonitorRuleSchemaField, index = 0):
     operators: field.operators.length > 0 ? field.operators : defaultOperatorsForType(field.type),
     values,
     target: "payload",
-    tone: FIELD_TONES[index % FIELD_TONES.length]
+    tone: FIELD_TONES[index % FIELD_TONES.length],
+    ...(field.options_source ? { optionsSource: field.options_source } : {})
   };
 }
 

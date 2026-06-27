@@ -856,6 +856,7 @@ export type MonitorRuleSchemaField = {
   type: MonitorRuleFieldType;
   operators: MonitorRuleOperator[];
   values?: MonitorRuleSchemaValue[];
+  options_source?: string;
 };
 
 export type MonitorRuleSchema = {

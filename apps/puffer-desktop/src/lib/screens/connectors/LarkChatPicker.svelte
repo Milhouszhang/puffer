@@ -41,9 +41,9 @@
 
   function conversationTypeTag(type: string): string | null {
     if (type === "person") return null;
-    if (type === "bot") return "机器人";
-    if (type === "external") return "外部";
-    if (type === "official") return "官方";
+    if (type === "bot") return "Bot";
+    if (type === "external") return "External";
+    if (type === "official") return "Official";
     return null;
   }
 
@@ -71,7 +71,7 @@
     // Exhausted retries
     loading = false;
     if (lastError) {
-      error = `加载会话失败：${lastError}`;
+      error = `Failed to load conversations: ${lastError}`;
     } else {
       // Legitimately empty after retries
       chats = [];
@@ -84,19 +84,19 @@
     error = null;
     try {
       await createMonitor(props.connectionSlug);
-      for (const chatId of checkedIds) {
+      for (const chatName of checkedIds) {
         await addMonitorRule({
           connection_slug: props.connectionSlug,
           mode: "include",
           kind: "field",
-          field: "chat_id",
+          field: "chat_name",
           operator: "equals",
-          value: chatId
+          value: chatName
         });
       }
       props.onDone();
     } catch (e) {
-      error = `操作失败：${(e as Error).message ?? String(e)}`;
+      error = `Failed to save: ${(e as Error).message ?? String(e)}`;
       submitting = false;
     }
   }
@@ -114,7 +114,7 @@
   <div
     class="pf-modal pf-lark-picker-modal"
     role="dialog"
-    aria-label="选择要接收的 Lark 会话"
+    aria-label="Choose which Lark conversations to receive"
     aria-modal="true"
     tabindex="-1"
     onclick={(event) => event.stopPropagation()}
@@ -127,10 +127,10 @@
   >
     <div class="pf-modal-head">
       <div class="pf-modal-title-group">
-        <div class="pf-modal-title">选择要接收的会话</div>
+        <div class="pf-modal-title">Choose which conversations to receive</div>
         <div class="pf-modal-eyebrow">{props.connectorSlug}</div>
       </div>
-      <button type="button" class="pf-modal-close" onclick={handleSkip} aria-label="跳过">
+      <button type="button" class="pf-modal-close" onclick={handleSkip} aria-label="Skip">
         ✕
       </button>
     </div>
@@ -140,35 +140,35 @@
         <div class="pf-connector-question-loading" role="status" aria-live="polite">
           <span class="pf-connector-loading-spinner" aria-hidden="true"></span>
           <div>
-            <strong>正在加载会话列表…</strong>
-            <span>请稍候，Lark feed 正在初始化。</span>
+            <strong>Loading conversations…</strong>
+            <span>Please wait while the Lark feed initializes.</span>
           </div>
         </div>
       {:else if error}
         <div class="pf-lark-picker-error" role="alert">
-          <strong>出错了</strong>
+          <strong>Something went wrong</strong>
           <span>{error}</span>
         </div>
       {:else if chats.length === 0}
         <div class="pf-lark-picker-empty">
-          <p>未发现任何会话。</p>
-          <p class="pf-lark-picker-hint">未选择 = 不接收，可随时在筛选规则里再选</p>
+          <p>No conversations found.</p>
+          <p class="pf-lark-picker-hint">Nothing selected = nothing received. You can choose later in the filter rules.</p>
         </div>
       {:else}
         <div class="pf-lark-picker-search">
           <input
             class="sc-input pf-lark-picker-search-input"
             type="search"
-            placeholder="搜索会话名称…"
+            placeholder="Search conversation names…"
             value={searchQuery}
             oninput={(e) => (searchQuery = (e.currentTarget as HTMLInputElement).value)}
-            aria-label="搜索会话"
+            aria-label="Search conversations"
           />
         </div>
 
         {#if filteredChats.length === 0}
           <div class="pf-lark-picker-empty">
-            <p>没有匹配的会话。</p>
+            <p>No matching conversations.</p>
           </div>
         {:else}
           <div class="pf-lark-picker-list" role="list">
@@ -177,8 +177,8 @@
               <label class="pf-lark-picker-row" role="listitem">
                 <input
                   type="checkbox"
-                  checked={checkedIds.has(chat.chat_id)}
-                  onchange={(e) => toggleChat(chat.chat_id, (e.currentTarget as HTMLInputElement).checked)}
+                  checked={checkedIds.has(chat.name)}
+                  onchange={(e) => toggleChat(chat.name, (e.currentTarget as HTMLInputElement).checked)}
                 />
                 <span class="pf-lark-picker-row-name">{chat.name}</span>
                 {#if tag}
@@ -193,7 +193,7 @@
         {/if}
 
         {#if !hasChecked}
-          <p class="pf-lark-picker-hint">未选择 = 不接收，可随时在筛选规则里再选</p>
+          <p class="pf-lark-picker-hint">Nothing selected = nothing received. You can choose later in the filter rules.</p>
         {/if}
       {/if}
     </div>
@@ -211,7 +211,7 @@
           onclick={handleSkip}
           disabled={submitting}
         >
-          先全部静默
+          Stay quiet for now
         </button>
         <button
           type="button"
@@ -222,7 +222,7 @@
           aria-busy={submitting}
           onclick={() => void handleSubmit()}
         >
-          {submitting ? "保存中…" : "开始接收选中的会话"}
+          {submitting ? "Saving…" : "Start receiving selected"}
         </button>
       </div>
     </div>

@@ -1,10 +1,12 @@
 <script lang="ts">
   import Icon from "../../design/Icon.svelte";
+  import { loadLarkChats } from "../../api/desktop";
   import type {
     MonitorRuleAddRequest,
     MonitorRuleMode,
     MonitorRuleOperator,
     MonitorRuleSchema,
+    MonitorRuleSchemaValue,
     WorkflowBinding,
     WorkflowFilterRule
   } from "../../types";
@@ -49,6 +51,11 @@
   let selectedValue = $state("");
   let activeBindingSlug = "";
 
+  // Dynamic options loading state for connector_chats fields
+  let dynamicOptions = $state<MonitorRuleSchemaValue[]>([]);
+  let dynamicOptionsLoading = $state(false);
+  let dynamicOptionsError = $state(false);
+
   let details = $derived(monitorRuleDetails(schema));
   let eventTextDetail = $derived(details.find((detail) => detail.target === "event_text"));
   let payloadDetails = $derived(details.filter((detail) => detail.target === "payload"));
@@ -59,6 +66,38 @@
   let includeChips = $derived(monitorRuleChipsForMode(binding, "include", schema));
   let excludeChips = $derived(monitorRuleChipsForMode(binding, "exclude", schema));
   let adding = $derived(openMode !== null && savingMode === openMode);
+
+  // When the selected detail uses connector_chats, fetch options dynamically
+  $effect(() => {
+    const detail = selectedDetail;
+    const slug = binding?.connection_slug;
+    if (!detail || detail.optionsSource !== "connector_chats" || !slug || openMode === null) {
+      return;
+    }
+    dynamicOptions = [];
+    dynamicOptionsLoading = true;
+    dynamicOptionsError = false;
+    loadLarkChats(slug)
+      .then((chats) => {
+        dynamicOptions = chats.map((c) => ({ value: c.name, label: c.name }));
+        if (dynamicOptions.length > 0 && selectedValue === "") {
+          selectedValue = String(dynamicOptions[0].value);
+        }
+        dynamicOptionsLoading = false;
+      })
+      .catch(() => {
+        dynamicOptionsError = true;
+        dynamicOptionsLoading = false;
+      });
+  });
+
+  // Resolve the effective value options for the current detail:
+  // prefer dynamicOptions for connector_chats fields, fall back to static options
+  let effectiveValueOptions = $derived(
+    selectedDetail?.optionsSource === "connector_chats"
+      ? dynamicOptions
+      : selectedValueOptions
+  );
 
   $effect(() => {
     const nextSlug = binding?.slug ?? "";
@@ -80,6 +119,9 @@
   function closeBuilder() {
     openMode = null;
     resetBuilderControls();
+    dynamicOptions = [];
+    dynamicOptionsLoading = false;
+    dynamicOptionsError = false;
   }
 
   function resetBuilderControls() {
@@ -87,6 +129,9 @@
     selectedPath = first?.path ?? MESSAGE_TEXT_PATH;
     selectedOperator = first?.operators[0] ?? "contains";
     selectedValue = first ? defaultValueKeyForDetail(first) : "";
+    dynamicOptions = [];
+    dynamicOptionsLoading = false;
+    dynamicOptionsError = false;
   }
 
   function detailForPath(path: string): MonitorRuleDetail {
@@ -98,6 +143,10 @@
     selectedPath = detail.path;
     selectedOperator = detail.operators[0] ?? "contains";
     selectedValue = defaultValueKeyForDetail(detail);
+    // Reset dynamic options so the $effect re-triggers for the new detail
+    dynamicOptions = [];
+    dynamicOptionsLoading = false;
+    dynamicOptionsError = false;
   }
 
   function onConditionChange(event: Event) {
@@ -204,9 +253,11 @@
           {#if selectedNeedsValue}
             <label>
               <span>Value</span>
-              {#if selectedValueOptions.length > 0}
+              {#if dynamicOptionsLoading}
+                <input aria-label="Value" value="" placeholder="Loading groups…" disabled />
+              {:else if effectiveValueOptions.length > 0}
                 <select aria-label="Value" value={selectedValue} onchange={onValueInput}>
-                  {#each selectedValueOptions as option (String(option.value))}
+                  {#each effectiveValueOptions as option (String(option.value))}
                     <option value={String(option.value)}>{option.label}</option>
                   {/each}
                 </select>
@@ -219,6 +270,9 @@
                 />
               {/if}
             </label>
+            {#if dynamicOptionsError || (selectedDetail?.optionsSource === "connector_chats" && !dynamicOptionsLoading && effectiveValueOptions.length === 0)}
+              <p class="pf-monitor-rule-builder-hint">Connector not ready — type a group name</p>
+            {/if}
           {/if}
           <div class="pf-monitor-rule-builder-actions">
             <button type="button" class="pf-secondary-button" onclick={closeBuilder}>Cancel</button>
@@ -290,9 +344,11 @@
           {#if selectedNeedsValue}
             <label>
               <span>Value</span>
-              {#if selectedValueOptions.length > 0}
+              {#if dynamicOptionsLoading}
+                <input aria-label="Value" value="" placeholder="Loading groups…" disabled />
+              {:else if effectiveValueOptions.length > 0}
                 <select aria-label="Value" value={selectedValue} onchange={onValueInput}>
-                  {#each selectedValueOptions as option (String(option.value))}
+                  {#each effectiveValueOptions as option (String(option.value))}
                     <option value={String(option.value)}>{option.label}</option>
                   {/each}
                 </select>
@@ -305,6 +361,9 @@
                 />
               {/if}
             </label>
+            {#if dynamicOptionsError || (selectedDetail?.optionsSource === "connector_chats" && !dynamicOptionsLoading && effectiveValueOptions.length === 0)}
+              <p class="pf-monitor-rule-builder-hint">Connector not ready — type a group name</p>
+            {/if}
           {/if}
           <div class="pf-monitor-rule-builder-actions">
             <button type="button" class="pf-secondary-button" onclick={closeBuilder}>Cancel</button>

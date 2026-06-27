@@ -55,6 +55,8 @@
   let dynamicOptions = $state<MonitorRuleSchemaValue[]>([]);
   let dynamicOptionsLoading = $state(false);
   let dynamicOptionsError = $state(false);
+  // Monotonic counter for fetch-race guard
+  let dynamicOptionsFetchId = 0;
 
   let details = $derived(monitorRuleDetails(schema));
   let eventTextDetail = $derived(details.find((detail) => detail.target === "event_text"));
@@ -77,8 +79,10 @@
     dynamicOptions = [];
     dynamicOptionsLoading = true;
     dynamicOptionsError = false;
+    const fetchId = ++dynamicOptionsFetchId;
     loadLarkChats(slug)
       .then((chats) => {
+        if (fetchId !== dynamicOptionsFetchId) return;
         dynamicOptions = chats.map((c) => ({ value: c.name, label: c.name }));
         if (dynamicOptions.length > 0 && selectedValue === "") {
           selectedValue = String(dynamicOptions[0].value);
@@ -86,6 +90,7 @@
         dynamicOptionsLoading = false;
       })
       .catch(() => {
+        if (fetchId !== dynamicOptionsFetchId) return;
         dynamicOptionsError = true;
         dynamicOptionsLoading = false;
       });
@@ -119,9 +124,6 @@
   function closeBuilder() {
     openMode = null;
     resetBuilderControls();
-    dynamicOptions = [];
-    dynamicOptionsLoading = false;
-    dynamicOptionsError = false;
   }
 
   function resetBuilderControls() {
@@ -143,9 +145,10 @@
     selectedPath = detail.path;
     selectedOperator = detail.operators[0] ?? "contains";
     selectedValue = defaultValueKeyForDetail(detail);
-    // Reset dynamic options so the $effect re-triggers for the new detail
+    // Reset dynamic options so the $effect re-triggers for the new detail.
+    // Eagerly show loading state for connector_chats fields to avoid flashing the text input.
     dynamicOptions = [];
-    dynamicOptionsLoading = false;
+    dynamicOptionsLoading = detail.optionsSource === "connector_chats";
     dynamicOptionsError = false;
   }
 

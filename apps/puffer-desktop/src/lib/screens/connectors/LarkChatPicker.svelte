@@ -185,7 +185,7 @@
                   <span class="pf-lark-picker-tag">{tag}</span>
                 {/if}
                 {#if chat.unread}
-                  <span class="pf-lark-picker-unread" aria-label="有未读消息"></span>
+                  <span class="pf-lark-picker-unread" aria-label="Has unread messages"></span>
                 {/if}
               </label>
             {/each}

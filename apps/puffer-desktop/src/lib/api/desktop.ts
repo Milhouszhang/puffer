@@ -18,6 +18,7 @@ import type {
   GenerateMediaInput,
   GenerateMediaResult,
   GeneratedVideoAccessResult,
+  LarkChat,
   ProviderSummary,
   ProxyTestResult,
   PullRequest,
@@ -2932,4 +2933,14 @@ export async function qwen35Recommend(): Promise<Qwen35Recommendation> {
  *  events; completion arrives as `qwen35://install-done` ({ success }). */
 export async function qwen35Install(): Promise<void> {
   await invoke("qwen35_install");
+}
+
+/** List chats available in a lark-browser or feishu-browser connector's feed.
+ *  Returns an empty array if the feed hasn't loaded yet — callers should retry. */
+export async function loadLarkChats(connectionSlug: string): Promise<LarkChat[]> {
+  const client = await ensureLocalDaemonClient();
+  const result = await client.request<{ chats: LarkChat[] }>("lark_browser_list_chats", {
+    connection_slug: connectionSlug
+  });
+  return result.chats ?? [];
 }

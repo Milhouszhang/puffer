@@ -983,3 +983,10 @@ export type ExternalCredential = {
   description: string;
   sourcePath: string;
 };
+
+export interface LarkChat {
+  chat_id: string;
+  name: string;
+  conversation_type: string;
+  unread: boolean;
+}

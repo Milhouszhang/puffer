@@ -105,18 +105,27 @@
     dynamicOptionsLoading = false;
   }
 
-  // When the selected detail uses connector_chats, fetch options dynamically
+  // When the selected detail uses connector_chats, fetch options dynamically.
+  // Guard on a stable (field, slug, open) KEY so the fetch is NOT restarted every
+  // time the parent passes a new `binding` object reference (which happens often
+  // while an active monitor refreshes the workflow snapshot). Restarting would
+  // cancel the in-flight fetch via the fetchId guard and the list would never
+  // populate.
+  let lastChatsFetchKey = "";
   $effect(() => {
     const detail = selectedDetail;
     const slug = binding?.connection_slug;
-    if (!detail || detail.optionsSource !== "connector_chats" || !slug || openMode === null) {
-      return;
-    }
+    const active =
+      !!detail && detail.optionsSource === "connector_chats" && !!slug && openMode !== null;
+    const key = active ? `${detail!.path}::${slug}` : "";
+    if (key === lastChatsFetchKey) return; // nothing relevant changed — keep current options
+    lastChatsFetchKey = key;
+    if (!active) return;
     dynamicOptions = [];
     dynamicOptionsLoading = true;
     dynamicOptionsError = false;
     const fetchId = ++dynamicOptionsFetchId;
-    void fetchConnectorChats(slug, fetchId);
+    void fetchConnectorChats(slug!, fetchId);
   });
 
   // Resolve the effective value options for the current detail:

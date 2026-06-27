@@ -121,12 +121,20 @@ fn ensure_lark_subscriber_running(
     if manager.subscriber_ids().iter().any(|id| id == subscriber_id) {
         return Ok(());
     }
-    // Determine the connector slug from the connection record, falling back to lark-browser.
+    // Determine the connector slug from the connection record. When no record
+    // exists (e.g. the subscriber has never been started in this session), derive
+    // the fallback from the brand encoded in connection_slug rather than
+    // hardcoding lark-browser — otherwise a feishu-browser connection loads the
+    // wrong manifest and state dir and always errors "not configured".
     let connector_slug = manager
         .connection_store()
         .get(subscriber_id)
         .map(|c| c.connector_slug.clone())
-        .unwrap_or_else(|| super::CONNECTOR_SLUG_LARK.to_string());
+        .unwrap_or_else(|| {
+            super::Brand::from_slug(connection_slug)
+                .map(|b| b.platform().to_string())
+                .unwrap_or_else(|| super::CONNECTOR_SLUG_LARK.to_string())
+        });
     let template = manager
         .connector_store()
         .get(&connector_slug)
@@ -546,6 +554,42 @@ fn integer_input(input: &Value, key: &str) -> Option<u64> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod subscriber_fallback_tests {
+    /// Mirrors the fallback branch in `ensure_lark_subscriber_running`:
+    ///   Brand::from_slug(connection_slug)
+    ///       .map(|b| b.platform().to_string())
+    ///       .unwrap_or_else(|| super::CONNECTOR_SLUG_LARK.to_string())
+    ///
+    /// Asserts that a feishu connection_slug resolves to "feishu-browser" (not
+    /// the old hardcoded "lark-browser"), and that lark still resolves correctly.
+    fn fallback_connector_slug(connection_slug: &str) -> String {
+        super::super::Brand::from_slug(connection_slug)
+            .map(|b| b.platform().to_string())
+            .unwrap_or_else(|| super::super::CONNECTOR_SLUG_LARK.to_string())
+    }
+
+    #[test]
+    fn feishu_connection_slug_resolves_to_feishu_connector() {
+        assert_eq!(
+            fallback_connector_slug("feishu-browser"),
+            "feishu-browser",
+            "feishu-browser connection must fall back to feishu-browser connector, not lark-browser"
+        );
+    }
+
+    #[test]
+    fn lark_connection_slug_resolves_to_lark_connector() {
+        assert_eq!(fallback_connector_slug("lark-browser"), "lark-browser");
+    }
+
+    #[test]
+    fn unknown_slug_falls_back_to_lark_connector() {
+        assert_eq!(fallback_connector_slug(""), "lark-browser");
+        assert_eq!(fallback_connector_slug("gmail-browser"), "lark-browser");
+    }
+}
 
 #[cfg(test)]
 mod list_chats_tests {

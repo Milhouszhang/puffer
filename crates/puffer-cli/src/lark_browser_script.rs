@@ -27,7 +27,7 @@ pub(crate) const LARK_FEED_SCRIPT: &str = r#"(() => {
   // while navigating so first-poll init isn't seeded on a non-messenger page.
   if (!/\/next\/messenger/.test(location.pathname)) {
     try { location.assign(location.origin + '/next/messenger/'); } catch (e) {}
-    return JSON.stringify({ loaded: false, rows: [], navigating: true });
+    return JSON.stringify({ ok: false, loaded: false, rows: [], navigating: true });
   }
   const loaded = !!document.querySelector('.lark_feedMainList, .a11y_feed_main_list, [class*="page-content-messenger"]');
   const cards = Array.from(document.querySelectorAll('[data-feed-id]'));
@@ -52,7 +52,10 @@ pub(crate) const LARK_FEED_SCRIPT: &str = r#"(() => {
       : 'person';
     return { chat_id, name, preview, unread, outgoing, conversation_type };
   }).filter(r => r.chat_id);
-  return JSON.stringify({ loaded, rows });
+  // ok:loaded lets evaluate_lark_script (list_chats) return as soon as the feed is
+  // loaded instead of always waiting the full LARK_LOAD_TIMEOUT. The polling path
+  // ignores `ok` and reads `loaded`/`rows`, so it is unaffected.
+  return JSON.stringify({ ok: loaded, loaded, rows });
 })()"#;
 
 /// Returns `true` when the feed script result indicates the messenger shell was

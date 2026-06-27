@@ -51,6 +51,11 @@
   let selectedValue = $state("");
   let activeBindingSlug = "";
 
+  // Combobox state for connector_chats value field
+  let comboOpen = $state(false);
+  let comboHighlightIndex = $state(-1);
+  let comboInputEl = $state<HTMLInputElement | null>(null);
+
   // Dynamic options loading state for connector_chats fields
   let dynamicOptions = $state<MonitorRuleSchemaValue[]>([]);
   let dynamicOptionsLoading = $state(false);
@@ -104,6 +109,72 @@
       : selectedValueOptions
   );
 
+  // Filtered combobox options based on what the user has typed
+  let comboFilteredOptions = $derived.by(() => {
+    if (selectedDetail?.optionsSource !== "connector_chats") return [];
+    const needle = selectedValue.trim().toLowerCase();
+    if (!needle) return dynamicOptions;
+    return dynamicOptions.filter((opt) =>
+      String(opt.label).toLowerCase().includes(needle)
+    );
+  });
+
+  function openCombo() {
+    comboOpen = true;
+    comboHighlightIndex = -1;
+  }
+
+  function closeCombo() {
+    comboOpen = false;
+    comboHighlightIndex = -1;
+  }
+
+  function pickComboOption(value: string) {
+    selectedValue = value;
+    closeCombo();
+  }
+
+  function onComboInput(event: Event) {
+    selectedValue = (event.currentTarget as HTMLInputElement).value;
+    comboOpen = true;
+    comboHighlightIndex = -1;
+  }
+
+  function onComboKeydown(event: KeyboardEvent) {
+    if (!comboOpen) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        openCombo();
+        event.preventDefault();
+      }
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      comboHighlightIndex = Math.min(comboHighlightIndex + 1, comboFilteredOptions.length - 1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      comboHighlightIndex = Math.max(comboHighlightIndex - 1, 0);
+    } else if (event.key === "Enter") {
+      const opt = comboFilteredOptions[comboHighlightIndex];
+      if (opt) {
+        event.preventDefault();
+        pickComboOption(String(opt.value));
+      }
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeCombo();
+      comboInputEl?.blur();
+    }
+  }
+
+  function onComboBlur(event: FocusEvent) {
+    // Only close if focus moves outside the combobox wrapper
+    const related = event.relatedTarget as Node | null;
+    const wrapper = (event.currentTarget as HTMLElement).closest(".pf-monitor-rule-combobox");
+    if (wrapper && related && wrapper.contains(related)) return;
+    closeCombo();
+  }
+
   $effect(() => {
     const nextSlug = binding?.slug ?? "";
     if (activeBindingSlug === nextSlug) return;
@@ -134,6 +205,7 @@
     dynamicOptions = [];
     dynamicOptionsLoading = false;
     dynamicOptionsError = false;
+    closeCombo();
   }
 
   function detailForPath(path: string): MonitorRuleDetail {
@@ -254,27 +326,65 @@
             </select>
           </label>
           {#if selectedNeedsValue}
-            <label>
-              <span>Value</span>
-              {#if dynamicOptionsLoading}
-                <input aria-label="Value" value="" placeholder="Loading groups…" disabled />
-              {:else if effectiveValueOptions.length > 0}
-                <select aria-label="Value" value={selectedValue} onchange={onValueInput}>
-                  {#each effectiveValueOptions as option (String(option.value))}
-                    <option value={String(option.value)}>{option.label}</option>
-                  {/each}
-                </select>
-              {:else}
-                <input
-                  aria-label="Value"
-                  value={selectedValue}
-                  placeholder="Value"
-                  oninput={onValueInput}
-                />
+            {#if selectedDetail?.optionsSource === "connector_chats"}
+              <label>
+                <span>Value</span>
+                {#if dynamicOptionsLoading}
+                  <input aria-label="Value" value="" placeholder="Loading groups…" disabled />
+                {:else}
+                  <div class="pf-monitor-rule-combobox" onblur={onComboBlur}>
+                    <input
+                      bind:this={comboInputEl}
+                      aria-label="Value"
+                      aria-autocomplete="list"
+                      aria-expanded={comboOpen}
+                      aria-haspopup="listbox"
+                      autocomplete="off"
+                      spellcheck="false"
+                      value={selectedValue}
+                      placeholder={dynamicOptions.length > 0 ? "Search or type a group name" : "Type a group name"}
+                      oninput={onComboInput}
+                      onfocus={openCombo}
+                      onkeydown={onComboKeydown}
+                    />
+                    {#if comboOpen && comboFilteredOptions.length > 0}
+                      <ul class="pf-monitor-rule-combobox-list" role="listbox" aria-label="Group names">
+                        {#each comboFilteredOptions as option, i (String(option.value))}
+                          <li
+                            role="option"
+                            aria-selected={selectedValue === String(option.value)}
+                            class:highlighted={i === comboHighlightIndex}
+                            onmousedown={(e) => { e.preventDefault(); pickComboOption(String(option.value)); }}
+                          >
+                            {option.label}
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
+                  </div>
+                {/if}
+              </label>
+              {#if dynamicOptionsError || (!dynamicOptionsLoading && dynamicOptions.length === 0)}
+                <p class="pf-monitor-rule-builder-hint">Connector not ready — type a group name</p>
               {/if}
-            </label>
-            {#if dynamicOptionsError || (selectedDetail?.optionsSource === "connector_chats" && !dynamicOptionsLoading && effectiveValueOptions.length === 0)}
-              <p class="pf-monitor-rule-builder-hint">Connector not ready — type a group name</p>
+            {:else}
+              <label>
+                <span>Value</span>
+                {#if selectedValueOptions.length > 0}
+                  <select aria-label="Value" value={selectedValue} onchange={onValueInput}>
+                    {#each selectedValueOptions as option (String(option.value))}
+                      <option value={String(option.value)}>{option.label}</option>
+                    {/each}
+                  </select>
+                {:else}
+                  <input
+                    aria-label="Value"
+                    value={selectedValue}
+                    placeholder="Value"
+                    oninput={onValueInput}
+                  />
+                {/if}
+              </label>
             {/if}
           {/if}
           <div class="pf-monitor-rule-builder-actions">
@@ -345,27 +455,65 @@
             </select>
           </label>
           {#if selectedNeedsValue}
-            <label>
-              <span>Value</span>
-              {#if dynamicOptionsLoading}
-                <input aria-label="Value" value="" placeholder="Loading groups…" disabled />
-              {:else if effectiveValueOptions.length > 0}
-                <select aria-label="Value" value={selectedValue} onchange={onValueInput}>
-                  {#each effectiveValueOptions as option (String(option.value))}
-                    <option value={String(option.value)}>{option.label}</option>
-                  {/each}
-                </select>
-              {:else}
-                <input
-                  aria-label="Value"
-                  value={selectedValue}
-                  placeholder="Value"
-                  oninput={onValueInput}
-                />
+            {#if selectedDetail?.optionsSource === "connector_chats"}
+              <label>
+                <span>Value</span>
+                {#if dynamicOptionsLoading}
+                  <input aria-label="Value" value="" placeholder="Loading groups…" disabled />
+                {:else}
+                  <div class="pf-monitor-rule-combobox" onblur={onComboBlur}>
+                    <input
+                      bind:this={comboInputEl}
+                      aria-label="Value"
+                      aria-autocomplete="list"
+                      aria-expanded={comboOpen}
+                      aria-haspopup="listbox"
+                      autocomplete="off"
+                      spellcheck="false"
+                      value={selectedValue}
+                      placeholder={dynamicOptions.length > 0 ? "Search or type a group name" : "Type a group name"}
+                      oninput={onComboInput}
+                      onfocus={openCombo}
+                      onkeydown={onComboKeydown}
+                    />
+                    {#if comboOpen && comboFilteredOptions.length > 0}
+                      <ul class="pf-monitor-rule-combobox-list" role="listbox" aria-label="Group names">
+                        {#each comboFilteredOptions as option, i (String(option.value))}
+                          <li
+                            role="option"
+                            aria-selected={selectedValue === String(option.value)}
+                            class:highlighted={i === comboHighlightIndex}
+                            onmousedown={(e) => { e.preventDefault(); pickComboOption(String(option.value)); }}
+                          >
+                            {option.label}
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
+                  </div>
+                {/if}
+              </label>
+              {#if dynamicOptionsError || (!dynamicOptionsLoading && dynamicOptions.length === 0)}
+                <p class="pf-monitor-rule-builder-hint">Connector not ready — type a group name</p>
               {/if}
-            </label>
-            {#if dynamicOptionsError || (selectedDetail?.optionsSource === "connector_chats" && !dynamicOptionsLoading && effectiveValueOptions.length === 0)}
-              <p class="pf-monitor-rule-builder-hint">Connector not ready — type a group name</p>
+            {:else}
+              <label>
+                <span>Value</span>
+                {#if selectedValueOptions.length > 0}
+                  <select aria-label="Value" value={selectedValue} onchange={onValueInput}>
+                    {#each selectedValueOptions as option (String(option.value))}
+                      <option value={String(option.value)}>{option.label}</option>
+                    {/each}
+                  </select>
+                {:else}
+                  <input
+                    aria-label="Value"
+                    value={selectedValue}
+                    placeholder="Value"
+                    oninput={onValueInput}
+                  />
+                {/if}
+              </label>
             {/if}
           {/if}
           <div class="pf-monitor-rule-builder-actions">

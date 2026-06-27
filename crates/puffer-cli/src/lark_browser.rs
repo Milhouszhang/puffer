@@ -109,6 +109,11 @@ pub(crate) struct SeenState {
     pub(crate) initialized: bool,
     #[serde(default)]
     pub(crate) seen: BTreeSet<String>,
+    /// Cache of chat_id → chat name, populated during feed polls and used by
+    /// the active drain path (which only has a chat_id, not the display name).
+    /// `#[serde(default)]` ensures old `seen.json` files without this field load correctly.
+    #[serde(default)]
+    pub(crate) names: std::collections::BTreeMap<String, String>,
 }
 
 struct SubscriberEnv {
@@ -262,6 +267,7 @@ fn build_message_event(
     platform: &str,
     brand: &str,
     chat_id: &str,
+    chat_name: &str,
     sender: &str,
     text: &str,
     is_outgoing: bool,
@@ -280,6 +286,7 @@ fn build_message_event(
             "platform": platform,
             "brand": brand,
             "chat_id": chat_id,
+            "chat_name": chat_name,
             "sender": sender,
             "is_outgoing": is_outgoing,
             "source": source,
@@ -472,6 +479,8 @@ pub(crate) fn process_feed_poll(
     for row in &rows {
         let key = feed_dedup_key(conn, row);
         newly_seen.insert(key.clone());
+        // Record chat_id → name so the active drain path can resolve display names.
+        seen.names.insert(row.chat_id.clone(), row.name.clone());
         // Suppress feed rows for the open chat — the active layer covers it
         // with higher fidelity (full text, snowflake id, outgoing direction).
         if !active_chat_id.is_empty() && row.chat_id == active_chat_id {
@@ -482,6 +491,7 @@ pub(crate) fn process_feed_poll(
                 platform,
                 brand_label,
                 &row.chat_id,
+                &row.name,
                 &row.name,
                 &row.preview,
                 row.is_outgoing,
@@ -526,6 +536,13 @@ pub(crate) fn process_active_drain(
     let mut newly_seen = BTreeSet::new();
     let mut events = Vec::new();
 
+    // Resolve the chat display name from the cache populated by feed polls.
+    let chat_name = seen
+        .names
+        .get(&active_chat_id)
+        .cloned()
+        .unwrap_or_default();
+
     for msg in &msgs {
         let key = format!("{}:{}:{}", conn, active_chat_id, msg.id);
         newly_seen.insert(key.clone());
@@ -534,6 +551,7 @@ pub(crate) fn process_active_drain(
                 platform,
                 brand_label,
                 &active_chat_id,
+                &chat_name,
                 "", // sender unknown at message level — text carries content
                 &msg.text,
                 msg.is_outgoing,
@@ -827,6 +845,7 @@ mod emit_tests {
             "lark-browser",
             "lark",
             "123",
+            "General Channel",
             "Alice",
             "hi",
             true,
@@ -836,6 +855,7 @@ mod emit_tests {
             "person",
         );
         assert_eq!(ev.payload["chat_id"], "123");
+        assert_eq!(ev.payload["chat_name"], "General Channel");
         assert_eq!(ev.payload["is_outgoing"], true);
         assert_eq!(ev.payload["platform"], "lark-browser");
         assert_eq!(ev.payload["brand"], "lark");
@@ -850,6 +870,7 @@ mod emit_tests {
             "lark-browser",
             "lark",
             "42",
+            "Support Group",
             "Bob",
             "hello",
             false,
@@ -860,6 +881,7 @@ mod emit_tests {
         );
         assert_eq!(ev.payload["unread"], true);
         assert_eq!(ev.payload["conversation_type"], "bot");
+        assert_eq!(ev.payload["chat_name"], "Support Group");
     }
 
     // --- process_feed_poll loaded-gate tests ---
@@ -917,10 +939,12 @@ mod emit_tests {
         let mut seen = SeenState {
             initialized: true,
             seen: std::collections::BTreeSet::new(),
+            names: std::collections::BTreeMap::new(),
         };
         let events = process_feed_poll(&parsed, "conn1", "lark-browser", "lark", &mut seen, "");
         assert_eq!(events.len(), 1, "post-init poll with new row should emit one event");
         assert_eq!(events[0].payload["chat_id"], "99");
+        assert_eq!(events[0].payload["chat_name"], "Bob");
     }
 
     // --- feed suppression: active chat_id skips the matching feed row ---
@@ -939,6 +963,7 @@ mod emit_tests {
         let mut seen = SeenState {
             initialized: true,
             seen: std::collections::BTreeSet::new(),
+            names: std::collections::BTreeMap::new(),
         };
         let events = process_feed_poll(
             &parsed,
@@ -951,6 +976,7 @@ mod emit_tests {
         // Only the OTHER_CHAT row should be emitted; ACTIVE_CHAT is suppressed.
         assert_eq!(events.len(), 1, "only non-active feed row should emit");
         assert_eq!(events[0].payload["chat_id"], "OTHER_CHAT");
+        assert_eq!(events[0].payload["chat_name"], "Bob");
     }
 
     #[test]
@@ -966,6 +992,7 @@ mod emit_tests {
         let mut seen = SeenState {
             initialized: true,
             seen: std::collections::BTreeSet::new(),
+            names: std::collections::BTreeMap::new(),
         };
         let events = process_feed_poll(&parsed, "conn1", "lark-browser", "lark", &mut seen, "");
         assert_eq!(events.len(), 2, "all feed rows should emit when active_chat_id is empty");
@@ -1025,6 +1052,7 @@ mod emit_tests {
     #[test]
     fn process_active_drain_emits_on_second_poll() {
         // Second poll: seen already initialized, new snowflake arrives → emits.
+        // Names cache is empty → chat_name defaults to "".
         let parsed = serde_json::json!({
             "chat_id": "CHAT1",
             "items": [{"id": "7652607883305029745", "dir": "out", "text": "reply"}]
@@ -1032,6 +1060,7 @@ mod emit_tests {
         let mut seen = SeenState {
             initialized: true,
             seen: std::collections::BTreeSet::new(),
+            names: std::collections::BTreeMap::new(),
         };
         let (chat_id, events) = process_active_drain(
             &parsed, "conn1", "lark-browser", "lark", &mut seen,
@@ -1039,8 +1068,37 @@ mod emit_tests {
         assert_eq!(chat_id, "CHAT1");
         assert_eq!(events.len(), 1, "new snowflake post-init must emit");
         assert_eq!(events[0].payload["chat_id"], "CHAT1");
+        assert_eq!(events[0].payload["chat_name"], ""); // names cache empty → default
         assert_eq!(events[0].payload["is_outgoing"], true);
         assert_eq!(events[0].payload["source"], "active");
+    }
+
+    #[test]
+    fn process_feed_populates_names_and_active_drain_resolves_chat_name() {
+        // Simulate: feed poll populates seen.names, then active drain resolves name.
+        let feed_parsed = serde_json::json!({
+            "loaded": true,
+            "rows": [{"chat_id": "CHAT1", "name": "Engineering Team", "preview": "hello", "unread": true, "outgoing": false}]
+        });
+        let mut seen = SeenState::default();
+        // First poll seeds only (not initialized yet).
+        let _events = process_feed_poll(&feed_parsed, "conn1", "lark-browser", "lark", &mut seen, "");
+        // After feed poll the name is cached regardless of init state.
+        assert_eq!(seen.names.get("CHAT1").map(String::as_str), Some("Engineering Team"));
+
+        // Second poll after init: active drain emits with resolved chat_name.
+        let active_parsed = serde_json::json!({
+            "chat_id": "CHAT1",
+            "items": [{"id": "7652607883305029745", "dir": "in", "text": "ship it"}]
+        });
+        // seen.initialized is now true from the feed poll.
+        let (_chat_id, events) = process_active_drain(
+            &active_parsed, "conn1", "lark-browser", "lark", &mut seen,
+        );
+        assert_eq!(events.len(), 1, "active drain should emit after init");
+        assert_eq!(events[0].payload["chat_name"], "Engineering Team",
+            "active drain must resolve chat_name from the names cache");
+        assert_eq!(events[0].payload["chat_id"], "CHAT1");
     }
 
     #[test]
@@ -1056,6 +1114,7 @@ mod emit_tests {
         let mut seen = SeenState {
             initialized: true,
             seen: std::collections::BTreeSet::new(),
+            names: std::collections::BTreeMap::new(),
         };
         let (_chat_id, events) = process_active_drain(
             &parsed, "conn1", "lark-browser", "lark", &mut seen,

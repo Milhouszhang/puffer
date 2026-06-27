@@ -21,10 +21,11 @@
       "operators": ["contains", "equals", "matches"]
     },
     {
-      "path": "chat_id",
-      "label": "Chat id",
-      "type": "string",
-      "operators": ["equals"]
+      "path": "chat_name",
+      "label": "Group / chat name",
+      "type": "enum",
+      "operators": ["equals"],
+      "options_source": "connector_chats"
     },
     {
       "path": "unread",

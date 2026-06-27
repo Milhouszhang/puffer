@@ -398,6 +398,25 @@ fn handle_command(
                 ),
             }
         }
+        SubscriberCommand::Custom { op, .. } if op == "lark_browser_list_chats" => {
+            let Some(config) = config else {
+                return emit_control(
+                    &env.topic,
+                    "lark_browser_list_chats_error",
+                    json!({ "error": "lark-browser connector is not configured yet" }),
+                );
+            };
+            match lark_browser_actions::list_chats(env, config, handshake) {
+                Ok(payload) => {
+                    emit_control(&env.topic, "lark_browser_list_chats_complete", payload)
+                }
+                Err(error) => emit_control(
+                    &env.topic,
+                    "lark_browser_list_chats_error",
+                    json!({ "error": format!("{error:#}") }),
+                ),
+            }
+        }
         SubscriberCommand::Custom { op, .. } => {
             emit_control(
                 &env.topic,
@@ -413,6 +432,18 @@ fn handle_command(
             )
         }
     }
+}
+
+/// Sends a `lark_browser_list_chats` command to the live lark/feishu-browser
+/// subscriber for `connection_slug` and returns the `{chats:[...]}` payload.
+///
+/// Thin re-export for the daemon RPC handler in `daemon.rs`.
+pub(crate) fn list_chats_via_subscriber(
+    manager: &puffer_subscriptions::SubscriptionManager,
+    paths: &puffer_config::ConfigPaths,
+    connection_slug: &str,
+) -> anyhow::Result<serde_json::Value> {
+    lark_browser_actions::lark_list_chats_via_subscriber(manager, paths, connection_slug)
 }
 
 /// Pure, testable core of a single feed poll. Computes which events to emit and

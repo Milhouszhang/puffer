@@ -1,6 +1,12 @@
 //! Connector action helpers for the Lark/Feishu browser subscriber.
 
 use anyhow::{Context, Result};
+use puffer_config::ConfigPaths;
+use puffer_subscriber_runtime::SubscriberCommand;
+use puffer_subscriptions::{
+    connection_subscriber_manifest, direct_subscriber_manifest, ConnectionRecord,
+    SubscriberManifestRoots, SubscriptionManager,
+};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
@@ -13,6 +19,172 @@ const LARK_LOAD_TIMEOUT: Duration = Duration::from_secs(15);
 const LARK_EVALUATE_INTERVAL: Duration = Duration::from_millis(500);
 
 // ── Public entry point ───────────────────────────────────────────────────────
+
+/// Scrapes the Lark/Feishu feed and returns a `{chats:[...]}` JSON payload
+/// for the group-picker wizard. Calls the same feed-scrape JS used by the
+/// normal poll loop so no new JS is introduced.
+pub(crate) fn list_chats(
+    env: &SubscriberEnv,
+    config: &LarkBrowserConfig,
+    handshake: &mut Option<crate::daemon::Handshake>,
+) -> Result<serde_json::Value> {
+    let handshake_ref = ensure_browser_daemon(config, handshake)?;
+    let result = evaluate_lark_script(env, handshake_ref, crate::lark_browser_script::LARK_FEED_SCRIPT)?;
+    let rows = crate::lark_browser_script::parse_feed_rows(&result);
+    Ok(feed_rows_to_chats_payload(&rows))
+}
+
+/// Converts a slice of [`FeedRow`]s into the `{chats:[...]}` wire payload
+/// consumed by the frontend group-picker wizard.
+///
+/// Pure and unit-tested.
+pub(crate) fn feed_rows_to_chats_payload(rows: &[crate::lark_browser_script::FeedRow]) -> serde_json::Value {
+    serde_json::json!({
+        "chats": rows.iter().map(|r| serde_json::json!({
+            "chat_id": r.chat_id,
+            "name": r.name,
+            "conversation_type": r.conversation_type,
+            "unread": r.unread,
+        })).collect::<Vec<_>>()
+    })
+}
+
+/// Sends a `lark_browser_list_chats` command to the subscriber identified by
+/// `connection_slug`, waits for a terminal event, and returns the
+/// `{chats:[...]}` payload on success.
+///
+/// Mirrors the gcal / email connector-action round-trip pattern.
+pub(crate) fn lark_list_chats_via_subscriber(
+    manager: &SubscriptionManager,
+    paths: &ConfigPaths,
+    connection_slug: &str,
+) -> Result<Value> {
+    let subscriber_id = lark_subscriber_id(connection_slug);
+    ensure_lark_subscriber_running(manager, paths, connection_slug, &subscriber_id)?;
+    let command = SubscriberCommand::Custom {
+        op: "lark_browser_list_chats".to_string(),
+        args: json!({}),
+    };
+    let terminal_events = [
+        "lark_browser_list_chats_complete",
+        "lark_browser_list_chats_error",
+        "command_ignored",
+    ];
+    let event = manager.send_command_and_wait(
+        &subscriber_id,
+        &subscriber_id,
+        &command,
+        &terminal_events,
+        LARK_LIST_CHATS_TIMEOUT,
+    )?;
+    match event.event.kind.as_str() {
+        "lark_browser_list_chats_complete" => Ok(event.event.payload),
+        "lark_browser_list_chats_error" | "command_ignored" => {
+            let error = event
+                .event
+                .payload
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if event.event.text.trim().is_empty() {
+                        "unknown error"
+                    } else {
+                        event.event.text.as_str()
+                    }
+                })
+                .to_string();
+            anyhow::bail!("lark_browser_list_chats via {subscriber_id} failed: {error}")
+        }
+        other => anyhow::bail!(
+            "lark_browser_list_chats returned unexpected event `{other}`"
+        ),
+    }
+}
+
+const LARK_LIST_CHATS_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn lark_subscriber_id(connection_slug: &str) -> String {
+    if connection_slug.trim().is_empty() {
+        super::CONNECTOR_SLUG_LARK.to_string()
+    } else {
+        connection_slug.to_string()
+    }
+}
+
+fn ensure_lark_subscriber_running(
+    manager: &SubscriptionManager,
+    paths: &ConfigPaths,
+    connection_slug: &str,
+    subscriber_id: &str,
+) -> Result<()> {
+    if manager.subscriber_ids().iter().any(|id| id == subscriber_id) {
+        return Ok(());
+    }
+    // Determine the connector slug from the connection record, falling back to lark-browser.
+    let connector_slug = manager
+        .connection_store()
+        .get(subscriber_id)
+        .map(|c| c.connector_slug.clone())
+        .unwrap_or_else(|| super::CONNECTOR_SLUG_LARK.to_string());
+    let template = manager
+        .connector_store()
+        .get(&connector_slug)
+        .ok_or_else(|| anyhow::anyhow!("connector `{connector_slug}` not found"))?;
+    let connection = manager
+        .connection_store()
+        .get(subscriber_id)
+        .unwrap_or_else(|| {
+            ConnectionRecord::authenticated(subscriber_id, &connector_slug, subscriber_id)
+        });
+    if let Some(manifest) =
+        connection_subscriber_manifest(&lark_subscriber_manifest_roots(paths), &connection, &template)?
+    {
+        manager.start_subscriber(manifest)?;
+        return Ok(());
+    }
+    let manifest = lark_browser_fallback_manifest(paths, &connector_slug, subscriber_id)?;
+    manager.start_subscriber(manifest)?;
+    Ok(())
+}
+
+fn lark_browser_fallback_manifest(
+    paths: &ConfigPaths,
+    connector_slug: &str,
+    subscriber_id: &str,
+) -> Result<puffer_subscriber_runtime::Manifest> {
+    let mut manifest = direct_subscriber_manifest(
+        &lark_subscriber_manifest_roots(paths),
+        connector_slug,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("{connector_slug} subscriber manifest not found"))?;
+    // Derive the per-brand state root from the connector slug (mirrors Brand::state_root).
+    let state_root = if connector_slug == super::CONNECTOR_SLUG_FEISHU {
+        "feishu-browser-accounts"
+    } else {
+        "lark-browser-accounts"
+    };
+    manifest.spec.id = subscriber_id.to_string();
+    manifest.spec.topic = Some(subscriber_id.to_string());
+    manifest.spec.display_name = Some(format!("Lark/Feishu Browser ({subscriber_id})"));
+    manifest.spec.state = Some(puffer_subscriber_runtime::StateSpec {
+        dir: paths
+            .user_config_dir
+            .join(state_root)
+            .join(subscriber_id)
+            .to_string_lossy()
+            .to_string(),
+    });
+    Ok(manifest)
+}
+
+fn lark_subscriber_manifest_roots(paths: &ConfigPaths) -> SubscriberManifestRoots {
+    SubscriberManifestRoots::new(
+        paths.workspace_config_dir.clone(),
+        paths.user_config_dir.clone(),
+        paths.builtin_resources_dir.clone(),
+    )
+}
 
 /// Executes one Lark/Feishu browser connector action through the managed Chrome
 /// profile. Dispatches on `action` ∈ {`send_message`, `read_history`, `react`}.
@@ -374,6 +546,57 @@ fn integer_input(input: &Value, key: &str) -> Option<u64> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod list_chats_tests {
+    use super::*;
+    use crate::lark_browser_script::FeedRow;
+    use serde_json::json;
+
+    fn make_row(chat_id: &str, name: &str, conversation_type: &str, unread: bool) -> FeedRow {
+        FeedRow {
+            chat_id: chat_id.to_string(),
+            name: name.to_string(),
+            preview: "".to_string(),
+            unread,
+            is_outgoing: false,
+            conversation_type: conversation_type.to_string(),
+        }
+    }
+
+    #[test]
+    fn empty_rows_produces_empty_chats_array() {
+        let payload = feed_rows_to_chats_payload(&[]);
+        assert_eq!(payload, json!({"chats": []}));
+    }
+
+    #[test]
+    fn maps_fields_correctly() {
+        let rows = vec![
+            make_row("7651002084879241330", "Alice", "person", true),
+            make_row("7650335261468921967", "Approval Bot", "bot", false),
+        ];
+        let payload = feed_rows_to_chats_payload(&rows);
+        assert_eq!(
+            payload,
+            json!({
+                "chats": [
+                    {"chat_id": "7651002084879241330", "name": "Alice", "conversation_type": "person", "unread": true},
+                    {"chat_id": "7650335261468921967", "name": "Approval Bot", "conversation_type": "bot", "unread": false},
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn does_not_include_preview_or_is_outgoing() {
+        let rows = vec![make_row("c1", "Bob", "external", false)];
+        let payload = feed_rows_to_chats_payload(&rows);
+        let chat = &payload["chats"][0];
+        assert!(chat.get("preview").is_none());
+        assert!(chat.get("is_outgoing").is_none());
+    }
+}
 
 #[cfg(test)]
 mod act_tests {

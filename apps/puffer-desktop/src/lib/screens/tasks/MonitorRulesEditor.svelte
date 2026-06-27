@@ -86,7 +86,9 @@
         if (fetchId !== dynamicOptionsFetchId) return;
         if (chats.length > 0) {
           dynamicOptions = chats.map((c) => ({ value: c.name, label: c.name }));
-          if (selectedValue === "") selectedValue = String(dynamicOptions[0].value);
+          // Do NOT pre-fill selectedValue — the combobox filters by it, so a
+          // pre-filled name would collapse the list to a single match. Leave it
+          // empty so the user sees all groups and types to filter / picks one.
           dynamicOptionsLoading = false;
           return;
         }
@@ -130,6 +132,11 @@
     if (selectedDetail?.optionsSource !== "connector_chats") return [];
     const needle = selectedValue.trim().toLowerCase();
     if (!needle) return dynamicOptions;
+    // If the value already exactly matches a group (the user picked one), show
+    // the full list again so they can re-pick — don't collapse it to one item.
+    if (dynamicOptions.some((opt) => String(opt.label).toLowerCase() === needle)) {
+      return dynamicOptions;
+    }
     return dynamicOptions.filter((opt) =>
       String(opt.label).toLowerCase().includes(needle)
     );

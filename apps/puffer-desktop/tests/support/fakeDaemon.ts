@@ -1587,6 +1587,27 @@ export class FakeDaemon {
             hidden: false
           }
         ];
+      case "list_workspace_mentions":
+        return {
+          items: [
+            {
+              kind: "directory",
+              path: "src/lib",
+              absolutePath: "/tmp/puffer/src/lib",
+              name: "lib",
+              parent: "src",
+              size: 0
+            },
+            {
+              kind: "file",
+              path: "src/lib/main.ts",
+              absolutePath: "/tmp/puffer/src/lib/main.ts",
+              name: "main.ts",
+              parent: "src/lib",
+              size: 1200
+            }
+          ]
+        };
       case "read_chat_attachment_preview":
         return this.readChatAttachmentPreview(request.params);
       case "read_generated_media_preview":

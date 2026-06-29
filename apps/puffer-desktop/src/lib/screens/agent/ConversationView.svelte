@@ -42,12 +42,14 @@
   import type { AgentState } from "../../shell/tweaks";
   import {
     listCommandSurface,
+    listWorkspaceMentions,
     listProviderModels,
     type AgentPermissionMode,
     type AgentTurnOptions,
     type AgentTurnSubmitOptions,
     type CommandSurfaceItem,
-    type ModelDescriptorInfo
+    type ModelDescriptorInfo,
+    type WorkspaceMentionItem
   } from "../../api/desktop";
   import {
     canonicalDaemonProviderId,
@@ -267,6 +269,9 @@
   let dismissedComposerTriggerKey = $state<string | null>(null);
   let commandSurfaceItems = $state<CommandSurfaceItem[]>([]);
   let commandSurfaceLoadAttempted = $state(false);
+  let workspaceMentionItems = $state<WorkspaceMentionItem[]>([]);
+  let workspaceMentionRequestSeq = 0;
+  let loadedWorkspaceMentionKey = $state<string | null>(null);
   let submitInFlightSessionIds = $state<string[]>([]);
   const submitInFlightGuards = new Set<string>();
   let thinkingProviderId = $state<string | null>(null);
@@ -690,7 +695,23 @@
         )
       );
     }
+    for (const item of workspaceMentionItems) {
+      suggestions.push(workspaceMentionSuggestion(item));
+    }
     return suggestions;
+  }
+
+  function workspaceMentionSuggestion(item: WorkspaceMentionItem): ComposerSuggestion {
+    const parent = item.parent ? item.parent : "workspace";
+    return mentionSuggestion(
+      `workspace:${item.path}`,
+      `@${item.path}`,
+      item.kind === "directory" ? "Workspace folder" : "Workspace file",
+      `@${item.path}`,
+      item.kind === "directory" ? "folder" : "file",
+      parent,
+      [item.name, item.parent, item.absolutePath].filter(Boolean)
+    );
   }
 
   function findComposerTrigger(value: string, cursor: number): ComposerTrigger | null {
@@ -1512,6 +1533,29 @@
       })
       .catch(() => {
         commandSurfaceItems = [];
+      });
+  });
+
+  $effect(() => {
+    if (!backendConnected || composerDisabled || composerTrigger?.kind !== "mention") {
+      workspaceMentionItems = [];
+      loadedWorkspaceMentionKey = null;
+      return;
+    }
+    const query = composerTrigger.query.trim();
+    const cwd = session?.cwd ?? "";
+    const key = `${cwd}:${query}`;
+    if (loadedWorkspaceMentionKey === key) return;
+    loadedWorkspaceMentionKey = key;
+    const requestSeq = ++workspaceMentionRequestSeq;
+    void listWorkspaceMentions(query, cwd || null, 40)
+      .then((items) => {
+        if (requestSeq !== workspaceMentionRequestSeq) return;
+        workspaceMentionItems = items;
+      })
+      .catch(() => {
+        if (requestSeq !== workspaceMentionRequestSeq) return;
+        workspaceMentionItems = [];
       });
   });
 

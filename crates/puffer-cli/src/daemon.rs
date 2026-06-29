@@ -1551,6 +1551,9 @@ async fn dispatch_request(
         "pty_resize" => respond!(handle_pty_resize(&state, &params)),
         "pty_close" => respond!(handle_pty_close(&state, &params)),
         "list_dir" => respond!(crate::daemon_files::handle_list_dir(&state, &params)),
+        "list_workspace_mentions" => respond!(crate::daemon_files::handle_list_workspace_mentions(
+            &state, &params
+        )),
         "read_file" => respond!(crate::daemon_files::handle_read_file(&state, &params)),
         "write_file" => respond!(crate::daemon_files::handle_write_file(&state, &params)),
         "lsp_inspect" => respond!(detached!(|s, p| crate::daemon_lsp::handle_lsp_inspect(

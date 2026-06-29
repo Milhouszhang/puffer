@@ -1738,6 +1738,18 @@ type BackendCommandSurfaceItem = Omit<CommandSurfaceItem, "argumentHint"> & {
   argumentHint?: string | null;
   argument_hint?: string | null;
 };
+export type WorkspaceMentionItem = {
+  kind: "file" | "directory";
+  path: string;
+  absolutePath: string;
+  name: string;
+  parent: string;
+  size: number;
+};
+type BackendWorkspaceMentionItem = Omit<WorkspaceMentionItem, "absolutePath"> & {
+  absolutePath?: string;
+  absolute_path?: string;
+};
 export type StaleTurnRecoveryResult =
   | { recovery: "retry_started"; turnId: string }
   | { recovery: "already_retried" }
@@ -1881,6 +1893,30 @@ export async function listCommandSurface(): Promise<CommandSurfaceItem[]> {
     argumentHint: command.argumentHint ?? command.argument_hint ?? null,
     kind: command.kind,
     hidden: command.hidden
+  }));
+}
+
+export async function listWorkspaceMentions(
+  query: string,
+  cwd?: string | null,
+  limit = 40
+): Promise<WorkspaceMentionItem[]> {
+  const client = await ensureLocalDaemonClient();
+  const result = await client.request<{ items: BackendWorkspaceMentionItem[] }>(
+    "list_workspace_mentions",
+    {
+      query,
+      limit,
+      ...(cwd ? { cwd } : {})
+    }
+  );
+  return result.items.map((item) => ({
+    kind: item.kind,
+    path: item.path,
+    absolutePath: item.absolutePath ?? item.absolute_path ?? "",
+    name: item.name,
+    parent: item.parent,
+    size: item.size
   }));
 }
 

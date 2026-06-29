@@ -187,6 +187,11 @@ impl BackendState {
             }
             "load_settings_snapshot" => serde_value(self.load_settings_snapshot()?),
             "list_command_surface" => serde_value(self.list_command_surface()?),
+            "list_workspace_mentions" => serde_value(files::list_workspace_mentions(
+                &params,
+                &self.allowed_roots()?,
+                &self.default_workspace()?,
+            )?),
             "login_with_oauth" => serde_value(self.load_settings_snapshot()?),
             "login_with_api_key" => {
                 let provider_id = string_param(&params, &["providerId", "provider_id"])?;

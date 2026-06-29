@@ -1,6 +1,7 @@
 export type ScreenId =
   | "workspace"
   | "workflows"
+  | "automation"
   | "tasks"
   | "settings"
   | "contacts";
@@ -63,6 +64,7 @@ function normalizeScreen(value: unknown): ScreenId {
   if (value === "telegram-relationships") return "contacts";
   return value === "workspace" ||
     value === "workflows" ||
+    value === "automation" ||
     value === "tasks" ||
     value === "settings" ||
     value === "contacts"

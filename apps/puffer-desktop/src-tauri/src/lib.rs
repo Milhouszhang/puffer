@@ -1,4 +1,5 @@
 mod backend;
+mod badge;
 mod browser;
 mod browser_debug;
 mod cef_host;

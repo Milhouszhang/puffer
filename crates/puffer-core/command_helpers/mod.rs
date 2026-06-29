@@ -68,6 +68,7 @@ pub use pentest::{
     prepare_pentest_command, PentestCommand, PentestStart, DEFAULT_PENTEST_MAX_DISPATCHES_PER_ITER,
     DEFAULT_PENTEST_MAX_ITERATIONS, PENTEST_USAGE,
 };
+pub use session::{sanitize_tool_invocation_input, sanitized_tool_invocation_input};
 pub use plugins::PluginActionEntry;
 pub(crate) use plugins::{
     handle_plugin_command, reload_plugins_summary, render_plugin_actions, render_plugin_summary,

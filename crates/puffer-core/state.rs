@@ -8,6 +8,7 @@ use puffer_config::PufferConfig;
 use puffer_media::ExactMediaDiscoveryCache;
 use puffer_runner_api::ToolRunner;
 use puffer_runner_grpc::RemoteToolRunner;
+use puffer_secrets::SecretVault;
 use puffer_session_store::{
     ClaudeReadSnapshotEvent, MessageActor, MessageActorKind, SessionMetadata, SessionRecord,
     StoredAttachment, TranscriptEvent, TranscriptRewrite,
@@ -15,7 +16,9 @@ use puffer_session_store::{
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -231,6 +234,48 @@ pub struct ActiveRemoteTarget {
     pub id: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct ManagedSshBootstrap {
+    child: Option<Child>,
+}
+
+impl ManagedSshBootstrap {
+    pub(crate) fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
+    pub(crate) fn is_running(&mut self) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return false;
+        };
+        matches!(child.try_wait(), Ok(None))
+    }
+
+    pub(crate) fn terminate(&mut self) -> String {
+        let Some(mut child) = self.child.take() else {
+            return String::new();
+        };
+        let mut stderr = child.stderr.take();
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut detail = String::new();
+        if let Some(mut stderr) = stderr.take() {
+            let _ = stderr.read_to_string(&mut detail);
+        }
+        detail.trim().to_string()
+    }
+}
+
+impl Drop for ManagedSshBootstrap {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
+}
+
 /// Stores the mutable session and UI state for one interactive Puffer run.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -257,12 +302,13 @@ pub struct AppState {
     pub remote_session_id: Option<String>,
     pub remote_session_url: Option<String>,
     pub remote_session_status: Option<String>,
-    /// Bearer token for the active remote runner. This is copied into the
-    /// session snapshot so desktop turn resume can reconnect authenticated
-    /// runners, and is cleared when the remote target is exited.
+    /// Bearer token for the active remote runner. This is process-local only:
+    /// snapshots persist a secret reference instead of raw token material.
     pub active_remote_runner_auth_token: Option<String>,
+    pub active_remote_runner_auth_secret_id: Option<String>,
     pub active_remote_target: Option<ActiveRemoteTarget>,
     pub active_remote_cwd: Option<PathBuf>,
+    pub(crate) active_ssh_bootstrap: Arc<Mutex<Option<ManagedSshBootstrap>>>,
     pub active_team_name: Option<String>,
     pub current_actor: Option<MessageActor>,
     pub statusline_enabled: bool,
@@ -448,8 +494,10 @@ impl AppState {
             remote_session_url: None,
             remote_session_status: None,
             active_remote_runner_auth_token: None,
+            active_remote_runner_auth_secret_id: None,
             active_remote_target: None,
             active_remote_cwd: None,
+            active_ssh_bootstrap: Arc::new(Mutex::new(None)),
             active_team_name: None,
             current_actor: None,
             statusline_enabled: true,
@@ -532,6 +580,49 @@ impl AppState {
         self
     }
 
+    pub(crate) fn replace_active_ssh_bootstrap(&self, next: Option<ManagedSshBootstrap>) -> String {
+        let Ok(mut guard) = self.active_ssh_bootstrap.lock() else {
+            return String::new();
+        };
+        let detail = guard
+            .as_mut()
+            .map(ManagedSshBootstrap::terminate)
+            .unwrap_or_default();
+        *guard = next;
+        detail
+    }
+
+    pub(crate) fn clear_active_ssh_bootstrap(&self) -> String {
+        self.replace_active_ssh_bootstrap(None)
+    }
+
+    pub(crate) fn active_ssh_bootstrap_debug(&self) -> Option<(u32, bool)> {
+        let Ok(mut guard) = self.active_ssh_bootstrap.lock() else {
+            return None;
+        };
+        let bootstrap = guard.as_mut()?;
+        let pid = bootstrap.pid()?;
+        Some((pid, bootstrap.is_running()))
+    }
+
+    fn resolve_persisted_remote_runner_auth_token(&self) -> Option<String> {
+        if let Some(secret_id) = self
+            .active_remote_runner_auth_secret_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let paths = puffer_config::ConfigPaths::discover(&self.cwd);
+            let vault =
+                SecretVault::open(SecretVault::default_path(&paths.user_config_dir)).ok()?;
+            return vault.reveal(secret_id).ok().map(|secret| secret.value);
+        }
+        self.config
+            .remote_runner
+            .as_ref()
+            .and_then(|runner| runner.resolve_auth_token())
+    }
+
     fn restore_active_remote_runner_from_snapshot(&mut self) {
         if self.remote_session_status.as_deref() != Some("connected") {
             return;
@@ -543,19 +634,50 @@ impl AppState {
         ) else {
             return;
         };
-        match RemoteToolRunner::connect(&endpoint, self.active_remote_runner_auth_token.as_deref())
-        {
+        let auth_token = self.resolve_persisted_remote_runner_auth_token();
+        if kind == "ssh" {
+            match crate::runtime::claude_tools::workflow::remote_execution::restore_ssh_remote_runner(
+                self, &id,
+            ) {
+                Ok(restored) => {
+                    if self.local_tool_runner.is_none() {
+                        self.local_tool_runner = Some(self.tool_runner.clone());
+                    }
+                    self.tool_runner = Arc::new(restored.runner);
+                    self.active_remote_runner_auth_token = None;
+                    self.active_remote_target = Some(ActiveRemoteTarget { kind, id });
+                    self.active_remote_cwd = Some(restored.cwd);
+                    self.remote_session_url = Some(restored.endpoint);
+                    self.remote_session_status = Some("connected".to_string());
+                    self.replace_active_ssh_bootstrap(Some(restored.bootstrap));
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("puffer: failed to restore SSH remote runner `{id}`: {error}");
+                    self.remote_session_status = Some("disconnected".to_string());
+                    self.active_remote_runner_auth_token = None;
+                    self.active_remote_runner_auth_secret_id = None;
+                    self.active_remote_target = None;
+                    self.active_remote_cwd = None;
+                    self.clear_active_ssh_bootstrap();
+                    return;
+                }
+            }
+        }
+        match RemoteToolRunner::connect(&endpoint, auth_token.as_deref()) {
             Ok(runner) => {
                 if self.local_tool_runner.is_none() {
                     self.local_tool_runner = Some(self.tool_runner.clone());
                 }
                 self.tool_runner = Arc::new(runner);
+                self.active_remote_runner_auth_token = auth_token;
                 self.active_remote_target = Some(ActiveRemoteTarget { kind, id });
             }
             Err(error) => {
                 eprintln!("puffer: failed to restore remote tool runner {endpoint}: {error}");
                 self.remote_session_status = Some("disconnected".to_string());
                 self.active_remote_runner_auth_token = None;
+                self.active_remote_runner_auth_secret_id = None;
                 self.active_remote_target = None;
                 self.active_remote_cwd = None;
             }
@@ -654,6 +776,7 @@ impl AppState {
                     remote_session_url,
                     remote_session_status,
                     active_remote_runner_auth_token,
+                    active_remote_runner_auth_secret_id,
                     active_remote_cwd,
                     active_team_name,
                     statusline_enabled,
@@ -680,7 +803,9 @@ impl AppState {
                     state.remote_session_id = remote_session_id;
                     state.remote_session_url = remote_session_url;
                     state.remote_session_status = remote_session_status;
-                    state.active_remote_runner_auth_token = active_remote_runner_auth_token;
+                    let _discard_legacy_raw_token = active_remote_runner_auth_token;
+                    state.active_remote_runner_auth_token = None;
+                    state.active_remote_runner_auth_secret_id = active_remote_runner_auth_secret_id;
                     state.active_remote_cwd = active_remote_cwd.map(PathBuf::from);
                     state.restore_active_remote_runner_from_snapshot();
                     state.active_team_name = active_team_name;
@@ -953,7 +1078,8 @@ impl AppState {
             remote_session_id: self.remote_session_id.clone(),
             remote_session_url: self.remote_session_url.clone(),
             remote_session_status: self.remote_session_status.clone(),
-            active_remote_runner_auth_token: self.active_remote_runner_auth_token.clone(),
+            active_remote_runner_auth_token: None,
+            active_remote_runner_auth_secret_id: self.active_remote_runner_auth_secret_id.clone(),
             active_remote_cwd: self
                 .active_remote_cwd
                 .as_ref()
@@ -1588,9 +1714,14 @@ mod tests {
         state.active_remote_runner_auth_token = Some("runner-token".to_string());
         state.active_remote_cwd = Some(PathBuf::from("/tmp"));
 
+        let snapshot = state.snapshot_event();
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(!serialized.contains("runner-token"));
+        assert!(!serialized.contains("active_remote_runner_auth_token"));
+
         let record = SessionRecord {
             metadata: state.session.clone(),
-            events: vec![state.snapshot_event()],
+            events: vec![snapshot],
         };
         let restored = AppState::from_session_record(PufferConfig::default(), record);
 
@@ -1602,10 +1733,7 @@ mod tests {
             })
         );
         assert_eq!(restored.active_remote_cwd, Some(PathBuf::from("/tmp")));
-        assert_eq!(
-            restored.active_remote_runner_auth_token.as_deref(),
-            Some("runner-token")
-        );
+        assert_eq!(restored.active_remote_runner_auth_token, None);
     }
 
     #[test]

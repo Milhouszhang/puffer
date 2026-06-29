@@ -29,7 +29,7 @@ use crate::desktop_api_types::{
     DiffSummaryDto, DivergenceReportDto, ExternalCredentialDto, FolderGroupDto,
     MediaGenerationSettingsDto, MediaSettingsDto, NetworkProxySettingsDto, ProviderSummaryDto,
     RemoteSettingsDto, RepoActionResultDto, RepoPullRequestDto, RepoStatusDto, ResourceCountsDto,
-    SanitizedProxyEndpointDto, SecretSummaryDto, SecretSourceDto, SecretsSettingsDto,
+    SanitizedProxyEndpointDto, SecretSourceDto, SecretSummaryDto, SecretsSettingsDto,
     SessionDetailDto, SessionGroupsPageDto, SessionListItemDto, SettingsConfigDto,
     SettingsSessionSummaryDto, SettingsSnapshotDto, SshHostSettingsDto, TimelineItemDto,
 };
@@ -477,8 +477,6 @@ fn remote_settings_dto(config: &PufferConfig) -> RemoteSettingsDto {
                 target: host.target.clone(),
                 port: host.port,
                 cwd: host.cwd.clone(),
-                auth_secret_id: host.auth_secret_id.clone(),
-                has_auth_secret: host.auth_secret_id.is_some(),
             })
             .collect(),
         agentenv: config
@@ -525,7 +523,6 @@ pub(crate) fn remote_config_from_settings(
                 target: host.target.trim().to_string(),
                 port: host.port,
                 cwd: normalize_optional_string(host.cwd),
-                auth_secret_id: normalize_optional_string(host.auth_secret_id),
             })
             .filter(|host| !host.id.is_empty() && !host.target.is_empty())
             .collect(),
@@ -2199,7 +2196,6 @@ mod tests {
                     target: " walden@example.com ".to_string(),
                     port: Some(2222),
                     cwd: Some(" /work/puffer ".to_string()),
-                    auth_secret_id: Some(" secret-ssh ".to_string()),
                 },
                 SaveSshHostParams {
                     id: "missing-target".to_string(),
@@ -2207,7 +2203,6 @@ mod tests {
                     target: " ".to_string(),
                     port: None,
                     cwd: None,
-                    auth_secret_id: None,
                 },
             ],
             agentenv: Some(SaveAgentEnvSettingsParams {
@@ -2234,10 +2229,6 @@ mod tests {
         assert_eq!(config.ssh_hosts.len(), 1);
         assert_eq!(config.ssh_hosts[0].id, "dev");
         assert_eq!(config.ssh_hosts[0].target, "walden@example.com");
-        assert_eq!(
-            config.ssh_hosts[0].auth_secret_id.as_deref(),
-            Some("secret-ssh")
-        );
 
         let agentenv = config.agentenv.expect("agentenv config");
         assert!(agentenv.enabled);

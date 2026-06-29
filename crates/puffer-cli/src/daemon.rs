@@ -4474,12 +4474,13 @@ fn append_ordered_turn_progress(
             }
             TurnProgressItem::ToolInvocation(invocation) => {
                 let subject = subject_for_tool(&invocation);
+                let input = puffer_core::sanitized_tool_invocation_input(&invocation);
                 session_store.append_event(
                     session_uuid,
                     TranscriptEvent::ToolInvocation {
                         call_id: invocation.call_id,
                         tool_id: invocation.tool_id,
-                        input: invocation.input,
+                        input,
                         output: invocation.output,
                         success: invocation.success,
                         metadata: (!invocation.metadata.is_null()).then_some(invocation.metadata),
@@ -4492,12 +4493,14 @@ fn append_ordered_turn_progress(
                 if !fail_pending_tools {
                     continue;
                 }
+                let input =
+                    puffer_core::sanitize_tool_invocation_input(&request.tool_id, &request.input);
                 session_store.append_event(
                     session_uuid,
                     TranscriptEvent::ToolInvocation {
                         call_id: request.call_id,
                         tool_id: request.tool_id,
-                        input: request.input,
+                        input,
                         output: CANCELLED_TURN_MESSAGE.to_string(),
                         success: false,
                         metadata: Some(json!({

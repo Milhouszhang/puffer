@@ -248,8 +248,10 @@ pub enum TranscriptEvent {
         remote_session_url: Option<String>,
         #[serde(default)]
         remote_session_status: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing)]
         active_remote_runner_auth_token: Option<String>,
+        #[serde(default)]
+        active_remote_runner_auth_secret_id: Option<String>,
         #[serde(default)]
         active_remote_cwd: Option<String>,
         #[serde(default)]

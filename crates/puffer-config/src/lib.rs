@@ -129,8 +129,6 @@ pub struct SshHostConfig {
     pub port: Option<u16>,
     #[serde(default)]
     pub cwd: Option<String>,
-    #[serde(default)]
-    pub auth_secret_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

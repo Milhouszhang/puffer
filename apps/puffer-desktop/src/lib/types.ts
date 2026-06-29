@@ -646,8 +646,6 @@ export type SshHostSettings = {
   target: string;
   port: number | null;
   cwd: string | null;
-  authSecretId: string | null;
-  hasAuthSecret: boolean;
 };
 
 export type AgentEnvSettings = {
@@ -680,7 +678,6 @@ export type SaveRemoteSettingsInput = {
     target: string;
     port: number | null;
     cwd: string | null;
-    authSecretId: string | null;
   }[];
   agentenv: {
     enabled: boolean;

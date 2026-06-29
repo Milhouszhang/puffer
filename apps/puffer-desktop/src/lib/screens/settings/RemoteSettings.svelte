@@ -19,9 +19,7 @@
     onRefresh: () => void;
   };
 
-  type SshDraft = SshHostSettings & {
-    authSecretDraft: string;
-  };
+  type SshDraft = SshHostSettings;
 
   let props: Props = $props();
 
@@ -62,10 +60,7 @@
     lastSnapshotKey = key;
     const remote = props.snapshot?.remote;
     defaultTarget = remote?.defaultTarget ?? null;
-    sshHosts = (remote?.sshHosts ?? []).map((host) => ({
-      ...host,
-      authSecretDraft: ""
-    }));
+    sshHosts = remote?.sshHosts ?? [];
     const nextAgentEnv = remote?.agentenv ?? defaultAgentEnv;
     agentenv = {
       ...nextAgentEnv,
@@ -150,10 +145,7 @@
         label: "SSH host",
         target: "",
         port: null,
-        cwd: null,
-        authSecretId: null,
-        hasAuthSecret: false,
-        authSecretDraft: ""
+        cwd: null
       }
     ];
   }
@@ -165,22 +157,6 @@
   function removeSshHost(id: string) {
     sshHosts = sshHosts.filter((host) => host.id !== id);
     if (defaultTarget === `ssh:${id}`) defaultTarget = null;
-  }
-
-  async function persistSshSecretIfNeeded(host: SshDraft): Promise<string | null> {
-    const value = host.authSecretDraft.trim();
-    if (!value) return host.authSecretId;
-    const snapshot = await saveSecret({
-      label: `${host.label.trim() || host.id} SSH credential`,
-      value,
-      description: "SSH remote host credential",
-      username: null,
-      origin: host.target.trim() || null
-    });
-    const matches = snapshot.secrets.items
-      .filter((secret) => secret.label === `${host.label.trim() || host.id} SSH credential`)
-      .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-    return matches[0]?.id ?? null;
   }
 
   async function saveSettings() {
@@ -201,8 +177,7 @@
           label: host.label.trim() || id,
           target,
           port: validateSshPort(host.port),
-          cwd: normalize(host.cwd),
-          authSecretId: await persistSshSecretIfNeeded(host)
+          cwd: normalize(host.cwd)
         });
       }
       const input: SaveRemoteSettingsInput = {
@@ -418,17 +393,6 @@
         <label>
           CWD
           <input class="sc-input" value={host.cwd ?? ""} disabled={disabled} placeholder="/home/user/project" oninput={(e) => updateSshHost(host.id, { cwd: (e.currentTarget as HTMLInputElement).value })} />
-        </label>
-        <label>
-          Credential
-          <input
-            class="sc-input"
-            type="password"
-            value={host.authSecretDraft}
-            disabled={disabled}
-            placeholder={host.hasAuthSecret ? "Stored secret configured" : "Optional password or key"}
-            oninput={(e) => updateSshHost(host.id, { authSecretDraft: (e.currentTarget as HTMLInputElement).value })}
-          />
         </label>
       </div>
       <div class="pf-remote-actions">

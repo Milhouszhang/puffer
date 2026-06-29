@@ -374,8 +374,6 @@ pub(crate) struct SshHostSettingsDto {
     pub(crate) target: String,
     pub(crate) port: Option<u16>,
     pub(crate) cwd: Option<String>,
-    pub(crate) auth_secret_id: Option<String>,
-    pub(crate) has_auth_secret: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -421,7 +419,6 @@ pub(crate) struct SaveSshHostParams {
     pub(crate) target: String,
     pub(crate) port: Option<u16>,
     pub(crate) cwd: Option<String>,
-    pub(crate) auth_secret_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

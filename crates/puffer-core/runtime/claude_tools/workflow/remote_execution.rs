@@ -1,18 +1,20 @@
-use crate::{state::ActiveRemoteTarget, AppState};
+use crate::{
+    state::{ActiveRemoteTarget, ManagedSshBootstrap},
+    AppState,
+};
 use anyhow::{bail, Context, Result};
 use puffer_config::{load_config, save_user_config, ConfigPaths, SshHostConfig};
 use puffer_runner_api::ToolRunner;
 use puffer_runner_grpc::RemoteToolRunner;
-use puffer_secrets::SecretVault;
+use puffer_secrets::{SecretUpsert, SecretVault};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::io::Read;
 use std::net::TcpListener;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -83,8 +85,6 @@ struct SshHostInput {
     port: Option<u16>,
     #[serde(default)]
     cwd: Option<String>,
-    #[serde(default)]
-    auth_secret_id: Option<String>,
 }
 
 pub fn execute_remote_execution(state: &mut AppState, cwd: &Path, input: Value) -> Result<String> {
@@ -116,7 +116,12 @@ pub fn execute_remote_execution(state: &mut AppState, cwd: &Path, input: Value) 
         }
         "agentenv:get-snapshot" => {
             let snapshot_id = required(parsed.snapshot_id, "snapshotId")?;
-            agentenv_get_with_params(state, cwd, &format!("/v1/snapshots/{snapshot_id}"), Vec::new())?
+            agentenv_get_with_params(
+                state,
+                cwd,
+                &format!("/v1/snapshots/{snapshot_id}"),
+                Vec::new(),
+            )?
         }
         "agentenv:create-sandbox" => agentenv_create_sandbox(state, cwd, parsed)?,
         "agentenv:terminate-sandbox" | "agentenv:delete-sandbox" => {
@@ -173,6 +178,12 @@ pub fn execute_remote_execution(state: &mut AppState, cwd: &Path, input: Value) 
 }
 
 fn status(state: &AppState) -> Value {
+    let ssh_bootstrap = state.active_ssh_bootstrap_debug().map(|(pid, running)| {
+        json!({
+            "pid": pid,
+            "running": running,
+        })
+    });
     let ssh_hosts = state
         .config
         .remote
@@ -186,7 +197,6 @@ fn status(state: &AppState) -> Value {
                 "target": host.target,
                 "port": host.port,
                 "cwd": host.cwd,
-                "hasAuthSecret": host.auth_secret_id.is_some(),
             })
         })
         .collect::<Vec<_>>();
@@ -212,6 +222,10 @@ fn status(state: &AppState) -> Value {
     });
     json!({
         "activeRemoteTarget": state.active_remote_target,
+        "runnerEndpoint": state.remote_session_url,
+        "runnerCwd": state.active_remote_cwd,
+        "remoteStatus": state.remote_session_status,
+        "sshBootstrap": ssh_bootstrap,
         "defaultTarget": state.config.remote.default_target,
         "sshHosts": ssh_hosts,
         "agentenv": agentenv,
@@ -230,7 +244,6 @@ fn ssh_create_config(
         target: required_string(ssh.target, "ssh.target")?,
         port: validate_ssh_port(ssh.port)?,
         cwd: normalize(ssh.cwd),
-        auth_secret_id: normalize(ssh.auth_secret_id),
     };
     state
         .config
@@ -248,7 +261,6 @@ fn ssh_create_config(
             "target": host.target,
             "port": host.port,
             "cwd": host.cwd,
-            "hasAuthSecret": host.auth_secret_id.is_some(),
         }
     }))
 }
@@ -273,7 +285,19 @@ fn ssh_delete_config(
         .as_ref()
         .is_some_and(|target| target.kind == "ssh" && target.id == host_id)
     {
+        if let Some(local_runner) = state.local_tool_runner.clone() {
+            state.tool_runner = local_runner;
+        }
+        state.remote_name = None;
+        state.remote_environment = None;
+        state.remote_session_id = None;
+        state.remote_session_url = None;
+        state.remote_session_status = None;
+        state.active_remote_runner_auth_token = None;
+        state.active_remote_runner_auth_secret_id = None;
         state.active_remote_target = None;
+        state.active_remote_cwd = None;
+        state.clear_active_ssh_bootstrap();
     }
     save_current_config(cwd, state)?;
     Ok(json!({
@@ -303,10 +327,14 @@ fn enter_remote(state: &mut AppState, cwd: &Path, input: RemoteExecutionInput) -
         "agentenv" => required(input.sandbox_id.or(input.host_id), "sandboxId")?,
         other => bail!("unsupported remote target type `{other}`"),
     };
-    let mut runner_auth_token = if let Some(token) = normalize(input.runner_auth_token) {
+    let runner_auth_secret_id = normalize(input.runner_auth_secret_id.clone());
+    let mut active_runner_auth_secret_id = None;
+    let mut runner_auth_token = if let Some(token) = normalize(input.runner_auth_token.clone()) {
+        active_runner_auth_secret_id =
+            Some(store_inline_runner_auth_token(cwd, &target_type, &id, &token)?);
         Some(token)
-    } else if let Some(token) = reveal_optional_secret(cwd, input.runner_auth_secret_id.as_deref())?
-    {
+    } else if let Some(token) = reveal_optional_secret(cwd, runner_auth_secret_id.as_deref())? {
+        active_runner_auth_secret_id = runner_auth_secret_id;
         Some(token)
     } else {
         state
@@ -317,7 +345,7 @@ fn enter_remote(state: &mut AppState, cwd: &Path, input: RemoteExecutionInput) -
     };
     let mut bootstrapped_ssh = false;
     let mut exposed_agentenv_port = None;
-    let mut ssh_bootstrap_child = None;
+    let mut ssh_bootstrap = None;
     let runner_endpoint = if let Some(endpoint) = normalize(input.runner_endpoint) {
         endpoint
     } else if let Some(endpoint) = state
@@ -334,7 +362,7 @@ fn enter_remote(state: &mut AppState, cwd: &Path, input: RemoteExecutionInput) -
         runner_auth_token = None;
         let bootstrap = bootstrapped_ssh_runner(host, None, &runner_cwd)?;
         bootstrapped_ssh = true;
-        ssh_bootstrap_child = bootstrap.child;
+        ssh_bootstrap = Some(bootstrap.child);
         bootstrap.endpoint
     } else if target_type == "agentenv" {
         let runner_port = input.port.unwrap_or(50051);
@@ -362,8 +390,8 @@ fn enter_remote(state: &mut AppState, cwd: &Path, input: RemoteExecutionInput) -
         .map_err(|error| anyhow::anyhow!("connect remote tool runner: {error}"))?;
     if input.wait_for_ready.unwrap_or(true) {
         if let Err(error) = wait_for_runner_ready(&runner, Duration::from_secs(20)) {
-            if let Some(mut child) = ssh_bootstrap_child.take() {
-                let ssh_detail = terminate_ssh_bootstrap(&mut child);
+            if let Some(mut bootstrap) = ssh_bootstrap.take() {
+                let ssh_detail = bootstrap.terminate();
                 if ssh_detail.is_empty() {
                     return Err(error);
                 }
@@ -371,6 +399,11 @@ fn enter_remote(state: &mut AppState, cwd: &Path, input: RemoteExecutionInput) -
             }
             return Err(error);
         }
+    }
+    if let Some(bootstrap) = ssh_bootstrap.take() {
+        state.replace_active_ssh_bootstrap(Some(bootstrap));
+    } else {
+        state.clear_active_ssh_bootstrap();
     }
     if state.local_tool_runner.is_none() {
         state.local_tool_runner = Some(state.tool_runner.clone());
@@ -386,6 +419,7 @@ fn enter_remote(state: &mut AppState, cwd: &Path, input: RemoteExecutionInput) -
     state.remote_session_url = Some(runner_endpoint.clone());
     state.remote_session_status = Some("connected".to_string());
     state.active_remote_runner_auth_token = runner_auth_token.clone();
+    state.active_remote_runner_auth_secret_id = active_runner_auth_secret_id;
     state.active_remote_target = Some(ActiveRemoteTarget {
         kind: target_type,
         id,
@@ -413,8 +447,10 @@ fn exit_remote(state: &mut AppState) -> Value {
     state.remote_session_url = None;
     state.remote_session_status = None;
     state.active_remote_runner_auth_token = None;
+    state.active_remote_runner_auth_secret_id = None;
     state.active_remote_target = None;
     state.active_remote_cwd = None;
+    state.clear_active_ssh_bootstrap();
     json!({
         "ok": true,
         "action": "exit-remote",
@@ -424,7 +460,51 @@ fn exit_remote(state: &mut AppState) -> Value {
 
 struct SshRunnerBootstrap {
     endpoint: String,
-    child: Option<Child>,
+    child: ManagedSshBootstrap,
+}
+
+pub(crate) struct RestoredSshRunner {
+    pub(crate) endpoint: String,
+    pub(crate) runner: RemoteToolRunner,
+    pub(crate) bootstrap: ManagedSshBootstrap,
+    pub(crate) cwd: PathBuf,
+}
+
+pub(crate) fn restore_ssh_remote_runner(
+    state: &AppState,
+    host_id: &str,
+) -> Result<RestoredSshRunner> {
+    let host = state
+        .config
+        .remote
+        .ssh_hosts
+        .iter()
+        .find(|host| host.id == host_id)
+        .with_context(|| format!("SSH host config `{host_id}` is missing"))?;
+    let runner_cwd = state
+        .active_remote_cwd
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+        .or_else(|| host.cwd.clone())
+        .unwrap_or_else(|| "~".to_string());
+    let bootstrap = bootstrapped_ssh_runner(host, None, &runner_cwd)
+        .with_context(|| format!("re-bootstrap SSH remote `{host_id}`"))?;
+    let runner = RemoteToolRunner::connect(&bootstrap.endpoint, None)
+        .map_err(|error| anyhow::anyhow!("connect restored SSH remote runner: {error}"))?;
+    if let Err(error) = wait_for_runner_ready(&runner, Duration::from_secs(20)) {
+        let mut bootstrap = bootstrap;
+        let detail = bootstrap.child.terminate();
+        if detail.is_empty() {
+            return Err(error);
+        }
+        bail!("{error}; ssh bootstrap detail: {detail}");
+    }
+    Ok(RestoredSshRunner {
+        endpoint: bootstrap.endpoint,
+        runner,
+        bootstrap: bootstrap.child,
+        cwd: PathBuf::from(runner_cwd),
+    })
 }
 
 fn bootstrapped_ssh_runner(
@@ -462,19 +542,8 @@ fn bootstrapped_ssh_runner(
         .with_context(|| format!("spawn SSH runner tunnel to {}", host.target))?;
     Ok(SshRunnerBootstrap {
         endpoint: format!("http://127.0.0.1:{local_port}"),
-        child: Some(child),
+        child: ManagedSshBootstrap::new(child),
     })
-}
-
-fn terminate_ssh_bootstrap(child: &mut Child) -> String {
-    let mut stderr = child.stderr.take();
-    let _ = child.kill();
-    let _ = child.wait();
-    let mut detail = String::new();
-    if let Some(mut stderr) = stderr.take() {
-        let _ = stderr.read_to_string(&mut detail);
-    }
-    detail.trim().to_string()
 }
 
 fn allocate_local_port() -> Result<u16> {
@@ -562,6 +631,7 @@ pub(crate) fn reconnect_active_remote_runner(state: &mut AppState, cwd: &Path) -
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
 
+    let mut ssh_bootstrap = None;
     let (endpoint, auth_token, active_cwd) = match target.kind.as_str() {
         "ssh" => {
             let host = find_ssh_host(state, cwd, &target.id)?;
@@ -574,8 +644,10 @@ pub(crate) fn reconnect_active_remote_runner(state: &mut AppState, cwd: &Path) -
             let runner_cwd = active_cwd_string
                 .or_else(|| host.cwd.clone())
                 .unwrap_or_else(|| "~".to_string());
+            state.clear_active_ssh_bootstrap();
             let bootstrap = bootstrapped_ssh_runner(&host, None, &runner_cwd)
                 .with_context(|| format!("re-bootstrap SSH remote `{}`", target.id))?;
+            ssh_bootstrap = Some(bootstrap.child);
             (bootstrap.endpoint, None, Some(PathBuf::from(runner_cwd)))
         }
         "agentenv" => {
@@ -603,7 +675,7 @@ pub(crate) fn reconnect_active_remote_runner(state: &mut AppState, cwd: &Path) -
             };
             (
                 endpoint,
-                state.active_remote_runner_auth_token.clone(),
+                resolve_active_remote_runner_auth_token(state, cwd)?,
                 active_cwd.or_else(|| Some(PathBuf::from("/user"))),
             )
         }
@@ -616,7 +688,7 @@ pub(crate) fn reconnect_active_remote_runner(state: &mut AppState, cwd: &Path) -
             })?;
             (
                 endpoint,
-                state.active_remote_runner_auth_token.clone(),
+                resolve_active_remote_runner_auth_token(state, cwd)?,
                 active_cwd,
             )
         }
@@ -624,7 +696,17 @@ pub(crate) fn reconnect_active_remote_runner(state: &mut AppState, cwd: &Path) -
 
     let runner = RemoteToolRunner::connect(&endpoint, auth_token.as_deref())
         .map_err(|error| anyhow::anyhow!("reconnect remote tool runner: {error}"))?;
-    wait_for_runner_ready(&runner, Duration::from_secs(20))?;
+    if let Err(error) = wait_for_runner_ready(&runner, Duration::from_secs(20)) {
+        if let Some(mut bootstrap) = ssh_bootstrap.take() {
+            let _ = bootstrap.terminate();
+        }
+        return Err(error);
+    }
+    if let Some(bootstrap) = ssh_bootstrap.take() {
+        state.replace_active_ssh_bootstrap(Some(bootstrap));
+    } else {
+        state.clear_active_ssh_bootstrap();
+    }
     if state.local_tool_runner.is_none() {
         state.local_tool_runner = Some(state.tool_runner.clone());
     }
@@ -638,6 +720,24 @@ pub(crate) fn reconnect_active_remote_runner(state: &mut AppState, cwd: &Path) -
     state.active_remote_target = Some(target);
     state.active_remote_cwd = active_cwd;
     Ok(true)
+}
+
+fn resolve_active_remote_runner_auth_token(state: &AppState, cwd: &Path) -> Result<Option<String>> {
+    if let Some(secret_id) = state
+        .active_remote_runner_auth_secret_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return reveal_optional_secret(cwd, Some(secret_id));
+    }
+    Ok(state.active_remote_runner_auth_token.clone().or_else(|| {
+        state
+            .config
+            .remote_runner
+            .as_ref()
+            .and_then(|runner| runner.resolve_auth_token())
+    }))
 }
 
 pub(crate) fn remote_error_is_reconnectable(error: &anyhow::Error) -> bool {
@@ -987,6 +1087,31 @@ fn reveal_optional_secret(cwd: &Path, secret_id: Option<&str>) -> Result<Option<
     Ok(Some(secret.value))
 }
 
+fn store_inline_runner_auth_token(
+    cwd: &Path,
+    target_type: &str,
+    target_id: &str,
+    token: &str,
+) -> Result<String> {
+    let paths = ConfigPaths::discover(cwd);
+    let vault = SecretVault::open(SecretVault::default_path(&paths.user_config_dir))
+        .context("open Puffer secret vault")?;
+    let summary = vault
+        .put(SecretUpsert {
+            id: None,
+            label: format!("Remote runner token for {target_type}:{target_id}"),
+            description: Some(
+                "Stored automatically from RemoteExecution runnerAuthToken input".to_string(),
+            ),
+            value: token.to_string(),
+            username: None,
+            origin: Some(format!("puffer-remote://{target_type}/{target_id}")),
+            source: "remote-execution".to_string(),
+        })
+        .context("save remote runner auth token to encrypted secret vault")?;
+    Ok(summary.id)
+}
+
 fn apply_agentenv_auth(
     request: reqwest::blocking::RequestBuilder,
     auth: &AgentEnvAuth,
@@ -1333,6 +1458,33 @@ mod tests {
         AppState::new(PufferConfig::default(), cwd, session)
     }
 
+    #[test]
+    fn status_includes_active_runner_endpoint_and_cwd() {
+        let mut state = temp_state();
+        state.active_remote_target = Some(ActiveRemoteTarget {
+            kind: "ssh".to_string(),
+            id: "ssh-cleanup-test".to_string(),
+        });
+        state.remote_session_url = Some("http://127.0.0.1:55019".to_string());
+        state.remote_session_status = Some("connected".to_string());
+        state.active_remote_cwd = Some(PathBuf::from("C:\\Users\\walde"));
+
+        let value = status(&state);
+
+        assert_eq!(
+            value.get("runnerEndpoint").and_then(Value::as_str),
+            Some("http://127.0.0.1:55019")
+        );
+        assert_eq!(
+            value.get("remoteStatus").and_then(Value::as_str),
+            Some("connected")
+        );
+        assert_eq!(
+            value.get("runnerCwd").and_then(Value::as_str),
+            Some("C:\\Users\\walde")
+        );
+    }
+
     fn puffer_home_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -1612,7 +1764,6 @@ mod tests {
             target: "walde@10.0.0.8".to_string(),
             port: None,
             cwd: Some("C:\\Users\\walde".to_string()),
-            auth_secret_id: None,
         });
         save_user_config(&paths, &saved).unwrap();
 
@@ -1637,7 +1788,6 @@ mod tests {
             target: "walde@10.0.0.8".to_string(),
             port: Some(1),
             cwd: Some("C:\\Users\\walde".to_string()),
-            auth_secret_id: None,
         });
         let cwd = state.cwd.clone();
         let paths = ConfigPaths::discover(&cwd);
@@ -1662,7 +1812,6 @@ mod tests {
             target: "walden@example.test".to_string(),
             port: Some(22),
             cwd: Some("/workspace/project".to_string()),
-            auth_secret_id: None,
         });
         let original_runner = state.tool_runner.clone();
         let cwd = state.cwd.clone();
@@ -1675,7 +1824,6 @@ mod tests {
                 "targetType": "ssh",
                 "hostId": "devbox",
                 "runnerEndpoint": "http://127.0.0.1:1",
-                "runnerAuthToken": "test-token",
                 "waitForReady": false
             }),
         )
@@ -1693,10 +1841,6 @@ mod tests {
             state.active_remote_cwd,
             Some(PathBuf::from("/workspace/project"))
         );
-        assert_eq!(
-            state.active_remote_runner_auth_token.as_deref(),
-            Some("test-token")
-        );
         assert!(!Arc::ptr_eq(&state.tool_runner, &original_runner));
 
         execute_remote_execution(&mut state, &cwd, json!({ "action": "exit-remote" })).unwrap();
@@ -1704,6 +1848,7 @@ mod tests {
         assert_eq!(state.active_remote_target, None);
         assert_eq!(state.active_remote_cwd, None);
         assert_eq!(state.active_remote_runner_auth_token, None);
+        assert_eq!(state.active_remote_runner_auth_secret_id, None);
         assert!(Arc::ptr_eq(&state.tool_runner, &original_runner));
     }
 
@@ -1720,7 +1865,6 @@ mod tests {
                 "targetType": "agentenv",
                 "sandboxId": "sandbox-123",
                 "runnerEndpoint": "http://127.0.0.1:1",
-                "runnerAuthToken": "test-token",
                 "waitForReady": false
             }),
         )

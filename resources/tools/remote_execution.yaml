@@ -148,9 +148,6 @@ input_schema:
           maximum: 65535
         cwd:
           type: string
-        authSecretId:
-          type: string
-          description: Existing Puffer secret id for SSH credential material.
       required:
         - id
         - label

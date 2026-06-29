@@ -712,6 +712,7 @@ fn resume_switches_to_matching_session_record() {
                 remote_session_url: None,
                 remote_session_status: None,
                 active_remote_runner_auth_token: None,
+                active_remote_runner_auth_secret_id: None,
                 active_remote_cwd: None,
                 active_team_name: None,
                 statusline_enabled: true,

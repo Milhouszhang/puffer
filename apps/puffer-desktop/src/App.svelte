@@ -93,6 +93,8 @@
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { invoke } from "@tauri-apps/api/core";
+  import { canInvokeTauri } from "./lib/api/daemonClient";
   import { detectPlatform } from "./lib/shell/platform";
   import type {
     DesktopPreferences,
@@ -4256,6 +4258,9 @@
   function handleSessionEvent(sid: string, ev: SessionStreamEvent) {
     const selectedForEvent = selectedSession?.id === sid;
     if (isTurnSettled(sid, ev.turnId)) return;
+    if (ev.type === "turn-complete" && !ev.replay && canInvokeTauri()) {
+      void invoke("badge_bump").catch(() => {});
+    }
     const ignoredForSelected = selectedForEvent && shouldIgnoreTurnEvent(sid, ev.turnId);
     if (!ignoredForSelected) applySidebarSessionEvent(sid, ev);
     if (ignoredForSelected) {

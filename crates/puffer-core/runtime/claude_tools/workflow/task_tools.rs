@@ -1094,26 +1094,20 @@ fn duplicate_monitor_task_skip(
     metadata: &Map<String, Value>,
     subject: &str,
 ) -> Option<Value> {
-    let subject = normalize_monitor_subject(subject)?;
+    let candidate_subject = normalize_monitor_subject(subject);
     let candidate_envelopes = monitor_envelope_ids(metadata);
     let candidate_sources = monitor_source_message_ids(metadata);
     for task in tasks {
-        if terminal_task_status(&task.status)
-            || metadata_marks_monitor_ignored(Some(&task.metadata))
-        {
-            continue;
-        }
         if !same_monitor_task_scope(metadata, &task.metadata) {
             continue;
         }
-        let existing_envelopes = monitor_envelope_ids(&task.metadata);
-        if !candidate_envelopes.is_disjoint(&existing_envelopes) {
-            return Some(monitor_task_skip_payload(
-                "duplicate_source",
-                Some(task.task_id.as_str()),
-                None,
-            ));
-        }
+
+        // Message identity is the ONLY status-independent duplicate signal: the same
+        // Telegram (chat_id, message_id) re-delivered by a reconnect/replay must never
+        // spawn a second task, even after the first was completed or ignored
+        // (agentenv/monorepo#625). Content and subject are deliberately NOT used as a
+        // cross-status signal — two *distinct* messages with identical text are
+        // distinct events and may each open their own task.
         let existing_sources = monitor_source_message_ids(&task.metadata);
         if !candidate_sources.is_empty()
             && !existing_sources.is_empty()
@@ -1125,12 +1119,31 @@ fn duplicate_monitor_task_skip(
                 None,
             ));
         }
-        if normalize_monitor_subject(&task.subject).as_deref() == Some(subject.as_str()) {
+
+        // The envelope and subject legs apply to OPEN tasks only (unchanged #432
+        // behavior): an in-flight re-delivery of the same envelope, or a still-open
+        // task with the same subject, is collapsed while it is actionable.
+        if terminal_task_status(&task.status)
+            || metadata_marks_monitor_ignored(Some(&task.metadata))
+        {
+            continue;
+        }
+        let existing_envelopes = monitor_envelope_ids(&task.metadata);
+        if !candidate_envelopes.is_disjoint(&existing_envelopes) {
             return Some(monitor_task_skip_payload(
-                "duplicate_monitor_task",
+                "duplicate_source",
                 Some(task.task_id.as_str()),
                 None,
             ));
+        }
+        if let Some(candidate_subject) = candidate_subject.as_deref() {
+            if normalize_monitor_subject(&task.subject).as_deref() == Some(candidate_subject) {
+                return Some(monitor_task_skip_payload(
+                    "duplicate_monitor_task",
+                    Some(task.task_id.as_str()),
+                    None,
+                ));
+            }
         }
     }
     None
@@ -4130,6 +4143,141 @@ mod tests {
         );
         let store = load_store::<TaskStore>(&monitor_tasks_path(tmp.path())).unwrap();
         assert_eq!(store.tasks.len(), 1);
+    }
+
+    // ---- agentenv/monorepo#625 regression coverage ----
+    // Direct, deterministic exercises of `duplicate_monitor_task_skip` (no LLM).
+    // The aligned scope is MESSAGE-IDENTITY ONLY: the same Telegram (chat_id,
+    // message_id) re-delivered must never spawn a second task (even after the first
+    // is completed/ignored), but two *distinct* messages with identical text are
+    // distinct events and may each open their own task.
+
+    fn issue625_existing(
+        subject: &str,
+        status: &str,
+        source_message_id: Option<i64>,
+        ignored: bool,
+    ) -> StoredTask {
+        let mut meta = serde_json::Map::new();
+        meta.insert("_monitor".into(), json!(true));
+        meta.insert("monitor_connection".into(), json!("telegram-user"));
+        meta.insert("monitor_connector".into(), json!("telegram-login"));
+        meta.insert("chat_id".into(), json!(8_689_648_954i64));
+        meta.insert("monitor_envelope_id".into(), json!("env-existing"));
+        if let Some(id) = source_message_id {
+            meta.insert("source_message_id".into(), json!(id));
+        }
+        if ignored {
+            meta.insert("ignored".into(), json!(true));
+        }
+        serde_json::from_value(json!({
+            "task_id": "monitor-existing",
+            "subject": subject,
+            "description": "",
+            "active_form": "",
+            "status": status,
+            "owner": null,
+            "blocks": [],
+            "blocked_by": [],
+            "metadata": Value::Object(meta),
+            "output": null,
+        }))
+        .expect("construct existing StoredTask")
+    }
+
+    fn issue625_candidate(
+        subject: &str,
+        source_message_id: Option<i64>,
+    ) -> (Map<String, Value>, String) {
+        let mut meta = serde_json::Map::new();
+        meta.insert("_monitor".into(), json!(true));
+        meta.insert("monitor_connection".into(), json!("telegram-user"));
+        meta.insert("monitor_connector".into(), json!("telegram-login"));
+        meta.insert("chat_id".into(), json!(8_689_648_954i64));
+        // Fresh per-delivery envelope id, distinct from the existing task's.
+        meta.insert("monitor_envelope_id".into(), json!("env-redelivery"));
+        if let Some(id) = source_message_id {
+            meta.insert("source_message_id".into(), json!(id));
+        }
+        (meta, subject.to_string())
+    }
+
+    #[test]
+    fn issue_625_same_message_id_dedups_across_completion() {
+        // The #625 fix: a reconnect/replay re-delivers the EXACT same Telegram message
+        // (same chat_id+message_id) after the original task was completed. Message
+        // identity must suppress it regardless of status or any subject drift.
+        let original = issue625_existing(
+            "Telegram: road test registration needs immediate decision",
+            "completed",
+            Some(6080),
+            false,
+        );
+        let (candidate, subject) =
+            issue625_candidate("Telegram: a re-paraphrased subject for the same message", Some(6080));
+        let v = duplicate_monitor_task_skip(&[original], &candidate, &subject)
+            .expect("same message id must dedup across completion");
+        assert_eq!(v["reason"], "duplicate_source");
+        assert_eq!(v["existingTaskId"].as_str(), Some("monitor-existing"));
+    }
+
+    #[test]
+    fn issue_625_distinct_messages_same_text_create_separate_tasks() {
+        // The aligned non-goal: a DIFFERENT message (different message_id) with the
+        // same text, after the original task closed, is a distinct event and must NOT
+        // be deduped — it opens its own task. (This is the monitor-3 -> monitor-4 case
+        // observed in bobo, which is correct behavior under message-identity dedup.)
+        let original = issue625_existing(
+            "Telegram: road test registration needs immediate decision",
+            "completed",
+            Some(6080),
+            false,
+        );
+        let (candidate, subject) = issue625_candidate(
+            "Telegram: road test registration needs immediate decision",
+            Some(6081),
+        );
+        assert!(
+            duplicate_monitor_task_skip(&[original], &candidate, &subject).is_none(),
+            "a distinct message with identical text must open its own task"
+        );
+    }
+
+    #[test]
+    fn issue_625_open_task_same_subject_still_dedups() {
+        // Preserve #432: a still-OPEN task with the same subject in the same chat is
+        // collapsed (avoids piling up near-identical open items while actionable).
+        let original = issue625_existing(
+            "Telegram: road test registration needs immediate decision",
+            "pending",
+            None,
+            false,
+        );
+        let (candidate, subject) = issue625_candidate(
+            "Telegram: road test registration needs immediate decision",
+            Some(6081),
+        );
+        let v = duplicate_monitor_task_skip(&[original], &candidate, &subject)
+            .expect("same subject against an open task should dedup (#432)");
+        assert_eq!(v["reason"], "duplicate_monitor_task");
+    }
+
+    #[test]
+    fn issue_625_different_subject_same_chat_is_not_a_duplicate() {
+        // Same chat/sender is not enough (router.rs source-isolation policy): a new,
+        // unrelated question must still create its own task.
+        let original = issue625_existing(
+            "Telegram: road test registration needs immediate decision",
+            "pending",
+            None,
+            false,
+        );
+        let (candidate, subject) =
+            issue625_candidate("Telegram: a brand new unrelated question about lunch", None);
+        assert!(
+            duplicate_monitor_task_skip(&[original], &candidate, &subject).is_none(),
+            "a different subject in the same chat is not a duplicate"
+        );
     }
 
     #[test]

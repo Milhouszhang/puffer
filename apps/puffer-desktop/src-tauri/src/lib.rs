@@ -75,6 +75,7 @@ const REGISTERED_TAURI_COMMANDS: &[&str] = &[
     "browser_cef_native_history",
     "browser_cef_native_close",
     "browser_cef_native_hide",
+    "badge_bump",
 ];
 
 fn backend_call(

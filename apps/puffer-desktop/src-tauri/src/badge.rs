@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, Window, WindowEvent, State};
+use tauri::{AppHandle, Manager, State, Window, WindowEvent};
 
 #[derive(Default)]
 pub struct BadgeState {
@@ -8,9 +8,10 @@ pub struct BadgeState {
 }
 
 impl BadgeState {
-    /// 一次对话完成。聚焦时不累加(返回 None,不碰 dock);
-    /// 未聚焦时 unread += 1 并返回 Some(新值)。
-    pub fn record_completion(&mut self) -> Option<i64> {
+    /// One conversation turn completed. While focused, do not accumulate
+    /// (return None, leave the dock untouched); while unfocused, increment
+    /// `unread` and return `Some(new count)`.
+    fn record_completion(&mut self) -> Option<i64> {
         if self.focused {
             return None;
         }
@@ -18,9 +19,10 @@ impl BadgeState {
         Some(self.unread)
     }
 
-    /// 焦点变化。仅"新获得焦点且有未读"时归零并返回 Some(0)(需清除徽章);
-    /// 其余情况返回 None(失焦、重复聚焦、无未读)。
-    pub fn focus_changed(&mut self, focused: bool) -> Option<i64> {
+    /// Focus changed. Only when *newly* gaining focus with unread > 0 do we
+    /// reset to zero and return `Some(0)` (the badge must be cleared); every
+    /// other case returns None (blur, repeated focus, nothing unread).
+    fn focus_changed(&mut self, focused: bool) -> Option<i64> {
         let gained = focused && !self.focused;
         self.focused = focused;
         if gained && self.unread > 0 {
@@ -32,23 +34,28 @@ impl BadgeState {
     }
 }
 
-/// 唯一触碰 Tauri/OS 的函数。n > 0 显示数字;n == 0 清除徽章。best-effort。
-pub fn apply(app: &AppHandle, n: i64) {
+/// The only function that touches Tauri/OS. `n > 0` shows the number;
+/// `n == 0` clears the badge. Best-effort: errors are ignored.
+fn apply(app: &AppHandle, n: i64) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.set_badge_count(if n > 0 { Some(n) } else { None });
     }
 }
 
-/// 前端在每个非 replay 的对话完成上调用一次。焦点门控在此(Rust)单一判定。
+/// Invoked once per non-replay conversation completion from the frontend.
+/// The focus gate lives here (Rust) as the single source of truth.
 #[tauri::command]
 pub fn badge_bump(app: AppHandle, state: State<'_, Mutex<BadgeState>>) {
-    let next = state.lock().unwrap().record_completion();
+    // `.lock().ok()` keeps the best-effort policy (no panic on a poisoned
+    // mutex); the guard is dropped when the closure returns, so the OS call
+    // below never runs while the lock is held.
+    let next = state.lock().ok().and_then(|mut s| s.record_completion());
     if let Some(n) = next {
         apply(&app, n);
     }
 }
 
-/// 接到 `.on_window_event`。仅处理 main 窗口的焦点变化。
+/// Hooked to `.on_window_event`. Only handles focus changes for the main window.
 pub fn handle_window_event(window: &Window, event: &WindowEvent) {
     if window.label() != "main" {
         return;
@@ -56,7 +63,10 @@ pub fn handle_window_event(window: &Window, event: &WindowEvent) {
     if let WindowEvent::Focused(focused) = event {
         let app = window.app_handle();
         let state = app.state::<Mutex<BadgeState>>();
-        let next = state.lock().unwrap().focus_changed(*focused);
+        let next = state
+            .lock()
+            .ok()
+            .and_then(|mut s| s.focus_changed(*focused));
         if let Some(n) = next {
             apply(app, n);
         }

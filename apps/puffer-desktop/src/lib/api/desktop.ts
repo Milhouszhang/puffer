@@ -1726,6 +1726,18 @@ export type AgentTurnOptions = {
 export type AgentTurnSubmitOptions = AgentTurnOptions & {
   displayAttachments?: ChatAttachmentUpload[];
 };
+export type CommandSurfaceItem = {
+  name: string;
+  aliases: string[];
+  description: string;
+  argumentHint: string | null;
+  kind: "Prompt" | "Local" | "Ui";
+  hidden: boolean;
+};
+type BackendCommandSurfaceItem = Omit<CommandSurfaceItem, "argumentHint"> & {
+  argumentHint?: string | null;
+  argument_hint?: string | null;
+};
 export type StaleTurnRecoveryResult =
   | { recovery: "retry_started"; turnId: string }
   | { recovery: "already_retried" }
@@ -1857,6 +1869,19 @@ export async function dispatchSlashCommand(
     message
   });
   return result.turnId;
+}
+
+export async function listCommandSurface(): Promise<CommandSurfaceItem[]> {
+  const client = await ensureLocalDaemonClient();
+  const commands = await client.request<BackendCommandSurfaceItem[]>("list_command_surface", {});
+  return commands.map((command) => ({
+    name: command.name,
+    aliases: command.aliases ?? [],
+    description: command.description,
+    argumentHint: command.argumentHint ?? command.argument_hint ?? null,
+    kind: command.kind,
+    hidden: command.hidden
+  }));
 }
 
 /** Runs deterministic connector setup without creating a persisted session.

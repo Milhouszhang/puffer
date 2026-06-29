@@ -1447,6 +1447,7 @@ async fn dispatch_request(
         "set_lambda_skill_approval" => {
             respond!(detached!(|s, p| handle_set_lambda_skill_approval(&s, &p)))
         }
+        "list_command_surface" => respond!(detached!(|s| handle_list_command_surface(&s))),
         "list_provider_models" => {
             respond!(detached!(|s, p| handle_list_provider_models(&s, &p)))
         }
@@ -2753,6 +2754,15 @@ fn mcp_server_dtos(resources: &LoadedResources) -> Vec<McpServerDto> {
             source_path: Some(item.source_info.path.display().to_string()),
         })
         .collect()
+}
+
+fn handle_list_command_surface(state: &DaemonState) -> Result<Value> {
+    let inputs = state.build_runtime_inputs_without_discovery()?;
+    let commands = command_surface(&inputs.resources)
+        .into_iter()
+        .filter(|command| !command.hidden)
+        .collect::<Vec<_>>();
+    Ok(serde_json::to_value(commands)?)
 }
 
 /// Returns the full model list for one provider. The snapshot only carries

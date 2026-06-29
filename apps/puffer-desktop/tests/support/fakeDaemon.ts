@@ -1560,6 +1560,33 @@ export class FakeDaemon {
         return this.runAgentTurn(request.params);
       case "dispatch_slash_command":
         return this.runAgentTurn(request.params);
+      case "list_command_surface":
+        return [
+          {
+            name: "compact",
+            aliases: [],
+            description: "Summarize the conversation to preserve context budget",
+            argumentHint: "<instructions>",
+            kind: "Prompt",
+            hidden: false
+          },
+          {
+            name: "review",
+            aliases: [],
+            description: "Review the current worktree or pull request",
+            argumentHint: null,
+            kind: "Prompt",
+            hidden: false
+          },
+          {
+            name: "plan",
+            aliases: [],
+            description: "Enable plan mode or view the current session plan",
+            argumentHint: "[open|description]",
+            kind: "Local",
+            hidden: false
+          }
+        ];
       case "read_chat_attachment_preview":
         return this.readChatAttachmentPreview(request.params);
       case "read_generated_media_preview":

@@ -41,10 +41,12 @@
   } from "../../types";
   import type { AgentState } from "../../shell/tweaks";
   import {
+    listCommandSurface,
     listProviderModels,
     type AgentPermissionMode,
     type AgentTurnOptions,
     type AgentTurnSubmitOptions,
+    type CommandSurfaceItem,
     type ModelDescriptorInfo
   } from "../../api/desktop";
   import {
@@ -63,6 +65,70 @@
     image: null,
     video: null
   };
+  const COMPOSER_COMMANDS: ComposerSuggestion[] = [
+    commandSuggestion("add-dir", "Add a new working directory", "<path>", ["folder"]),
+    commandSuggestion("agents", "Manage agent configurations", undefined, [], "bot"),
+    commandSuggestion("autodream", "Consolidate durable project memory and suggest skill-worthy traces", "[status]", ["dream"], "sparkles"),
+    commandSuggestion("branch", "Create a branch of the current conversation at this point", "[name]", ["fork"], "branch"),
+    commandSuggestion("btw", "Ask a quick side question without interrupting the main conversation", "<question>", [], "sparkles"),
+    commandSuggestion("buddy", "Show or interact with Clawd", undefined, [], "bot"),
+    commandSuggestion("clear", "Clear conversation history and free up context", undefined, ["reset", "new"], "refresh"),
+    commandSuggestion("commit", "Create a git commit", undefined, [], "git"),
+    commandSuggestion("compact", "Summarize the conversation to preserve context budget", "<instructions>", [], "layers"),
+    commandSuggestion("config", "Open config panel", undefined, ["settings"], "settings"),
+    commandSuggestion("connect", "Configure a named connector connection", "<connector-slug> <connection-name>", [], "plug"),
+    commandSuggestion("context", "Show current context usage", undefined, [], "token"),
+    commandSuggestion("cost", "Show the total cost and duration of the current session", undefined, [], "coin"),
+    commandSuggestion("diff", "View uncommitted changes and per-turn diffs", undefined, [], "git"),
+    commandSuggestion("doctor", "Diagnose and verify your Puffer Code installation and settings", undefined, [], "test"),
+    commandSuggestion("effort", "Set effort level for model usage", "[minimal|low|medium|high|xhigh|max|auto]", [], "cpu"),
+    commandSuggestion("export", "Export the current conversation to a file or clipboard", "[filename]", [], "download"),
+    commandSuggestion("files", "List all files currently in context", undefined, [], "file"),
+    commandSuggestion("fast", "Toggle fast mode", "[on|off]", [], "bolt"),
+    commandSuggestion("goal", "Set or view the goal for a long-running task", "[text | clear | budget N | status]", ["objective"], "rocket"),
+    commandSuggestion("genskill", "Generate a reusable skill from the current conversation", "[--candidates N] [--rounds K]", [], "sparkles"),
+    commandSuggestion("help", "Show help and available commands", undefined, ["?"], "search"),
+    commandSuggestion("hooks", "View hook configurations for tool events", undefined, [], "wrench"),
+    commandSuggestion("ide", "Manage IDE integrations and show status", "[open]", [], "panel"),
+    commandSuggestion("init", "Initialize project guidance and defaults", undefined, [], "sparkles"),
+    commandSuggestion("keybindings", "Open or create your keybindings configuration file", undefined, [], "key"),
+    commandSuggestion("login", "Sign in to a provider", "[provider]", [], "lock"),
+    commandSuggestion("loop", "Run a prompt on a recurring interval until a condition is met", "<interval> <prompt> | stop", [], "clock"),
+    commandSuggestion("logout", "Sign out from a provider", "[provider]", [], "lock"),
+    commandSuggestion("maximize", "Iteratively maximize a metric via repeated prompt execution", "<metric> <prompt>", ["max"], "arrowUp"),
+    commandSuggestion("mcp", "Manage MCP servers", "[enable|disable server-name]", [], "server"),
+    commandSuggestion("memory", "Edit memory files", undefined, [], "file"),
+    commandSuggestion("model", "Select the active model", "[provider/model]", [], "cpu"),
+    commandSuggestion("monitor", "Create connector monitors that turn messages into tasks", "[connection search | connection ...]", [], "eye"),
+    commandSuggestion("night", "Autonomous overnight work with subagents in isolated worktrees", undefined, [], "flame"),
+    commandSuggestion("pentest", "Run an authorized web penetration test", "<url> [iter] [disp] [task-spec=file]", [], "shield"),
+    commandSuggestion("permissions", "Manage allow and deny tool permission rules", undefined, ["allowed-tools"], "shield"),
+    commandSuggestion("plan", "Enable plan mode or view the current session plan", "[open|description]", [], "listTodo"),
+    commandSuggestion("plugin", "Manage Puffer plugins", undefined, ["plugins", "marketplace"], "plug"),
+    commandSuggestion("pr-comments", "Get comments from a GitHub pull request", undefined, [], "git"),
+    commandSuggestion("recap", "Summarize the session in 1-2 sentences", undefined, [], "logs"),
+    commandSuggestion("reflect", "Toggle runtime reflection for this session", "[on|off|toggle|status]", [], "refresh"),
+    commandSuggestion("reload-plugins", "Activate pending plugin changes in the current session", undefined, [], "refresh"),
+    commandSuggestion("remote-control", "Connect this terminal for remote-control sessions", "[name]", ["rc"], "terminal"),
+    commandSuggestion("remote-env", "Configure the remote environment for this session", undefined, [], "server"),
+    commandSuggestion("rename", "Rename the current conversation", "[name]", [], "edit"),
+    commandSuggestion("resume", "Resume a previous conversation", "[conversation id or search term]", ["continue"], "clock"),
+    commandSuggestion("rewind", "Restore the code and/or conversation to a previous point", undefined, ["checkpoint"], "refresh"),
+    commandSuggestion("review", "Review the current worktree or pull request", undefined, [], "search"),
+    commandSuggestion("security-review", "Complete a security review of pending changes", undefined, [], "shield"),
+    commandSuggestion("session", "Show remote session URL and QR code", undefined, ["remote"], "link"),
+    commandSuggestion("skills", "List available skills", undefined, [], "sparkles"),
+    commandSuggestion("skill:<name>", "Run a loaded skill by slash-safe skill name", undefined, [], "sparkles"),
+    commandSuggestion("status", "Show current session configuration and status", undefined, [], "logs"),
+    commandSuggestion("statusline", "Set up Claude Code's status line UI", undefined, [], "terminal"),
+    commandSuggestion("tag", "Toggle a searchable tag on the current session", "<tag-name>", [], "pin"),
+    commandSuggestion("tasks", "List and manage background tasks", undefined, ["bashes"], "listTodo"),
+    commandSuggestion("theme", "Change the theme", undefined, [], "settings"),
+    commandSuggestion("ultrareview", "Multi-agent code review of the current worktree or PR", "[pr-url-or-number]", [], "bot"),
+    commandSuggestion("usage", "Show plan usage limits", undefined, [], "token"),
+    commandSuggestion("vim", "Toggle between Vim and Normal editing modes", undefined, [], "terminal"),
+    commandSuggestion("workflows", "Show workflow, connector, and connection status", "[list|new|append|delete|actions]", ["workflow"], "layers")
+  ];
   const MEDIA_SETTINGS_LABELS: Record<MediaKind, string> = {
     image: "Image generation settings",
     video: "Video generation settings"
@@ -71,6 +137,24 @@
   type ComposerRoutingPreference = {
     providerId: string | null;
     modelId: string | null;
+  };
+  type ComposerSuggestionKind = "command" | "mention";
+  type ComposerSuggestion = {
+    id: string;
+    kind: ComposerSuggestionKind;
+    label: string;
+    insertText: string;
+    detail: string;
+    hint?: string;
+    aliases?: string[];
+    icon: IconName;
+  };
+  type ComposerTrigger = {
+    kind: ComposerSuggestionKind;
+    marker: "/" | "@";
+    start: number;
+    end: number;
+    query: string;
   };
   type RecapContent = {
     summary: string;
@@ -179,6 +263,10 @@
   let selectedProviderId = $state<string | null>(null);
   let selectedModelId = $state<string | null>(null);
   let selectedThinkingOptionId = $state("");
+  let composerSuggestionIndex = $state(0);
+  let dismissedComposerTriggerKey = $state<string | null>(null);
+  let commandSurfaceItems = $state<CommandSurfaceItem[]>([]);
+  let commandSurfaceLoadAttempted = $state(false);
   let submitInFlightSessionIds = $state<string[]>([]);
   const submitInFlightGuards = new Set<string>();
   let thinkingProviderId = $state<string | null>(null);
@@ -194,6 +282,15 @@
     selectedProviderId ?? session?.providerId ?? settingsSnapshot?.config.defaultProvider ?? null
   );
   let engineerName = $derived(`${ENGINEER_NAME} (${providerDisplayName(displayedProviderId)})`);
+  let composerTrigger = $derived(findComposerTrigger(draft, composerTextareaEl?.selectionStart ?? draft.length));
+  let composerTriggerKey = $derived(
+    composerTrigger
+      ? `${composerTrigger.marker}:${composerTrigger.start}:${composerTrigger.end}:${composerTrigger.query}`
+      : null
+  );
+  let mentionSuggestions = $derived(buildMentionSuggestions());
+  let commandSuggestions = $derived(buildCommandSuggestions());
+  let composerSuggestions = $derived(filteredComposerSuggestions(composerTrigger));
 
   let fastModeAvailable = $derived(modelSupportsFastMode(selectedModelId));
   let selectedProviderModelSourceId = $derived.by(() => {
@@ -283,6 +380,14 @@
       submitInFlight ||
       agentBusy ||
       (!selectedProviderAuthenticated && !providerSwitchCanRecover)
+  );
+  let composerPaletteOpen = $derived(
+    Boolean(
+      composerTrigger &&
+        composerTriggerKey !== dismissedComposerTriggerKey &&
+        composerSuggestions.length > 0 &&
+        !composerDisabled
+    )
   );
   let canAcceptAttachmentDrop = $derived(!composerDisabled);
   let modelPickerDisabled = $derived(
@@ -404,6 +509,243 @@
       .filter(Boolean)
       .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
       .join(" ") || "Codex";
+  }
+
+  function commandSuggestion(
+    name: string,
+    detail: string,
+    hint?: string,
+    aliases: string[] = [],
+    icon: IconName = "terminal"
+  ): ComposerSuggestion {
+    return {
+      id: `command:${name}`,
+      kind: "command",
+      label: `/${name}`,
+      insertText: `/${name}`,
+      detail,
+      hint,
+      aliases,
+      icon
+    };
+  }
+
+  function iconForCommand(command: CommandSurfaceItem): IconName {
+    const name = command.name.toLowerCase();
+    if (name.includes("review") || name === "help") return "search";
+    if (name.includes("skill") || command.kind === "Prompt") return "sparkles";
+    if (name.includes("agent") || name === "ultrareview") return "bot";
+    if (name.includes("permission") || name.includes("security")) return "shield";
+    if (name.includes("plugin") || name === "connect") return "plug";
+    if (name.includes("model") || name === "effort") return "cpu";
+    if (name.includes("branch") || name.includes("commit") || name.includes("diff")) return "git";
+    if (name.includes("file") || name.includes("memory")) return "file";
+    if (name.includes("remote") || name.includes("mcp")) return "server";
+    if (name.includes("workflow")) return "layers";
+    if (name.includes("task") || name === "plan") return "listTodo";
+    if (name.includes("status") || name === "recap") return "logs";
+    return "terminal";
+  }
+
+  function buildCommandSuggestions(): ComposerSuggestion[] {
+    if (commandSurfaceItems.length === 0) return COMPOSER_COMMANDS;
+    return commandSurfaceItems
+      .filter((command) => !command.hidden)
+      .map((command) =>
+        commandSuggestion(
+          command.name,
+          command.description,
+          command.argumentHint ?? undefined,
+          command.aliases ?? [],
+          iconForCommand(command)
+        )
+      );
+  }
+
+  function mentionSuggestion(
+    id: string,
+    label: string,
+    detail: string,
+    insertText = label,
+    icon: IconName = "file",
+    hint?: string,
+    aliases: string[] = []
+  ): ComposerSuggestion {
+    return {
+      id: `mention:${id}`,
+      kind: "mention",
+      label,
+      insertText,
+      detail,
+      hint,
+      aliases,
+      icon
+    };
+  }
+
+  function buildMentionSuggestions(): ComposerSuggestion[] {
+    const suggestions: ComposerSuggestion[] = [];
+    if (session?.cwd) {
+      suggestions.push(
+        mentionSuggestion(
+          "workspace",
+          "@workspace",
+          "Current working directory",
+          `@${session.cwd}`,
+          "folder",
+          session.cwd,
+          ["cwd", "project"]
+        )
+      );
+    }
+    if (session?.title) {
+      suggestions.push(
+        mentionSuggestion(
+          "session",
+          "@session",
+          "Current conversation",
+          "@session",
+          "logs",
+          session.title,
+          ["conversation", session.slug ?? ""].filter(Boolean)
+        )
+      );
+    }
+    const providerLabel = providerDisplayName(selectedProviderId ?? session?.providerId);
+    if (selectedProviderId || session?.providerId) {
+      suggestions.push(
+        mentionSuggestion(
+          "provider",
+          `@${providerLabel.toLowerCase().replace(/\s+/g, "-")}`,
+          "Selected provider",
+          `@${providerLabel}`,
+          "bot",
+          selectedProviderId ?? session?.providerId ?? undefined,
+          ["provider", "model"]
+        )
+      );
+    }
+    if (selectedModelId || session?.modelId) {
+      const modelId = selectedModelId ?? session?.modelId ?? "";
+      suggestions.push(
+        mentionSuggestion("model", `@${modelId}`, "Selected model", `@${modelId}`, "cpu", undefined, [
+          "model",
+          providerLabel
+        ])
+      );
+    }
+    if (permissionMode) {
+      suggestions.push(
+        mentionSuggestion(
+          "permissions",
+          `@${permissionMode}`,
+          "Composer permission mode",
+          `@${permissionMode}`,
+          "shield",
+          "permissions",
+          ["sandbox", "approval"]
+        )
+      );
+    }
+    for (const attachment of attachmentDrafts) {
+      suggestions.push(
+        mentionSuggestion(
+          `attachment:${attachment.id}`,
+          `@${attachment.file.name}`,
+          "Attached draft file",
+          `@${attachment.file.name}`,
+          attachment.kind === "image" ? "image" : attachment.kind === "video" ? "video" : "paperclip",
+          attachment.file.type || attachment.file.size.toLocaleString(),
+          ["attachment", attachment.kind]
+        )
+      );
+    }
+    const providerIds = new Set<string>();
+    for (const provider of settingsSnapshot?.providers ?? []) {
+      if (!provider.id.trim()) continue;
+      providerIds.add(provider.id);
+      suggestions.push(
+        mentionSuggestion(
+          `provider:${provider.id}`,
+          `@${providerDisplayName(provider.id).toLowerCase().replace(/\s+/g, "-")}`,
+          "Configured provider",
+          `@${providerDisplayName(provider.id)}`,
+          "bot",
+          provider.id,
+          [provider.displayName, provider.id].filter(Boolean)
+        )
+      );
+    }
+    for (const auth of settingsSnapshot?.auth ?? []) {
+      if (providerIds.has(auth.providerId)) continue;
+      suggestions.push(
+        mentionSuggestion(
+          `auth:${auth.providerId}`,
+          `@${providerDisplayName(auth.providerId).toLowerCase().replace(/\s+/g, "-")}`,
+          "Signed-in provider",
+          `@${providerDisplayName(auth.providerId)}`,
+          "lock",
+          auth.email ?? auth.organizationName ?? auth.providerId,
+          [auth.providerId]
+        )
+      );
+    }
+    return suggestions;
+  }
+
+  function findComposerTrigger(value: string, cursor: number): ComposerTrigger | null {
+    const beforeCursor = value.slice(0, cursor);
+    const match = /(^|\s)([/@][^\s/@]*)$/.exec(beforeCursor);
+    if (!match) return null;
+    const token = match[2] ?? "";
+    const marker = token.charAt(0) as "/" | "@";
+    const start = beforeCursor.length - token.length;
+    if (marker === "/" && start !== 0) return null;
+    return {
+      kind: marker === "/" ? "command" : "mention",
+      marker,
+      start,
+      end: cursor,
+      query: token.slice(1).toLowerCase()
+    };
+  }
+
+  function suggestionSearchText(suggestion: ComposerSuggestion): string {
+    return [suggestion.label, suggestion.detail, suggestion.hint, ...(suggestion.aliases ?? [])]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+  }
+
+  function filteredComposerSuggestions(trigger: ComposerTrigger | null): ComposerSuggestion[] {
+    if (!trigger) return [];
+    const source = trigger.kind === "command" ? commandSuggestions : mentionSuggestions;
+    const query = trigger.query.trim().toLowerCase();
+    const filtered = query
+      ? source.filter((suggestion) => suggestionSearchText(suggestion).includes(query))
+      : source;
+    return filtered.slice(0, 8);
+  }
+
+  function suggestionReplacementText(suggestion: ComposerSuggestion, trigger: ComposerTrigger): string {
+    const suffix = suggestion.kind === "command" && suggestion.hint ? " " : " ";
+    return `${suggestion.insertText}${suffix}`;
+  }
+
+  function acceptComposerSuggestion(suggestion: ComposerSuggestion | null = null) {
+    const trigger = composerTrigger;
+    const selected = suggestion ?? composerSuggestions[composerSuggestionIndex] ?? composerSuggestions[0];
+    if (!trigger || !selected) return;
+    const replacement = suggestionReplacementText(selected, trigger);
+    const nextDraft = `${draft.slice(0, trigger.start)}${replacement}${draft.slice(trigger.end)}`;
+    const cursor = trigger.start + replacement.length;
+    updateDraft(nextDraft);
+    composerSuggestionIndex = 0;
+    dismissedComposerTriggerKey = null;
+    void tick().then(() => {
+      composerTextareaEl?.focus();
+      composerTextareaEl?.setSelectionRange(cursor, cursor);
+    });
   }
 
   function normalizePermissionMode(value: string | null): AgentPermissionMode {
@@ -993,6 +1335,7 @@
 
   function updateDraft(value: string) {
     draft = value;
+    dismissedComposerTriggerKey = null;
     setDraftForSession(session?.id, value);
     scheduleComposerResize();
   }
@@ -1142,6 +1485,7 @@
       attachmentDrafts = nextSessionId ? attachmentDraftsBySessionId[nextSessionId] ?? [] : [];
       attachmentError = null;
       attachmentMenuOpen = false;
+      dismissedComposerTriggerKey = null;
       resetAttachmentDropState();
       expandedActivityIds = [];
       selectedActivityChildren = {};
@@ -1160,9 +1504,28 @@
   });
 
   $effect(() => {
+    if (commandSurfaceLoadAttempted || !backendConnected) return;
+    commandSurfaceLoadAttempted = true;
+    void listCommandSurface()
+      .then((commands) => {
+        commandSurfaceItems = commands;
+      })
+      .catch(() => {
+        commandSurfaceItems = [];
+      });
+  });
+
+  $effect(() => {
     if (!composerDisabled) return;
     attachmentMenuOpen = false;
+    dismissedComposerTriggerKey = composerTriggerKey;
     resetAttachmentDropState();
+  });
+
+  $effect(() => {
+    if (composerSuggestionIndex >= composerSuggestions.length) {
+      composerSuggestionIndex = 0;
+    }
   });
 
   $effect(() => {
@@ -1421,6 +1784,30 @@
 
   function onKeydown(e: KeyboardEvent) {
     if (e.isComposing || e.keyCode === 229) return;
+    if (composerPaletteOpen) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        composerSuggestionIndex = (composerSuggestionIndex + 1) % composerSuggestions.length;
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        composerSuggestionIndex =
+          (composerSuggestionIndex - 1 + composerSuggestions.length) % composerSuggestions.length;
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        acceptComposerSuggestion();
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        composerSuggestionIndex = 0;
+        dismissedComposerTriggerKey = composerTriggerKey;
+        return;
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
@@ -2546,6 +2933,37 @@
       {#if attachmentError}
         <p class="pf-attachment-error" role="alert">{attachmentError}</p>
       {/if}
+      {#if composerPaletteOpen}
+        <div class="pf-composer-palette" role="listbox" aria-label={composerTrigger?.kind === "command" ? "Slash commands" : "Mentions"}>
+          {#each composerSuggestions as suggestion, index (suggestion.id)}
+            <button
+              type="button"
+              class="pf-composer-suggestion"
+              class:active={index === composerSuggestionIndex}
+              role="option"
+              aria-selected={index === composerSuggestionIndex}
+              onmouseenter={() => (composerSuggestionIndex = index)}
+              onpointerdown={(event) => {
+                event.preventDefault();
+                acceptComposerSuggestion(suggestion);
+              }}
+            >
+              <span class="pf-composer-suggestion-icon">
+                <Icon name={suggestion.icon} size={14} />
+              </span>
+              <span class="pf-composer-suggestion-copy">
+                <span class="pf-composer-suggestion-title">
+                  <strong>{suggestion.label}</strong>
+                  {#if suggestion.hint}
+                    <code>{suggestion.hint}</code>
+                  {/if}
+                </span>
+                <span class="pf-composer-suggestion-detail">{suggestion.detail}</span>
+              </span>
+            </button>
+          {/each}
+        </div>
+      {/if}
       <textarea
         bind:this={composerTextareaEl}
         value={draft}
@@ -2793,6 +3211,96 @@
     font-size: 12px;
     line-height: 16px;
     font-weight: 600;
+  }
+  .pf-composer-palette {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: calc(100% + 10px);
+    z-index: 22;
+    display: grid;
+    gap: 2px;
+    max-height: min(360px, 48vh);
+    overflow: auto;
+    padding: 6px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: color-mix(in oklab, var(--background) 96%, var(--muted));
+    box-shadow: var(--shadow-lg);
+  }
+  .pf-composer-suggestion {
+    width: 100%;
+    min-height: 42px;
+    display: grid;
+    grid-template-columns: 24px minmax(0, 1fr);
+    align-items: center;
+    gap: 9px;
+    padding: 6px 8px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--foreground);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .pf-composer-suggestion:hover,
+  .pf-composer-suggestion.active {
+    background: var(--accent);
+  }
+  .pf-composer-suggestion-icon {
+    width: 24px;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid color-mix(in oklab, var(--border) 78%, transparent);
+    border-radius: 6px;
+    color: var(--muted-foreground);
+    background: color-mix(in oklab, var(--background) 76%, var(--muted));
+  }
+  .pf-composer-suggestion-copy {
+    min-width: 0;
+    display: grid;
+    gap: 2px;
+  }
+  .pf-composer-suggestion-title {
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    white-space: nowrap;
+  }
+  .pf-composer-suggestion-title strong {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 13px;
+    line-height: 17px;
+    font-weight: 750;
+  }
+  .pf-composer-suggestion-title code {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--muted-foreground);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    line-height: 16px;
+    font-weight: 650;
+    white-space: nowrap;
+  }
+  .pf-composer-suggestion-detail {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--muted-foreground);
+    font-size: 12px;
+    line-height: 16px;
+    font-weight: 550;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .pf-composer-foot :global(.picker) {
     min-width: 0;

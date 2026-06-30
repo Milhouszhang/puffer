@@ -1134,3 +1134,40 @@ fn builder_attaches_run_finished_observer_to_history_store() {
 
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn manager_injects_proxy_env_into_supervisor_config() {
+    use puffer_config::{ProxyConfig, ProxyEndpoint, ProxyScheme};
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let manager = SubscriptionManagerBuilder::new(dir.path().join("subs.json"))
+        .build(runtime.handle().clone())
+        .unwrap();
+    manager.set_proxy_config(ProxyConfig {
+        enabled: true,
+        selected: Some("p".into()),
+        bypass: vec![],
+        proxies: vec![ProxyEndpoint {
+            id: "p".into(),
+            scheme: ProxyScheme::Socks5,
+            host: "127.0.0.1".into(),
+            port: 7890,
+            username: None,
+            password: None,
+        }],
+    });
+    let cfg = manager.supervisor_config_with_proxy();
+    assert!(
+        cfg.env_set
+            .iter()
+            .any(|(k, v)| k == "ALL_PROXY" && v == "socks5://127.0.0.1:7890"),
+        "expected ALL_PROXY=socks5://127.0.0.1:7890 in env_set, got {:?}",
+        cfg.env_set
+    );
+    assert!(cfg.env_unset.is_empty());
+    manager.shutdown();
+}

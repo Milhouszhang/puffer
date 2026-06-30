@@ -58,6 +58,10 @@ impl Default for SupervisorConfig {
 pub struct SubscriberHandle {
     /// Subscriber manifest id.
     pub id: String,
+    /// The manifest this subscriber was spawned from. Retained so the manager
+    /// can re-spawn the subscriber (e.g. after a proxy config change) without
+    /// going back to disk.
+    pub manifest: Manifest,
     /// Control channel: send [`crate::SubscriberCommand`] values to the
     /// child's stdin.
     pub commands: CommandSender,
@@ -98,6 +102,7 @@ impl SubscriberSupervisor {
         let commands = CommandSender::disconnected();
         let (ready_tx, ready_rx) = oneshot::channel();
 
+        let manifest_for_handle = manifest.clone();
         let commands_for_task = commands.clone();
         let shutdown_for_error = shutdown_tx.clone();
         let join = tokio::spawn(run_loop(
@@ -129,6 +134,7 @@ impl SubscriberSupervisor {
 
         Ok(SubscriberHandle {
             id,
+            manifest: manifest_for_handle,
             commands,
             shutdown_tx,
             join: Some(join),

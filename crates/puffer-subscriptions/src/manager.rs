@@ -22,6 +22,7 @@ use crate::router::{MonitorDigestQueue, SubscriptionRouter};
 use crate::self_gate::{DropAllSelfGate, SelfMessageGate};
 use crate::store::SubscriptionStore;
 use anyhow::Result;
+use puffer_config::{proxy_env_block, ProxyConfig};
 use puffer_subscriber_runtime::{
     CommandSender, EventBus, EventEnvelope, Manifest, SubscriberCommand, SubscriberHandle,
     SubscriberSupervisor, SupervisorConfig,
@@ -302,6 +303,7 @@ impl SubscriptionManagerBuilder {
             subscribers: Mutex::new(HashMap::new()),
             connector_streams: Mutex::new(HashMap::new()),
             command_wait_locks: Mutex::new(HashMap::new()),
+            proxy_config: Mutex::new(ProxyConfig::default()),
         };
         manager.refresh_connection_consumers()?;
         Ok(manager)
@@ -338,6 +340,9 @@ pub struct SubscriptionManager {
     subscribers: Mutex<HashMap<String, SubscriberHandle>>,
     connector_streams: Mutex<HashMap<String, ConnectorStreamHandle>>,
     command_wait_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Proxy configuration injected into every subscriber child spawn. Updated
+    /// at runtime via `set_proxy_config`; never touches the process env.
+    proxy_config: Mutex<ProxyConfig>,
 }
 
 impl SubscriptionManager {
@@ -768,11 +773,53 @@ impl SubscriptionManager {
             "starting subscriber"
         );
         let bus = self.bus.clone();
+        let supervisor_config = self.supervisor_config_with_proxy();
         let handle = block_on_manager_handle(&self.handle, async move {
-            SubscriberSupervisor::spawn(manifest, bus, SupervisorConfig::default()).await
+            SubscriberSupervisor::spawn(manifest, bus, supervisor_config).await
         })?;
         guard.insert(id.clone(), handle);
         Ok(id)
+    }
+
+    /// Updates the proxy config used for future child spawns. Called by the
+    /// daemon on startup and whenever proxy settings are saved.
+    pub fn set_proxy_config(&self, proxy: ProxyConfig) {
+        *self.proxy_config.lock().unwrap() = proxy;
+    }
+
+    fn supervisor_config_with_proxy(&self) -> SupervisorConfig {
+        let block = proxy_env_block(&self.proxy_config.lock().unwrap());
+        SupervisorConfig {
+            env_set: block.set,
+            env_unset: block.unset,
+            ..SupervisorConfig::default()
+        }
+    }
+
+    /// Respawns subscribers whose egress is proxy-sensitive (currently the
+    /// Telegram MTProto subscriber) so a proxy change takes effect without an
+    /// app restart. Other transports pick the change up via the startup env or
+    /// (browser) their own launch args.
+    pub fn respawn_proxy_sensitive_subscribers(&self) -> Result<()> {
+        const PROXY_SENSITIVE: &[&str] = &["telegram-user"];
+        for id in PROXY_SENSITIVE {
+            let (handle, manifest) = {
+                let mut guard = self.subscribers.lock().unwrap();
+                match guard.remove(*id) {
+                    Some(handle) => {
+                        let manifest = handle.manifest.clone();
+                        (handle, manifest)
+                    }
+                    None => continue, // not running; nothing to respawn
+                }
+            };
+            block_on_manager_handle(&self.handle, async move {
+                handle.shutdown().await;
+                Ok(())
+            })?;
+            self.start_subscriber(manifest)?;
+        }
+        Ok(())
     }
 
     /// Sends a control command to the named subscriber. Returns an error

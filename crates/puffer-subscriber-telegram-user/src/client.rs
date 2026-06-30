@@ -1250,7 +1250,8 @@ async fn import_and_connect(
                 "login_error",
                 json!({
                     "error": format!("Telegram Desktop import failed: {error}"),
-                    "phase": "import_desktop"
+                    "phase": "import_desktop",
+                    "class": "import",
                 }),
             )?;
             return Ok(None);

@@ -689,7 +689,37 @@
 }
 
 .pf-connector-card-settings {
-  grid-template-columns: 32px minmax(0, 1fr) auto auto;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+}
+
+/* Right side of a connection card: status+source on top, buttons below —
+   always two rows, right-aligned, regardless of card width. */
+.pf-connection-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* status + source travel together as one row. */
+.pf-connection-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Keep the connection action buttons together, right-aligned, at their natural
+   size so they don't wrap or squish (Remove left, monitor right). */
+.pf-connection-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.pf-connection-actions .sc-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .pf-connector-catalog-button {
@@ -789,11 +819,16 @@
   }
 
   .pf-mcp-card .pf-status-pill,
-  .pf-mcp-card .pf-connector-source,
-  .pf-connector-card-settings .pf-status-pill,
-  .pf-connector-card-settings .pf-connector-source {
+  .pf-mcp-card .pf-connector-source {
     grid-column: 2;
     justify-self: start;
+  }
+
+  /* Stacked (narrow) card: drop the side column under the content, still
+     right-aligned (status+source row, then buttons row). */
+  .pf-connector-card-settings .pf-connection-side {
+    grid-column: 2;
+    justify-self: stretch;
   }
 
   .pf-connector-selected {

@@ -2080,40 +2080,46 @@
                   <div class="title">{connection.slug}</div>
                   <div class="desc">{connection.description || connection.connector_slug}</div>
                 </div>
-                <span class:ready={connection.state === "active" || connection.state === "authenticated"} class="pf-status-pill">
-                  {connection.state}
-                </span>
-                <span class="pf-connector-source">{connection.connector_slug}</span>
-                <button
-                  type="button"
-                  class="sc-btn"
-                  data-variant="outline"
-                  data-size="sm"
-                  aria-label={connection.state === "active"
-                    ? `Stop monitoring ${connection.slug}`
-                    : `Start monitoring ${connection.slug}`}
-                  disabled={!daemonReachable || connectorMonitoring !== null || connection.state === "pending"}
-                  aria-busy={connectorMonitoring === connection.slug}
-                  onclick={() => void toggleConnectionMonitor(connection.slug, connection.state === "active")}
-                >
-                  <Icon name="eye" size={12} />{connectorMonitoring === connection.slug
-                    ? "Working..."
-                    : connection.state === "active"
-                      ? "Stop monitoring"
-                      : "Start monitoring"}
-                </button>
-                <button
-                  type="button"
-                  class="sc-btn"
-                  data-variant="outline"
-                  data-size="sm"
-                  aria-label={`Remove connection ${connection.slug}`}
-                  disabled={!daemonReachable || connectorDeleting !== null}
-                  aria-busy={connectorDeleting === connection.slug}
-                  onclick={() => void removeConnectorConnection(connection.slug)}
-                >
-                  <Icon name="x" size={12} />{connectorDeleting === connection.slug ? "Removing..." : "Remove"}
-                </button>
+                <div class="pf-connection-side">
+                  <div class="pf-connection-meta">
+                    <span class:ready={connection.state === "active" || connection.state === "authenticated"} class="pf-status-pill">
+                      {connection.state}
+                    </span>
+                    <span class="pf-connector-source">{connection.connector_slug}</span>
+                  </div>
+                  <div class="pf-connection-actions">
+                    <button
+                      type="button"
+                      class="sc-btn"
+                      data-variant="outline"
+                      data-size="sm"
+                      aria-label={`Remove connection ${connection.slug}`}
+                      disabled={!daemonReachable || connectorDeleting !== null}
+                      aria-busy={connectorDeleting === connection.slug}
+                      onclick={() => void removeConnectorConnection(connection.slug)}
+                    >
+                      <Icon name="x" size={12} />{connectorDeleting === connection.slug ? "Removing..." : "Remove"}
+                    </button>
+                    <button
+                      type="button"
+                      class="sc-btn"
+                      data-variant="outline"
+                      data-size="sm"
+                      aria-label={connection.state === "active"
+                        ? `Stop monitoring ${connection.slug}`
+                        : `Start monitoring ${connection.slug}`}
+                      disabled={!daemonReachable || connectorMonitoring !== null || connection.state === "pending"}
+                      aria-busy={connectorMonitoring === connection.slug}
+                      onclick={() => void toggleConnectionMonitor(connection.slug, connection.state === "active")}
+                    >
+                      <Icon name="eye" size={12} />{connectorMonitoring === connection.slug
+                        ? "Working..."
+                        : connection.state === "active"
+                          ? "Stop monitoring"
+                          : "Start monitoring"}
+                    </button>
+                  </div>
+                </div>
               </div>
             {/each}
             {#if !connectorLoading && connections.length === 0}

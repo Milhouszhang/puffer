@@ -70,8 +70,10 @@
   const COMPOSER_COMMANDS: ComposerSuggestion[] = [
     commandSuggestion("add-dir", "Add a new working directory", "<path>", ["folder"]),
     commandSuggestion("agents", "Manage agent configurations", undefined, [], "bot"),
+    commandSuggestion("attach", "Attach files to the next message", undefined, ["file", "upload"], "paperclip"),
     commandSuggestion("autodream", "Consolidate durable project memory and suggest skill-worthy traces", "[status]", ["dream"], "sparkles"),
     commandSuggestion("branch", "Create a branch of the current conversation at this point", "[name]", ["fork"], "branch"),
+    commandSuggestion("browser", "Open or control the browser tool", "[url or instruction]", ["web"], "globe"),
     commandSuggestion("btw", "Ask a quick side question without interrupting the main conversation", "<question>", [], "sparkles"),
     commandSuggestion("buddy", "Show or interact with Clawd", undefined, [], "bot"),
     commandSuggestion("clear", "Clear conversation history and free up context", undefined, ["reset", "new"], "refresh"),
@@ -87,11 +89,13 @@
     commandSuggestion("export", "Export the current conversation to a file or clipboard", "[filename]", [], "download"),
     commandSuggestion("files", "List all files currently in context", undefined, [], "file"),
     commandSuggestion("fast", "Toggle fast mode", "[on|off]", [], "bolt"),
+    commandSuggestion("feedback", "Send feedback about the current session", "[message]", ["bug", "report"], "bug"),
     commandSuggestion("goal", "Set or view the goal for a long-running task", "[text | clear | budget N | status]", ["objective"], "rocket"),
     commandSuggestion("genskill", "Generate a reusable skill from the current conversation", "[--candidates N] [--rounds K]", [], "sparkles"),
     commandSuggestion("help", "Show help and available commands", undefined, ["?"], "search"),
     commandSuggestion("hooks", "View hook configurations for tool events", undefined, [], "wrench"),
     commandSuggestion("ide", "Manage IDE integrations and show status", "[open]", [], "panel"),
+    commandSuggestion("image", "Open image generation settings", undefined, ["media"], "image"),
     commandSuggestion("init", "Initialize project guidance and defaults", undefined, [], "sparkles"),
     commandSuggestion("keybindings", "Open or create your keybindings configuration file", undefined, [], "key"),
     commandSuggestion("login", "Sign in to a provider", "[provider]", [], "lock"),
@@ -128,6 +132,7 @@
     commandSuggestion("theme", "Change the theme", undefined, [], "settings"),
     commandSuggestion("ultrareview", "Multi-agent code review of the current worktree or PR", "[pr-url-or-number]", [], "bot"),
     commandSuggestion("usage", "Show plan usage limits", undefined, [], "token"),
+    commandSuggestion("video", "Open video generation settings", undefined, ["media"], "video"),
     commandSuggestion("vim", "Toggle between Vim and Normal editing modes", undefined, [], "terminal"),
     commandSuggestion("workflows", "Show workflow, connector, and connection status", "[list|new|append|delete|actions]", ["workflow"], "layers")
   ];
@@ -150,6 +155,15 @@
     hint?: string;
     aliases?: string[];
     icon: IconName;
+  };
+  type ComposerHighlightSegment = {
+    text: string;
+    active: boolean;
+    caret?: boolean;
+    chip?: {
+      label: string;
+      icon: IconName;
+    };
   };
   type ComposerTrigger = {
     kind: ComposerSuggestionKind;
@@ -245,12 +259,19 @@
   let attachmentError = $state<string | null>(null);
   let attachmentMenuOpen = $state(false);
   let mediaSettingsKind = $state<MediaKind | null>(null);
+  let feedbackMenuOpen = $state(false);
+  let feedbackDraft = $state("");
+  let feedbackSubmitting = $state(false);
+  let feedbackError = $state<string | null>(null);
   let attachmentDropActive = $state(false);
   let attachmentDragDepth = 0;
   let attachmentIdSequence = 0;
   let fileInputEl: HTMLInputElement | undefined;
   let composerTextareaEl: HTMLTextAreaElement | undefined;
+  let feedbackTextareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
   let attachmentMenuEl: HTMLDivElement | undefined;
+  let thinkingSelectEl: HTMLSelectElement | undefined;
+  let permissionSelectEl: HTMLSelectElement | undefined;
   let threadEl: HTMLDivElement | undefined;
   let showScrollToBottom = $state(false);
   let lastSessionId: string | null = null;
@@ -267,12 +288,16 @@
   let selectedThinkingOptionId = $state("");
   let composerSuggestionIndex = $state(0);
   let dismissedComposerTriggerKey = $state<string | null>(null);
+  let composerPaletteSuppressed = $state(false);
   let commandSurfaceItems = $state<CommandSurfaceItem[]>([]);
   let commandSurfaceLoadAttempted = $state(false);
   let workspaceMentionItems = $state<WorkspaceMentionItem[]>([]);
   let workspaceMentionRequestSeq = 0;
   let loadedWorkspaceMentionKey = $state<string | null>(null);
   let composerTextareaScrollTop = $state(0);
+  let composerSelectionStart = $state(0);
+  let composerSelectionEnd = $state(0);
+  let composerFocused = $state(false);
   let submitInFlightSessionIds = $state<string[]>([]);
   const submitInFlightGuards = new Set<string>();
   let thinkingProviderId = $state<string | null>(null);
@@ -288,7 +313,7 @@
     selectedProviderId ?? session?.providerId ?? settingsSnapshot?.config.defaultProvider ?? null
   );
   let engineerName = $derived(`${ENGINEER_NAME} (${providerDisplayName(displayedProviderId)})`);
-  let composerTrigger = $derived(findComposerTrigger(draft, composerTextareaEl?.selectionStart ?? draft.length));
+  let composerTrigger = $derived(findComposerTrigger(draft, Math.min(composerSelectionStart, draft.length)));
   let composerTriggerKey = $derived(
     composerTrigger
       ? `${composerTrigger.marker}:${composerTrigger.start}:${composerTrigger.end}:${composerTrigger.query}`
@@ -390,7 +415,8 @@
   );
   let composerPaletteOpen = $derived(
     Boolean(
-      composerTrigger &&
+        composerTrigger &&
+        !composerPaletteSuppressed &&
         composerTriggerKey !== dismissedComposerTriggerKey &&
         composerSuggestions.length > 0 &&
         !composerDisabled
@@ -540,6 +566,8 @@
   function iconForCommand(command: CommandSurfaceItem): IconName {
     const name = command.name.toLowerCase();
     if (name.includes("review") || name === "help") return "search";
+    if (name.includes("browser") || name.includes("web")) return "globe";
+    if (name.includes("feedback") || name.includes("bug")) return "bug";
     if (name.includes("skill") || command.kind === "Prompt") return "sparkles";
     if (name.includes("agent") || name === "ultrareview") return "bot";
     if (name.includes("permission") || name.includes("security")) return "shield";
@@ -555,8 +583,7 @@
   }
 
   function buildCommandSuggestions(): ComposerSuggestion[] {
-    if (commandSurfaceItems.length === 0) return COMPOSER_COMMANDS;
-    return commandSurfaceItems
+    const backendCommands = commandSurfaceItems
       .filter((command) => !command.hidden)
       .map((command) =>
         commandSuggestion(
@@ -567,6 +594,11 @@
           iconForCommand(command)
         )
       );
+    const byName = new Map<string, ComposerSuggestion>();
+    for (const suggestion of [...COMPOSER_COMMANDS, ...backendCommands]) {
+      byName.set(suggestion.insertText.toLowerCase(), suggestion);
+    }
+    return Array.from(byName.values()).sort((a, b) => a.label.localeCompare(b.label));
   }
 
   function mentionSuggestion(
@@ -740,12 +772,34 @@
       .toLowerCase();
   }
 
+  function normalizedSuggestionName(suggestion: ComposerSuggestion): string {
+    return suggestion.label.replace(/^[/@]/, "").toLowerCase();
+  }
+
+  function composerSuggestionScore(suggestion: ComposerSuggestion, query: string): number {
+    if (!query) return 0;
+    const name = normalizedSuggestionName(suggestion);
+    const insert = suggestion.insertText.replace(/^[/@]/, "").toLowerCase();
+    const aliases = suggestion.aliases?.map((alias) => alias.toLowerCase()) ?? [];
+    if (name === query || insert === query) return 0;
+    if (name.startsWith(query) || insert.startsWith(query)) return 10;
+    if (aliases.some((alias) => alias === query)) return 20;
+    if (aliases.some((alias) => alias.startsWith(query))) return 30;
+    if (name.includes(query) || insert.includes(query)) return 40;
+    if (suggestionSearchText(suggestion).includes(query)) return 80;
+    return Number.POSITIVE_INFINITY;
+  }
+
   function filteredComposerSuggestions(trigger: ComposerTrigger | null): ComposerSuggestion[] {
     if (!trigger) return [];
     const source = trigger.kind === "command" ? commandSuggestions : mentionSuggestions;
     const query = trigger.query.trim().toLowerCase();
     const filtered = query
-      ? source.filter((suggestion) => suggestionSearchText(suggestion).includes(query))
+      ? source
+          .map((suggestion) => ({ suggestion, score: composerSuggestionScore(suggestion, query) }))
+          .filter((entry) => Number.isFinite(entry.score))
+          .sort((a, b) => a.score - b.score || a.suggestion.label.localeCompare(b.suggestion.label))
+          .map((entry) => entry.suggestion)
       : source;
     return filtered.slice(0, 8);
   }
@@ -755,38 +809,218 @@
     return `${suggestion.insertText}${suffix}`;
   }
 
+  function displayLabelForSuggestion(suggestion: ComposerSuggestion): string {
+    const label = suggestion.label.replace(/^[/@]/, "");
+    return label
+      .split(/[-_\s/]+/)
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(" ");
+  }
+
+  function exactSuggestionForToken(token: string): ComposerSuggestion | null {
+    const marker = token.charAt(0);
+    const source = marker === "/" ? commandSuggestions : marker === "@" ? mentionSuggestions : [];
+    const normalized = token.toLowerCase();
+    return (
+      source.find(
+        (suggestion) =>
+          suggestion.insertText.toLowerCase() === normalized ||
+          suggestion.label.toLowerCase() === normalized
+      ) ?? null
+    );
+  }
+
+  function clearComposerTriggerToken(trigger: ComposerTrigger) {
+    const nextDraft = `${draft.slice(0, trigger.start)}${draft.slice(trigger.end).replace(/^\s/, "")}`;
+    updateDraft(nextDraft, { resetComposerPalette: false });
+    composerPaletteSuppressed = true;
+    dismissedComposerTriggerKey = composerTriggerKey;
+    void tick().then(() => {
+      const cursor = Math.min(trigger.start, nextDraft.length);
+      composerTextareaEl?.focus();
+      composerTextareaEl?.setSelectionRange(cursor, cursor);
+      syncComposerSelection();
+      composerPaletteSuppressed = false;
+    });
+  }
+
+  function openFeedbackMenu() {
+    if (composerDisabled) return;
+    feedbackMenuOpen = true;
+    feedbackError = null;
+    attachmentMenuOpen = false;
+    mediaSettingsKind = null;
+    void tick().then(() => feedbackTextareaEl?.focus());
+  }
+
+  function closeFeedbackMenu() {
+    if (feedbackSubmitting) return;
+    feedbackMenuOpen = false;
+    feedbackError = null;
+  }
+
+  function handleLocalComposerCommand(suggestion: ComposerSuggestion, trigger: ComposerTrigger): boolean {
+    if (suggestion.kind !== "command") return false;
+    const command = normalizedSuggestionName(suggestion);
+    if (command === "fast") {
+      if (!fastModeAvailable || turnRunning) return false;
+      fastMode = !fastMode;
+      clearComposerTriggerToken(trigger);
+      return true;
+    }
+    if (command === "feedback") {
+      clearComposerTriggerToken(trigger);
+      openFeedbackMenu();
+      return true;
+    }
+    if (command === "attach") {
+      clearComposerTriggerToken(trigger);
+      void tick().then(openAttachmentPicker);
+      return true;
+    }
+    if (command === "image") {
+      clearComposerTriggerToken(trigger);
+      void tick().then(() => openMediaSettings("image"));
+      return true;
+    }
+    if (command === "video") {
+      clearComposerTriggerToken(trigger);
+      void tick().then(() => openMediaSettings("video"));
+      return true;
+    }
+    if (command === "effort") {
+      clearComposerTriggerToken(trigger);
+      void tick().then(() => thinkingSelectEl?.focus());
+      return true;
+    }
+    if (command === "permissions") {
+      clearComposerTriggerToken(trigger);
+      void tick().then(() => permissionSelectEl?.focus());
+      return true;
+    }
+    return false;
+  }
+
   function acceptComposerSuggestion(suggestion: ComposerSuggestion | null = null) {
     const trigger = composerTrigger;
     const selected = suggestion ?? composerSuggestions[composerSuggestionIndex] ?? composerSuggestions[0];
     if (!trigger || !selected) return;
+    if (handleLocalComposerCommand(selected, trigger)) return;
     const replacement = suggestionReplacementText(selected, trigger);
     const nextDraft = `${draft.slice(0, trigger.start)}${replacement}${draft.slice(trigger.end)}`;
     const cursor = trigger.start + replacement.length;
-    updateDraft(nextDraft);
+    updateDraft(nextDraft, { resetComposerPalette: false });
     composerSuggestionIndex = 0;
-    dismissedComposerTriggerKey = null;
+    composerPaletteSuppressed = true;
+    dismissedComposerTriggerKey = composerTriggerKey;
     void tick().then(() => {
       composerTextareaEl?.focus();
       composerTextareaEl?.setSelectionRange(cursor, cursor);
+      syncComposerSelection();
+      composerPaletteSuppressed = false;
     });
   }
 
   function buildHighlightedComposerSegments(
     value: string,
     trigger: ComposerTrigger | null
-  ): Array<{ text: string; active: boolean }> {
-    if (!trigger || trigger.start < 0 || trigger.end <= trigger.start) {
-      return [{ text: value || " ", active: false }];
+  ): ComposerHighlightSegment[] {
+    const segments: ComposerHighlightSegment[] = [];
+    const caretPosition =
+      composerFocused && composerSelectionStart === composerSelectionEnd
+        ? Math.min(composerSelectionStart, value.length)
+        : -1;
+    const pushCaret = () => {
+      if (caretPosition >= 0) segments.push({ text: "", active: false, caret: true });
+    };
+    const pushPlain = (text: string, start: number) => {
+      if (text.length === 0) {
+        if (caretPosition === start) pushCaret();
+        return;
+      }
+      if (caretPosition >= start && caretPosition <= start + text.length) {
+        const caretOffset = caretPosition - start;
+        const before = text.slice(0, caretOffset);
+        const after = text.slice(caretOffset);
+        if (before.length > 0) segments.push({ text: before, active: false });
+        pushCaret();
+        if (after.length > 0) segments.push({ text: after, active: false });
+        return;
+      }
+      segments.push({ text, active: false });
+    };
+    const pushToken = (text: string, start: number, active: boolean) => {
+      if (caretPosition >= start && caretPosition <= start + text.length) {
+        const caretOffset = caretPosition - start;
+        const before = text.slice(0, caretOffset);
+        const after = text.slice(caretOffset);
+        if (before.length > 0) segments.push({ text: before, active });
+        pushCaret();
+        if (after.length > 0) segments.push({ text: after, active });
+        return;
+      }
+      segments.push({ text, active });
+    };
+    const tokenPattern = /(^|\s)([/@][^\s/@]+)/g;
+    let cursor = 0;
+    let match: RegExpExecArray | null;
+    while ((match = tokenPattern.exec(value)) !== null) {
+      const prefix = match[1] ?? "";
+      const token = match[2] ?? "";
+      const tokenStart = match.index + prefix.length;
+      const tokenEnd = tokenStart + token.length;
+      pushPlain(value.slice(cursor, tokenStart), cursor);
+      const isActive =
+        Boolean(trigger) &&
+        trigger!.start === tokenStart &&
+        trigger!.end === tokenEnd;
+      const suggestion = isActive ? null : exactSuggestionForToken(token);
+      if (suggestion) {
+        segments.push({
+          text: token,
+          active: true,
+          chip: {
+            label: displayLabelForSuggestion(suggestion),
+            icon: suggestion.icon
+          }
+        });
+      } else {
+        pushToken(token, tokenStart, isActive);
+      }
+      cursor = tokenEnd;
     }
-    return [
-      { text: value.slice(0, trigger.start), active: false },
-      { text: value.slice(trigger.start, trigger.end), active: true },
-      { text: value.slice(trigger.end) || " ", active: false }
-    ].filter((segment) => segment.text.length > 0);
+    pushPlain(value.slice(cursor), cursor);
+    if (segments.length > 0) return segments;
+    return caretPosition === 0
+      ? [{ text: "", active: false, caret: true }]
+      : [{ text: " ", active: false }];
   }
 
   function syncComposerTextareaScroll() {
     composerTextareaScrollTop = composerTextareaEl?.scrollTop ?? 0;
+  }
+
+  function syncComposerSelection() {
+    composerSelectionStart = composerTextareaEl?.selectionStart ?? draft.length;
+    composerSelectionEnd = composerTextareaEl?.selectionEnd ?? composerSelectionStart;
+  }
+
+  function handleComposerInput(event: Event) {
+    const textarea = event.currentTarget as HTMLTextAreaElement;
+    updateDraft(textarea.value);
+    composerSelectionStart = textarea.selectionStart;
+    composerSelectionEnd = textarea.selectionEnd;
+  }
+
+  function handleComposerFocus() {
+    composerFocused = true;
+    syncComposerSelection();
+  }
+
+  function handleComposerBlur() {
+    composerFocused = false;
+    syncComposerSelection();
   }
 
   function normalizePermissionMode(value: string | null): AgentPermissionMode {
@@ -1374,9 +1608,17 @@
     });
   }
 
-  function updateDraft(value: string) {
+  function updateDraft(
+    value: string,
+    { resetComposerPalette = true }: { resetComposerPalette?: boolean } = {}
+  ) {
     draft = value;
-    dismissedComposerTriggerKey = null;
+    if (resetComposerPalette) {
+      dismissedComposerTriggerKey = null;
+      composerPaletteSuppressed = false;
+    }
+    composerSelectionStart = Math.min(composerSelectionStart, value.length);
+    composerSelectionEnd = Math.min(composerSelectionEnd, value.length);
     setDraftForSession(session?.id, value);
     scheduleComposerResize();
   }
@@ -1527,6 +1769,8 @@
     if (nextSessionId !== lastSessionId) {
       showScrollToBottom = false;
       draft = nextSessionId ? draftBySessionId[nextSessionId] ?? readDraftForSession(nextSessionId) : "";
+      composerSelectionStart = draft.length;
+      composerSelectionEnd = draft.length;
       attachmentDrafts = nextSessionId ? attachmentDraftsBySessionId[nextSessionId] ?? [] : [];
       attachmentError = null;
       attachmentMenuOpen = false;
@@ -1835,6 +2079,27 @@
     }
   }
 
+  async function submitFeedback() {
+    const message = feedbackDraft.trim();
+    const targetSessionId = session?.id;
+    if (!message || !targetSessionId || feedbackSubmitting || composerDisabled) return;
+    feedbackSubmitting = true;
+    feedbackError = null;
+    try {
+      const accepted = await onSubmitMessage(`/feedback ${message}`, composerOptions());
+      if (accepted === false) {
+        feedbackError = "Feedback was not accepted. Please try again.";
+        return;
+      }
+      feedbackDraft = "";
+      feedbackMenuOpen = false;
+    } catch (error) {
+      feedbackError = error instanceof Error ? error.message : "Could not submit feedback.";
+    } finally {
+      feedbackSubmitting = false;
+    }
+  }
+
   async function submitCanvasStateMessage(message: string): Promise<boolean | void> {
     const targetSessionId = session?.id ?? null;
     if (!targetSessionId) return false;
@@ -1875,6 +2140,11 @@
         dismissedComposerTriggerKey = composerTriggerKey;
         return;
       }
+    }
+    if (e.key === "Tab" && composerTrigger && composerSuggestions.length > 0) {
+      e.preventDefault();
+      acceptComposerSuggestion();
+      return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -3037,6 +3307,49 @@
           {/each}
         </div>
       {/if}
+      {#if feedbackMenuOpen}
+        <form
+          class="pf-composer-feedback-menu"
+          aria-label="Submit feedback"
+          onsubmit={(event) => {
+            event.preventDefault();
+            void submitFeedback();
+          }}
+        >
+          <div class="pf-composer-feedback-head">
+            <span><Icon name="bug" size={15} /></span>
+            <strong>Feedback</strong>
+            <button type="button" aria-label="Close feedback" onclick={closeFeedbackMenu}>
+              <Icon name="x" size={14} />
+            </button>
+          </div>
+          <textarea
+            bind:this={feedbackTextareaEl}
+            bind:value={feedbackDraft}
+            placeholder="What should we improve?"
+            disabled={feedbackSubmitting}
+            onkeydown={(event) => {
+              if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                event.preventDefault();
+                void submitFeedback();
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                closeFeedbackMenu();
+              }
+            }}
+          ></textarea>
+          {#if feedbackError}
+            <p class="pf-composer-feedback-error" role="alert">{feedbackError}</p>
+          {/if}
+          <div class="pf-composer-feedback-actions">
+            <button type="button" onclick={closeFeedbackMenu} disabled={feedbackSubmitting}>Cancel</button>
+            <button type="submit" disabled={!feedbackDraft.trim() || feedbackSubmitting}>
+              {feedbackSubmitting ? "Sending..." : "Send feedback"}
+            </button>
+          </div>
+        </form>
+      {/if}
       <div class="pf-composer-input-shell">
         <div
           class="pf-composer-highlight"
@@ -3044,15 +3357,29 @@
           style={`transform: translateY(-${composerTextareaScrollTop}px);`}
         >
           {#each highlightedComposerSegments as segment, segmentIndex (`${segmentIndex}-${segment.active}-${segment.text}`)}
-            <span class:active={segment.active}>{segment.text}</span>
+            {#if segment.caret}
+              <span class="pf-composer-highlight-caret"></span>
+            {:else if segment.chip}
+              <span class="pf-composer-highlight-chip" class:active={segment.active}>
+                <Icon name={segment.chip.icon} size={16} />
+                <span>{segment.chip.label}</span>
+              </span>
+            {:else}
+              <span class:active={segment.active}>{segment.text}</span>
+            {/if}
           {/each}
         </div>
         <textarea
           bind:this={composerTextareaEl}
           value={draft}
           placeholder={session ? `Reply to ${engineerName}…` : "Select a session to continue"}
-          oninput={(event) => updateDraft(event.currentTarget.value)}
+          oninput={handleComposerInput}
           onkeydown={onKeydown}
+          onkeyup={syncComposerSelection}
+          onclick={syncComposerSelection}
+          onselect={syncComposerSelection}
+          onfocus={handleComposerFocus}
+          onblur={handleComposerBlur}
           onscroll={syncComposerTextareaScroll}
           disabled={composerDisabled}
         ></textarea>
@@ -3130,6 +3457,7 @@
         >
           <Icon name="cpu" size={11} />
           <select
+            bind:this={thinkingSelectEl}
             bind:value={selectedThinkingOptionId}
             disabled={!thinkingAvailable || turnRunning}
             aria-label="Thinking level"
@@ -3142,7 +3470,7 @@
         </label>
         <label class="pf-select-chip" title="Codex permissions">
           <Icon name="shield" size={11} />
-          <select bind:value={permissionMode} disabled={turnRunning} aria-label="Codex permissions">
+          <select bind:this={permissionSelectEl} bind:value={permissionMode} disabled={turnRunning} aria-label="Codex permissions">
             <option value="read-only">Read only</option>
             <option value="workspace-write">Workspace</option>
             <option value="full-access">Full access</option>
@@ -3277,17 +3605,50 @@
     font-size: var(--pf-chat-text-size);
     line-height: 1.5;
   }
-  .pf-composer-highlight span.active {
+  .pf-composer-highlight span.active:not(.pf-composer-highlight-chip) {
     border-radius: 5px;
     background: color-mix(in oklab, var(--puffer-accent) 20%, transparent);
     box-shadow: 0 0 0 1px color-mix(in oklab, var(--puffer-accent) 24%, transparent);
+  }
+  .pf-composer-highlight-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 5px;
+    border-radius: 6px;
+    color: color-mix(in oklab, var(--puffer-accent) 78%, #58a6ff);
+    font-weight: 650;
+    vertical-align: baseline;
+    white-space: nowrap;
+  }
+  .pf-composer-highlight-chip.active {
+    background: color-mix(in oklab, var(--puffer-accent) 8%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in oklab, var(--puffer-accent) 12%, transparent);
+  }
+  .pf-composer-highlight-chip :global(svg) {
+    flex: 0 0 auto;
+  }
+  .pf-composer-highlight-caret {
+    display: inline-block;
+    width: 2px;
+    height: 1.25em;
+    margin: 0 -1px;
+    border-radius: 999px;
+    background: var(--foreground);
+    vertical-align: -0.18em;
+    animation: pf-composer-caret-blink 1s steps(2, start) infinite;
+  }
+  @keyframes pf-composer-caret-blink {
+    50% {
+      opacity: 0;
+    }
   }
   .pf-composer-input-shell textarea {
     position: relative;
     z-index: 1;
     width: 100%;
     color: transparent;
-    caret-color: var(--foreground);
+    caret-color: transparent;
     background: transparent;
   }
   .pf-composer-input-shell textarea::placeholder {
@@ -3387,6 +3748,107 @@
     border-radius: 8px;
     background: color-mix(in oklab, var(--background) 96%, var(--muted));
     box-shadow: var(--shadow-lg);
+  }
+  .pf-composer-feedback-menu {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: calc(100% + 10px);
+    z-index: 23;
+    display: grid;
+    gap: 10px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: color-mix(in oklab, var(--background) 96%, var(--muted));
+    box-shadow: var(--shadow-lg);
+  }
+  .pf-composer-feedback-head {
+    display: grid;
+    grid-template-columns: 24px minmax(0, 1fr) 28px;
+    align-items: center;
+    gap: 8px;
+    color: var(--foreground);
+    font-size: 13px;
+    line-height: 18px;
+  }
+  .pf-composer-feedback-head > span {
+    width: 24px;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    color: var(--puffer-accent);
+    background: color-mix(in oklab, var(--puffer-accent) 12%, transparent);
+  }
+  .pf-composer-feedback-head button {
+    width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted-foreground);
+    cursor: pointer;
+  }
+  .pf-composer-feedback-head button:hover {
+    background: color-mix(in oklab, var(--muted) 58%, transparent);
+    color: var(--foreground);
+  }
+  .pf-composer-feedback-menu textarea {
+    width: 100%;
+    min-height: 92px;
+    resize: vertical;
+    padding: 9px 10px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    outline: none;
+    background: color-mix(in oklab, var(--background) 94%, var(--muted));
+    color: var(--foreground);
+    font: inherit;
+    font-size: 13px;
+    line-height: 18px;
+  }
+  .pf-composer-feedback-menu textarea:focus {
+    border-color: var(--puffer-accent);
+    box-shadow: 0 0 0 2px color-mix(in oklab, var(--puffer-accent) 18%, transparent);
+  }
+  .pf-composer-feedback-error {
+    margin: -2px 0 0;
+    color: var(--destructive);
+    font-size: 12px;
+    line-height: 16px;
+    font-weight: 600;
+  }
+  .pf-composer-feedback-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .pf-composer-feedback-actions button {
+    min-height: 30px;
+    padding: 0 11px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--background);
+    color: var(--foreground);
+    font: inherit;
+    font-size: 12px;
+    line-height: 16px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .pf-composer-feedback-actions button[type="submit"] {
+    border-color: color-mix(in oklab, var(--puffer-accent) 52%, var(--border));
+    background: var(--puffer-accent);
+    color: var(--puffer-accent-foreground);
+  }
+  .pf-composer-feedback-actions button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
   }
   .pf-composer-suggestion {
     width: 100%;

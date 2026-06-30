@@ -64,6 +64,35 @@ impl OpenAISseApiError {
         Self::from_incomplete_response(event.get("response"))
     }
 
+    /// Builds a typed error from a top-level `error` event.
+    ///
+    /// Unlike `response.failed` (which nests the error under
+    /// `/response/error`), the Responses streaming schema delivers
+    /// stream-level failures as a standalone event whose `code`/`message`
+    /// sit at the document root, e.g.
+    /// `{"type":"error","code":"context_too_large","message":"Your input
+    /// exceeds the context window of this model."}`. Some OpenAI-compatible
+    /// proxies instead nest those fields under `error`, so accept both
+    /// shapes.
+    fn from_error_event(event: &Value) -> Self {
+        let code = event
+            .get("code")
+            .or_else(|| event.pointer("/error/code"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let message = event
+            .get("message")
+            .or_else(|| event.pointer("/error/message"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Self {
+            status: "failed".to_string(),
+            code,
+            message,
+            reason: None,
+        }
+    }
+
     fn from_incomplete_response(response: Option<&Value>) -> Self {
         let reason = response
             .and_then(|value| value.pointer("/incomplete_details/reason"))
@@ -419,6 +448,17 @@ where
         "response.failed" => {
             return Err(OpenAISseApiError::from_event(event).into());
         }
+        // Top-level stream error (e.g. `context_too_large`). The upstream
+        // emits this then closes the connection without a terminal
+        // `response.*` event; without this arm the parser would reach EOF
+        // with `terminal == false` and bail with the misleading
+        // `stream closed before response.completed`, masking the real
+        // `code`/`message`. Surfacing it as a typed error also routes it
+        // through the non-retryable classification (a deterministic
+        // `context_too_large` must not be retried with the same input).
+        "error" => {
+            return Err(OpenAISseApiError::from_error_event(event).into());
+        }
         _ => {}
     }
     Ok(false)
@@ -680,6 +720,64 @@ mod tests {
 
         let error = parse_openai_sse_response(stream).unwrap_err();
         assert!(error.to_string().contains("failed: server_error"));
+        assert!(is_retryable_openai_sse_api_error(&error));
+    }
+
+    #[test]
+    fn parse_openai_sse_response_surfaces_top_level_error_events() {
+        // The Responses streaming schema delivers stream-level failures as a
+        // standalone `error` event (code/message at the document root), then
+        // closes the connection without a terminal `response.*` event. The
+        // parser must surface the real code/message instead of bailing with
+        // `stream closed before response.completed`.
+        let stream = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_123\"}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"code\":\"context_too_large\",\"message\":\"Your input exceeds the context window of this model. Please adjust your input and try again.\",\"sequence_number\":0}\n\n"
+        );
+
+        let error = parse_openai_sse_response(stream).unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("context_too_large") && rendered.contains("exceeds the context window"),
+            "expected the real code/message to surface, got: {rendered}"
+        );
+        assert!(is_openai_sse_api_error(&error));
+        // A deterministic context overflow must not be retried with the same
+        // oversized input.
+        assert!(!is_retryable_openai_sse_api_error(&error));
+        // The surfaced message must be recognizable by the cross-provider
+        // overflow recognizer (so overflow recovery can engage downstream).
+        assert!(crate::runtime::overflow::is_context_overflow(&rendered));
+    }
+
+    #[test]
+    fn parse_openai_sse_response_surfaces_nested_top_level_error_events() {
+        // Some OpenAI-compatible proxies nest the fields under `error`.
+        let stream = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"context_too_large\",\"message\":\"Your input exceeds the context window of this model.\"}}\n\n"
+        );
+
+        let error = parse_openai_sse_response(stream).unwrap_err();
+        assert!(error.to_string().contains("context_too_large"));
+        assert!(is_openai_sse_api_error(&error));
+        assert!(!is_retryable_openai_sse_api_error(&error));
+    }
+
+    #[test]
+    fn parse_openai_sse_response_top_level_error_honors_retryable_codes() {
+        // A transient code delivered as a top-level error event should still
+        // be classified retryable (reuses the same code whitelist as
+        // response.failed).
+        let stream = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"An error occurred while processing your request.\"}\n\n"
+        );
+
+        let error = parse_openai_sse_response(stream).unwrap_err();
+        assert!(error.to_string().contains("server_error"));
         assert!(is_retryable_openai_sse_api_error(&error));
     }
 

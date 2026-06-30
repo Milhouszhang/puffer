@@ -778,6 +778,28 @@ mod tests {
     }
 
     #[test]
+    fn does_not_retry_top_level_context_overflow_errors() {
+        // A top-level `error` event carrying a deterministic
+        // `context_too_large` must NOT be retried — retrying with the same
+        // oversized input just fails identically up to the attempt cap.
+        let stream = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_123\"}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"code\":\"context_too_large\",\"message\":\"Your input exceeds the context window of this model.\"}\n\n"
+        );
+        let error = parse_openai_sse_response(stream).unwrap_err();
+        assert!(!is_retryable_openai_transport_error(&error));
+
+        // Even if a caller wraps it with the SSE-parse context, the typed
+        // error in the chain keeps it non-retryable (no string-match retry).
+        let wrapped = parse_openai_sse_response(stream)
+            .unwrap_err()
+            .context("failed to parse SSE response from http://example.test/v1/responses");
+        assert!(!is_retryable_openai_transport_error(&wrapped));
+    }
+
+    #[test]
     fn detects_openai_include_validation_errors() {
         let error = anyhow!(
             "request failed with status 400 Bad Request: {{\"error\":{{\"message\":\"Invalid value: 'rea...ent'. Supported values are: 'reasoning.encryptedcontent'.\",\"param\":\"include[0]\"}}}}"

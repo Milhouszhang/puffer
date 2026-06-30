@@ -5598,7 +5598,14 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
         let perm_turn = turn_id_thread.clone();
         let perm_pending = pending.clone();
         let perm_actor = stream_actor.clone();
+        let perm_cancel = cancel.clone();
         let on_permission = move |req: PermissionPromptRequest| -> PermissionPromptAction {
+            // Turn already interrupted: deny immediately instead of surfacing a
+            // fresh prompt. Re-emitting after cancel is what made a canceled
+            // turn pop its prompt back up. (#671)
+            if perm_cancel.is_cancelled() {
+                return PermissionPromptAction::Deny;
+            }
             let request_id = next_req_id.fetch_add(1, Ordering::SeqCst).to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             perm_pending.lock().unwrap().insert(request_id.clone(), tx);
@@ -5629,7 +5636,18 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
         let question_pending = pending_questions.clone();
         let question_next_id = setup_state.next_request_id.clone();
         let question_actor = stream_actor.clone();
+        let question_cancel = cancel.clone();
         let on_user_question = move |req: UserQuestionPromptRequest| -> UserQuestionPromptResponse {
+            // Don't re-surface a question once the user interrupted the turn.
+            // Returning an empty answer lets the tool record "pending" and the
+            // agent loop bails at its next cancel boundary, instead of popping
+            // the prompt back up after it was dismissed. (#671)
+            if question_cancel.is_cancelled() {
+                return UserQuestionPromptResponse {
+                    answers: serde_json::Map::new(),
+                    annotations: serde_json::Map::new(),
+                };
+            }
             let request_id = question_next_id.fetch_add(1, Ordering::SeqCst).to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             question_pending
@@ -5916,7 +5934,18 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
         let question_pending = pending_questions.clone();
         let question_next_id = next_req_id.clone();
         let question_actor = stream_actor.clone();
+        let question_cancel = cancel.clone();
         let on_user_question = move |req: UserQuestionPromptRequest| -> UserQuestionPromptResponse {
+            // Don't re-surface a question once the user interrupted the turn.
+            // Returning an empty answer lets the tool record "pending" and the
+            // agent loop bails at its next cancel boundary, instead of popping
+            // the prompt back up after it was dismissed. (#671)
+            if question_cancel.is_cancelled() {
+                return UserQuestionPromptResponse {
+                    answers: serde_json::Map::new(),
+                    annotations: serde_json::Map::new(),
+                };
+            }
             let request_id = question_next_id.fetch_add(1, Ordering::SeqCst).to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             question_pending
@@ -6256,7 +6285,18 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
         let question_pending = pending_questions.clone();
         let question_next_id = next_req_id.clone();
         let question_actor = stream_actor.clone();
+        let question_cancel = cancel.clone();
         let on_user_question = move |req: UserQuestionPromptRequest| -> UserQuestionPromptResponse {
+            // Don't re-surface a question once the user interrupted the turn.
+            // Returning an empty answer lets the tool record "pending" and the
+            // agent loop bails at its next cancel boundary, instead of popping
+            // the prompt back up after it was dismissed. (#671)
+            if question_cancel.is_cancelled() {
+                return UserQuestionPromptResponse {
+                    answers: serde_json::Map::new(),
+                    annotations: serde_json::Map::new(),
+                };
+            }
             let request_id = question_next_id.fetch_add(1, Ordering::SeqCst).to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             question_pending

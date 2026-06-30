@@ -1295,11 +1295,12 @@ enum VerifyOutcome {
 /// `login_error` event the connector-setup UI shows.
 fn verify_failure_login_error(failure: &VerifyFailure) -> (&'static str, String) {
     match failure {
-        VerifyFailure::Unreachable(_) => (
+        VerifyFailure::Unreachable(detail) => (
             "network",
-            "Couldn't reach Telegram to verify the import (likely a network/proxy block). \
-             The local session was imported; check your network/proxy and retry."
-                .to_string(),
+            format!(
+                "Couldn't reach Telegram to verify the import (likely a network/proxy block): \
+                 {detail}. The local session was imported; check your network/proxy and retry."
+            ),
         ),
         VerifyFailure::Rejected => (
             "auth",
@@ -1313,13 +1314,14 @@ async fn verify_imported_session(
     env: &SkillEnv,
     outcome: &mut TdataImportOutcome,
 ) -> anyhow::Result<VerifyOutcome> {
-    let mut last_unreachable: Option<String> = None;
-
-    match try_resume_session(env).await? {
+    // The first attempt against the imported DC is the only path that can fall
+    // through to the candidate-DC loop, so it always seeds `last_unreachable`
+    // with a real failure detail; no synthetic fallback is needed.
+    let mut last_unreachable = match try_resume_session(env).await? {
         SessionResume::Resumed(client) => return Ok(VerifyOutcome::Connected(client)),
         SessionResume::AuthRequired => return Ok(VerifyOutcome::Failed(VerifyFailure::Rejected)),
-        SessionResume::Transient(detail) => last_unreachable = Some(detail),
-    }
+        SessionResume::Transient(detail) => detail,
+    };
 
     let mut tried = vec![outcome.dc_id];
     for dc_id in outcome.candidate_dc_ids.clone() {
@@ -1334,13 +1336,11 @@ async fn verify_imported_session(
             SessionResume::AuthRequired => {
                 return Ok(VerifyOutcome::Failed(VerifyFailure::Rejected))
             }
-            SessionResume::Transient(detail) => last_unreachable = Some(detail),
+            SessionResume::Transient(detail) => last_unreachable = detail,
         }
     }
 
-    Ok(VerifyOutcome::Failed(VerifyFailure::Unreachable(
-        last_unreachable.unwrap_or_else(|| "Telegram unreachable".to_string()),
-    )))
+    Ok(VerifyOutcome::Failed(VerifyFailure::Unreachable(last_unreachable)))
 }
 
 fn rewrite_imported_session_dc(env: &SkillEnv, dc_id: i32) -> anyhow::Result<()> {

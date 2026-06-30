@@ -70,11 +70,14 @@ pub struct SubscriberHandle {
 }
 
 impl SubscriberHandle {
-    /// Fires the shutdown signal and awaits supervisor task exit.
+    /// Fires the shutdown signal, then aborts the supervisor task so a child
+    /// currently blocked in `child.wait()` is dropped and killed (kill_on_drop),
+    /// guaranteeing shutdown cannot hang on a long-running subscriber.
     pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);
         if let Some(handle) = self.join.take() {
-            let _ = handle.await;
+            handle.abort();
+            let _ = handle.await; // JoinError::Cancelled is expected and ignored
         }
     }
 }

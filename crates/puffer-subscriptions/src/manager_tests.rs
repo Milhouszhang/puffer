@@ -1189,15 +1189,19 @@ cmd = ["sh", "run.sh"]
 "#,
     )
     .unwrap();
-    // Exit immediately: child exits quickly, run_loop enters its restart
-    // backoff where it checks the shutdown watch channel.  A blocking script
-    // would deadlock because spawn_once holds child.wait() while the child
-    // holds stdin open, and stdin is only closed *after* spawn_once returns.
-    std::fs::write(subscriber_dir.join("run.sh"), "exit 0\n").unwrap();
+    // Use a blocking (infinite-loop) script so child.wait() would never return
+    // without an abort.  This proves that SubscriberHandle::shutdown aborts the
+    // supervisor task, causing kill_on_drop to reap the child, and the respawn
+    // does not deadlock.
+    std::fs::write(
+        subscriber_dir.join("run.sh"),
+        "while true; do sleep 0.2; done\n",
+    )
+    .unwrap();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(1)
+        .worker_threads(2)
         .build()
         .unwrap();
     let manager = SubscriptionManagerBuilder::new(temp.path().join("subscriptions.json"))
@@ -1213,13 +1217,30 @@ cmd = ["sh", "run.sh"]
         "telegram-user should be registered after start_subscriber"
     );
 
-    manager.respawn_proxy_sensitive_subscribers().unwrap();
-    assert!(
-        manager
+    // respawn_proxy_sensitive_subscribers is sync (uses block_on_manager_handle
+    // internally). Move manager into a dedicated thread and use recv_timeout so
+    // a hang is detected within 10 s rather than blocking the test suite forever.
+    // Both the post-respawn assertion and shutdown are done inside the thread so
+    // we don't need manager to outlive it.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(anyhow::Result<()>, bool)>(0);
+    std::thread::spawn(move || {
+        let result = manager.respawn_proxy_sensitive_subscribers();
+        let contains = manager
             .subscriber_ids()
-            .contains(&"telegram-user".to_string()),
-        "telegram-user should still be registered after respawn"
-    );
-
-    manager.shutdown();
+            .contains(&"telegram-user".to_string());
+        tx.send((result, contains)).ok();
+        manager.shutdown();
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok((result, contains)) => {
+            result.unwrap();
+            assert!(
+                contains,
+                "telegram-user should still be registered after respawn"
+            );
+        }
+        Err(_) => panic!(
+            "respawn_proxy_sensitive_subscribers hung for >10 s with a blocking child — deadlock not fixed"
+        ),
+    }
 }

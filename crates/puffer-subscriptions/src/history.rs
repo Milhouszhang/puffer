@@ -199,7 +199,10 @@ impl WorkflowHistoryStore {
             ended_at_ms: result.turn_ended_at_ms.unwrap_or(ended_at_ms),
             usage: result.usage,
         };
-        self.append_event_outcome(binding, envelope, log, status, started_at_ms, ended_at_ms)
+        let run =
+            self.append_event_outcome(binding, envelope, log, status, started_at_ms, ended_at_ms)?;
+        self.notify_run_finished(&run);
+        Ok(run)
     }
 
     /// Appends a direct workflow run before a long-running action starts.
@@ -319,14 +322,11 @@ impl WorkflowHistoryStore {
         &self,
         mut run: WorkflowBindingRun,
     ) -> Result<WorkflowBindingRun, WorkflowHistoryStoreError> {
-        {
-            let mut guard = self.inner.lock().unwrap();
-            run.idx = guard.next_idx;
-            guard.next_idx += 1;
-            guard.runs.push(run.clone());
-            write_atomic(&self.path, &*guard)?;
-        } // guard dropped here
-        self.notify_run_finished(&run);
+        let mut guard = self.inner.lock().unwrap();
+        run.idx = guard.next_idx;
+        guard.next_idx += 1;
+        guard.runs.push(run.clone());
+        write_atomic(&self.path, &*guard)?;
         Ok(run)
     }
 
@@ -607,6 +607,28 @@ mod tests {
                 &ActionSpec::RunWorkflow { slug: "native".into() }, &run_result(true), 1, 2)
             .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1); // the path a router-level hook would miss
+    }
+
+    #[test]
+    fn observer_silent_on_monitor_router_outcome() {
+        // Monitor routing records skip/filter/queue decisions as `Completed`
+        // runs via `append_event_outcome` — these are bookkeeping, not
+        // user-facing task completions, and must never badge the dock.
+        let temp = tempfile::tempdir().unwrap();
+        let (store, count) = counting_store(temp.path().join("h.json"));
+        let log = WorkflowActionLog {
+            action: "monitor_filter_skip".into(),
+            status: WorkflowBindingRunStatus::Completed,
+            summary: "skipped".into(),
+            started_at_ms: 1,
+            ended_at_ms: 1,
+            usage: None,
+        };
+        store
+            .append_event_outcome(&binding(), &envelope(), log,
+                WorkflowBindingRunStatus::Completed, 1, 1)
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
     #[test]

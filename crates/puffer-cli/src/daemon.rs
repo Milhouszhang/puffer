@@ -2445,7 +2445,17 @@ fn handle_login_with_oauth(state: &DaemonState, params: &Value) -> Result<Value>
 
     let mut inputs = state.build_runtime_inputs()?;
     let auth_path = state.paths.user_config_dir.join("auth.json");
-    let listener = crate::authflow::CallbackListener::bind_localhost("/callback")?;
+    // OpenAI/Codex registers an exact redirect URI
+    // (`http://localhost:1455/auth/callback`); an ephemeral callback port makes
+    // the provider reject the authorize request with
+    // `authorize_hydra_invalid_request`. Anthropic accepts a dynamic localhost
+    // port, so it keeps the OS-assigned ephemeral listener.
+    let listener = match oauth_family_for_provider(&inputs.providers, &provider_id) {
+        Some(OauthFamily::OpenAi) => {
+            crate::authflow::CallbackListener::bind_localhost_port("/auth/callback", 1455)?
+        }
+        _ => crate::authflow::CallbackListener::bind_localhost("/callback")?,
+    };
     let bundle =
         oauth_login_bundle_for_provider(&inputs.providers, &provider_id, listener.redirect_uri())?;
     let launch_url = bundle

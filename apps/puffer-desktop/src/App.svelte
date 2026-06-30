@@ -4810,6 +4810,7 @@
               onRunRemoteBash={(command) => void handleRemoteBash(command)}
               onReadRemoteFile={(path) => void handleRemoteRead(path)}
               onWriteRemoteFile={(path, contents) => void handleRemoteWrite(path, contents)}
+              onStatus={(message) => (statusMessage = message)}
             />
           {/if}
         </div>

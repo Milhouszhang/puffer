@@ -1,4 +1,5 @@
 use crate::cli_args::{McpCommand, McpTransport, PluginCommand, ResourceScope};
+use crate::command_surface_desktop::import_claude_desktop_mcp_servers;
 use crate::resource_fs::{
     disabled_variant, enabled_variant, find_yaml_file_by_id, is_disabled_yaml_path,
     plugin_manifest_path, remove_if_exists, sorted_dir_entries,
@@ -44,8 +45,11 @@ pub(crate) fn run_mcp_command(
         McpCommand::AddJson { name, json, scope } => {
             add_mcp_server_from_json(paths, scope, &name, &json)
         }
-        McpCommand::AddFromClaudeDesktop => {
-            println!("Import from Claude Desktop is not implemented in Puffer yet.");
+        McpCommand::AddFromClaudeDesktop { scope } => {
+            println!(
+                "{}",
+                import_claude_desktop_mcp_servers(paths, scope)?
+            );
             Ok(())
         }
         McpCommand::Remove { name, scope } => remove_mcp_server(paths, scope, &name),

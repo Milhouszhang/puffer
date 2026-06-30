@@ -235,7 +235,11 @@ async fn run_async(options: DaemonOptions) -> Result<()> {
         disable_auto_title,
         yolo,
     )?;
-    apply_proxy_env_at_startup(&state.config.lock().unwrap().network.proxy);
+    // Proxy env vars (ALL_PROXY/HTTP(S)_PROXY/NO_PROXY) are applied earlier in
+    // `run_main`, immediately after config load and BEFORE any background thread
+    // (provider discovery, heartbeat, workflow runtime, subscriptions::install)
+    // spawns, so their reqwest clients observe the proxy. See
+    // `apply_proxy_env_at_startup`.
     // Overwrite the proxy config the manager received during install() with the
     // daemon's own startup config. install() already applies the proxy before
     // autostart_subscribers so the first launch is correct; this call ensures
@@ -1004,7 +1008,7 @@ fn proxy_test_error_message(endpoint: &ProxyEndpoint, error: &anyhow::Error) -> 
 /// daemon startup, before any outbound HTTP — `env::set_var` is process-global
 /// and not safe to race against live readers, and reqwest memoizes system
 /// proxies, so this is intentionally never called again at runtime.
-fn apply_proxy_env_at_startup(proxy: &puffer_config::ProxyConfig) {
+pub(crate) fn apply_proxy_env_at_startup(proxy: &puffer_config::ProxyConfig) {
     let block = puffer_config::proxy_env_block(proxy);
     for (key, value) in &block.set {
         std::env::set_var(key, value);
@@ -2358,6 +2362,19 @@ fn handle_save_proxy_settings(state: &DaemonState, params: &Value) -> Result<Val
     config.network.proxy.validate()?;
     save_user_config(&state.paths, &config).context("save user config")?;
     reload_daemon_config(state)?;
+    // Rebuild managed-Chrome launch settings from the freshly reloaded config so
+    // the new `--proxy-server` flags take effect on the next browser launch
+    // without a daemon restart. Mirrors `DaemonState::load`: staging failures
+    // degrade to defaults rather than aborting the settings save.
+    {
+        let fresh_config = state.config.lock().unwrap().clone();
+        let launch_settings = browser_launch_settings_or_default(
+            BrowserLaunchSettings::from_config(&state.paths, &fresh_config),
+        );
+        if let Err(error) = state.browsers.update_launch_settings(launch_settings) {
+            tracing::warn!(%error, "failed to refresh browser launch settings after proxy change");
+        }
+    }
     // Push the new proxy config into the manager and respawn proxy-sensitive
     // subscribers (Telegram) so the change takes effect without an app restart.
     // Failures here are logged but must not prevent the settings save from

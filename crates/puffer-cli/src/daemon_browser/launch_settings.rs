@@ -3,7 +3,7 @@
 use anyhow::Result;
 use puffer_config::{
     builtin_captcha_solvers, stage_builtin_captcha_extension, CaptchaExtensionSeed, ConfigPaths,
-    ProxyConfig, PufferConfig,
+    ProxyConfig, ProxyScheme, PufferConfig,
 };
 use puffer_secrets::SecretVault;
 use std::collections::BTreeSet;
@@ -145,9 +145,16 @@ fn chrome_proxy_args(proxy: &ProxyConfig) -> Vec<String> {
     else {
         return Vec::new();
     };
+    // Chrome's `--proxy-server` rejects the `socks5h` scheme; its `socks5://`
+    // already performs remote DNS resolution, so map Socks5h down to socks5.
+    // (reqwest/env `ALL_PROXY` keep socks5h — see `proxy_env_block`.)
+    let scheme = match endpoint.scheme {
+        ProxyScheme::Socks5h => "socks5",
+        other => other.as_uri_scheme(),
+    };
     let server = format!(
         "{}://{}:{}",
-        endpoint.scheme.as_uri_scheme(),
+        scheme,
         endpoint.host.trim(),
         endpoint.port
     );
@@ -198,6 +205,17 @@ mod tests {
                 && a.contains("example.com")
                 && a.contains("<-loopback>")),
             "expected --proxy-bypass-list with example.com and <-loopback>, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn chrome_proxy_args_maps_socks5h_to_socks5() {
+        let mut cfg = socks_proxy_config();
+        cfg.proxies[0].scheme = ProxyScheme::Socks5h;
+        let args = chrome_proxy_args(&cfg);
+        assert!(
+            args.contains(&"--proxy-server=socks5://127.0.0.1:7890".to_string()),
+            "Chrome rejects socks5h; expected socks5:// server arg, got: {args:?}"
         );
     }
 

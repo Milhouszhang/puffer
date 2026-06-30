@@ -235,6 +235,7 @@ async fn run_async(options: DaemonOptions) -> Result<()> {
         disable_auto_title,
         yolo,
     )?;
+    apply_proxy_env_at_startup(&state.config.lock().unwrap().network.proxy);
     if let Some(prompt) = system_prompt_1
         .as_deref()
         .map(str::trim)
@@ -987,6 +988,20 @@ fn proxy_test_error_message(endpoint: &ProxyEndpoint, error: &anyhow::Error) -> 
         format!("{truncated}...")
     } else {
         truncated
+    }
+}
+
+/// Applies the configured proxy to this process's environment. Call ONCE during
+/// daemon startup, before any outbound HTTP — `env::set_var` is process-global
+/// and not safe to race against live readers, and reqwest memoizes system
+/// proxies, so this is intentionally never called again at runtime.
+fn apply_proxy_env_at_startup(proxy: &puffer_config::ProxyConfig) {
+    let block = puffer_config::proxy_env_block(proxy);
+    for (key, value) in &block.set {
+        std::env::set_var(key, value);
+    }
+    for key in &block.unset {
+        std::env::remove_var(key);
     }
 }
 
@@ -6701,7 +6716,8 @@ mod tests {
     }
 
     use super::{
-        append_ordered_turn_progress, apply_daemon_yolo_mode, apply_turn_model_override,
+        append_ordered_turn_progress, apply_daemon_yolo_mode, apply_proxy_env_at_startup,
+        apply_turn_model_override,
         apply_turn_request_options, browser_launch_settings_or_default,
         browser_permission_payload_json, browser_status_for_turn, cancel_all_active_turns,
         connector_setup_connect_args, connector_setup_id, daemon_now_ms,
@@ -11772,5 +11788,29 @@ input_schema:
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn apply_proxy_env_sets_then_clears() {
+        use puffer_config::{ProxyConfig, ProxyEndpoint, ProxyScheme};
+        let enabled = ProxyConfig {
+            enabled: true,
+            selected: Some("p".into()),
+            bypass: vec![],
+            proxies: vec![ProxyEndpoint {
+                id: "p".into(),
+                scheme: ProxyScheme::Socks5,
+                host: "127.0.0.1".into(),
+                port: 7890,
+                username: None,
+                password: None,
+            }],
+        };
+        apply_proxy_env_at_startup(&enabled);
+        assert_eq!(std::env::var("ALL_PROXY").unwrap(), "socks5://127.0.0.1:7890");
+
+        let disabled = ProxyConfig { enabled: false, ..enabled.clone() };
+        apply_proxy_env_at_startup(&disabled);
+        assert!(std::env::var("ALL_PROXY").is_err());
     }
 }

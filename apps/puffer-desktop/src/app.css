@@ -114,6 +114,11 @@ body {
 }
 .dark body { background: var(--background); }
 button, input, textarea, select { font: inherit; color: inherit; }
+/* Native <select> popups: WebView2 on Windows ignores `color-scheme` for the
+   option listbox, so options would inherit the near-white --foreground over a
+   native white popup in dark mode (illegible). Color the options explicitly so
+   the popup follows the theme in both light and dark mode. */
+option, optgroup { background-color: var(--popover); color: var(--popover-foreground); }
 a { color: inherit; text-decoration: none; }
 
 h1, h2, h3, h4, h5, h6 {
@@ -284,8 +289,9 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
   width: var(--pf-sidebar-width, 248px); flex-shrink: 0;
   min-width: 220px;
   max-width: 420px;
-  background: #fafafa;
-  border-right: 1px solid #ebebeb;
+  background: var(--sidebar);
+  color: var(--sidebar-foreground);
+  border-right: 1px solid var(--sidebar-border);
   display: flex; flex-direction: column;
   gap: 10px;
   padding: 12px;
@@ -342,7 +348,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
   line-height: 1.1;
 }
 .pf-sidebar-brand-copy strong {
-  color: #111111;
+  color: var(--sidebar-foreground);
   font-size: 15px;
   font-weight: 700;
   line-height: 17px;
@@ -354,10 +360,10 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid #ebebeb;
+  border: 1px solid var(--sidebar-border);
   border-radius: 7px;
-  background: #ffffff;
-  color: #8e8e8e;
+  background: var(--background);
+  color: var(--muted-foreground);
   cursor: pointer;
   transition: background 120ms, color 120ms, border-color 120ms, box-shadow 120ms;
   flex-shrink: 0;
@@ -365,7 +371,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
 .pf-sidebar-collapse:hover {
   background: var(--background);
   border-color: var(--pf-sidebar-accent-border);
-  color: #111111;
+  color: var(--sidebar-foreground);
   box-shadow: 0 1px 2px rgb(0 0 0 / 0.04);
 }
 .pf-sidebar-section + .pf-sidebar-section {
@@ -378,7 +384,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
   font-size: 11px;
   text-transform: capitalize;
   letter-spacing: 0;
-  color: #6f6f73;
+  color: var(--muted-foreground);
   font-weight: 700;
   padding: 4px 6px;
   display: flex; align-items: center; justify-content: space-between;
@@ -387,7 +393,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
   display: flex; align-items: center; gap: 10px;
   padding: 6px 12px;
   border-radius: 7px;
-  color: #77777d;
+  color: var(--muted-foreground);
   font-weight: 500;
   cursor: pointer;
   transition: color 120ms, border-color 120ms, box-shadow 120ms, background 120ms;
@@ -403,12 +409,12 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
 .pf-sidebar-item:hover {
   background: var(--pf-sidebar-accent-bg-hover);
   border-color: var(--pf-sidebar-accent-border);
-  color: #111111;
+  color: var(--sidebar-foreground);
 }
 .pf-sidebar-item[data-active="true"] {
   background: var(--pf-sidebar-accent-bg);
   border-color: var(--pf-sidebar-accent-border);
-  color: #111111;
+  color: var(--sidebar-foreground);
   font-weight: 700;
   box-shadow: none;
 }
@@ -416,7 +422,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
   color: var(--pf-sidebar-accent);
 }
 .pf-sidebar-item:not([data-active="true"]) svg {
-  color: #8e8e8e;
+  color: var(--muted-foreground);
 }
 .pf-sidebar-item .pf-row-stack {
   display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0;
@@ -430,8 +436,8 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
 .pf-sidebar-user {
   margin: 0;
   min-height: 44px;
-  background: #f5f5f5;
-  border-color: #e4e4e4;
+  background: var(--secondary);
+  border-color: var(--sidebar-border);
   padding: 8px;
 }
 .pf-sidebar-user svg {
@@ -471,7 +477,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
   border-radius: 6px;
   background: transparent;
   border: 0;
-  color: #77777d;
+  color: var(--muted-foreground);
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
@@ -479,7 +485,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
   width: 100%;
   transition: color 120ms;
 }
-.pf-sidebar-project-header:hover { color: #111111; }
+.pf-sidebar-project-header:hover { color: var(--sidebar-foreground); }
 .pf-sidebar-project-header .name {
   flex: 1; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -488,7 +494,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
   font-size: 12px;
   line-height: 16px;
   font-weight: 600;
-  color: #77777d;
+  color: var(--muted-foreground);
   font-variant-numeric: tabular-nums;
 }
 .pf-sidebar-project-children {
@@ -497,7 +503,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
   gap: 2px;
   padding-left: 10px;
   margin-left: 6px;
-  border-left: 1px solid #e4e4e4;
+  border-left: 1px solid var(--sidebar-border);
 }
 
 .pf-sidebar-agent-row {
@@ -512,7 +518,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
   padding: 5px 8px;
   border-radius: 6px;
   cursor: pointer;
-  color: #77777d;
+  color: var(--muted-foreground);
   font-size: 12px;
   line-height: 16px;
   font-weight: 600;
@@ -539,7 +545,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
   width: 24px;
   border: 0;
   background: transparent;
-  color: #8e8e8e;
+  color: var(--muted-foreground);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -563,7 +569,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
 }
 .pf-sidebar-agent .state {
   font-size: 10.5px; font-family: var(--font-mono);
-  color: #8e8e8e;
+  color: var(--muted-foreground);
   text-transform: lowercase;
   white-space: nowrap;
   flex-shrink: 0;
@@ -573,7 +579,7 @@ html.is-tauri-mac .pf-titlebar { padding-left: 88px; }
 .pf-sidebar-agent .state[data-state="review"]   { color: oklch(0.55 0.17 40); }
 .pf-sidebar-agent .age {
   font-size: 11px;
-  color: #8e8e8e;
+  color: var(--muted-foreground);
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
 }

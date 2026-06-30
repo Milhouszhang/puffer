@@ -527,7 +527,7 @@
   }
 
   .heading {
-    color: var(--text);
+    color: var(--foreground);
     font-weight: 760;
     line-height: 1.25;
     letter-spacing: 0;
@@ -571,10 +571,10 @@
 
   blockquote {
     padding: 0.9rem 1rem;
-    border-left: 3px solid rgba(20, 99, 86, 0.24);
-    background: rgba(222, 238, 232, 0.38);
+    border-left: 3px solid var(--border);
+    background: var(--muted);
     border-radius: 0;
-    color: var(--text-muted);
+    color: var(--muted-foreground);
     white-space: pre-wrap;
   }
 
@@ -584,8 +584,8 @@
     font-size: 0.9em;
     padding: 0.08rem 0.32rem;
     border-radius: 0;
-    background: rgba(247, 243, 235, 0.92);
-    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.55) inset;
+    background: var(--muted);
+    box-shadow: inset 0 0 0 1px var(--border);
   }
 
   .strong {
@@ -628,20 +628,20 @@
   th,
   td {
     padding: 0.42rem 0.55rem;
-    border: 1px solid rgba(47, 75, 69, 0.14);
+    border: 1px solid var(--border);
     text-align: left;
     vertical-align: top;
   }
 
   th {
-    background: rgba(222, 238, 232, 0.42);
+    background: var(--muted);
     font-weight: 720;
   }
 
   hr {
     width: 100%;
     border: 0;
-    border-top: 1px solid rgba(47, 75, 69, 0.18);
+    border-top: 1px solid var(--border);
     margin: 0.2rem 0;
   }
 
@@ -651,7 +651,7 @@
   }
 
   .language {
-    color: var(--text-muted);
+    color: var(--muted-foreground);
     font-size: 0.74rem;
     letter-spacing: 0.12em;
     text-transform: uppercase;
@@ -660,12 +660,12 @@
   pre {
     padding: 0.95rem 1rem;
     border-radius: 0;
-    background: rgba(247, 243, 235, 0.82);
+    background: var(--muted);
     font-family: var(--font-mono);
     font-size: 0.88rem;
     line-height: 1.68;
     white-space: pre-wrap;
     overflow: auto;
-    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.55) inset;
+    box-shadow: inset 0 0 0 1px var(--border);
   }
 </style>

@@ -309,6 +309,22 @@
     color: var(--foreground);
   }
 
+  /* Dark mode: the diff tokens above are tuned for a light canvas (very light
+     add/del rows + a light hunk bar), so on a dark background the line text
+     becomes illegible. Re-tune them to dark-friendly tints with brighter
+     foreground/markers. Light mode is unchanged. */
+  :global(.dark) .diff-view {
+    --diff-add-bg: color-mix(in oklab, oklch(0.7 0.15 145) 16%, var(--background));
+    --diff-add-bg-strong: color-mix(in oklab, oklch(0.7 0.15 145) 26%, var(--background));
+    --diff-add-fg: oklch(0.8 0.15 145);
+    --diff-add-marker: oklch(0.78 0.16 145);
+    --diff-del-bg: color-mix(in oklab, oklch(0.7 0.18 25) 16%, var(--background));
+    --diff-del-bg-strong: color-mix(in oklab, oklch(0.7 0.18 25) 26%, var(--background));
+    --diff-del-fg: oklch(0.8 0.15 25);
+    --diff-del-marker: oklch(0.76 0.17 25);
+    --diff-hunk-bg: color-mix(in oklab, oklch(0.62 0.08 254) 16%, var(--background));
+  }
+
   .eyebrow {
     color: var(--muted-foreground);
     font-family: var(--font-mono);
@@ -530,6 +546,10 @@
     background: var(--diff-hunk-bg);
     text-align: left;
     font-size: 11px;
+  }
+
+  :global(.dark) .hunk-head {
+    color: color-mix(in oklab, oklch(0.72 0.1 254) 72%, var(--foreground));
   }
 
   .patch-lines {

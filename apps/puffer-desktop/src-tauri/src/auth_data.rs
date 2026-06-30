@@ -24,7 +24,6 @@ use puffer_transport_anthropic::{
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Performs an OAuth login for the selected provider and returns the updated settings snapshot.
@@ -529,20 +528,7 @@ impl CallbackListener {
 }
 
 fn open_browser(url: &str) -> bool {
-    let mut command = if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        command.arg(url);
-        command
-    } else if cfg!(target_os = "windows") {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command
-    } else {
-        let mut command = Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    command.spawn().is_ok()
+    tauri_plugin_opener::open_url(url, None::<&str>).is_ok()
 }
 
 fn parse_callback_request(

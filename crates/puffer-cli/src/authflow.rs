@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Owns one ephemeral localhost OAuth callback listener.
@@ -29,6 +28,28 @@ impl CallbackListener {
             port,
             expected_path: path.to_string(),
             redirect_uri: format!("http://127.0.0.1:{port}{path}"),
+        })
+    }
+
+    /// Binds a fixed localhost callback port for the provided path. Used by
+    /// flows whose OAuth client registers an exact redirect URI: the
+    /// OpenAI/Codex client only accepts `http://localhost:1455/auth/callback`,
+    /// so an ephemeral port (as `bind_localhost` uses) is rejected by the
+    /// provider with `authorize_hydra_invalid_request`.
+    pub(crate) fn bind_localhost_port(path: &str, port: u16) -> Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", port)).with_context(|| {
+            format!("failed to bind callback listener on port {port} for {path}")
+        })?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            host: "127.0.0.1".to_string(),
+            port,
+            expected_path: path.to_string(),
+            // `localhost` (not 127.0.0.1) to match the provider-registered
+            // redirect URI exactly; the browser resolves it to 127.0.0.1
+            // where this listener is bound.
+            redirect_uri: format!("http://localhost:{port}{path}"),
         })
     }
 
@@ -66,20 +87,7 @@ impl CallbackListener {
 
 /// Tries to open a URL in the user's default browser.
 pub(crate) fn open_browser(url: &str) -> bool {
-    let mut command = if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        command.arg(url);
-        command
-    } else if cfg!(target_os = "windows") {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command
-    } else {
-        let mut command = Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    command.spawn().is_ok()
+    webbrowser::open(url).is_ok()
 }
 
 fn parse_callback_request(

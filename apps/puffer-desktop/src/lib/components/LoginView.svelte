@@ -688,19 +688,19 @@
   .error-banner,
   .remote-banner {
     border-radius: 16px;
-    border: 1px solid rgba(111, 101, 89, 0.14);
+    border: 1px solid var(--border);
     padding: 0.85rem 1rem;
     font-size: 0.9rem;
     line-height: 1.45;
   }
   .error-banner {
-    background: rgba(247, 225, 220, 0.76);
-    border-color: rgba(157, 58, 43, 0.16);
-    color: var(--danger);
+    background: color-mix(in oklab, var(--destructive) 12%, var(--card));
+    border-color: color-mix(in oklab, var(--destructive) 24%, var(--border));
+    color: var(--destructive);
   }
   .remote-banner {
-    background: rgba(255, 255, 255, 0.7);
-    color: var(--text-muted);
+    background: var(--card);
+    color: var(--muted-foreground);
   }
 
   .provider-section {
@@ -710,7 +710,7 @@
   }
   .provider-section h3 {
     margin: 0;
-    color: var(--text);
+    color: var(--foreground);
     font-size: 14px;
     font-weight: 600;
     line-height: 18px;
@@ -724,10 +724,10 @@
     width: 100%;
     height: 36px;
     padding: 0 12px;
-    border: 1px solid rgba(111, 101, 89, 0.18);
+    border: 1px solid var(--border);
     border-radius: 8px;
-    background: rgba(255, 255, 255, 0.88);
-    color: var(--text);
+    background: var(--background);
+    color: var(--foreground);
     font: inherit;
     font-size: 14px;
   }
@@ -740,9 +740,9 @@
     height: 36px;
     padding: 0 12px;
     border-radius: 8px;
-    border: 1px solid rgba(111, 101, 89, 0.18);
-    background: rgba(255, 255, 255, 0.88);
-    color: var(--text);
+    border: 1px solid var(--border);
+    background: var(--background);
+    color: var(--foreground);
     cursor: pointer;
     font: inherit;
     font-size: 14px;
@@ -754,9 +754,9 @@
 
   .provider-fallback-note {
     border-radius: 12px;
-    border: 1px solid color-mix(in oklab, var(--accent) 22%, rgba(111, 101, 89, 0.16));
-    background: color-mix(in oklab, var(--accent) 8%, rgba(255, 255, 255, 0.78));
-    color: var(--text-muted);
+    border: 1px solid color-mix(in oklab, var(--accent) 22%, var(--border));
+    background: color-mix(in oklab, var(--accent) 8%, var(--card));
+    color: var(--muted-foreground);
     padding: 0.72rem 0.9rem;
     font-size: 0.82rem;
     line-height: 1.4;
@@ -771,20 +771,20 @@
   .provider-card {
     --provider-accent: #475569;
     border-radius: 16px;
-    border: 1px solid rgba(111, 101, 89, 0.16);
+    border: 1px solid var(--border);
     background: linear-gradient(
       180deg,
-      color-mix(in oklab, var(--provider-accent) 7%, white) 0%,
-      rgba(255, 255, 255, 0.92) 100%
+      color-mix(in oklab, var(--provider-accent) 7%, var(--card)) 0%,
+      var(--card) 100%
     );
-    box-shadow: var(--shadow-soft);
+    box-shadow: var(--shadow-soft, 0 1px 3px rgba(0, 0, 0, 0.08));
     padding: 18px 16px;
     display: flex;
     flex-direction: column;
     gap: 10px;
     min-height: 118px;
     justify-content: space-between;
-    color: var(--text);
+    color: var(--foreground);
   }
 
   .card-head {
@@ -803,7 +803,7 @@
     justify-content: center;
     box-shadow:
       0 1px 0 rgba(255, 255, 255, 0.4) inset,
-      0 0 0 1px color-mix(in oklab, var(--provider-accent) 35%, rgba(111, 101, 89, 0.25)) inset;
+      0 0 0 1px color-mix(in oklab, var(--provider-accent) 35%, var(--border)) inset;
   }
   .logo img {
     width: 23px;
@@ -829,16 +829,16 @@
   .meta {
     margin: 0;
     font-size: 12.5px;
-    color: var(--text-muted);
+    color: var(--muted-foreground);
     font-family: var(--font-sans, system-ui, sans-serif);
     line-height: 18px;
   }
   .status {
     justify-self: end;
     border-radius: 999px;
-    border: 1px solid rgba(111, 101, 89, 0.16);
-    background: rgba(255, 255, 255, 0.74);
-    color: var(--text-muted);
+    border: 1px solid var(--border);
+    background: var(--secondary);
+    color: var(--muted-foreground);
     flex: 0 0 auto;
     font-size: 11px;
     font-weight: 700;
@@ -846,9 +846,9 @@
     padding: 5px 10px;
   }
   .status[data-connected="true"] {
-    border-color: color-mix(in oklab, var(--provider-accent) 42%, rgba(111, 101, 89, 0.18));
-    background: color-mix(in oklab, var(--provider-accent) 13%, white);
-    color: color-mix(in oklab, var(--provider-accent) 72%, black);
+    border-color: color-mix(in oklab, var(--provider-accent) 42%, var(--border));
+    background: color-mix(in oklab, var(--provider-accent) 13%, var(--card));
+    color: color-mix(in oklab, var(--provider-accent) 72%, var(--foreground));
   }
   .imports {
     display: grid;
@@ -858,15 +858,15 @@
     text-align: left;
     padding: 0.5rem 0.7rem;
     border-radius: 10px;
-    border: 1px dashed color-mix(in oklab, var(--provider-accent) 50%, rgba(111, 101, 89, 0.4));
-    background: color-mix(in oklab, var(--provider-accent) 8%, white);
-    color: color-mix(in oklab, var(--provider-accent) 70%, var(--text));
+    border: 1px dashed color-mix(in oklab, var(--provider-accent) 50%, var(--border));
+    background: color-mix(in oklab, var(--provider-accent) 8%, var(--card));
+    color: color-mix(in oklab, var(--provider-accent) 70%, var(--foreground));
     font: inherit;
     font-size: 0.85rem;
     cursor: pointer;
   }
   .import:hover:not(:disabled) {
-    background: color-mix(in oklab, var(--provider-accent) 14%, white);
+    background: color-mix(in oklab, var(--provider-accent) 14%, var(--card));
   }
   .import:disabled {
     opacity: 0.7;
@@ -897,28 +897,28 @@
     filter: brightness(1.05);
   }
   .provider-card .oauth-btn {
-    border: 1px solid color-mix(in oklab, var(--provider-accent) 24%, rgba(111, 101, 89, 0.16));
-    background: color-mix(in oklab, var(--provider-accent) 10%, rgba(255, 255, 255, 0.9));
-    color: color-mix(in oklab, var(--provider-accent) 78%, black);
+    border: 1px solid color-mix(in oklab, var(--provider-accent) 24%, var(--border));
+    background: color-mix(in oklab, var(--provider-accent) 10%, var(--card));
+    color: color-mix(in oklab, var(--provider-accent) 78%, var(--foreground));
     box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--provider-accent) 8%, transparent);
   }
   .provider-card .oauth-btn:hover:not(:disabled) {
-    background: color-mix(in oklab, var(--provider-accent) 14%, rgba(255, 255, 255, 0.92));
-    border-color: color-mix(in oklab, var(--provider-accent) 34%, rgba(111, 101, 89, 0.16));
+    background: color-mix(in oklab, var(--provider-accent) 14%, var(--card));
+    border-color: color-mix(in oklab, var(--provider-accent) 34%, var(--border));
     filter: none;
   }
   .apikey-btn {
-    background: color-mix(in oklab, var(--provider-accent) 14%, white);
-    color: color-mix(in oklab, var(--provider-accent) 80%, black);
-    border: 1px solid color-mix(in oklab, var(--provider-accent) 35%, rgba(111, 101, 89, 0.25));
+    background: color-mix(in oklab, var(--provider-accent) 14%, var(--card));
+    color: color-mix(in oklab, var(--provider-accent) 80%, var(--foreground));
+    border: 1px solid color-mix(in oklab, var(--provider-accent) 35%, var(--border));
   }
   .disconnect-btn {
-    border: 1px solid rgba(111, 101, 89, 0.18);
-    background: rgba(255, 255, 255, 0.78);
-    color: var(--text);
+    border: 1px solid var(--border);
+    background: var(--secondary);
+    color: var(--foreground);
   }
   .disconnect-btn:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.94);
+    background: var(--accent);
   }
   .oauth-btn:disabled,
   .apikey-btn:disabled,
@@ -939,7 +939,7 @@
   .custom-provider-form label {
     display: grid;
     gap: 6px;
-    color: var(--text);
+    color: var(--foreground);
     font-size: 12px;
     font-weight: 700;
     line-height: 16px;
@@ -949,9 +949,9 @@
     min-height: 36px;
     padding: 0 10px;
     border-radius: 10px;
-    border: 1px solid rgba(111, 101, 89, 0.2);
-    background: rgba(255, 255, 255, 0.92);
-    color: var(--text);
+    border: 1px solid var(--border);
+    background: var(--background);
+    color: var(--foreground);
     font: inherit;
     font-size: 13px;
     font-weight: 400;
@@ -969,9 +969,9 @@
     min-height: 34px;
     padding: 0 10px;
     border-radius: 10px;
-    border: 1px solid rgba(111, 101, 89, 0.2);
-    background: rgba(255, 255, 255, 0.92);
-    color: var(--text);
+    border: 1px solid var(--border);
+    background: var(--background);
+    color: var(--foreground);
     font: inherit;
     font-size: 13px;
     min-width: 0;
@@ -985,10 +985,10 @@
   .empty-card {
     grid-column: 1 / -1;
     border-radius: 16px;
-    border: 1px dashed rgba(111, 101, 89, 0.25);
-    background: rgba(255, 255, 255, 0.6);
+    border: 1px dashed var(--border);
+    background: var(--card);
     padding: 1.4rem;
-    color: var(--text-muted);
+    color: var(--muted-foreground);
     text-align: center;
   }
 
@@ -1007,11 +1007,11 @@
     width: min(520px, calc(100vw - 32px));
     max-height: min(720px, calc(100vh - 48px));
     overflow: auto;
-    border: 1px solid rgba(111, 101, 89, 0.18);
+    border: 1px solid var(--border);
     border-radius: 16px;
     background: var(--background);
     box-shadow: 0 22px 60px rgba(15, 23, 42, 0.18);
-    color: var(--text);
+    color: var(--foreground);
   }
 
   .provider-modal-head {
@@ -1020,7 +1020,7 @@
     gap: 12px;
     align-items: center;
     padding: 18px 18px 14px;
-    border-bottom: 1px solid rgba(111, 101, 89, 0.14);
+    border-bottom: 1px solid var(--border);
   }
 
   .provider-modal-head h2 {
@@ -1032,7 +1032,7 @@
 
   .provider-modal-head p {
     margin: 2px 0 0;
-    color: var(--text-muted);
+    color: var(--muted-foreground);
     font-size: 12.5px;
     line-height: 18px;
   }
@@ -1040,10 +1040,10 @@
   .modal-close {
     width: 30px;
     height: 30px;
-    border: 1px solid rgba(111, 101, 89, 0.14);
+    border: 1px solid var(--border);
     border-radius: 8px;
-    background: rgba(255, 255, 255, 0.72);
-    color: var(--text-muted);
+    background: var(--secondary);
+    color: var(--muted-foreground);
     cursor: pointer;
     font: inherit;
     font-size: 14px;
@@ -1064,7 +1064,7 @@
 
   .provider-modal-section h3 {
     margin: 0;
-    color: var(--text);
+    color: var(--foreground);
     font-size: 13px;
     font-weight: 700;
     line-height: 16px;
@@ -1072,7 +1072,7 @@
 
   .provider-modal-note {
     margin: 0;
-    color: var(--text-muted);
+    color: var(--muted-foreground);
     font-size: 13px;
     line-height: 18px;
   }

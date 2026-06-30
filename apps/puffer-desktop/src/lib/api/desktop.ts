@@ -825,6 +825,14 @@ export async function loadSettingsSnapshot(remote?: RemoteConnection): Promise<S
   return invoke<BackendSettingsSnapshot>("load_settings_snapshot", remoteArgs(remote));
 }
 
+// The daemon's OAuth login handler blocks until the user finishes the browser
+// authorization (it waits for the localhost callback) and then exchanges the
+// code for tokens. The default 30s request timeout fires long before a user
+// can realistically complete interactive sign-in, surfacing a misleading
+// "request timed out: login_with_oauth" even though auth succeeds. Give the
+// interactive flow a much longer budget.
+const OAUTH_LOGIN_TIMEOUT_MS = 90_000;
+
 export async function loginWithOauth(
   providerId: string,
   remote?: RemoteConnection
@@ -837,9 +845,13 @@ export async function loginWithOauth(
   }
   if (canReachDaemon()) {
     const client = await ensureLocalDaemonClient();
-    return client.request<BackendSettingsSnapshot>("login_with_oauth", {
-      providerId
-    });
+    return client.request<BackendSettingsSnapshot>(
+      "login_with_oauth",
+      {
+        providerId
+      },
+      { timeoutMs: OAUTH_LOGIN_TIMEOUT_MS }
+    );
   }
   if (!canInvokeTauri()) {
     return mockSettingsSnapshot;

@@ -454,8 +454,6 @@ pub(crate) struct DaemonState {
     /// window so a runaway browser checkout can't keep running once the user's
     /// app has gone away (issue #600).
     live_connections: Arc<AtomicUsize>,
-    /// Monitor reply action sessions stay source-bound across follow-up turns.
-    monitor_reply_sessions: Arc<Mutex<HashMap<String, String>>>,
 }
 
 const RECENT_EVENT_CAPACITY: usize = 500;
@@ -758,7 +756,6 @@ impl DaemonState {
             generated_video_tickets: Arc::new(Mutex::new(HashMap::new())),
             recent_events: Arc::new(Mutex::new(VecDeque::with_capacity(RECENT_EVENT_CAPACITY))),
             live_connections: Arc::new(AtomicUsize::new(0)),
-            monitor_reply_sessions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -2448,7 +2445,17 @@ fn handle_login_with_oauth(state: &DaemonState, params: &Value) -> Result<Value>
 
     let mut inputs = state.build_runtime_inputs()?;
     let auth_path = state.paths.user_config_dir.join("auth.json");
-    let listener = crate::authflow::CallbackListener::bind_localhost("/callback")?;
+    // OpenAI/Codex registers an exact redirect URI
+    // (`http://localhost:1455/auth/callback`); an ephemeral callback port makes
+    // the provider reject the authorize request with
+    // `authorize_hydra_invalid_request`. Anthropic accepts a dynamic localhost
+    // port, so it keeps the OS-assigned ephemeral listener.
+    let listener = match oauth_family_for_provider(&inputs.providers, &provider_id) {
+        Some(OauthFamily::OpenAi) => {
+            crate::authflow::CallbackListener::bind_localhost_port("/auth/callback", 1455)?
+        }
+        _ => crate::authflow::CallbackListener::bind_localhost("/callback")?,
+    };
     let bundle =
         oauth_login_bundle_for_provider(&inputs.providers, &provider_id, listener.redirect_uri())?;
     let launch_url = bundle
@@ -4728,6 +4735,21 @@ struct MonitorReplyTurnScope {
     prompt_tool_scope: &'static str,
 }
 
+/// Resolves the monitor-reply tool scope for one turn.
+///
+/// A scope is granted ONLY on the genuine action-prompt turn — the turn that
+/// carries the seeded `Act on monitored task <id>:` message together with a
+/// matching `monitorActionTaskId` param. That turn is hard-locked to the draft
+/// `allowed_tools` set so it produces a single human-gated reply draft.
+///
+/// Every other turn resolves `None` (#561): the draft tool is neither offered to
+/// the model nor bound to a task, so an unrelated follow-up question can never be
+/// re-scoped into (re-)drafting the reply. The scope is strictly per-turn — it is
+/// never made sticky to the session and never recovered from the transcript.
+/// Refining a saved draft is done by editing it in the Bobo review modal (both
+/// `ReplyDraftModal` and `PendingActionModal` expose the draft text for editing)
+/// or by re-running the task action, which re-sends the action prompt and
+/// re-arms the scope for that single turn.
 fn resolve_monitor_reply_turn_scope(
     state: &DaemonState,
     params: &Value,
@@ -4742,7 +4764,10 @@ fn resolve_monitor_reply_turn_scope(
         if monitor_action_kind_param(params).is_some() {
             anyhow::bail!("monitorActionKind requires a monitor action prompt");
         }
-        return resolve_existing_monitor_reply_session_scope(state, session_id, turn_id);
+        // Not the action turn → no reply scope (#561). The follow-up runs with
+        // the full tool set and cannot draft; the prior session-sticky behavior
+        // (re-bind from the in-memory map or by scanning the transcript) is gone.
+        return Ok(None);
     };
     let Some(explicit_task_id) = monitor_action_task_id_param(params) else {
         anyhow::bail!("human-gated monitor action prompt requires matching monitorActionTaskId");
@@ -4801,128 +4826,12 @@ fn resolve_monitor_reply_turn_scope(
             MONITOR_REPLY_ACTION_PROMPT_SCOPE
         }
     };
-    state
-        .monitor_reply_sessions
-        .lock()
-        .unwrap()
-        .insert(session_id.to_string(), prompt_task_id.clone());
 
     Ok(Some(MonitorReplyTurnScope {
         task_id: prompt_task_id,
         session_id: session_id.to_string(),
         turn_id: turn_id.to_string(),
         prompt_tool_scope,
-    }))
-}
-
-fn resolve_existing_monitor_reply_session_scope(
-    state: &DaemonState,
-    session_id: &str,
-    turn_id: &str,
-) -> Result<Option<MonitorReplyTurnScope>> {
-    let mut scoped_task_id = state
-        .monitor_reply_sessions
-        .lock()
-        .unwrap()
-        .get(session_id)
-        .cloned();
-    if scoped_task_id.is_none() {
-        scoped_task_id = recover_monitor_reply_task_id_from_transcript(state, session_id)?;
-        if let Some(task_id) = &scoped_task_id {
-            state
-                .monitor_reply_sessions
-                .lock()
-                .unwrap()
-                .insert(session_id.to_string(), task_id.clone());
-        }
-    }
-    let Some(task_id) = scoped_task_id else {
-        return Ok(None);
-    };
-
-    let task = match load_monitor_task_for_scope(&state.paths, &task_id) {
-        Ok(task) => task,
-        Err(_) => {
-            state
-                .monitor_reply_sessions
-                .lock()
-                .unwrap()
-                .remove(session_id);
-            return Ok(None);
-        }
-    };
-    if monitor_task_is_terminal(&task) {
-        state
-            .monitor_reply_sessions
-            .lock()
-            .unwrap()
-            .remove(session_id);
-        return Ok(None);
-    }
-    let prompt_tool_scope = match monitor_task_kind(&task).as_deref() {
-        Some("gmail.reply") => {
-            if !monitor_task_has_gmail_thread_target(&task) {
-                anyhow::bail!("monitor task `{task_id}` is missing a Gmail thread target");
-            }
-            MONITOR_GMAIL_ACTION_PROMPT_SCOPE
-        }
-        Some("telegram.reply") => {
-            if !monitor_task_has_delivery_target(&task) {
-                anyhow::bail!("monitor task `{task_id}` is missing a source delivery target");
-            }
-            MONITOR_TELEGRAM_ACTION_PROMPT_SCOPE
-        }
-        Some(kind) if kind != "telegram.reply" => {
-            state
-                .monitor_reply_sessions
-                .lock()
-                .unwrap()
-                .remove(session_id);
-            return Ok(None);
-        }
-        _ => {
-            if !monitor_task_is_human_gated(&task) {
-                state
-                    .monitor_reply_sessions
-                    .lock()
-                    .unwrap()
-                    .remove(session_id);
-                return Ok(None);
-            }
-            if !monitor_task_has_delivery_target(&task) {
-                anyhow::bail!("monitor task `{task_id}` is missing a source delivery target");
-            }
-            MONITOR_REPLY_ACTION_PROMPT_SCOPE
-        }
-    };
-
-    Ok(Some(MonitorReplyTurnScope {
-        task_id,
-        session_id: session_id.to_string(),
-        turn_id: turn_id.to_string(),
-        prompt_tool_scope,
-    }))
-}
-
-fn recover_monitor_reply_task_id_from_transcript(
-    state: &DaemonState,
-    session_id: &str,
-) -> Result<Option<String>> {
-    let Ok(session_uuid) = Uuid::parse_str(session_id) else {
-        return Ok(None);
-    };
-    let Ok(session_store) = SessionStore::from_paths(&state.paths) else {
-        return Ok(None);
-    };
-    let Ok(record) = session_store.load_session(session_uuid) else {
-        return Ok(None);
-    };
-
-    Ok(record.events.iter().rev().find_map(|event| {
-        let TranscriptEvent::UserMessage { text, .. } = event else {
-            return None;
-        };
-        parse_monitor_action_prompt_task_id(text)
     }))
 }
 
@@ -6802,8 +6711,9 @@ mod tests {
         handle_set_lambda_skill_enabled, handle_update_config, model_descriptor_dto,
         parse_single_byte_range, permission_review_payload_json,
         realtime_session_config_from_params, report_cancelled_turn, requires_explicit_subscription,
-        resolve_create_session_model_id, run_off_runtime, session_used_browser_tool,
-        start_connector_setup_turn, turn_browser_tab_context, CancelToken, ConnectionGuard,
+        resolve_create_session_model_id, resolve_monitor_reply_turn_scope, run_off_runtime,
+        session_used_browser_tool, start_connector_setup_turn, turn_browser_tab_context,
+        CancelToken, ConnectionGuard, MONITOR_REPLY_ACTION_PROMPT_SCOPE,
         DaemonState, GenerateMediaArtifactResult, GenerateMediaResult, GeneratedVideoRangeError,
         GeneratedVideoTicket, ServerEnvelope, TurnHandle, TurnProgress, TurnProgressItem,
         TurnRequestOptions,
@@ -8288,6 +8198,122 @@ models: []
             false,
         )
         .expect("daemon state")
+    }
+
+    // ── #561: monitor-reply scope must not lock unrelated follow-up turns ──────
+
+    /// Builds a daemon state whose monitor task store holds one open, human-gated
+    /// (legacy `MonitorReplyDraft`) Telegram task `monitor-16` with a delivery
+    /// target. The returned `TempDir` must outlive the state.
+    fn monitor_reply_env() -> (tempfile::TempDir, DaemonState) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let paths = ConfigPaths {
+            workspace_root: workspace_root.clone(),
+            workspace_config_dir: workspace_root.join(".puffer"),
+            user_config_dir: temp.path().join("home").join(".puffer"),
+            builtin_resources_dir: workspace_root.join("resources"),
+        };
+        ensure_workspace_dirs(&paths).expect("workspace dirs");
+        let task_dir = paths
+            .workspace_config_dir
+            .join("runtime")
+            .join("claude_workflow");
+        std::fs::create_dir_all(&task_dir).expect("task dir");
+        std::fs::write(
+            task_dir.join("monitor_tasks.json"),
+            serde_json::to_string(&json!({
+                "tasks": [{
+                    "task_id": "monitor-16",
+                    "status": "open",
+                    "metadata": {
+                        "completion_policy": { "mode": "draft_then_approve" },
+                        "source_context": { "delivery_target": { "chat_id": 7842887746_i64 } }
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .expect("write monitor task");
+        let state = test_state_with_paths(paths);
+        (temp, state)
+    }
+
+    const MONITOR_ACTION_MSG: &str =
+        "Act on monitored task monitor-16: tonight's release window moved\n\n\
+         Task description:\nValidate your endpoint before the new window.";
+
+    /// The #561 regression: only the genuine action turn (seeded prompt + a
+    /// matching `monitorActionTaskId`) resolves a draft scope. An unrelated
+    /// follow-up question in the same session resolves NO scope, so the draft
+    /// tool is never offered to the model and the earlier reply can't be
+    /// re-drafted. Re-running the task action re-arms the scope for that one turn.
+    #[test]
+    fn monitor_reply_scope_is_action_turn_only() {
+        let (_temp, state) = monitor_reply_env();
+        let session_id = Uuid::new_v4().to_string();
+
+        // Action turn: scoped (hard-locked to the draft toolset downstream).
+        let action = resolve_monitor_reply_turn_scope(
+            &state,
+            &json!({ "monitorActionTaskId": "monitor-16" }),
+            MONITOR_ACTION_MSG,
+            &session_id,
+            "turn-action",
+        )
+        .expect("action scope resolves")
+        .expect("action turn is scoped");
+        assert_eq!(action.task_id, "monitor-16");
+        assert_eq!(action.prompt_tool_scope, MONITOR_REPLY_ACTION_PROMPT_SCOPE);
+
+        // Unrelated follow-up in the SAME session (the #561 transcript): no param,
+        // an ordinary question → no scope at all, so the model cannot draft.
+        let follow_up = resolve_monitor_reply_turn_scope(
+            &state,
+            &json!({}),
+            "帮我查我绑定的link卡号是多少",
+            &session_id,
+            "turn-follow-up",
+        )
+        .expect("follow-up scope resolves");
+        assert!(
+            follow_up.is_none(),
+            "an unrelated follow-up must not inherit any monitor-reply scope (#561)"
+        );
+
+        // Re-running the task action re-arms the scope for that turn only.
+        let rearm = resolve_monitor_reply_turn_scope(
+            &state,
+            &json!({ "monitorActionTaskId": "monitor-16" }),
+            MONITOR_ACTION_MSG,
+            &session_id,
+            "turn-rearm",
+        )
+        .expect("re-arm scope resolves")
+        .expect("re-running the action re-scopes the turn");
+        assert_eq!(rearm.prompt_tool_scope, MONITOR_REPLY_ACTION_PROMPT_SCOPE);
+    }
+
+    /// A plain (non-action) message carrying a `monitorActionTaskId` param is
+    /// rejected — the param is only valid alongside the seeded action prompt, so
+    /// it can't be used to smuggle a draft scope onto an arbitrary turn.
+    #[test]
+    fn monitor_action_task_id_param_requires_action_prompt() {
+        let (_temp, state) = monitor_reply_env();
+        let session_id = Uuid::new_v4().to_string();
+
+        let err = resolve_monitor_reply_turn_scope(
+            &state,
+            &json!({ "monitorActionTaskId": "monitor-16" }),
+            "帮我查我绑定的link卡号是多少",
+            &session_id,
+            "turn-x",
+        )
+        .expect_err("param without an action prompt must be rejected");
+        assert!(
+            err.to_string().contains("requires a monitor action prompt"),
+            "unexpected error: {err}"
+        );
     }
 
     fn write_generated_image_artifact(

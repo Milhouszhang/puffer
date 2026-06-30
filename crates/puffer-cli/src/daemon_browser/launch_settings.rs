@@ -3,7 +3,7 @@
 use anyhow::Result;
 use puffer_config::{
     builtin_captcha_solvers, stage_builtin_captcha_extension, CaptchaExtensionSeed, ConfigPaths,
-    PufferConfig,
+    ProxyConfig, PufferConfig,
 };
 use puffer_secrets::SecretVault;
 use std::collections::BTreeSet;
@@ -14,14 +14,19 @@ use std::path::{Path, PathBuf};
 pub(crate) struct BrowserLaunchSettings {
     extension_dirs: Vec<PathBuf>,
     seeds: Vec<CaptchaExtensionSeed>,
+    proxy_args: Vec<String>,
 }
 
 impl BrowserLaunchSettings {
     /// Builds launch settings from the currently loaded daemon config.
     pub(crate) fn from_config(paths: &ConfigPaths, config: &PufferConfig) -> Result<Self> {
+        let proxy_args = chrome_proxy_args(&config.network.proxy);
         let browser = &config.browser;
         if !browser.extensions_enabled {
-            return Ok(Self::default());
+            return Ok(Self {
+                proxy_args,
+                ..Self::default()
+            });
         }
 
         let mut extension_dirs = Vec::new();
@@ -67,6 +72,7 @@ impl BrowserLaunchSettings {
         Ok(Self {
             extension_dirs,
             seeds,
+            proxy_args,
         })
     }
 
@@ -80,12 +86,18 @@ impl BrowserLaunchSettings {
         &self.seeds
     }
 
+    /// Returns Chrome proxy flags to pass at launch. Empty when proxy is disabled.
+    pub(crate) fn proxy_args(&self) -> &[String] {
+        &self.proxy_args
+    }
+
     /// Creates launch settings with extension directories for tests.
     #[cfg(test)]
     pub(crate) fn with_extension_dirs(extension_dirs: Vec<PathBuf>) -> Self {
         Self {
             extension_dirs,
             seeds: Vec::new(),
+            proxy_args: Vec::new(),
         }
     }
 }
@@ -117,4 +129,87 @@ fn reveal_secret_value(paths: &ConfigPaths, secret_id: &str) -> Option<String> {
 fn dedupe_extension_dirs(extension_dirs: &mut Vec<PathBuf>) {
     let mut seen = BTreeSet::new();
     extension_dirs.retain(|path| seen.insert(path.clone()));
+}
+
+/// Chrome proxy flags derived from config. Empty when disabled. Authenticated
+/// proxies are unsupported for browser sessions (Chrome --proxy-server cannot
+/// carry inline credentials) — credentials are dropped from the server arg.
+fn chrome_proxy_args(proxy: &ProxyConfig) -> Vec<String> {
+    if !proxy.enabled {
+        return Vec::new();
+    }
+    let Some(endpoint) = proxy
+        .selected
+        .as_deref()
+        .and_then(|sel| proxy.proxies.iter().find(|e| e.id == sel))
+    else {
+        return Vec::new();
+    };
+    let server = format!(
+        "{}://{}:{}",
+        endpoint.scheme.as_uri_scheme(),
+        endpoint.host.trim(),
+        endpoint.port
+    );
+    let mut bypass = vec!["<-loopback>".to_string()];
+    bypass.extend(
+        proxy
+            .bypass
+            .iter()
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty()),
+    );
+    vec![
+        format!("--proxy-server={server}"),
+        format!("--proxy-bypass-list={}", bypass.join(";")),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use puffer_config::{ProxyEndpoint, ProxyScheme};
+
+    fn socks_proxy_config() -> ProxyConfig {
+        ProxyConfig {
+            enabled: true,
+            selected: Some("p".into()),
+            bypass: vec!["example.com".into()],
+            proxies: vec![ProxyEndpoint {
+                id: "p".into(),
+                scheme: ProxyScheme::Socks5,
+                host: "127.0.0.1".into(),
+                port: 7890,
+                username: None,
+                password: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn chrome_proxy_args_enabled_emits_server_and_bypass() {
+        let args = chrome_proxy_args(&socks_proxy_config());
+        assert!(
+            args.contains(&"--proxy-server=socks5://127.0.0.1:7890".to_string()),
+            "expected --proxy-server arg, got: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.starts_with("--proxy-bypass-list=")
+                && a.contains("example.com")
+                && a.contains("<-loopback>")),
+            "expected --proxy-bypass-list with example.com and <-loopback>, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn chrome_proxy_args_disabled_is_empty() {
+        let cfg = ProxyConfig {
+            enabled: false,
+            ..socks_proxy_config()
+        };
+        assert!(
+            chrome_proxy_args(&cfg).is_empty(),
+            "expected empty args when proxy disabled"
+        );
+    }
 }

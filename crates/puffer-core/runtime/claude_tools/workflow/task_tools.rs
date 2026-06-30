@@ -1270,6 +1270,16 @@ fn monitor_source_message_ids(metadata: &Map<String, Value>) -> HashSet<i64> {
     if let Some(id) = metadata_i64(metadata, &["source_message_id", "sourceMessageId"]) {
         ids.insert(id);
     }
+    // Plural form stamped onto consolidated multi-envelope (generic.review) tasks.
+    for key in ["source_message_ids", "sourceMessageIds"] {
+        if let Some(items) = metadata.get(key).and_then(Value::as_array) {
+            for item in items {
+                if let Some(id) = value_i64(item) {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
     for key in ["monitor_task_gate", "monitorTaskGate"] {
         if let Some(gate) = metadata.get(key) {
             if let Some(id) = value_i64_field(gate, &["source_message_id", "sourceMessageId"]) {
@@ -1603,6 +1613,11 @@ fn stamp_monitor_task_metadata_from_current_sources(
                     .collect(),
             ),
         );
+        // The generic.review contract drops per-message source identity, which would
+        // leave a consolidated burst task un-scope-matchable and un-deduplicable.
+        // Restore the shared scalar identity so message-identity dedup still applies
+        // (agentenv/monorepo#625).
+        stamp_shared_monitor_source_identity(metadata, &selected);
         return Ok(());
     }
 
@@ -1623,6 +1638,54 @@ fn stamp_monitor_task_metadata_from_current_sources(
     }
     apply_stamped_monitor_contract(metadata, contract)?;
     Ok(())
+}
+
+/// For a consolidated multi-envelope (generic.review) monitor task, copy the
+/// source identity that is shared across all contributing envelopes to top-level
+/// metadata, so scope-matching and message-identity dedup behave the same as for
+/// single-source tasks. A same-conversation burst is bucketed by chat in the
+/// digest, so `chat_id`/`sender_id` are normally uniform; only fields that are
+/// uniform across the batch are stamped, and the per-message ids are collected
+/// into a plural `source_message_ids` array. Content/subject are deliberately not
+/// involved (agentenv/monorepo#625 is message-identity only).
+fn stamp_shared_monitor_source_identity(
+    metadata: &mut Map<String, Value>,
+    stamps: &[MonitorSourceStampContext],
+) {
+    if let Some(chat_id) = uniform_stamp_i64(stamps, &["chat_id", "chatId"]) {
+        metadata.insert("chat_id".to_string(), Value::from(chat_id));
+    }
+    if let Some(sender_id) = uniform_stamp_i64(stamps, &["sender_id", "senderId"]) {
+        metadata.insert("sender_id".to_string(), Value::from(sender_id));
+    }
+    let mut source_message_ids = stamps
+        .iter()
+        .filter_map(source_message_id_from_stamp)
+        .collect::<Vec<_>>();
+    source_message_ids.sort_unstable();
+    source_message_ids.dedup();
+    if !source_message_ids.is_empty() {
+        metadata.insert(
+            "source_message_ids".to_string(),
+            Value::Array(source_message_ids.into_iter().map(Value::from).collect()),
+        );
+    }
+}
+
+/// Returns the i64 value for `keys` iff every stamp's payload has it and they all
+/// agree; otherwise `None` (the field is not uniform across the batch, so there is
+/// no single authoritative value to stamp — e.g. a genuinely cross-chat review).
+fn uniform_stamp_i64(stamps: &[MonitorSourceStampContext], keys: &[&str]) -> Option<i64> {
+    let mut agreed: Option<i64> = None;
+    for stamp in stamps {
+        let value = value_i64_field(&stamp.payload, keys)?;
+        match agreed {
+            None => agreed = Some(value),
+            Some(existing) if existing == value => {}
+            Some(_) => return None,
+        }
+    }
+    agreed
 }
 
 fn reject_llm_written_typed_monitor_fields(metadata: &Map<String, Value>) -> Result<()> {
@@ -4278,6 +4341,94 @@ mod tests {
             duplicate_monitor_task_skip(&[original], &candidate, &subject).is_none(),
             "a different subject in the same chat is not a duplicate"
         );
+    }
+
+    // ---- option (a): generic.review (consolidated multi-envelope) identity ----
+
+    fn issue625_stamp(
+        envelope_id: &str,
+        chat_id: i64,
+        sender_id: i64,
+        message_id: i64,
+    ) -> crate::MonitorSourceStampContext {
+        crate::MonitorSourceStampContext {
+            envelope_id: envelope_id.to_string(),
+            connection_slug: "telegram-user".to_string(),
+            connector_slug: Some("telegram-login".to_string()),
+            received_at_ms: None,
+            text: Some("burst message".to_string()),
+            payload: json!({ "chat_id": chat_id, "sender_id": sender_id, "message_id": message_id }),
+        }
+    }
+
+    #[test]
+    fn issue_625_monitor_source_message_ids_reads_plural() {
+        let mut meta = serde_json::Map::new();
+        meta.insert("source_message_ids".into(), json!([6090, 6091]));
+        let ids = monitor_source_message_ids(&meta);
+        assert!(ids.contains(&6090) && ids.contains(&6091));
+    }
+
+    #[test]
+    fn issue_625_same_chat_batch_stamps_shared_identity() {
+        // A same-conversation burst -> uniform chat_id/sender_id stamped to top level,
+        // plus the per-message ids as a plural array.
+        let stamps = vec![
+            issue625_stamp("env-a", 8_689_648_954, 8_689_648_954, 6090),
+            issue625_stamp("env-b", 8_689_648_954, 8_689_648_954, 6091),
+        ];
+        let mut meta = serde_json::Map::new();
+        stamp_shared_monitor_source_identity(&mut meta, &stamps);
+        assert_eq!(metadata_i64(&meta, &["chat_id"]), Some(8_689_648_954));
+        assert_eq!(metadata_i64(&meta, &["sender_id"]), Some(8_689_648_954));
+        let ids = monitor_source_message_ids(&meta);
+        assert!(ids.contains(&6090) && ids.contains(&6091));
+    }
+
+    #[test]
+    fn issue_625_cross_chat_batch_does_not_stamp_chat_id() {
+        // A genuinely cross-chat review: chat_id is not uniform, so it must NOT be
+        // stamped (the task is not scoped to a single chat), but message ids are kept.
+        let stamps = vec![
+            issue625_stamp("env-a", 111, 111, 6090),
+            issue625_stamp("env-b", 222, 222, 6091),
+        ];
+        let mut meta = serde_json::Map::new();
+        stamp_shared_monitor_source_identity(&mut meta, &stamps);
+        assert_eq!(metadata_i64(&meta, &["chat_id"]), None);
+        assert_eq!(metadata_i64(&meta, &["sender_id"]), None);
+        assert!(monitor_source_message_ids(&meta).contains(&6090));
+    }
+
+    #[test]
+    fn issue_625_generic_review_task_dedups_by_message_id() {
+        // The goal of option (a): a consolidated generic.review task now carries
+        // chat_id + source_message_ids, so a re-delivery of one of its messages dedups
+        // (which previously slipped through because the identity was stripped).
+        let mut meta = serde_json::Map::new();
+        meta.insert("_monitor".into(), json!(true));
+        meta.insert("monitor_connection".into(), json!("telegram-user"));
+        meta.insert("monitor_connector".into(), json!("telegram-login"));
+        meta.insert("chat_id".into(), json!(8_689_648_954i64));
+        meta.insert("source_message_ids".into(), json!([6090, 6091]));
+        let existing: StoredTask = serde_json::from_value(json!({
+            "task_id": "monitor-existing",
+            "subject": "Telegram: consolidated burst",
+            "description": "",
+            "active_form": "",
+            "status": "completed",
+            "owner": null,
+            "blocks": [],
+            "blocked_by": [],
+            "metadata": Value::Object(meta),
+            "output": null,
+        }))
+        .expect("construct generic.review StoredTask");
+        // A re-delivery of message 6090 (same chat) as a fresh single-source candidate.
+        let (candidate, subject) = issue625_candidate("Telegram: a re-paraphrased subject", Some(6090));
+        let v = duplicate_monitor_task_skip(&[existing], &candidate, &subject)
+            .expect("re-delivery of a message already in a generic.review task should dedup");
+        assert_eq!(v["reason"], "duplicate_source");
     }
 
     #[test]

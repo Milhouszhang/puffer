@@ -15,13 +15,13 @@ use crate::daemon::ServerEnvelope;
 static SINK: OnceLock<Sender<ServerEnvelope>> = OnceLock::new();
 
 /// Registers the daemon WS event sender. Idempotent: a second call is ignored.
-pub fn set_workflow_run_event_sink(tx: Sender<ServerEnvelope>) {
+pub(crate) fn set_workflow_run_event_sink(tx: Sender<ServerEnvelope>) {
     let _ = SINK.set(tx);
 }
 
 /// Emits a non-replay `workflow-run:finished` event for one finished run.
 /// No-op when no sink is registered or there are no receivers (best-effort).
-pub fn emit_workflow_run_finished(run: &WorkflowBindingRun) {
+pub(crate) fn emit_workflow_run_finished(run: &WorkflowBindingRun) {
     if let Some(tx) = SINK.get() {
         let _ = tx.send(ServerEnvelope::Event {
             event: "workflow-run:finished".to_string(),
@@ -36,8 +36,8 @@ pub fn emit_workflow_run_finished(run: &WorkflowBindingRun) {
 }
 
 /// The observer to attach to the subscription manager's history store.
-pub fn workflow_run_finished_observer() -> RunFinishedObserver {
-    Arc::new(|run: &WorkflowBindingRun| emit_workflow_run_finished(run))
+pub(crate) fn workflow_run_finished_observer() -> RunFinishedObserver {
+    Arc::new(emit_workflow_run_finished)
 }
 
 #[cfg(test)]

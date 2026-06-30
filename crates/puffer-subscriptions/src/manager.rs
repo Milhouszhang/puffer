@@ -227,7 +227,7 @@ impl SubscriptionManagerBuilder {
         let connection_store = Arc::new(ConnectionStore::load(&self.connection_store_path)?);
         let history_store = Arc::new({
             let store = WorkflowHistoryStore::load(&self.history_store_path)?;
-            match self.run_finished_observer.clone() {
+            match self.run_finished_observer {
                 Some(observer) => store.with_run_finished_observer(observer),
                 None => store,
             }

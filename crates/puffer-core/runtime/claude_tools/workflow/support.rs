@@ -1,28 +1,27 @@
 use super::store::{
-    agents_path, append_agent_message, claude_task_dir, detect_powershell_binary,
+    agents_path, append_agent_message, claude_task_dir, ensure_safe_identifier,
     find_team_for_session, git_ahead_count, git_dirty, git_head_commit, git_toplevel, is_git_repo,
-    load_store, messages_path, next_task_id, now_ms, register_team_member,
-    remove_claude_team_artifacts, resolve_recipients, save_store, shutdown_requests_path,
-    task_output_path, tasks_path, team_lead_agent_id, teams_path, validate_ask_user_questions,
-    workflow_root, worktrees_path, write_claude_team_file, AgentInput, AgentStore,
-    AskUserQuestionInput, ClaudeTeamFile, ClaudeTeamMember, ConfigInput, EnterWorktreeInput,
-    ExitWorktreeInput, MessageStore, PendingShutdownRequest, PowerShellInput, SendMessageInput,
-    ShutdownRequestStore, StoredAgent, StoredMessage, StoredTask, StoredTeam, StoredWorktree,
-    TaskStore, TeamCreateInput, TeamStore, WorktreeStore,
+    load_store, messages_path, now_ms, register_team_member, remove_claude_team_artifacts,
+    resolve_recipients, save_store, shutdown_requests_path, tasks_path, team_lead_agent_id,
+    teams_path, workflow_root, worktrees_path, write_claude_team_file, AgentInput, AgentStore,
+    ClaudeTeamFile, ClaudeTeamMember, ConfigInput, EnterWorktreeInput, ExitWorktreeInput,
+    MessageStore, PendingShutdownRequest, SendMessageInput, ShutdownRequestStore, StoredAgent,
+    StoredMessage, StoredTask, StoredTeam, StoredWorktree, TaskStore, TeamCreateInput, TeamStore,
+    WorktreeStore,
 };
-use super::task_runtime::{terminal_task_status, wait_for_child_output};
+use super::task_runtime::terminal_task_status;
 use crate::config_settings::{
-    config_setting_path, config_setting_scope, get_config_value, persist_config_setting,
-    scope_label, set_config_value,
+    config_setting_path, config_setting_scope, get_config_value, normalize_config_key,
+    persist_config_setting, scope_label, set_config_value,
 };
 use crate::AppState;
 use anyhow::{anyhow, bail, Context, Result};
 use puffer_config::{ensure_workspace_dirs, ConfigPaths};
+use puffer_session_store::MessageActor;
 use serde_json::{json, Value};
 use std::fs;
-use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use uuid::Uuid;
 
 fn current_team_name(state: &AppState) -> Option<&str> {
@@ -161,11 +160,8 @@ pub(super) fn execute_send_message(
     }
 
     // --- Sender identity ---
-    let from = if let Some(ref team_name) = state.active_team_name {
-        team_lead_agent_id(team_name)
-    } else {
-        "user".to_string()
-    };
+    let from = state.workflow_sender_id();
+    let actor = Some(state.assistant_actor());
 
     let store_cwd = state.session.cwd.as_path();
     let recipients = resolve_recipients(store_cwd, state.active_team_name.as_deref(), &to)?;
@@ -182,13 +178,13 @@ pub(super) fn execute_send_message(
 
     match message_type.as_deref() {
         Some("shutdown_request") => {
-            return handle_shutdown_request(store_cwd, &from, &recipients, &parsed);
+            return handle_shutdown_request(store_cwd, &from, &recipients, &parsed, actor);
         }
         Some("shutdown_response") => {
-            return handle_shutdown_response(store_cwd, &from, &parsed);
+            return handle_shutdown_response(store_cwd, &from, &parsed, actor);
         }
         Some("plan_approval_response") => {
-            return handle_plan_approval_response(store_cwd, &from, &recipients, &parsed);
+            return handle_plan_approval_response(store_cwd, &from, &recipients, &parsed, actor);
         }
         _ => {}
     }
@@ -208,6 +204,7 @@ pub(super) fn execute_send_message(
             read: false,
             summary: parsed.summary.clone(),
             message: parsed.message.clone(),
+            actor: actor.clone(),
             created_at_ms: now_ms(),
         };
         // Try in-process delivery via teammate registry.
@@ -260,6 +257,7 @@ fn handle_shutdown_request(
     from: &str,
     recipients: &[String],
     parsed: &SendMessageInput,
+    actor: Option<MessageActor>,
 ) -> Result<String> {
     let request_id = format!("shutdown-{}", Uuid::new_v4().simple());
     let reason = parsed
@@ -297,6 +295,7 @@ fn handle_shutdown_request(
             read: false,
             summary: Some("shutdown request".to_string()),
             message: enriched.clone(),
+            actor: actor.clone(),
             created_at_ms: now_ms(),
         });
         if let Some(agent) = agents
@@ -321,6 +320,7 @@ fn handle_shutdown_response(
     store_cwd: &Path,
     from: &str,
     parsed: &SendMessageInput,
+    actor: Option<MessageActor>,
 ) -> Result<String> {
     let request_id = parsed
         .message
@@ -381,6 +381,7 @@ fn handle_shutdown_response(
             "shutdown rejected".to_string()
         }),
         message: response_msg,
+        actor,
         created_at_ms: now_ms(),
     });
     save_store(&messages_path(store_cwd), &messages)?;
@@ -398,6 +399,7 @@ fn handle_plan_approval_response(
     from: &str,
     recipients: &[String],
     parsed: &SendMessageInput,
+    actor: Option<MessageActor>,
 ) -> Result<String> {
     let request_id = parsed
         .message
@@ -437,6 +439,7 @@ fn handle_plan_approval_response(
                 format!("plan rejected: {}", feedback.as_deref().unwrap_or(""))
             }),
             message: response_msg.clone(),
+            actor: actor.clone(),
             created_at_ms: now_ms(),
         });
         if let Some(agent) = agents
@@ -466,9 +469,7 @@ pub(super) fn execute_team_create(
     let parsed: TeamCreateInput =
         serde_json::from_value(input).context("invalid TeamCreate input")?;
     let requested_team_name = parsed.team_name.trim();
-    if requested_team_name.is_empty() {
-        bail!("team_name is required for TeamCreate");
-    }
+    ensure_safe_identifier(requested_team_name, "team_name")?;
     let store_cwd = state.session.cwd.as_path();
     if let Some(existing_team_name) = current_team_name(state).map(str::to_string).or_else(|| {
         find_team_for_session(store_cwd, &state.session.id.to_string())
@@ -617,16 +618,17 @@ pub(super) fn execute_team_delete(
     }))?)
 }
 
-/// Persists one background Bash task into the shared workflow task store.
+/// Persists one background Bash task into the session-scoped workflow task store.
 pub(super) fn register_background_shell_task(
     cwd: &Path,
+    session_id: &Uuid,
     task_id: &str,
     subject: &str,
     command: &str,
     process_id: u32,
     output_file: &Path,
 ) -> Result<()> {
-    let mut store = load_store::<TaskStore>(&tasks_path(cwd))?;
+    let mut store = load_store::<TaskStore>(&tasks_path(cwd, session_id))?;
     let started_at_ms = now_ms();
     store.tasks.retain(|task| task.task_id != task_id);
     store.tasks.push(StoredTask {
@@ -644,21 +646,26 @@ pub(super) fn register_background_shell_task(
         command: Some(command.to_string()),
         process_id: Some(process_id),
         output_file: Some(output_file.display().to_string()),
+        received_at: None,
+        expires_at: None,
         started_at_ms: Some(started_at_ms),
+        created_at_ms: Some(started_at_ms),
         updated_at_ms: Some(started_at_ms),
         exit_code: None,
+        completed_via: None,
     });
-    save_store(&tasks_path(cwd), &store)
+    save_store(&tasks_path(cwd, session_id), &store)
 }
 
 /// Marks a background shell task as completed in the persistent store.
 /// Called from the reaper thread after `child.wait()` returns.
 pub(super) fn mark_shell_task_completed(
     cwd: &Path,
+    session_id: &Uuid,
     task_id: &str,
     exit_code: Option<i32>,
 ) -> Result<()> {
-    let mut store = load_store::<TaskStore>(&tasks_path(cwd))?;
+    let mut store = load_store::<TaskStore>(&tasks_path(cwd, session_id))?;
     if let Some(task) = store.tasks.iter_mut().find(|t| t.task_id == task_id) {
         if task.status == "running" {
             task.status = "completed".to_string();
@@ -670,7 +677,7 @@ pub(super) fn mark_shell_task_completed(
             }
         }
     }
-    save_store(&tasks_path(cwd), &store)?;
+    save_store(&tasks_path(cwd, session_id), &store)?;
     // Write a completion marker so the agent loop can detect newly finished tasks.
     let marker_dir = cwd
         .join(".puffer")
@@ -684,7 +691,7 @@ pub(super) fn mark_shell_task_completed(
 
 /// Drains completion markers for background shell tasks that finished since
 /// the last call.  Returns a human-readable description for each.
-pub(super) fn drain_completed_shell_tasks(cwd: &Path) -> Vec<String> {
+pub(super) fn drain_completed_shell_tasks(cwd: &Path, session_id: &Uuid) -> Vec<String> {
     let marker_dir = cwd
         .join(".puffer")
         .join("runtime")
@@ -695,7 +702,7 @@ pub(super) fn drain_completed_shell_tasks(cwd: &Path) -> Vec<String> {
         Err(_) => return Vec::new(),
     };
     let mut descriptions = Vec::new();
-    let store = load_store::<TaskStore>(&tasks_path(cwd)).ok();
+    let store = load_store::<TaskStore>(&tasks_path(cwd, session_id)).ok();
     for entry in entries.flatten() {
         let task_id = entry.file_name().to_string_lossy().to_string();
         // Remove marker so we don't report it again.
@@ -720,35 +727,6 @@ pub(super) fn drain_completed_shell_tasks(cwd: &Path) -> Vec<String> {
     descriptions
 }
 
-/// Executes the live `AskUserQuestion` workflow tool.
-pub(super) fn execute_ask_user_question(
-    state: &mut AppState,
-    _cwd: &Path,
-    input: Value,
-) -> Result<String> {
-    let parsed: AskUserQuestionInput =
-        serde_json::from_value(input).context("invalid AskUserQuestion input")?;
-    validate_ask_user_questions(&parsed.questions)?;
-    let pending_path = workflow_root(state.session.cwd.as_path())?.join("pending_questions.json");
-    let pending = parsed.answers.is_empty();
-    if pending {
-        fs::write(
-            &pending_path,
-            serde_json::to_string_pretty(&parsed.questions)?,
-        )?;
-    } else if pending_path.exists() {
-        let _ = fs::remove_file(&pending_path);
-    }
-    Ok(serde_json::to_string_pretty(&json!({
-        "questions": parsed.questions,
-        "answers": parsed.answers,
-        "annotations": parsed.annotations,
-        "metadata": parsed.metadata,
-        "pending": pending,
-        "pendingFile": pending_path.display().to_string()
-    }))?)
-}
-
 /// Executes the live `EnterWorktree` workflow tool.
 pub(super) fn execute_enter_worktree(
     state: &mut AppState,
@@ -767,8 +745,10 @@ pub(super) fn execute_enter_worktree(
     }
     let worktree_name = parsed
         .name
-        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| format!("worktree-{}", Uuid::new_v4().simple()));
+    ensure_safe_identifier(&worktree_name, "worktree name")?;
     if store
         .worktrees
         .iter()
@@ -906,6 +886,10 @@ pub(super) fn execute_config(state: &mut AppState, cwd: &Path, input: Value) -> 
     let storage_path = config_setting_path(&paths, &parsed.setting)?;
     if has_value {
         let value = parsed.value.unwrap_or(Value::Null);
+        if normalize_config_key(&parsed.setting) == Some("status_line_command") && !value.is_null()
+        {
+            bail!("Config tool cannot set executable status_line_command");
+        }
         set_config_value(state, &parsed.setting, value)?;
         let _ = persist_config_setting(&paths, state, &parsed.setting)?;
     }
@@ -924,91 +908,5 @@ pub(super) fn execute_config(state: &mut AppState, cwd: &Path, input: Value) -> 
         "newValue": if operation == "set" { current.clone() } else { Value::Null },
         "persisted": storage_path.is_some(),
         "path": path_value
-    }))?)
-}
-
-/// Executes the live `PowerShell` workflow tool.
-pub(super) fn execute_powershell(state: &mut AppState, cwd: &Path, input: Value) -> Result<String> {
-    let parsed: PowerShellInput =
-        serde_json::from_value(input).context("invalid PowerShell input")?;
-    let shell = detect_powershell_binary()?;
-    if parsed.run_in_background {
-        let mut tasks = load_store::<TaskStore>(&tasks_path(state.session.cwd.as_path()))?;
-        let task_id = next_task_id(&tasks.tasks);
-        let output_file = task_output_path(state.session.cwd.as_path(), &task_id)?;
-        let stdout = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&output_file)
-            .with_context(|| format!("failed to create {}", output_file.display()))?;
-        let stderr = stdout
-            .try_clone()
-            .with_context(|| format!("failed to clone {}", output_file.display()))?;
-        let child = Command::new(&shell)
-            .args(["-NoLogo", "-Command", &parsed.command])
-            .current_dir(cwd)
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .with_context(|| format!("failed to start {}", shell))?;
-        tasks.tasks.push(StoredTask {
-            task_id: task_id.clone(),
-            subject: parsed
-                .description
-                .clone()
-                .unwrap_or_else(|| "PowerShell".to_string()),
-            description: parsed.command.clone(),
-            active_form: "Running PowerShell command".to_string(),
-            status: "running".to_string(),
-            owner: None,
-            blocks: Vec::new(),
-            blocked_by: Vec::new(),
-            metadata: Default::default(),
-            output: None,
-            task_type: Some("powershell".to_string()),
-            command: Some(parsed.command.clone()),
-            process_id: Some(child.id()),
-            output_file: Some(output_file.display().to_string()),
-            started_at_ms: Some(now_ms()),
-            updated_at_ms: Some(now_ms()),
-            exit_code: None,
-        });
-        save_store(&tasks_path(state.session.cwd.as_path()), &tasks)?;
-        return Ok(serde_json::to_string_pretty(&json!({
-            "stdout": "",
-            "stderr": "",
-            "interrupted": false,
-            "backgroundTaskId": task_id,
-            "outputFile": output_file.display().to_string(),
-            "processId": child.id(),
-            "dangerouslyDisableSandbox": parsed.dangerously_disable_sandbox
-        }))?);
-    }
-
-    let timeout_ms = parsed.timeout.unwrap_or(120_000).clamp(1, 600_000);
-    let child = Command::new(&shell)
-        .args(["-NoLogo", "-Command", &parsed.command])
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to execute {}", shell))?;
-    let timed = wait_for_child_output(child, timeout_ms)
-        .with_context(|| format!("failed to execute {}", shell))?;
-    state.record_task(
-        parsed
-            .description
-            .clone()
-            .unwrap_or_else(|| "PowerShell".to_string()),
-        parsed.command.clone(),
-        !timed.timed_out,
-    );
-    Ok(serde_json::to_string_pretty(&json!({
-        "stdout": timed.stdout,
-        "stderr": timed.stderr,
-        "interrupted": timed.timed_out,
-        "dangerouslyDisableSandbox": parsed.dangerously_disable_sandbox,
-        "timeoutMs": timeout_ms
     }))?)
 }

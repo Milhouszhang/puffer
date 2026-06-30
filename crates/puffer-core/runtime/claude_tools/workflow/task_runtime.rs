@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::Child;
 use std::thread;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 const MAX_PROCESS_OUTPUT_CHARS: usize = 30_000;
 pub(super) const VERIFICATION_NUDGE: &str =
@@ -146,8 +147,13 @@ pub(super) fn read_task_output(task: &StoredTask) -> Option<String> {
 }
 
 /// Refreshes one stored task from disk-backed process and output state.
-pub(super) fn refresh_stored_task(store_cwd: &Path, task_id: &str) -> Result<Option<StoredTask>> {
-    let mut store = load_store::<TaskStore>(&tasks_path(store_cwd))?;
+pub(super) fn refresh_stored_task(
+    store_cwd: &Path,
+    session_id: &Uuid,
+    task_id: &str,
+) -> Result<Option<StoredTask>> {
+    let tp = tasks_path(store_cwd, session_id);
+    let mut store = load_store::<TaskStore>(&tp)?;
     let Some(task) = store.tasks.iter_mut().find(|task| task.task_id == task_id) else {
         return Ok(None);
     };
@@ -170,7 +176,7 @@ pub(super) fn refresh_stored_task(store_cwd: &Path, task_id: &str) -> Result<Opt
 
     let output = task.clone();
     if changed {
-        save_store(&tasks_path(store_cwd), &store)?;
+        save_store(&tp, &store)?;
     }
     Ok(Some(output))
 }
@@ -178,12 +184,13 @@ pub(super) fn refresh_stored_task(store_cwd: &Path, task_id: &str) -> Result<Opt
 /// Waits until one stored task reaches a terminal state or the timeout elapses.
 pub(super) fn wait_for_stored_task(
     store_cwd: &Path,
+    session_id: &Uuid,
     task_id: &str,
     timeout_ms: u64,
 ) -> Result<(Option<StoredTask>, bool)> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        let task = refresh_stored_task(store_cwd, task_id)?;
+        let task = refresh_stored_task(store_cwd, session_id, task_id)?;
         if task
             .as_ref()
             .is_some_and(|task| terminal_task_status(&task.status))
@@ -328,9 +335,13 @@ mod tests {
                 command: None,
                 process_id: None,
                 output_file: None,
+                received_at: None,
+                expires_at: None,
                 started_at_ms: None,
+                created_at_ms: None,
                 updated_at_ms: None,
                 exit_code: None,
+                completed_via: None,
             },
             StoredTask {
                 task_id: "2".to_string(),
@@ -347,9 +358,13 @@ mod tests {
                 command: None,
                 process_id: None,
                 output_file: None,
+                received_at: None,
+                expires_at: None,
                 started_at_ms: None,
+                created_at_ms: None,
                 updated_at_ms: None,
                 exit_code: None,
+                completed_via: None,
             },
             StoredTask {
                 task_id: "3".to_string(),
@@ -366,9 +381,13 @@ mod tests {
                 command: None,
                 process_id: None,
                 output_file: None,
+                received_at: None,
+                expires_at: None,
                 started_at_ms: None,
+                created_at_ms: None,
                 updated_at_ms: None,
                 exit_code: None,
+                completed_via: None,
             },
             StoredTask {
                 task_id: "4".to_string(),
@@ -385,9 +404,13 @@ mod tests {
                 command: None,
                 process_id: None,
                 output_file: None,
+                received_at: None,
+                expires_at: None,
                 started_at_ms: None,
+                created_at_ms: None,
                 updated_at_ms: None,
                 exit_code: None,
+                completed_via: None,
             },
         ];
         assert!(should_emit_verification_nudge_for_tasks(&tasks));

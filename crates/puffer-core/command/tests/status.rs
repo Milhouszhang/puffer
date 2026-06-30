@@ -30,6 +30,7 @@ fn status_command_reports_richer_session_and_resource_status() {
         headers: Default::default(),
         query_params: Default::default(),
         discovery: None,
+        media: None,
         models: vec![ModelDescriptor {
             provider: "openai".to_string(),
             id: "gpt-5".to_string(),
@@ -38,7 +39,11 @@ fn status_command_reports_richer_session_and_resource_status() {
             context_window: 200_000,
             max_output_tokens: 8_192,
             supports_reasoning: true,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
         }],
+        chat_completions_path: None,
     });
     let mut auth_store = AuthStore::default();
     auth_store.set_api_key("openai".to_string(), "sk-test".to_string());

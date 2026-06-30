@@ -1,6 +1,6 @@
 use crate::AppState;
 use anyhow::Result;
-use puffer_resources::{render_prompt_by_id, LoadedResources};
+use puffer_resources::{render_prompt_for, LoadedResources, SkillSpec};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -25,13 +25,12 @@ IMPORTANT: You must NEVER generate or guess URLs for the user unless you are con
  - In general, do not propose changes to code you haven't read. If a user asks about or wants you to modify a file, read it first. Understand existing code before suggesting modifications.
  - Do not create files unless they're absolutely necessary for achieving your goal. Generally prefer editing an existing file to creating a new one, as this prevents file bloat and builds on existing work more effectively.
  - Avoid giving time estimates or predictions for how long tasks will take, whether for your own work or for users planning projects. Focus on what needs to be done, not how long it might take.
- - If an approach fails, diagnose why before switching tactics - read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either. Escalate to the user with AskUserQuestion only when you're genuinely stuck after investigation, not as a first response to friction.
+ - If an approach fails, diagnose why before switching tactics—read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either. Escalate to the user with AskUserQuestion only when you're genuinely stuck after investigation, not as a first response to friction.
  - Be careful not to introduce security vulnerabilities such as command injection, XSS, SQL injection, and other OWASP top 10 vulnerabilities. If you notice that you wrote insecure code, immediately fix it. Prioritize writing safe, secure, and correct code.
  - Don't add features, refactor code, or make "improvements" beyond what was asked. A bug fix doesn't need surrounding code cleaned up. A simple feature doesn't need extra configurability. Don't add docstrings, comments, or type annotations to code you didn't change. Only add comments where the logic isn't self-evident.
  - Don't add error handling, fallbacks, or validation for scenarios that can't happen. Trust internal code and framework guarantees. Only validate at system boundaries (user input, external APIs). Don't use feature flags or backwards-compatibility shims when you can just change the code.
- - Don't create helpers, utilities, or abstractions for one-time operations. Don't design for hypothetical future requirements. The right amount of complexity is what the task actually requires-no speculative abstractions, but no half-finished implementations either. Three similar lines of code is better than a premature abstraction.
+ - Don't create helpers, utilities, or abstractions for one-time operations. Don't design for hypothetical future requirements. The right amount of complexity is what the task actually requires—no speculative abstractions, but no half-finished implementations either. Three similar lines of code is better than a premature abstraction.
  - Avoid backwards-compatibility hacks like renaming unused _vars, re-exporting types, adding // removed comments for removed code, etc. If you are certain that something is unused, you can delete it completely.
-
 # Executing actions with care
 Carefully consider the reversibility and blast radius of actions. Generally you can freely take local, reversible actions like editing files or running tests. But for actions that are hard to reverse, affect shared systems beyond your local environment, or could otherwise be risky or destructive, check with the user before proceeding. The cost of pausing to confirm is low, while the cost of an unwanted action (lost work, unintended messages sent, deleted branches) can be very high. For actions like these, consider the context, the action, and user instructions, and by default transparently communicate the action and ask for confirmation before proceeding. This default can be changed by user instructions - if explicitly asked to operate more autonomously, then you may proceed without confirmation, but still attend to the risks and consequences when taking actions. A user approving an action (like a git push) once does NOT mean that they approve it in all contexts, so unless actions are authorized in advance in durable instructions like CLAUDE.md files, always confirm first. Authorization stands for the scope specified, not beyond. Match the scope of your actions to what was actually requested.
 
@@ -70,6 +69,7 @@ $SESSION_GUIDANCE
 
 # Important context behavior
 When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later to free context space.
+If the user explicitly says to ignore or not use memory, proceed as if any loaded memory files were empty. Do not apply remembered facts, cite memory content, compare against memory, or mention memory unless the user later re-enables it.
 
 $ENVIRONMENT"#;
 
@@ -94,21 +94,48 @@ pub(super) fn render_runtime_system_prompt(
             build_environment_section(state, model_id)?,
         ),
     ]);
-    let rendered = render_prompt_by_id(resources, SYSTEM_PROMPT_ID, &variables)
-        .unwrap_or_else(|| render_fallback_prompt(&variables));
+    let provider_id = state.current_provider.as_deref();
+    let rendered = render_prompt_for(
+        resources,
+        SYSTEM_PROMPT_ID,
+        provider_id,
+        Some(model_id),
+        &variables,
+    )
+    .unwrap_or_else(|| render_fallback_prompt(&variables));
     let mut prompt = normalize_prompt_whitespace(&rendered);
-    // Inject CLAUDE.md / memory contents if present (matches CC's memory section).
-    if let Some(mut memory) = load_memory_prompt(&state.cwd) {
-        // CC limits memory to 40K characters to avoid bloating the system prompt.
-        const MAX_MEMORY_CHARS: usize = 40_000;
-        if memory.chars().count() > MAX_MEMORY_CHARS {
-            memory = memory.chars().take(MAX_MEMORY_CHARS).collect();
-            memory.push_str("\n\n[CLAUDE.md truncated — 40K char limit reached]");
-        }
-        prompt.push_str("\n\n# Project Context (CLAUDE.md)\n");
+    // soul.md / user.md are intentionally NOT appended to the system prompt.
+    // The Anthropic system prompt carries `cache_control: ephemeral`, so it is
+    // the cached prefix; user.md is agent-mutable, and even soul edits would
+    // bust the cache. They are injected per-turn in `build_system_reminder`
+    // (the `<system-reminder>` block after the cache breakpoint), which is
+    // rebuilt each turn and never rewrites prior messages. See
+    // openai::conversation::build_system_reminder.
+    if let Some(memory) = load_memory_prompt(&state.cwd, provider_id) {
+        prompt.push_str("\n\n");
         prompt.push_str(&memory);
     }
     Ok(prompt)
+}
+
+const MEMORY_INSTRUCTION_PROMPT: &str = "Codebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.";
+
+const SOUL_INSTRUCTION_PROMPT: &str = "The following describes your identity: who you are, your values, your voice, and your boundaries. Embody it consistently across the session. A direct user instruction takes precedence - this is context, not a hard rule.";
+
+const USER_INSTRUCTION_PROMPT: &str = "The following are durable facts and preferences about the user you are helping (their environment, tools, and personal preferences). Use them to tailor your work. They are user-provided context, not a hard rule.";
+
+enum MemorySource {
+    Project,
+    UserGlobal,
+}
+
+impl MemorySource {
+    fn description(&self) -> &'static str {
+        match self {
+            MemorySource::Project => "(project instructions, checked into the codebase)",
+            MemorySource::UserGlobal => "(user's private global instructions for all projects)",
+        }
+    }
 }
 
 fn render_fallback_prompt(variables: &BTreeMap<String, String>) -> String {
@@ -146,6 +173,9 @@ fn build_using_tools_section(enabled_tools: &BTreeSet<String>) -> String {
     let bash_tool =
         preferred_tool_name(enabled_tools, &["Bash", "bash", "PowerShell"]).unwrap_or("Bash");
     let task_tool = preferred_tool_name(enabled_tools, &["TaskCreate", "TodoWrite"]);
+    let connector_act = preferred_tool_name(enabled_tools, &["ConnectorAct"]);
+    let connector_action_draft = preferred_tool_name(enabled_tools, &["ConnectorActionDraft"]);
+    let connector_list = preferred_tool_name(enabled_tools, &["ConnectorList", "ConnectionList"]);
 
     let mut provided_tool_subitems = Vec::new();
     if let Some(read_tool) = read_tool {
@@ -189,6 +219,17 @@ fn build_using_tools_section(enabled_tools: &BTreeSet<String>) -> String {
             "Do NOT use the {task_tool} tool when the task is trivial, single-step, purely conversational, or can be completed in fewer than 3 steps. In those cases, just do the work directly without creating a task."
         ));
     }
+    if let (Some(connector_act), Some(draft), Some(list)) =
+        (connector_act, connector_action_draft, connector_list)
+    {
+        items.push(format!(
+            "When the user's request EXPLICITLY names an external messaging, chat, or email app or account (e.g. \"send a WeChat message in the xx group\", \"reply on Telegram\", \"post in Slack\", \"email ...\"), FIRST call {list} to find the matching connector connection. For external message sends, replies, forwards, posts, or emails, create a human-reviewable draft with {draft}; do not use {connector_act} to send directly. Use {connector_act} only for non-send connector actions. Do NOT drive a local desktop app, AppleScript/osascript, or shell automation for this; use the connector. Only fall back to other means if no matching connector connection exists. If the request does NOT name such an app, do NOT route it through a connector or go looking for one."
+        ));
+    } else if let (Some(connector_act), Some(list)) = (connector_act, connector_list) {
+        items.push(format!(
+            "When the user's request EXPLICITLY names an external messaging, chat, or email app or account (e.g. \"send a WeChat message in the xx group\", \"reply on Telegram\", \"post in Slack\", \"email ...\"), FIRST call {list} to find the matching connector connection, then perform the action with {connector_act}. Do NOT drive a local desktop app, AppleScript/osascript, or shell automation for this — use the connector. Only fall back to other means if no matching connector connection exists. If the request does NOT name such an app, do NOT route it through a connector or go looking for one."
+        ));
+    }
     items.push("You can call multiple tools in a single response. If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel. Maximize use of parallel tool calls where possible to increase efficiency. However, if some tool calls depend on previous calls to inform dependent values, do NOT call these tools in parallel and instead call them sequentially. For instance, if one operation must complete before another starts, run these operations sequentially instead.".to_string());
 
     let mut lines = vec!["# Using your tools".to_string()];
@@ -214,6 +255,23 @@ fn build_session_guidance_section(
     }
     if preferred_tool_name(enabled_tools, &["Skill"]).is_some() && !resources.skills.is_empty() {
         items.push("User-invocable skills appear as slash commands like `/reviewer`; `/skill:<name>` remains a compatibility alias. When executed, the skill expands to a full prompt. Use the Skill tool only for skills listed in its user-invocable skills section - do not guess or use built-in CLI commands.".to_string());
+        let mut model_invocable_skills = resources
+            .skills
+            .iter()
+            .filter(|skill| is_model_invocable_skill(&skill.value))
+            .map(|skill| model_invocable_skill_summary(&skill.value))
+            .collect::<Vec<_>>();
+        model_invocable_skills.sort();
+        if !model_invocable_skills.is_empty() {
+            let mut skill_list = String::from(
+                "Available model-invocable skills. Invoke these with the Skill tool by exact skill name:",
+            );
+            for skill in model_invocable_skills {
+                skill_list.push_str("\n  - ");
+                skill_list.push_str(&skill);
+            }
+            items.push(skill_list);
+        }
     }
     if items.is_empty() {
         return String::new();
@@ -222,6 +280,38 @@ fn build_session_guidance_section(
     let mut lines = vec!["# Session-specific guidance".to_string()];
     lines.extend(prepend_bullets(items));
     lines.join("\n")
+}
+
+fn model_invocable_skill_summary(skill: &SkillSpec) -> String {
+    let mut summary = format!("{}: {}", skill.name, skill.description.trim());
+    if let Some(verification) = skill.verification.as_ref() {
+        summary.push_str(&format!(" [verified {}]", verification.system));
+    }
+    summary
+}
+
+fn is_model_invocable_skill(skill: &SkillSpec) -> bool {
+    if skill.disable_model_invocation {
+        return false;
+    }
+    if is_lambda_verified_skill(skill) {
+        return lambda_skill_is_gate_ready_for_model(skill);
+    }
+    true
+}
+
+fn is_lambda_verified_skill(skill: &SkillSpec) -> bool {
+    skill
+        .verification
+        .as_ref()
+        .is_some_and(|verification| verification.system == "lambda-skill")
+}
+
+fn lambda_skill_is_gate_ready_for_model(skill: &SkillSpec) -> bool {
+    super::lambda_skill_activation::gate_for_verified_skill_activation(skill)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn build_environment_section(state: &AppState, model_id: &str) -> Result<String> {
@@ -264,25 +354,6 @@ fn build_environment_section(state: &AppState, model_id: &str) -> Result<String>
     ];
     lines.extend(prepend_bullets(items));
 
-    // Scratchpad directory: session-isolated temp space for intermediate files.
-    if let Some(scratchpad) = scratchpad_dir(state) {
-        lines.push(String::new());
-        lines.push("# Scratchpad Directory".to_string());
-        lines.push(format!(
-            "IMPORTANT: Always use this scratchpad directory for temporary files instead of `/tmp` or other system temp directories:\n\
-             `{}`\n\n\
-             Use this directory for ALL temporary file needs:\n\
-             - Storing intermediate results or data during multi-step tasks\n\
-             - Writing temporary scripts or configuration files\n\
-             - Saving outputs that don't belong in the user's project\n\
-             - Creating working files during analysis or processing\n\
-             - Any file that would otherwise go to `/tmp`\n\n\
-             Only use `/tmp` if the user explicitly requests it.\n\
-             The scratchpad directory is session-specific, isolated from the user's project, and can be used freely without permission prompts.",
-            scratchpad.display()
-        ));
-    }
-
     Ok(lines.join("\n"))
 }
 
@@ -311,47 +382,101 @@ fn prepend_bullets(items: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// Loads CLAUDE.md from the working directory and user home, concatenating both if present.
-fn load_memory_prompt(cwd: &Path) -> Option<String> {
-    let mut parts = Vec::new();
-    // Project-level CLAUDE.md
-    let project_path = cwd.join("CLAUDE.md");
-    if let Ok(content) = std::fs::read_to_string(&project_path) {
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            parts.push(trimmed.to_string());
+/// Loads project-doc / memory files for the system prompt. The OpenAI path
+/// favors AGENTS.md (Codex's convention) and falls back to CLAUDE.md only if
+/// no AGENTS.md is found anywhere; all other providers use CLAUDE.md.
+/// Output is formatted to match Claude Code's user-context memory injection
+/// (MEMORY_INSTRUCTION_PROMPT + per-file "Contents of <path> (<description>):"
+/// blocks).
+fn load_memory_prompt(cwd: &Path, provider_id: Option<&str>) -> Option<String> {
+    if provider_id == Some("openai") {
+        if let Some(prompt) = load_memory_prompt_for_filename(cwd, "AGENTS.md") {
+            return Some(prompt);
         }
     }
-    // User-level CLAUDE.md (in ~/.claude/ or ~/.puffer/)
+    load_memory_prompt_for_filename(cwd, "CLAUDE.md")
+}
+
+/// Reads a context filename from the project dir plus the user-global dirs
+/// (~/.claude, ~/.puffer), returning one "Contents of <path> (<description>):"
+/// block per non-empty file found, nearest (project) first.
+fn load_context_blocks(cwd: &Path, filename: &str) -> Vec<String> {
+    let mut sources: Vec<(PathBuf, MemorySource)> = Vec::new();
+    sources.push((cwd.join(filename), MemorySource::Project));
     if let Some(home) = env::var_os("HOME") {
         for dir in &[".claude", ".puffer"] {
-            let user_path = Path::new(&home).join(dir).join("CLAUDE.md");
-            if let Ok(content) = std::fs::read_to_string(&user_path) {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    parts.push(trimmed.to_string());
-                }
-            }
+            sources.push((
+                Path::new(&home).join(dir).join(filename),
+                MemorySource::UserGlobal,
+            ));
         }
     }
-    if parts.is_empty() {
+
+    let mut blocks = Vec::new();
+    for (path, source) in &sources {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        blocks.push(format!(
+            "Contents of {} {}:\n\n{}",
+            path.display(),
+            source.description(),
+            trimmed
+        ));
+    }
+    blocks
+}
+
+fn load_memory_prompt_for_filename(cwd: &Path, filename: &str) -> Option<String> {
+    let blocks = load_context_blocks(cwd, filename);
+    if blocks.is_empty() {
         None
     } else {
-        Some(parts.join("\n\n"))
+        Some(format!(
+            "{}\n\n{}",
+            MEMORY_INSTRUCTION_PROMPT,
+            blocks.join("\n\n")
+        ))
     }
 }
 
-/// Returns the session-specific scratchpad directory, creating it if needed.
-/// Returns the session-specific scratchpad directory under $HOME/.puffer/
-/// (not in the project directory, to avoid polluting workspace listings).
-fn scratchpad_dir(state: &AppState) -> Option<PathBuf> {
-    let home = env::var_os("HOME")?;
-    let dir = Path::new(&home)
-        .join(".puffer")
-        .join("scratchpad")
-        .join(state.session.id.to_string());
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir)
+/// Loads the agent identity file (soul.md) from the project + user-global dirs.
+/// Universal across providers: identity is not a provider-specific convention
+/// the way AGENTS.md (Codex) vs CLAUDE.md (Anthropic) operating docs are.
+/// Injected per-turn via `build_system_reminder`, not the cached system prompt.
+pub(crate) fn load_soul_prompt(cwd: &Path) -> Option<String> {
+    let blocks = load_context_blocks(cwd, "soul.md");
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{}\n\n{}",
+            SOUL_INSTRUCTION_PROMPT,
+            blocks.join("\n\n")
+        ))
+    }
+}
+
+/// Loads the agent-writable user-facts file (`user.md`) from the project +
+/// user-global dirs. The same file the `Remember` tool and the daemon's
+/// `user_memory_*` RPC write to (see `crate::user_memory`). Universal across
+/// providers. Injected per-turn via `build_system_reminder` (not the cached
+/// system prompt) because it is agent-mutable.
+pub(crate) fn load_user_prompt(cwd: &Path) -> Option<String> {
+    let blocks = load_context_blocks(cwd, "user.md");
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{}\n\n{}",
+            USER_INSTRUCTION_PROMPT,
+            blocks.join("\n\n")
+        ))
+    }
 }
 
 fn is_git_repository(cwd: &Path) -> bool {
@@ -401,10 +526,61 @@ fn os_version() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render_runtime_system_prompt;
+    use super::{
+        load_memory_prompt, load_soul_prompt, load_user_prompt, render_runtime_system_prompt,
+    };
     use crate::runtime::tests::state;
-    use puffer_resources::LoadedResources;
+    use puffer_resources::{
+        LoadedItem, LoadedResources, PromptTemplate, SkillSpec, SkillVerificationSpec, SourceInfo,
+        SourceKind,
+    };
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    fn prompt_template(template: &str, for_model: Option<&str>) -> LoadedItem<PromptTemplate> {
+        LoadedItem {
+            value: PromptTemplate {
+                id: "system-base".to_string(),
+                description: String::new(),
+                template: template.to_string(),
+                variables: Vec::new(),
+                allowed_tools: Vec::new(),
+                provider_override: None,
+                model_override: None,
+                mode: None,
+                chained_from: Vec::new(),
+                for_provider: None,
+                for_model: for_model.map(str::to_string),
+            },
+            source_info: SourceInfo {
+                path: PathBuf::from("system-base.yaml"),
+                kind: SourceKind::Builtin,
+            },
+        }
+    }
+
+    #[test]
+    fn runtime_system_prompt_uses_model_specific_override_when_present() {
+        let state = state();
+        let resources = LoadedResources {
+            prompts: vec![
+                prompt_template("BASE SYSTEM BODY for $ENVIRONMENT", None),
+                prompt_template("GPT5 SYSTEM BODY for $ENVIRONMENT", Some("gpt-5")),
+            ],
+            ..LoadedResources::default()
+        };
+
+        let prompt =
+            render_runtime_system_prompt(&state, &resources, "gpt-5", &BTreeSet::new()).unwrap();
+        assert!(prompt.contains("GPT5 SYSTEM BODY"));
+        assert!(!prompt.contains("BASE SYSTEM BODY"));
+
+        let fallback =
+            render_runtime_system_prompt(&state, &resources, "claude-opus-4-6", &BTreeSet::new())
+                .unwrap();
+        assert!(fallback.contains("BASE SYSTEM BODY"));
+        assert!(!fallback.contains("GPT5 SYSTEM BODY"));
+    }
 
     #[test]
     fn runtime_system_prompt_mentions_tools_and_environment() {
@@ -432,5 +608,323 @@ mod tests {
         assert!(prompt.contains("AskUserQuestion"));
         assert!(prompt.contains("# Environment"));
         assert!(prompt.contains("Primary working directory:"));
+        assert!(prompt.contains("ignore or not use memory"));
+    }
+
+    #[test]
+    fn runtime_system_prompt_lists_model_invocable_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_path = temp.path().join("host.json");
+        let broken_host_path = temp.path().join("broken-host.json");
+        std::fs::write(&host_path, r#"{"effects":[],"domains":[],"tools":[]}"#).unwrap();
+        std::fs::write(&broken_host_path, "not-json").unwrap();
+        let state = state();
+        let enabled_tools = BTreeSet::from(["Skill".to_string()]);
+        let resources = LoadedResources {
+            skills: vec![
+                LoadedItem {
+                    value: SkillSpec {
+                        name: "agent-browser".to_string(),
+                        description: "Use AgentEnv platform browsers".to_string(),
+                        allowed_tools: vec!["ToolSearch".to_string()],
+                        disable_model_invocation: false,
+                        verification: Some(SkillVerificationSpec {
+                            system: "lambda-skill".to_string(),
+                            source_path: Some(
+                                ".puffer/lambda/agent-browser/skill.lskill".to_string(),
+                            ),
+                            generated_path: Some(
+                                ".puffer/lambda/agent-browser/out/GENERATED.SKILL.md".to_string(),
+                            ),
+                            host_catalogue_path: Some(host_path.display().to_string()),
+                            compiler_path: None,
+                            host_tool_bindings: Default::default(),
+                            require_approval: false,
+                            tools: None,
+                            actions: None,
+                        }),
+                        ..SkillSpec::default()
+                    },
+                    source_info: SourceInfo {
+                        path: PathBuf::from(".puffer/resources/skills/agent-browser/SKILL.md"),
+                        kind: SourceKind::Workspace,
+                    },
+                },
+                LoadedItem {
+                    value: SkillSpec {
+                        name: "prompt-only-verified".to_string(),
+                        description: "Verified but not gate ready".to_string(),
+                        allowed_tools: vec!["ToolSearch".to_string()],
+                        disable_model_invocation: false,
+                        verification: Some(SkillVerificationSpec {
+                            system: "lambda-skill".to_string(),
+                            source_path: Some(
+                                ".puffer/lambda/prompt-only/skill.lskill".to_string(),
+                            ),
+                            generated_path: Some(
+                                ".puffer/lambda/prompt-only/out/GENERATED.SKILL.md".to_string(),
+                            ),
+                            host_catalogue_path: None,
+                            compiler_path: None,
+                            host_tool_bindings: Default::default(),
+                            require_approval: false,
+                            tools: None,
+                            actions: None,
+                        }),
+                        ..SkillSpec::default()
+                    },
+                    source_info: SourceInfo {
+                        path: PathBuf::from(".puffer/resources/skills/prompt-only/SKILL.md"),
+                        kind: SourceKind::Workspace,
+                    },
+                },
+                LoadedItem {
+                    value: SkillSpec {
+                        name: "broken-host-verified".to_string(),
+                        description: "Verified but invalid host catalogue".to_string(),
+                        allowed_tools: vec!["ToolSearch".to_string()],
+                        disable_model_invocation: false,
+                        verification: Some(SkillVerificationSpec {
+                            system: "lambda-skill".to_string(),
+                            source_path: Some(
+                                ".puffer/lambda/broken-host/skill.lskill".to_string(),
+                            ),
+                            generated_path: Some(
+                                ".puffer/lambda/broken-host/out/GENERATED.SKILL.md".to_string(),
+                            ),
+                            host_catalogue_path: Some(broken_host_path.display().to_string()),
+                            compiler_path: None,
+                            host_tool_bindings: Default::default(),
+                            require_approval: false,
+                            tools: None,
+                            actions: None,
+                        }),
+                        ..SkillSpec::default()
+                    },
+                    source_info: SourceInfo {
+                        path: PathBuf::from(".puffer/resources/skills/broken-host/SKILL.md"),
+                        kind: SourceKind::Workspace,
+                    },
+                },
+                LoadedItem {
+                    value: SkillSpec {
+                        name: "reviewer".to_string(),
+                        description: "Review source changes".to_string(),
+                        disable_model_invocation: false,
+                        ..SkillSpec::default()
+                    },
+                    source_info: SourceInfo {
+                        path: PathBuf::from(".puffer/resources/skills/reviewer/SKILL.md"),
+                        kind: SourceKind::Workspace,
+                    },
+                },
+                LoadedItem {
+                    value: SkillSpec {
+                        name: "hidden".to_string(),
+                        description: "Do not show this one".to_string(),
+                        disable_model_invocation: true,
+                        ..SkillSpec::default()
+                    },
+                    source_info: SourceInfo {
+                        path: PathBuf::from(".puffer/resources/skills/hidden/SKILL.md"),
+                        kind: SourceKind::Workspace,
+                    },
+                },
+            ],
+            ..LoadedResources::default()
+        };
+
+        let prompt =
+            render_runtime_system_prompt(&state, &resources, "gpt-5", &enabled_tools).unwrap();
+
+        assert!(prompt.contains("Available model-invocable skills"));
+        assert!(prompt
+            .contains("- agent-browser: Use AgentEnv platform browsers [verified lambda-skill]"));
+        assert!(prompt.contains("- reviewer: Review source changes"));
+        assert!(!prompt.contains("prompt-only-verified"));
+        assert!(!prompt.contains("broken-host-verified"));
+        assert!(!prompt.contains("Do not show this one"));
+    }
+
+    #[test]
+    fn runtime_system_prompt_lists_media_generation_skills_when_skill_tool_is_enabled() {
+        let state = state();
+        let enabled_tools = BTreeSet::from(["Skill".to_string()]);
+        let resources = LoadedResources {
+            skills: vec![
+                LoadedItem {
+                    value: SkillSpec {
+                        name: "image-generation".to_string(),
+                        description: "Use when the user asks to create images".to_string(),
+                        disable_model_invocation: false,
+                        ..SkillSpec::default()
+                    },
+                    source_info: SourceInfo {
+                        path: PathBuf::from("resources/skills/image-generation/SKILL.md"),
+                        kind: SourceKind::Builtin,
+                    },
+                },
+                LoadedItem {
+                    value: SkillSpec {
+                        name: "video-generation".to_string(),
+                        description: "Use when the user asks to create text-to-video clips"
+                            .to_string(),
+                        disable_model_invocation: false,
+                        ..SkillSpec::default()
+                    },
+                    source_info: SourceInfo {
+                        path: PathBuf::from("resources/skills/video-generation/SKILL.md"),
+                        kind: SourceKind::Builtin,
+                    },
+                },
+            ],
+            ..LoadedResources::default()
+        };
+
+        let prompt =
+            render_runtime_system_prompt(&state, &resources, "gpt-5", &enabled_tools).unwrap();
+
+        assert!(prompt.contains("Available model-invocable skills"));
+        assert!(prompt.contains("- image-generation: Use when the user asks to create images"));
+        assert!(prompt
+            .contains("- video-generation: Use when the user asks to create text-to-video clips"));
+    }
+
+    #[test]
+    fn runtime_system_prompt_hides_compiler_path_only_lambda_skill() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("skill.lskill");
+        let compiler_path = temp.path().join("lskillc");
+        std::fs::write(&source_path, "host {}\n").unwrap();
+        std::fs::write(&compiler_path, "unused").unwrap();
+        let resources = LoadedResources {
+            skills: vec![LoadedItem {
+                value: SkillSpec {
+                    name: "compiler-path-only".to_string(),
+                    description: "Compiler path only verified skill".to_string(),
+                    allowed_tools: vec!["ToolSearch".to_string()],
+                    disable_model_invocation: false,
+                    verification: Some(SkillVerificationSpec {
+                        system: "lambda-skill".to_string(),
+                        source_path: Some(source_path.display().to_string()),
+                        generated_path: Some(
+                            temp.path()
+                                .join("out/GENERATED.SKILL.md")
+                                .display()
+                                .to_string(),
+                        ),
+                        host_catalogue_path: None,
+                        compiler_path: Some(compiler_path.display().to_string()),
+                        host_tool_bindings: Default::default(),
+                        require_approval: false,
+                        tools: None,
+                        actions: None,
+                    }),
+                    ..SkillSpec::default()
+                },
+                source_info: SourceInfo {
+                    path: source_path,
+                    kind: SourceKind::Workspace,
+                },
+            }],
+            ..LoadedResources::default()
+        };
+        let state = state();
+        let enabled_tools = BTreeSet::from(["Skill".to_string()]);
+
+        let prompt =
+            render_runtime_system_prompt(&state, &resources, "gpt-5", &enabled_tools).unwrap();
+
+        assert!(!prompt.contains("compiler-path-only"));
+    }
+
+    #[test]
+    fn load_memory_prompt_prefers_agents_md_for_openai_with_claude_md_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "agent rules here").unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "claude rules here").unwrap();
+
+        // OpenAI: AGENTS.md wins; CLAUDE.md is not loaded.
+        let openai = load_memory_prompt(tmp.path(), Some("openai")).unwrap();
+        assert!(openai.contains("AGENTS.md"));
+        assert!(openai.contains("agent rules here"));
+        assert!(!openai.contains("claude rules here"));
+
+        // Non-OpenAI providers ignore AGENTS.md.
+        let anthropic = load_memory_prompt(tmp.path(), Some("anthropic")).unwrap();
+        assert!(anthropic.contains("CLAUDE.md"));
+        assert!(anthropic.contains("claude rules here"));
+        assert!(!anthropic.contains("agent rules here"));
+
+        // OpenAI with no AGENTS.md falls back to CLAUDE.md.
+        std::fs::remove_file(tmp.path().join("AGENTS.md")).unwrap();
+        let fallback = load_memory_prompt(tmp.path(), Some("openai")).unwrap();
+        assert!(fallback.contains("CLAUDE.md"));
+        assert!(fallback.contains("claude rules here"));
+
+        // Neither file: nothing injected (assuming no global files contain these markers).
+        std::fs::remove_file(tmp.path().join("CLAUDE.md")).unwrap();
+        let none = load_memory_prompt(tmp.path(), Some("openai"));
+        if let Some(text) = &none {
+            assert!(!text.contains(tmp.path().to_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn load_soul_prompt_loads_identity_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Absent: nothing.
+        assert!(load_soul_prompt(tmp.path()).is_none());
+        // Present: wrapped in the identity instruction with a Contents block.
+        std::fs::write(tmp.path().join("soul.md"), "I am Puffer.").unwrap();
+        let soul = load_soul_prompt(tmp.path()).unwrap();
+        assert!(
+            soul.contains("your identity"),
+            "missing identity instruction"
+        );
+        assert!(soul.contains("soul.md"));
+        assert!(soul.contains("I am Puffer."));
+    }
+
+    #[test]
+    fn load_user_prompt_loads_user_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(load_user_prompt(tmp.path()).is_none());
+        std::fs::write(tmp.path().join("user.md"), "## home-address\n\n123 Main St").unwrap();
+        let user = load_user_prompt(tmp.path()).unwrap();
+        assert!(user.contains("facts and preferences about the user"));
+        assert!(user.contains("user.md"));
+        assert!(user.contains("123 Main St"));
+    }
+
+    #[test]
+    fn render_system_prompt_keeps_memory_but_excludes_soul_and_user() {
+        // soul.md / user.md must NOT be in the (cache_control'd) system prompt —
+        // they ride in the per-turn build_system_reminder instead. Project
+        // memory (AGENTS.md/CLAUDE.md) stays in the system prompt as before.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("soul.md"), "SOUL_IDENTITY_MARKER").unwrap();
+        std::fs::write(tmp.path().join("user.md"), "## x\n\nUSER_FACTS_MARKER").unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "MEMORY_RULES_MARKER").unwrap();
+        let mut state = state();
+        state.cwd = tmp.path().to_path_buf();
+        state.current_provider = Some("openai".to_string());
+        let resources = LoadedResources::default();
+        let enabled_tools = BTreeSet::new();
+
+        let prompt =
+            render_runtime_system_prompt(&state, &resources, "gpt-5", &enabled_tools).unwrap();
+        assert!(
+            prompt.contains("MEMORY_RULES_MARKER"),
+            "project memory should stay in the system prompt"
+        );
+        assert!(
+            !prompt.contains("SOUL_IDENTITY_MARKER"),
+            "soul.md must NOT be in the cached system prompt"
+        );
+        assert!(
+            !prompt.contains("USER_FACTS_MARKER"),
+            "user.md must NOT be in the cached system prompt"
+        );
     }
 }

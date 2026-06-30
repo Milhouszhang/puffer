@@ -140,6 +140,8 @@ fn branch_clears_active_remote_session_connection() {
             state.session.id,
             TranscriptEvent::UserMessage {
                 text: "Inspect the remote environment".to_string(),
+                attachments: Vec::new(),
+                actor: None,
             },
         )
         .unwrap();
@@ -186,6 +188,8 @@ fn rewind_command_can_target_a_specific_user_turn() {
             session.id,
             TranscriptEvent::UserMessage {
                 text: "first".to_string(),
+                attachments: Vec::new(),
+                actor: None,
             },
         )
         .unwrap();
@@ -194,6 +198,7 @@ fn rewind_command_can_target_a_specific_user_turn() {
             session.id,
             TranscriptEvent::AssistantMessage {
                 text: "a1".to_string(),
+                actor: None,
             },
         )
         .unwrap();
@@ -202,6 +207,8 @@ fn rewind_command_can_target_a_specific_user_turn() {
             session.id,
             TranscriptEvent::UserMessage {
                 text: "second".to_string(),
+                attachments: Vec::new(),
+                actor: None,
             },
         )
         .unwrap();
@@ -210,6 +217,7 @@ fn rewind_command_can_target_a_specific_user_turn() {
             session.id,
             TranscriptEvent::AssistantMessage {
                 text: "a2".to_string(),
+                actor: None,
             },
         )
         .unwrap();

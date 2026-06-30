@@ -1,19 +1,48 @@
 [workspace]
 members = [
+    "benchmark/genskill/ladybird",
     "crates/puffer-cli",
     "crates/puffer-config",
+    "crates/puffer-connector-core",
+    "crates/puffer-connector-discord",
+    "crates/puffer-connector-email",
+    "crates/puffer-connector-matrix",
+    "crates/puffer-connector-slack",
+    "crates/puffer-connector-telegram",
     "crates/puffer-core",
+    "crates/puffer-logging",
+    "crates/puffer-media",
+    "crates/puffer-mcp-oauth",
+    "crates/puffer-observability",
     "crates/puffer-provider-openai",
     "crates/puffer-provider-registry",
     "crates/puffer-resources",
+    "crates/puffer-runner-api",
+    "crates/puffer-runner-local",
+    "crates/puffer-runner-grpc",
+    "crates/puffer-secrets",
+    "crates/puffer-slack",
+    "crates/puffer-tool-runner",
     "crates/puffer-session-store",
+    "crates/puffer-skill-evolution",
+    "crates/puffer-subscriber-email",
+    "crates/puffer-subscriber-runtime",
+    "crates/puffer-subscriber-telegram-user",
+    "crates/puffer-subscriptions",
     "crates/puffer-test-support",
     "crates/puffer-tools",
     "crates/puffer-transport-anthropic",
     "crates/puffer-tui",
+    "crates/puffer-workflow",
 ]
 default-members = ["crates/puffer-cli"]
+# Vendored third-party (MIT) — its own cargo workspace, built separately via
+# scripts/build-cua-driver.sh. Excluded so it never folds into puffer's build.
+exclude = ["vendor/cua-driver"]
 resolver = "2"
+
+[patch.crates-io]
+grammers-session = { path = "vendor/grammers-session" }
 
 [workspace.package]
 edition = "2021"
@@ -31,11 +60,46 @@ html2text = "0.13.5"
 glob = "0.3.3"
 fslock = "0.2.1"
 indexmap = { version = "2.12.1", features = ["serde"] }
+ipnet = "2.11.0"
 insta = "1.44.1"
+notify = "6"
 jsonschema = { version = "0.45.1", default-features = false }
+libc = "0.2"
 libloading = "0.8.9"
+psl = "2.1.163"
+qrcode = "0.14.1"
 ratatui = "0.29.0"
-reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# Anthropic's official Rust SDK for the Model Context Protocol. Pinned to the
+# same major version codex uses (0.15) and opted into the client + server +
+# child-process transport so the runner can drive subprocess MCP servers and
+# ship a tiny in-tree stub server for tests.
+rmcp = { version = "0.15.0", default-features = false, features = [
+    "client",
+    "server",
+    "macros",
+    "schemars",
+    "base64",
+    "elicitation",
+    "auth",
+    "transport-child-process",
+    "transport-io",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-server",
+] }
+tokio = { version = "1.51", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "io-util",
+    "io-std",
+    "process",
+    "time",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls", "socks"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["preserve_order"] }
 serde_yaml = "0.9.34"
@@ -43,7 +107,11 @@ shell-words = "1.1.0"
 sha2 = "0.10.9"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
+regex = "1.10"
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+rand = "0.8"
 time = { version = "0.3.44", features = ["formatting", "local-offset", "parsing"] }
 toml = "0.9.8"
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 url = "2.5.7"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }

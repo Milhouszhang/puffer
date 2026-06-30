@@ -7,6 +7,8 @@ use uuid::Uuid;
 pub struct SessionMetadata {
     pub id: Uuid,
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub generated_title: Option<String>,
     pub cwd: PathBuf,
     #[serde(default)]
     pub created_at_ms: u64,
@@ -34,6 +36,8 @@ pub struct SessionRecord {
 pub struct SessionSummary {
     pub id: Uuid,
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub generated_title: Option<String>,
     pub cwd: PathBuf,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,

@@ -1,5 +1,7 @@
 use super::retry_http_send;
+use crate::runtime::openai_sse::openai_response_incomplete_error;
 use anyhow::{anyhow, bail, Context, Result};
+use puffer_config::ProxyConfig;
 use puffer_provider_openai::{
     build_tool_responses_request, extract_responses_text, parse_responses_response,
     OpenAIRequestConfig, OpenAIResponsesTool, OpenAIResponsesToolChoice,
@@ -55,6 +57,7 @@ pub fn execute_claude_openai_web_search(
     request_config: &OpenAIRequestConfig,
     model_id: &str,
     raw_input: Value,
+    proxy: &ProxyConfig,
 ) -> Result<String> {
     let input = parse_input(raw_input)?;
 
@@ -73,7 +76,7 @@ pub fn execute_claude_openai_web_search(
                 user_location: None,
                 external_web_access: None,
             }],
-            include: vec!["web_search_call.action.sources".to_string()],
+            include: Vec::new(),
             tool_choice: Some(OpenAIResponsesToolChoice::Mode(
                 OpenAIResponsesToolChoiceMode::Auto,
             )),
@@ -82,17 +85,36 @@ pub fn execute_claude_openai_web_search(
         },
     )?;
 
-    let response = send_json_request(&request.url, &request.headers, &request.body, false)?;
-    let parsed = parse_responses_response(&serde_json::to_string(&response)?)?;
+    let client = crate::network::blocking_client_for_url(
+        proxy,
+        crate::network::HttpPurpose::Model,
+        &request.url,
+        std::time::Duration::from_secs(300),
+    )
+    .unwrap_or_else(|_| Client::new());
+    let response = send_json_request_with_client(
+        &client,
+        &request.url,
+        &request.headers,
+        &request.body,
+        false,
+    )?;
+    let (text, sources) = parse_openai_web_search_response(&response)?;
+
+    Ok(format_search_output(text, sources))
+}
+
+fn parse_openai_web_search_response(response: &Value) -> Result<(String, Vec<SourceLink>)> {
+    if let Some(error) = openai_response_incomplete_error(response) {
+        return Err(error);
+    }
+    let parsed = parse_responses_response(&serde_json::to_string(response)?)?;
     let text = extract_responses_text(&parsed);
     if text.trim().is_empty() {
         bail!("OpenAI web search returned no text");
     }
 
-    Ok(format_search_output(
-        text,
-        extract_openai_sources(&response),
-    ))
+    Ok((text, extract_openai_sources(response)))
 }
 
 /// Executes Claude-style WebSearch against an Anthropic Messages-compatible endpoint.
@@ -100,6 +122,7 @@ pub fn execute_claude_anthropic_web_search(
     request_config: &AnthropicRequestConfig,
     model_id: &str,
     raw_input: Value,
+    proxy: &ProxyConfig,
 ) -> Result<String> {
     let input = parse_input(raw_input)?;
 
@@ -133,7 +156,20 @@ pub fn execute_claude_anthropic_web_search(
     })]);
     body["tool_choice"] = json!({ "type": "auto" });
 
-    let response = send_json_request(&request.url, &request.headers, &body.to_string(), true)?;
+    let client = crate::network::blocking_client_for_url(
+        proxy,
+        crate::network::HttpPurpose::Model,
+        &request.url,
+        std::time::Duration::from_secs(300),
+    )
+    .unwrap_or_else(|_| Client::new());
+    let response = send_json_request_with_client(
+        &client,
+        &request.url,
+        &request.headers,
+        &body.to_string(),
+        true,
+    )?;
     let text = extract_anthropic_text(&response)?;
     Ok(format_search_output(
         text,
@@ -164,13 +200,13 @@ fn build_openai_filters(input: &ClaudeWebSearchInput) -> Option<Value> {
     (!filters.is_empty()).then(|| Value::Object(filters))
 }
 
-fn send_json_request(
+fn send_json_request_with_client(
+    client: &Client,
     url: &str,
     headers: &[(String, String)],
     body: &str,
     anthropic: bool,
 ) -> Result<Value> {
-    let client = Client::new();
     let response = retry_http_send(3, || {
         let mut request = client.post(url);
         for (key, value) in headers {
@@ -367,5 +403,24 @@ mod tests {
         assert!(output.contains("Sources:"));
         assert!(output.contains("- [One](https://one.example)"));
         assert!(output.contains("- [Two](https://two.example)"));
+    }
+
+    #[test]
+    fn openai_web_search_rejects_incomplete_response() {
+        let error = parse_openai_web_search_response(&json!({
+            "id": "resp_incomplete",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "partial"}]
+            }]
+        }))
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Incomplete response returned, reason: content_filter"
+        );
     }
 }

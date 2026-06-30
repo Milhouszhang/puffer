@@ -9,7 +9,12 @@ commands:
   - name: ide
     description: Manage IDE integrations
 skills:
+  - project-memory
   - reviewer
+  - browser
+  - email
+  - telegram
+  - book-by-phone
 mcp_servers:
   - id: filesystem
     display_name: Filesystem

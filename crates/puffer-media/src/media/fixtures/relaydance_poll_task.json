@@ -1,0 +1,49 @@
+{
+  "code": "success",
+  "message": "",
+  "data": {
+    "id": 917,
+    "created_at": 1780929596,
+    "updated_at": 1780929779,
+    "task_id": "task_TA20QV69xGqQXapyyM3ynyB1elNki8pg",
+    "platform": "54",
+    "user_id": 171,
+    "group": "default",
+    "channel_id": 1,
+    "quota": 1093750,
+    "action": "generate",
+    "status": "SUCCESS",
+    "fail_reason": "",
+    "result_url": "[redacted-url]",
+    "submit_time": 1780929596,
+    "start_time": 1780929602,
+    "finish_time": 1780929779,
+    "progress": "100%",
+    "properties": {
+      "input": "",
+      "upstream_model_name": "dreamina-seedance-2-0-260128",
+      "origin_model_name": "doubao-seedance-2-0-720p"
+    },
+    "data": {
+      "content": {
+        "video_url": "[redacted-url]"
+      },
+      "created_at": 1780929596,
+      "draft": false,
+      "duration": 5,
+      "execution_expires_after": 172800,
+      "framespersecond": 24,
+      "generate_audio": true,
+      "id": "cgt-20260608223955-mjs52",
+      "model": "dreamina-seedance-2-0-260128",
+      "priority": 0,
+      "ratio": "16:9",
+      "resolution": "720p",
+      "seed": 38069,
+      "service_tier": "default",
+      "status": "succeeded",
+      "updated_at": 1780929778,
+      "usage": "[redacted-usage]"
+    }
+  }
+}

@@ -7,12 +7,15 @@ use puffer_provider_openai::{
     OpenAIResponsesTextFormat, OpenAIResponsesTool,
 };
 use puffer_provider_registry::{AuthMode, OAuthCredential, ProviderDescriptor, StoredCredential};
-use puffer_resources::{AgentSpec, LoadedItem, LoadedResources, SourceInfo, SourceKind, ToolSpec};
+use puffer_resources::{
+    load_resources, AgentSpec, LoadedItem, LoadedResources, SourceInfo, SourceKind, ToolSpec,
+};
 use puffer_session_store::SessionMetadata;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 fn provider() -> ProviderDescriptor {
@@ -25,6 +28,7 @@ fn provider() -> ProviderDescriptor {
         headers: Default::default(),
         query_params: Default::default(),
         discovery: None,
+        media: None,
         models: vec![puffer_provider_registry::ModelDescriptor {
             id: "claude-sonnet-4-5".to_string(),
             display_name: "Claude Sonnet 4.5".to_string(),
@@ -33,8 +37,53 @@ fn provider() -> ProviderDescriptor {
             context_window: 200_000,
             max_output_tokens: 8192,
             supports_reasoning: true,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
         }],
+        chat_completions_path: None,
     }
+}
+
+fn env_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[test]
+fn simple_turn_tool_suppression_is_env_gated() {
+    let _guard = env_lock();
+    std::env::remove_var(SUPPRESS_TOOLS_FOR_SIMPLE_TURNS_ENV);
+    assert!(!suppress_tools_for_simple_turn("hi"));
+
+    std::env::set_var(SUPPRESS_TOOLS_FOR_SIMPLE_TURNS_ENV, "1");
+    assert!(suppress_tools_for_simple_turn("hi"));
+    assert!(suppress_tools_for_simple_turn(" Hello "));
+    assert!(!suppress_tools_for_simple_turn("please read a file"));
+    std::env::remove_var(SUPPRESS_TOOLS_FOR_SIMPLE_TURNS_ENV);
+}
+
+#[test]
+fn local_simple_turn_reply_requires_both_env_flags() {
+    let _guard = env_lock();
+    std::env::remove_var(SUPPRESS_TOOLS_FOR_SIMPLE_TURNS_ENV);
+    std::env::remove_var(LOCAL_REPLY_FOR_SIMPLE_TURNS_ENV);
+    assert!(!suppress_tools_for_simple_turn("hi"));
+    assert!(!local_reply_for_simple_turns_enabled());
+
+    std::env::set_var(SUPPRESS_TOOLS_FOR_SIMPLE_TURNS_ENV, "1");
+    assert!(suppress_tools_for_simple_turn("hi"));
+    assert!(!local_reply_for_simple_turns_enabled());
+
+    std::env::set_var(LOCAL_REPLY_FOR_SIMPLE_TURNS_ENV, "1");
+    assert!(local_reply_for_simple_turns_enabled());
+    assert_eq!(local_simple_turn_reply("hi"), "Hi.");
+    assert_eq!(local_simple_turn_reply(" hey "), "Hey.");
+
+    std::env::remove_var(SUPPRESS_TOOLS_FOR_SIMPLE_TURNS_ENV);
+    std::env::remove_var(LOCAL_REPLY_FOR_SIMPLE_TURNS_ENV);
 }
 
 pub(super) fn state() -> AppState {
@@ -44,6 +93,7 @@ pub(super) fn state() -> AppState {
         SessionMetadata {
             id: Uuid::nil(),
             display_name: None,
+            generated_title: None,
             cwd: std::env::current_dir().unwrap(),
             created_at_ms: 0,
             updated_at_ms: 0,
@@ -63,6 +113,7 @@ pub(super) fn plan_mode_state() -> AppState {
     let session = SessionMetadata {
         id: Uuid::new_v4(),
         display_name: None,
+        generated_title: None,
         cwd: cwd.clone(),
         created_at_ms: 0,
         updated_at_ms: 0,
@@ -107,6 +158,50 @@ fn loaded_tool(id: &str, description: &str, handler: &str) -> LoadedItem<ToolSpe
     }
 }
 
+/// Scripted HTTP server for runtime loop tests.
+fn spawn_server<F>(
+    content_type: &'static str,
+    expected_requests: usize,
+    response_body: F,
+) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>)
+where
+    F: Fn(usize) -> String + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let request_log = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut handled = 0_usize;
+        while handled < expected_requests && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut buffer = vec![0_u8; 65_536];
+                    let bytes = stream.read(&mut buffer).unwrap();
+                    let request = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+                    request_log.lock().unwrap().push(request);
+                    let body = response_body(handled);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    handled += 1;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("listener accept failed: {error}"),
+            }
+        }
+    });
+    (format!("http://{address}"), requests, server)
+}
+
 fn loaded_agent(
     id: &str,
     description: &str,
@@ -139,6 +234,7 @@ fn openai_provider(base_url: String) -> ProviderDescriptor {
         headers: Default::default(),
         query_params: Default::default(),
         discovery: None,
+        media: None,
         models: vec![puffer_provider_registry::ModelDescriptor {
             id: "gpt-5".to_string(),
             display_name: "GPT-5".to_string(),
@@ -147,8 +243,177 @@ fn openai_provider(base_url: String) -> ProviderDescriptor {
             context_window: 272_000,
             max_output_tokens: 16_384,
             supports_reasoning: true,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
         }],
+        chat_completions_path: None,
     }
+}
+
+fn test_image_attachment() -> puffer_session_store::StoredAttachment {
+    puffer_session_store::StoredAttachment {
+        id: "11111111-1111-1111-1111-111111111111".to_string(),
+        name: "pixel.png".to_string(),
+        mime_type: "image/png".to_string(),
+        size: 3,
+        extension: "PNG".to_string(),
+        kind: puffer_session_store::StoredAttachmentKind::Image,
+        storage_key: "11111111-1111-1111-1111-111111111111/original".to_string(),
+    }
+}
+
+fn provider_with_api_and_modalities(
+    api: &str,
+    input: Vec<puffer_provider_registry::Modality>,
+) -> puffer_provider_registry::ProviderDescriptor {
+    let mut provider = openai_provider("http://127.0.0.1:9".to_string());
+    provider.default_api = api.to_string();
+    provider.models[0].api = api.to_string();
+    provider.models[0].input = input;
+    provider
+}
+
+#[test]
+fn native_image_gate_rejects_text_only_model() {
+    let mut state = state();
+    state.current_provider = Some("openai-completions-test".to_string());
+    state.current_model = Some("openai-completions-test/gpt-5".to_string());
+    state.push_user_message_with_attachments(
+        "read image",
+        vec![
+            crate::RenderedAttachment::from_stored(test_image_attachment())
+                .with_model_url("data:image/png;base64,AQID".to_string()),
+        ],
+    );
+    let provider = provider_with_api_and_modalities(
+        "openai-completions",
+        vec![puffer_provider_registry::Modality::Text],
+    );
+
+    let err = super::validate_native_image_input(&state, &provider, "gpt-5", "openai-completions")
+        .unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("not declared to support image input"));
+}
+
+#[test]
+fn native_image_gate_rejects_unhydrated_image() {
+    let mut state = state();
+    state.push_user_message_with_attachments(
+        "read image",
+        vec![crate::RenderedAttachment::from_stored(
+            test_image_attachment(),
+        )],
+    );
+    let provider = provider_with_api_and_modalities(
+        "openai-completions",
+        vec![
+            puffer_provider_registry::Modality::Text,
+            puffer_provider_registry::Modality::Image,
+        ],
+    );
+
+    let err = super::validate_native_image_input(&state, &provider, "gpt-5", "openai-completions")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("missing hydrated model_url"));
+}
+
+#[test]
+fn native_image_gate_allows_all_implemented_image_apis() {
+    for api in [
+        "openai-completions",
+        "openai-responses",
+        "anthropic-messages",
+    ] {
+        let mut state = state();
+        state.push_user_message_with_attachments(
+            "read image",
+            vec![
+                crate::RenderedAttachment::from_stored(test_image_attachment())
+                    .with_model_url("data:image/png;base64,AQID".to_string()),
+            ],
+        );
+        let provider = provider_with_api_and_modalities(
+            api,
+            vec![
+                puffer_provider_registry::Modality::Text,
+                puffer_provider_registry::Modality::Image,
+            ],
+        );
+
+        super::validate_native_image_input(&state, &provider, "gpt-5", api).unwrap();
+    }
+}
+
+#[test]
+fn native_image_gate_rejects_unsupported_image_api() {
+    let mut state = state();
+    state.push_user_message_with_attachments(
+        "read image",
+        vec![
+            crate::RenderedAttachment::from_stored(test_image_attachment())
+                .with_model_url("data:image/png;base64,AQID".to_string()),
+        ],
+    );
+    let provider = provider_with_api_and_modalities(
+        "custom-text-api",
+        vec![
+            puffer_provider_registry::Modality::Text,
+            puffer_provider_registry::Modality::Image,
+        ],
+    );
+
+    let err = super::validate_native_image_input(&state, &provider, "gpt-5", "custom-text-api")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("not yet enabled for image input"));
+}
+
+#[test]
+fn native_image_gate_rejects_malformed_model_data_url() {
+    let mut state = state();
+    state.push_user_message_with_attachments(
+        "read image",
+        vec![
+            crate::RenderedAttachment::from_stored(test_image_attachment())
+                .with_model_url("file:///tmp/pixel.png".to_string()),
+        ],
+    );
+    let provider = provider_with_api_and_modalities(
+        "anthropic-messages",
+        vec![
+            puffer_provider_registry::Modality::Text,
+            puffer_provider_registry::Modality::Image,
+        ],
+    );
+
+    let err = super::validate_native_image_input(&state, &provider, "gpt-5", "anthropic-messages")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("malformed model data URL"));
+}
+
+#[test]
+fn native_image_gate_disables_simple_turn_suppression() {
+    let _guard = env_lock();
+    std::env::set_var(SUPPRESS_TOOLS_FOR_SIMPLE_TURNS_ENV, "1");
+    let mut state = state();
+    assert!(super::suppress_tools_for_turn(&state, "hi"));
+
+    state.push_user_message_with_attachments(
+        "hi",
+        vec![
+            crate::RenderedAttachment::from_stored(test_image_attachment())
+                .with_model_url("data:image/png;base64,AQID".to_string()),
+        ],
+    );
+
+    assert!(!super::suppress_tools_for_turn(&state, "hi"));
+    std::env::remove_var(SUPPRESS_TOOLS_FOR_SIMPLE_TURNS_ENV);
 }
 
 fn test_anthropic_request_config() -> AnthropicRequestConfig {
@@ -181,6 +446,8 @@ fn test_openai_request_config() -> OpenAIRequestConfig {
         account_id: None,
         custom_headers: Vec::new(),
         query_params: Vec::new(),
+        chat_completions_path: None,
+        responses_path: None,
     }
 }
 
@@ -192,12 +459,44 @@ pub(super) fn refresh_env_lock() -> &'static Mutex<()> {
     crate::test_locks::env_lock()
 }
 
+fn bundled_resources() -> LoadedResources {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("workspace root")
+        .to_path_buf();
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConfigPaths {
+        workspace_root: temp.path().join("workspace"),
+        workspace_config_dir: temp.path().join("workspace/.puffer"),
+        user_config_dir: temp.path().join("user"),
+        builtin_resources_dir: root.join("resources"),
+    };
+    ensure_workspace_dirs(&paths).unwrap();
+    let runner = crate::runner_adapter::LocalToolRunner::new();
+    load_resources(&paths, &runner).unwrap()
+}
+
 #[test]
 fn anthropic_tool_schema_lists_expected_fields() {
     let schema = anthropic_tool_schema("write_file");
     let required = schema.get("required").and_then(Value::as_array).unwrap();
     assert!(required.iter().any(|value| value == "path"));
     assert!(required.iter().any(|value| value == "contents"));
+}
+
+#[test]
+fn runtime_system_prompt_mentions_ignore_memory_policy() {
+    let prompt = super::system_prompt::render_runtime_system_prompt(
+        &state(),
+        &bundled_resources(),
+        "gpt-5",
+        &std::collections::BTreeSet::new(),
+    )
+    .unwrap();
+
+    assert!(prompt.contains("ignore or not use memory"));
+    assert!(prompt.contains("loaded memory files were empty"));
 }
 
 #[test]
@@ -208,6 +507,48 @@ fn resolve_selection_uses_first_provider_model_when_unset() {
     let (provider, model_id) = resolve_provider_and_model(&state, &registry).unwrap();
     assert_eq!(provider.id, "anthropic");
     assert_eq!(model_id, "claude-sonnet-4-5");
+}
+
+#[test]
+fn resolve_selection_uses_provider_scoped_default_model_id() {
+    let mut registry = ProviderRegistry::new();
+    let mut descriptor = provider();
+    descriptor.id = "openai".to_string();
+    descriptor.display_name = "OpenAI".to_string();
+    descriptor.default_api = "openai-responses".to_string();
+    descriptor.models = vec![
+        puffer_provider_registry::ModelDescriptor {
+            id: "gpt-5.1".to_string(),
+            display_name: "gpt-5.1".to_string(),
+            provider: "openai".to_string(),
+            api: "openai-responses".to_string(),
+            context_window: 272_000,
+            max_output_tokens: 16_384,
+            supports_reasoning: true,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
+        },
+        puffer_provider_registry::ModelDescriptor {
+            id: "gpt-5.4".to_string(),
+            display_name: "gpt-5.4".to_string(),
+            provider: "openai".to_string(),
+            api: "openai-responses".to_string(),
+            context_window: 272_000,
+            max_output_tokens: 16_384,
+            supports_reasoning: true,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
+        },
+    ];
+    registry.register(descriptor);
+    let mut state = state();
+    state.current_provider = Some("openai".to_string());
+    state.current_model = Some("gpt-5.4".to_string());
+    let (provider, model_id) = resolve_provider_and_model(&state, &registry).unwrap();
+    assert_eq!(provider.id, "openai");
+    assert_eq!(model_id, "gpt-5.4");
 }
 
 #[test]
@@ -369,6 +710,15 @@ fn openai_tool_definitions_use_registry_schema() {
 
 #[test]
 fn openai_tool_definitions_fill_missing_array_items() {
+    // The production WebSearch resource uses the `provider:web_search`
+    // handler, which now serializes as a native server-side tool with no
+    // function-shaped parameters. Force the function-form path so the
+    // schema-normalization assertions still apply.
+    let _guard = crate::test_locks::env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let prev = std::env::var_os("PUFFER_OPENAI_NATIVE_WEB_SEARCH");
+    std::env::set_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH", "0");
     let mut web_search = loaded_tool("WebSearch", "Search the web", "provider:web_search");
     web_search.value.input_schema = Some(json!({
         "type": "object",
@@ -394,6 +744,10 @@ fn openai_tool_definitions_fill_missing_array_items() {
     };
     let registry = ToolRegistry::from_resources(&resources);
     let tools = openai_tool_definitions(&registry, None, false).unwrap();
+    match prev {
+        Some(value) => std::env::set_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH", value),
+        None => std::env::remove_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH"),
+    }
     assert_eq!(tools[0].name, "WebSearch");
     assert_eq!(
         tools[0].parameters["properties"]["allowed_domains"]["items"]["type"].as_str(),
@@ -407,6 +761,13 @@ fn openai_tool_definitions_fill_missing_array_items() {
 
 #[test]
 fn openai_web_search_description_mentions_current_month_year() {
+    // Description rendering only applies on the function-form fallback; the
+    // native server-side tool has no description.
+    let _guard = crate::test_locks::env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let prev = std::env::var_os("PUFFER_OPENAI_NATIVE_WEB_SEARCH");
+    std::env::set_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH", "0");
     let description = "\
 - Allows Claude to search the web and use the results to inform responses
 
@@ -418,6 +779,10 @@ IMPORTANT - Use the correct year in search queries:
     };
     let registry = ToolRegistry::from_resources(&resources);
     let tools = openai_tool_definitions(&registry, None, false).unwrap();
+    match prev {
+        Some(value) => std::env::set_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH", value),
+        None => std::env::remove_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH"),
+    }
     assert!(tools[0].description.contains("The current month is"));
     assert!(!tools[0]
         .description
@@ -521,6 +886,7 @@ fn resolve_openai_execution_config_uses_codex_chatgpt_route_for_builtin_oauth() 
     .unwrap();
 
     assert_eq!(config.request_config.base_url, OPENAI_CHATGPT_BASE_URL);
+    assert_eq!(config.request_config.version, OPENAI_CODEX_COMPAT_VERSION);
     assert_eq!(
         config.request_config.account_id.as_deref(),
         Some("acct-123")
@@ -538,6 +904,7 @@ fn build_codex_openai_request_body_matches_codex_shape() {
     let state = state();
     let body = build_codex_openai_request_body(
         &state,
+        OPENAI_CHATGPT_BASE_URL,
         "gpt-5",
         "system instructions",
         Value::String("hello".to_string()),
@@ -549,14 +916,14 @@ fn build_codex_openai_request_body_matches_codex_shape() {
 
     assert_eq!(body["model"], json!("gpt-5"));
     assert_eq!(body["stream"], json!(true));
-    assert_eq!(body["include"][0], json!("reasoning.encrypted_content"));
+    assert_eq!(body["include"], json!([]));
     assert_eq!(body["prompt_cache_key"], json!(Uuid::nil().to_string()));
     assert_eq!(body["instructions"], json!("system instructions"));
     assert_eq!(body["input"][0]["type"], json!("message"));
     assert_eq!(body["input"][0]["content"][0]["text"], json!("hello"));
     assert_eq!(body["reasoning"]["summary"], json!("auto"));
     assert_eq!(body["reasoning"]["effort"], json!("medium"));
-    assert_eq!(body["parallel_tool_calls"], json!(false));
+    assert!(body.get("parallel_tool_calls").is_none());
     assert!(body.get("previous_response_id").is_none());
     assert!(body.get("service_tier").is_none());
 }
@@ -567,6 +934,7 @@ fn build_codex_openai_request_body_supports_xhigh_effort() {
     state.effort_level = "xhigh".to_string();
     let body = build_codex_openai_request_body(
         &state,
+        OPENAI_CHATGPT_BASE_URL,
         "gpt-5",
         "",
         Value::String("hello".to_string()),
@@ -600,6 +968,7 @@ fn build_codex_openai_request_body_uses_priority_tier_for_fast_mode() {
     }];
     let body = build_codex_openai_request_body(
         &state,
+        OPENAI_CHATGPT_BASE_URL,
         "gpt-5",
         "",
         Value::String("hello".to_string()),
@@ -614,7 +983,7 @@ fn build_codex_openai_request_body_uses_priority_tier_for_fast_mode() {
     // Fast mode no longer disables reasoning — it only sets service_tier.
     // Reasoning is controlled solely by effort_level, matching Anthropic behavior.
     assert_eq!(body["reasoning"]["effort"], json!("medium"));
-    assert_eq!(body["include"][0], json!("reasoning.encrypted_content"));
+    assert_eq!(body["include"], json!([]));
 }
 
 #[test]
@@ -622,13 +991,14 @@ fn build_codex_openai_request_body_includes_native_structured_output_config() {
     let state = state();
     let body = build_codex_openai_request_body(
         &state,
+        OPENAI_CHATGPT_BASE_URL,
         "gpt-5",
         "",
         Value::String("hello".to_string()),
         &Vec::new(),
         true,
         Some(OpenAIResponsesTextConfig {
-            format: OpenAIResponsesTextFormat {
+            format: Some(OpenAIResponsesTextFormat {
                 kind: "json_schema".to_string(),
                 name: "answer_shape".to_string(),
                 description: None,
@@ -639,7 +1009,8 @@ fn build_codex_openai_request_body_includes_native_structured_output_config() {
                     }
                 }),
                 strict: true,
-            },
+            }),
+            verbosity: None,
         }),
         false,
     );
@@ -659,7 +1030,7 @@ fn openai_structured_output_falls_back_and_caches_unsupported_native_support() {
     let server = thread::spawn(move || {
         for index in 0..5 {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0_u8; 16384];
+            let mut buffer = [0_u8; 131072];
             let bytes = stream.read(&mut buffer).unwrap();
             let request = String::from_utf8_lossy(&buffer[..bytes]).to_string();
             request_log.lock().unwrap().push(request);
@@ -872,7 +1243,9 @@ fn parse_openai_sse_response_streaming_emits_text_deltas() {
 
 #[test]
 fn execute_user_prompt_refreshes_openai_oauth_after_401() {
-    let _guard = refresh_env_lock().lock().unwrap();
+    let _guard = refresh_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1024,12 +1397,24 @@ fn tool_definitions_keep_never_approval_tools_enabled() {
     assert_eq!(openai_tools[0].name, "read_file");
 }
 
+#[path = "tests/agent_loop_e2e.rs"]
+mod agent_loop_e2e;
+#[path = "tests/anthropic_sse_error_event.rs"]
+mod anthropic_sse_error_event;
 #[path = "tests/http_retries.rs"]
 mod http_retries;
+#[path = "tests/iteration_behavior.rs"]
+mod iteration_behavior;
+#[path = "tests/lambda_skill_agent_loop.rs"]
+mod lambda_skill_agent_loop;
+#[path = "tests/openai_stream_transport.rs"]
+mod openai_stream_transport;
 #[path = "tests/openai_tool_errors.rs"]
 mod openai_tool_errors;
 #[path = "tests/permissions.rs"]
 mod permissions;
+#[path = "tests/skill_action_obligation_e2e.rs"]
+mod skill_action_obligation_e2e;
 #[path = "tests/tool_execution.rs"]
 mod tool_execution;
 #[path = "tests/tool_visibility.rs"]
@@ -1038,4 +1423,93 @@ mod tool_visibility;
 fn request_json_body(raw_request: &str) -> Value {
     let body = raw_request.split("\r\n\r\n").nth(1).unwrap_or_default();
     serde_json::from_str(body).unwrap()
+}
+
+mod persisted_output_preview {
+    //! Tests for `build_persisted_output_message` — the formatter
+    //! that produces the `<persisted-output>` message the model sees
+    //! when a tool result is too large to inline. As of 2026-05-08
+    //! long outputs render as head + tail (so terminal failure
+    //! messages survive); short / borderline outputs keep CC-parity
+    //! head-only wording.
+
+    use crate::runtime::{build_persisted_output_message, PREVIEW_SIZE_CHARS};
+
+    #[test]
+    fn long_output_shows_head_and_tail_blocks() {
+        let head_payload = "A".repeat(8_000);
+        let tail_payload = "Z".repeat(8_000);
+        let text = format!("{head_payload}\n{tail_payload}");
+
+        let message = build_persisted_output_message("/tmp/persist.txt", &text);
+
+        assert!(
+            message.contains("head + last"),
+            "head+tail format should advertise both blocks; got: {message}"
+        );
+        let marker_idx = message.find("truncated").expect("truncated marker present");
+        let (before_marker, after_marker) = message.split_at(marker_idx);
+        assert!(
+            before_marker.contains('A'),
+            "head should contain A's; before marker: {before_marker}"
+        );
+        assert!(
+            !before_marker.contains('Z'),
+            "head must not contain tail content; before marker has Z"
+        );
+        assert!(
+            after_marker.contains('Z'),
+            "tail should contain Z's; after marker: {after_marker}"
+        );
+    }
+
+    #[test]
+    fn borderline_output_keeps_head_only_wording_for_cc_parity() {
+        // 1.5x preview budget: tail too short to be useful, so keep
+        // CC-parity head-only wording.
+        let text = "x".repeat(PREVIEW_SIZE_CHARS + PREVIEW_SIZE_CHARS / 2);
+
+        let message = build_persisted_output_message("/tmp/persist.txt", &text);
+
+        assert!(
+            message.contains("Preview (first"),
+            "borderline output should use head-only wording; got: {message}"
+        );
+        assert!(
+            !message.contains("head + last"),
+            "borderline output should NOT use head+tail wording"
+        );
+        assert!(
+            !message.contains("chars truncated"),
+            "borderline output should NOT show a truncated-chars marker"
+        );
+    }
+
+    #[test]
+    fn long_output_truncated_count_is_within_slack_of_expected() {
+        let head = "h".repeat(2_000);
+        let mid = "m".repeat(10_000);
+        let tail = "t".repeat(2_000);
+        let text = format!("{head}{mid}{tail}");
+        let total = text.chars().count();
+
+        let message = build_persisted_output_message("/tmp/persist.txt", &text);
+
+        let marker = message
+            .lines()
+            .find(|line| line.contains("chars truncated"))
+            .expect("truncated marker line");
+        let n: usize = marker
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .expect("truncated count parses");
+        let expected = total - PREVIEW_SIZE_CHARS;
+        let slack = 8;
+        assert!(
+            n + slack >= expected && n <= expected + slack,
+            "truncated count {n} should be within ±{slack} of {expected}"
+        );
+    }
 }

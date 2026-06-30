@@ -207,7 +207,10 @@ fn resume_scope(path: &Path) -> ResumeScope {
 
 fn session_scope_matches(scope: &ResumeScope, session_cwd: &Path) -> bool {
     match scope {
-        ResumeScope::Repo(repo_root) => git_toplevel(session_cwd).as_ref() == Some(repo_root),
+        ResumeScope::Repo(repo_root) => {
+            let session_path = normalize_resume_path(session_cwd);
+            path_is_inside(&session_path, repo_root)
+        }
         ResumeScope::Directory(directory) => {
             let session_path = normalize_resume_path(session_cwd);
             session_path == *directory
@@ -215,6 +218,10 @@ fn session_scope_matches(scope: &ResumeScope, session_cwd: &Path) -> bool {
                 || directory.starts_with(&session_path)
         }
     }
+}
+
+fn path_is_inside(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
 }
 
 fn git_toplevel(path: &Path) -> Option<PathBuf> {
@@ -235,7 +242,27 @@ fn git_toplevel(path: &Path) -> Option<PathBuf> {
 }
 
 fn normalize_resume_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    if let Ok(normalized) = std::fs::canonicalize(path) {
+        return normalized;
+    }
+
+    let mut candidate = path;
+    let mut missing_suffix = PathBuf::new();
+    while let Some(name) = candidate.file_name() {
+        let mut next_suffix = PathBuf::from(name);
+        next_suffix.push(&missing_suffix);
+        missing_suffix = next_suffix;
+
+        let Some(parent) = candidate.parent().filter(|parent| *parent != candidate) else {
+            break;
+        };
+        candidate = parent;
+        if let Ok(normalized_parent) = std::fs::canonicalize(candidate) {
+            return normalized_parent.join(missing_suffix);
+        }
+    }
+
+    path.to_path_buf()
 }
 
 fn looks_like_session_id(query: &str) -> bool {
@@ -387,8 +414,12 @@ fn resume_into_session(
     summary: &SessionSummary,
 ) -> Result<()> {
     let record = session_store.load_session(summary.id)?;
+    let pending_query_prompt = state.take_pending_query_prompt();
     let config = state.config.clone();
     *state = AppState::from_session_record(config, record);
+    if let Some(prompt) = pending_query_prompt {
+        state.queue_pending_query_prompt(prompt);
+    }
     emit_system(
         state,
         session_store,
@@ -403,9 +434,11 @@ fn resume_into_session(
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_resume_launch, resume_scope, search_sessions, session_scope_matches,
-        ResumeLaunchResolution,
+        normalize_resume_path, resolve_resume_launch, resume_into_session, resume_scope,
+        search_sessions, session_scope_matches, ResumeLaunchResolution, ResumeScope,
     };
+    use crate::AppState;
+    use puffer_config::PufferConfig;
     use puffer_config::{ensure_workspace_dirs, ConfigPaths};
     use puffer_session_store::SessionStore;
     use puffer_session_store::SessionSummary;
@@ -426,6 +459,7 @@ mod tests {
         SessionSummary {
             id: Uuid::parse_str(id).unwrap(),
             display_name: name.map(str::to_string),
+            generated_title: None,
             cwd: PathBuf::from(cwd),
             created_at_ms: updated_at_ms,
             updated_at_ms,
@@ -510,6 +544,23 @@ mod tests {
     }
 
     #[test]
+    fn repo_scope_matches_by_path_containment_without_session_git_probe() {
+        let tempdir = tempdir().unwrap();
+        let repo_root = tempdir.path().join("repo");
+        let child = repo_root.join("crates/puffer-core");
+        let deleted_child = repo_root.join("deleted/session/path");
+        let sibling_with_prefix = tempdir.path().join("repo-sibling");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&sibling_with_prefix).unwrap();
+        let scope = ResumeScope::Repo(normalize_resume_path(&repo_root));
+
+        assert!(session_scope_matches(&scope, &repo_root));
+        assert!(session_scope_matches(&scope, &child));
+        assert!(session_scope_matches(&scope, &deleted_child));
+        assert!(!session_scope_matches(&scope, &sibling_with_prefix));
+    }
+
+    #[test]
     fn resolve_resume_launch_uses_picker_for_empty_query() {
         let tempdir = tempdir().unwrap();
         let repo_root = tempdir.path().join("repo");
@@ -590,6 +641,40 @@ mod tests {
             }
             other => panic!("expected picker resolution, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resume_into_session_preserves_pending_query_prompt() {
+        let tempdir = tempdir().unwrap();
+        let paths = ConfigPaths::discover(tempdir.path());
+        ensure_workspace_dirs(&paths).unwrap();
+        let session_store = SessionStore::from_paths(&paths).unwrap();
+        let current = session_store
+            .create_session(tempdir.path().join("current"))
+            .unwrap();
+        let target = session_store
+            .create_session(tempdir.path().join("target"))
+            .unwrap();
+        let summary = session_store
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|session| session.id == target.id)
+            .unwrap();
+        let mut state = AppState::new(
+            PufferConfig::default(),
+            tempdir.path().join("current"),
+            current,
+        );
+        state.queue_pending_query_prompt("follow up after picking session");
+
+        resume_into_session(&mut state, &session_store, &summary).unwrap();
+
+        assert_eq!(state.session.id, target.id);
+        assert_eq!(
+            state.take_pending_query_prompt().as_deref(),
+            Some("follow up after picking session")
+        );
     }
 
     fn init_git_repo(path: &Path) {

@@ -14,6 +14,7 @@ fn provider(id: &str, models: &[&str]) -> puffer_provider_registry::ProviderDesc
         headers: Default::default(),
         query_params: Default::default(),
         discovery: None,
+        media: None,
         models: models
             .iter()
             .map(|model_id| puffer_provider_registry::ModelDescriptor {
@@ -24,8 +25,12 @@ fn provider(id: &str, models: &[&str]) -> puffer_provider_registry::ProviderDesc
                 context_window: 1000,
                 max_output_tokens: 100,
                 supports_reasoning: false,
+                compat: None,
+                input: vec![puffer_provider_registry::Modality::Text],
+                cost: None,
             })
             .collect(),
+        chat_completions_path: None,
     }
 }
 
@@ -633,6 +638,6 @@ fn effort_command_accepts_auto_mode() {
         state.transcript.last(),
         Some(RenderedMessage { text, .. })
             if text.contains("Effort level set to auto.")
-                && text.contains("Current provider default: high")
+                && text.contains("Current provider default: low")
     ));
 }

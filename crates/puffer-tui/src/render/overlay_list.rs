@@ -21,8 +21,10 @@ pub(super) fn overlay_selection(overlay: &OverlayState) -> Option<usize> {
         | OverlayState::OnboardingTheme { selection, .. }
         | OverlayState::OnboardingProvider { selection, .. }
         | OverlayState::OnboardingAuth { selection, .. }
-        | OverlayState::OnboardingModel { selection, .. } => Some(*selection),
+        | OverlayState::OnboardingModel { selection, .. }
+        | OverlayState::AutoDreamSuggestion { selection, .. } => Some(*selection),
         OverlayState::PermissionPrompt { overlay } => Some(overlay.selection()),
+        OverlayState::UserQuestionPrompt { overlay } => Some(overlay.selection()),
         OverlayState::ApiKeyPrompt { .. }
         | OverlayState::Help
         | OverlayState::Btw(..)

@@ -1,5 +1,6 @@
 use crate::workspace_paths;
 use anyhow::{anyhow, bail, Context, Result};
+use puffer_runner_api::FilesystemExecutionPolicy;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -80,7 +81,7 @@ struct UnchangedFilePayload {
 pub fn execute_claude_read_tool(
     cwd: &Path,
     working_dirs: &[PathBuf],
-    allow_all_paths: bool,
+    filesystem: &FilesystemExecutionPolicy,
     input: Value,
 ) -> Result<String> {
     let input: ClaudeReadInput =
@@ -89,7 +90,7 @@ pub fn execute_claude_read_tool(
         pages: normalize_optional_string(input.pages),
         ..input
     };
-    let output = execute_claude_read(cwd, working_dirs, allow_all_paths, input)?;
+    let output = execute_claude_read(cwd, working_dirs, filesystem, input)?;
     Ok(serde_json::to_string_pretty(&output)?)
 }
 
@@ -108,7 +109,7 @@ pub fn execute_claude_file_unchanged(file_path: &str) -> Result<String> {
 fn execute_claude_read(
     cwd: &Path,
     working_dirs: &[PathBuf],
-    allow_all_paths: bool,
+    filesystem: &FilesystemExecutionPolicy,
     input: ClaudeReadInput,
 ) -> Result<ClaudeReadOutput> {
     if let Some(limit) = input.limit {
@@ -121,7 +122,7 @@ fn execute_claude_read(
         validate_pdf_pages(pages)?;
     }
 
-    let path = resolve_absolute_read_path(cwd, working_dirs, allow_all_paths, &input.file_path)?;
+    let path = resolve_absolute_read_path(cwd, working_dirs, filesystem, &input.file_path)?;
     let ext = path
         .extension()
         .and_then(|value| value.to_str())
@@ -169,14 +170,16 @@ fn read_text(
         }
     };
     let total_lines = contents.lines().count();
-    let start_line = offset.unwrap_or(1);
+    // CC convention is 1-indexed offsets ("Line numbers begin at 1").
+    // A model that passes `offset: 0` previously got back
+    // `start_line: 0` and content rendered with line numbers
+    // `0\tfirst_line\n` — a quietly off-by-one rendering that the
+    // model isn't told about and can't easily detect. Clamp to 1
+    // so the rendering matches the convention.
+    let start_line = offset.map(|o| o.max(1)).unwrap_or(1);
     let effective_limit = limit.unwrap_or(MAX_LINES_TO_READ);
 
-    let start_index = if start_line == 0 {
-        0
-    } else {
-        start_line.saturating_sub(1)
-    };
+    let start_index = start_line.saturating_sub(1);
     let all_lines = contents.lines().collect::<Vec<_>>();
     let end_index = start_index
         .saturating_add(effective_limit)
@@ -401,7 +404,7 @@ fn parse_pdf_range(value: &str) -> Result<(u32, u32)> {
 fn resolve_absolute_read_path(
     cwd: &Path,
     working_dirs: &[PathBuf],
-    allow_all_paths: bool,
+    filesystem: &FilesystemExecutionPolicy,
     raw_path: &str,
 ) -> Result<PathBuf> {
     let provided = PathBuf::from(raw_path);
@@ -411,15 +414,10 @@ fn resolve_absolute_read_path(
             provided.display()
         );
     }
-    let sandbox_mode = if allow_all_paths {
-        "danger-full-access"
-    } else {
-        "workspace-write"
-    };
-    let resolved = workspace_paths::resolve_path_for_session(
+    let resolved = workspace_paths::resolve_path_for_filesystem_policy(
         cwd,
         working_dirs,
-        sandbox_mode,
+        filesystem.sandbox_mode,
         Path::new(raw_path),
     )?;
     if resolved.is_dir() {
@@ -489,7 +487,14 @@ fn encode_base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use puffer_runner_api::{FilesystemExecutionPolicy, FilesystemSandboxMode};
     use std::sync::{Mutex, OnceLock};
+
+    fn workspace_write_policy() -> FilesystemExecutionPolicy {
+        FilesystemExecutionPolicy {
+            sandbox_mode: FilesystemSandboxMode::WorkspaceWrite,
+        }
+    }
 
     #[test]
     fn text_read_uses_one_indexed_offset() {
@@ -501,7 +506,8 @@ mod tests {
             "offset": 2,
             "limit": 2,
         });
-        let output = execute_claude_read_tool(temp.path(), &[], false, payload).unwrap();
+        let output =
+            execute_claude_read_tool(temp.path(), &[], &workspace_write_policy(), payload).unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["type"], "text");
         assert_eq!(parsed["file"]["content"], "     2\ttwo\n     3\tthree\n");
@@ -522,7 +528,8 @@ mod tests {
         let payload = serde_json::json!({
             "file_path": path.display().to_string(),
         });
-        let output = execute_claude_read_tool(temp.path(), &[], false, payload).unwrap();
+        let output =
+            execute_claude_read_tool(temp.path(), &[], &workspace_write_policy(), payload).unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["type"], "text");
         assert_eq!(parsed["file"]["startLine"], 1);
@@ -539,7 +546,8 @@ mod tests {
         let payload = serde_json::json!({
             "file_path": "relative.txt",
         });
-        let error = execute_claude_read_tool(temp.path(), &[], false, payload).unwrap_err();
+        let error = execute_claude_read_tool(temp.path(), &[], &workspace_write_policy(), payload)
+            .unwrap_err();
         assert!(error
             .to_string()
             .contains("Read requires an absolute file_path"));
@@ -563,7 +571,8 @@ mod tests {
         let payload = serde_json::json!({
             "file_path": path.display().to_string(),
         });
-        let output = execute_claude_read_tool(temp.path(), &[], false, payload).unwrap();
+        let output =
+            execute_claude_read_tool(temp.path(), &[], &workspace_write_policy(), payload).unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["type"], "notebook");
         assert_eq!(parsed["file"]["cells"].as_array().unwrap().len(), 2);
@@ -577,7 +586,8 @@ mod tests {
         let payload = serde_json::json!({
             "file_path": path.display().to_string(),
         });
-        let output = execute_claude_read_tool(temp.path(), &[], false, payload).unwrap();
+        let output =
+            execute_claude_read_tool(temp.path(), &[], &workspace_write_policy(), payload).unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["type"], "image");
         assert_eq!(parsed["file"]["type"], "image/png");
@@ -593,7 +603,8 @@ mod tests {
             "file_path": path.display().to_string(),
         });
 
-        let output = execute_claude_read_tool(temp.path(), &[], false, payload).unwrap();
+        let output =
+            execute_claude_read_tool(temp.path(), &[], &workspace_write_policy(), payload).unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(parsed["type"], "text");
@@ -614,7 +625,8 @@ mod tests {
             "file_path": path.display().to_string(),
             "pages": "1-30",
         });
-        let error = execute_claude_read_tool(temp.path(), &[], false, payload).unwrap_err();
+        let error = execute_claude_read_tool(temp.path(), &[], &workspace_write_policy(), payload)
+            .unwrap_err();
         assert!(error.to_string().contains("exceeds maximum of 20 pages"));
     }
 
@@ -628,7 +640,8 @@ mod tests {
             "pages": "   ",
         });
 
-        let output = execute_claude_read_tool(temp.path(), &[], false, payload).unwrap();
+        let output =
+            execute_claude_read_tool(temp.path(), &[], &workspace_write_policy(), payload).unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(parsed["type"], "text");
@@ -645,7 +658,7 @@ mod tests {
         let output = execute_claude_read_tool(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             serde_json::json!({ "file_path": path.display().to_string() }),
         )
         .unwrap();
@@ -653,6 +666,39 @@ mod tests {
         assert!(parsed["file"]["content"]
             .as_str()
             .is_some_and(|text| text.contains("contents are empty")));
+    }
+
+    /// Regression: a model that passes `offset: 0` used to get back
+    /// `start_line: 0` and content rendered with line numbers
+    /// `0\tfirst_line\n` — quietly off-by-one vs the
+    /// CC-convention 1-indexing the rest of Read uses. Now clamped
+    /// to 1.
+    #[test]
+    fn offset_zero_is_clamped_to_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.txt");
+        fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+        let output = execute_claude_read_tool(
+            temp.path(),
+            &[],
+            &workspace_write_policy(),
+            serde_json::json!({
+                "file_path": path.display().to_string(),
+                "offset": 0,
+                "limit": 2,
+            }),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["file"]["startLine"], 1, "offset=0 must clamp to 1");
+        // Line numbering should start at 1, not 0.
+        let content = parsed["file"]["content"].as_str().unwrap();
+        assert!(
+            content.starts_with("     1\talpha"),
+            "first line should be numbered 1; got: {content:?}"
+        );
+        assert!(content.contains("     2\tbeta"));
+        assert!(!content.contains("     0\t"));
     }
 
     #[test]
@@ -663,7 +709,7 @@ mod tests {
         let output = execute_claude_read_tool(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             serde_json::json!({
                 "file_path": path.display().to_string(),
                 "offset": 5,
@@ -708,7 +754,7 @@ mod tests {
         let output = execute_claude_read_tool(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             serde_json::json!({
                 "file_path": pdf_path.display().to_string(),
                 "pages": "1-2",
@@ -741,7 +787,7 @@ mod tests {
         let output = execute_claude_read_tool(
             temp.path(),
             &[extra],
-            false,
+            &workspace_write_policy(),
             serde_json::json!({ "file_path": path.display().to_string() }),
         )
         .unwrap();
@@ -754,16 +800,16 @@ mod tests {
     }
 
     #[test]
-    fn read_rejects_files_outside_working_directories() {
+    fn read_rejects_files_outside_default_writable_roots() {
+        // Path outside cwd, /tmp, $TMPDIR, /add-dir. Codex-style default
+        // writable set; this exercises the gate's reject branch.
         let temp = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let path = outside.path().join("secret.txt");
-        fs::write(&path, "secret\n").unwrap();
+        let path = std::path::PathBuf::from("/__puffer_test_outside_writable_set__/secret.txt");
 
         let error = execute_claude_read_tool(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             serde_json::json!({ "file_path": path.display().to_string() }),
         )
         .unwrap_err()

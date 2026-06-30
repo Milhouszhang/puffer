@@ -1,0 +1,53 @@
+id: ImageGeneration
+name: ImageGeneration
+aliases:
+  - image-generation
+  - imagegen
+description: |-
+  Generate one or more images through Puffer's configured image media settings
+  and write the resulting image artifacts into the workspace image folder.
+
+  Use one ImageGeneration call for one logical image-generation request. When
+  the user asks for multiple images from one prompt, set count to the requested
+  number instead of issuing multiple count=1 calls. When count is omitted, the
+  persisted image Output setting is used. The tool reads a
+  workspace-relative prompt file when the prompt value names one; otherwise it
+  treats prompt as literal text. The result includes one media job id and one
+  artifact entry per persisted image file.
+handler: runtime:workflow:image_generation
+approval_policy: ask
+sandbox_policy: network
+input_schema:
+  type: object
+  properties:
+    prompt:
+      type: string
+      description: Literal prompt text or a workspace-relative prompt file path.
+    promptReference:
+      type: string
+      description: Optional workspace-relative prompt/reference file to prepend as generation context.
+    aspect:
+      type: string
+      description: Aspect ratio such as square, landscape, portrait, 1:1, 16:9, 9:16, or auto.
+    count:
+      type: integer
+      description: Optional number of images to generate in one request. Must be between 1 and 9 when provided.
+      minimum: 1
+      maximum: 9
+    purpose:
+      type: string
+      description: Optional caller purpose preserved in the result metadata.
+    retryFromError:
+      description: Optional previous error payload for retrying the same prompt.
+  required:
+    - prompt
+  additionalProperties: false
+metadata:
+  may_spawn_processes: false
+  may_read_files: true
+  may_write_files: true
+  may_access_network: true
+display:
+  group: media
+  title: ImageGeneration
+  show_in_status: true

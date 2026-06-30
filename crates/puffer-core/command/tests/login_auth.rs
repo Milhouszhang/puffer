@@ -17,6 +17,7 @@ fn provider(
         headers: Default::default(),
         query_params: Default::default(),
         discovery: None,
+        media: None,
         models: vec![puffer_provider_registry::ModelDescriptor {
             id: "model".to_string(),
             display_name: "model".to_string(),
@@ -25,7 +26,11 @@ fn provider(
             context_window: 1000,
             max_output_tokens: 100,
             supports_reasoning: false,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
         }],
+        chat_completions_path: None,
     }
 }
 
@@ -84,6 +89,64 @@ fn login_command_runs_oauth_flow_for_oauth_capable_provider() {
             role: MessageRole::System,
             text, ..
         }) if text == "Completed login flow for custom-openai."
+    ));
+}
+
+#[test]
+fn login_command_accepts_desktop_provider_aliases() {
+    let tempdir = tempdir().unwrap();
+    let _home_lock = lock_puffer_home();
+    let home = tempdir.path().join("home");
+    let workspace = tempdir.path().join("workspace");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let _home = ScopedPufferHome::set(&home);
+
+    let paths = ConfigPaths::discover(&workspace);
+    ensure_workspace_dirs(&paths).unwrap();
+    let session_store = SessionStore::from_paths(&paths).unwrap();
+    let session = session_store.create_session(workspace.clone()).unwrap();
+    let mut state = AppState::new(PufferConfig::default(), workspace, session);
+    let mut providers = ProviderRegistry::new();
+    providers.register(provider(
+        "openai",
+        "openai-responses",
+        vec![AuthMode::ApiKey, AuthMode::OAuth],
+    ));
+
+    let auth_path = paths.user_config_dir.join("auth.json");
+    let mut auth_store = AuthStore::default();
+    with_login_flow_handler(
+        move |request| {
+            assert_eq!(request.provider_id, "openai");
+            assert_eq!(request.auth_path, auth_path);
+            let mut written = AuthStore::default();
+            written.set_api_key("openai", "token");
+            written.save(&request.auth_path)?;
+            Ok(())
+        },
+        || {
+            dispatch_command(
+                &mut state,
+                &supported_commands(),
+                &LoadedResources::default(),
+                &mut providers,
+                &mut auth_store,
+                &session_store,
+                "/login codex",
+            )
+            .unwrap();
+        },
+    );
+
+    assert!(auth_store.has_auth("openai"));
+    assert!(!auth_store.has_auth("codex"));
+    assert!(matches!(
+        state.transcript.last(),
+        Some(RenderedMessage {
+            role: MessageRole::System,
+            text, ..
+        }) if text == "Completed login flow for openai."
     ));
 }
 

@@ -1,0 +1,680 @@
+//! Runtime-local Browser tool client for the desktop daemon.
+
+use anyhow::{anyhow, bail, Context, Result};
+use puffer_config::ConfigPaths;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+#[cfg(test)]
+use std::cell::RefCell;
+use std::path::Path;
+use tungstenite::{connect, Message};
+use url::Url;
+use uuid::Uuid;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DAEMON_HANDLER: RefCell<Option<Box<dyn FnMut(&str, &Value) -> Result<Value>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Executes the model-facing Browser tool against the local Puffer daemon.
+pub(super) fn execute_browser_tool(
+    cwd: &Path,
+    current_session_id: &Uuid,
+    input: Value,
+) -> Result<String> {
+    let input = enrich_browser_permission_input(cwd, current_session_id, input)?;
+    let mut params: BrowserToolInput =
+        serde_json::from_value(input).context("invalid Browser tool input")?;
+    normalize_session_id(&mut params, current_session_id);
+    let payload = serde_json::to_value(params)?;
+    let handshakes = read_handshake_candidates(cwd)?;
+    let mut last_error = None;
+    for handshake in &handshakes {
+        match send_daemon_request(handshake, "browser_agent", payload.clone()) {
+            Ok(response) => return Ok(serde_json::to_string_pretty(&response)?),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+    bail!("Browser tool found no daemon handshakes")
+}
+
+/// Hydrates Browser permission input with daemon tab context when the action omits a URL.
+pub(crate) fn enrich_browser_permission_input(
+    cwd: &Path,
+    current_session_id: &Uuid,
+    input: Value,
+) -> Result<Value> {
+    let Some(payload) = input.as_object() else {
+        return Ok(input);
+    };
+    if browser_action_uses_explicit_url(payload) || browser_action_has_url(payload) {
+        return Ok(input);
+    }
+
+    let mut enriched = payload.clone();
+    let session_id = normalized_browser_session_id(payload, current_session_id);
+    let tab_context = read_current_tab_context(cwd, &session_id)?;
+    if let Some(tab_id) = tab_context.tab_id.as_deref() {
+        if !enriched.contains_key("tabId") {
+            enriched.insert("tabId".to_string(), Value::String(tab_id.to_string()));
+        }
+    }
+    if matches!(tab_context.status, BrowserCurrentTabStatus::Available) {
+        if let Some(url) = tab_context.url {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() {
+                enriched.insert("url".to_string(), Value::String(trimmed.to_string()));
+            }
+        }
+    }
+    Ok(Value::Object(enriched))
+}
+
+fn normalize_session_id(params: &mut BrowserToolInput, current_session_id: &Uuid) {
+    let use_current = params
+        .session_id
+        .as_deref()
+        .map(|value| value.trim().is_empty() || value == "current")
+        .unwrap_or(true);
+    if use_current {
+        params.session_id = Some(current_session_id.to_string());
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserToolInput {
+    action: String,
+    #[serde(default, rename = "sessionId")]
+    session_id: Option<String>,
+    #[serde(default, rename = "tabId")]
+    tab_id: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    page: Option<Value>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default, rename = "ref")]
+    ref_id: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    question: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    script: Option<String>,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    px: Option<u32>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    activate: Option<bool>,
+    #[serde(default)]
+    clear: Option<bool>,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+    #[serde(default)]
+    annotate: Option<bool>,
+    #[serde(default, rename = "screenshotFormat")]
+    screenshot_format: Option<String>,
+    #[serde(default, rename = "screenshotQuality")]
+    screenshot_quality: Option<u32>,
+    #[serde(default, rename = "idleMs")]
+    idle_ms: Option<u32>,
+    #[serde(default, rename = "timeoutMs")]
+    timeout_ms: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DaemonHandshake {
+    url: String,
+    token: String,
+    #[serde(default)]
+    workspace_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonResponse {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<DaemonError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonError {
+    message: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserCurrentTabContext {
+    pub(crate) status: BrowserCurrentTabStatus,
+    pub(crate) tab_id: Option<String>,
+    pub(crate) url: Option<String>,
+    pub(crate) origin: Option<String>,
+    pub(crate) host: Option<String>,
+    pub(crate) port: Option<u16>,
+    pub(crate) title: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BrowserCurrentTabStatus {
+    NoActiveTab,
+    EmptyUrl,
+    AboutBlank,
+    Available,
+}
+
+fn read_handshake_candidates(cwd: &Path) -> Result<Vec<DaemonHandshake>> {
+    let paths = ConfigPaths::discover(cwd);
+    let workspace_root = canonical_workspace_root(&paths.workspace_root);
+    let workspace_path = paths.workspace_config_dir.join("daemon.handshake");
+    let user_path = paths.user_config_dir.join("daemon.handshake");
+
+    let mut last_error = None;
+    let workspace_handshake = match read_handshake_file(&workspace_path) {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            last_error = Some(error);
+            None
+        }
+    };
+    let user_handshake = match read_handshake_file(&user_path) {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            last_error = Some(error);
+            None
+        }
+    };
+    let handshakes = select_handshake_candidates_for_browser(
+        workspace_handshake,
+        user_handshake,
+        &workspace_root,
+    );
+    if !handshakes.is_empty() {
+        return Ok(handshakes);
+    }
+
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+
+    bail!(
+        "Browser tool requires a running Puffer daemon at {} or {}",
+        workspace_path.display(),
+        user_path.display()
+    );
+}
+
+fn read_handshake_file(path: &Path) -> Result<Option<DaemonHandshake>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow!(error).context(format!("read daemon handshake {}", path.display())));
+        }
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .context(format!("decode daemon handshake {}", path.display()))
+}
+
+#[cfg(test)]
+fn select_handshake_for_browser(
+    workspace_handshake: Option<DaemonHandshake>,
+    user_handshake: Option<DaemonHandshake>,
+    workspace_root: &Path,
+) -> Option<DaemonHandshake> {
+    select_handshake_candidates_for_browser(workspace_handshake, user_handshake, workspace_root)
+        .into_iter()
+        .next()
+}
+
+fn select_handshake_candidates_for_browser(
+    workspace_handshake: Option<DaemonHandshake>,
+    user_handshake: Option<DaemonHandshake>,
+    workspace_root: &Path,
+) -> Vec<DaemonHandshake> {
+    let mut candidates = Vec::new();
+    if let Some(handshake) = workspace_handshake
+        .filter(|handshake| handshake_matches_workspace(handshake, workspace_root))
+    {
+        candidates.push(handshake);
+    }
+    if let Some(handshake) = user_handshake {
+        candidates.push(handshake);
+    }
+    candidates
+}
+
+fn handshake_matches_workspace(handshake: &DaemonHandshake, workspace_root: &Path) -> bool {
+    let workspace_root = canonical_workspace_root(workspace_root);
+    handshake
+        .workspace_root
+        .as_deref()
+        .map(Path::new)
+        .map(canonical_workspace_root)
+        .map(|candidate| candidate == workspace_root)
+        .unwrap_or(true)
+}
+
+fn canonical_workspace_root(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn send_daemon_request(handshake: &DaemonHandshake, method: &str, params: Value) -> Result<Value> {
+    #[cfg(test)]
+    if let Some(result) = test_daemon_request(method, &params) {
+        return result;
+    }
+    let request_id = Uuid::new_v4().to_string();
+    let endpoint = endpoint_with_token(&handshake.url, &handshake.token)?;
+    let (mut socket, _) = connect(endpoint.as_str()).context("connect to Puffer daemon")?;
+    let request = json!({
+        "id": request_id,
+        "method": method,
+        "params": params
+    });
+    socket
+        .send(Message::Text(request.to_string().into()))
+        .context("send Browser request to daemon")?;
+    loop {
+        let message = socket.read().context("read Browser response from daemon")?;
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let response: DaemonResponse =
+            serde_json::from_str(&text).context("decode Browser daemon response")?;
+        if response.id.as_deref() != Some(request_id.as_str()) {
+            continue;
+        }
+        if let Some(error) = response.error {
+            bail!("{}", error.message);
+        }
+        return response
+            .result
+            .ok_or_else(|| anyhow!("daemon returned no Browser result"));
+    }
+}
+
+fn endpoint_with_token(raw: &str, token: &str) -> Result<String> {
+    let mut url = Url::parse(raw).context("parse daemon URL")?;
+    url.query_pairs_mut().append_pair("token", token);
+    Ok(url.to_string())
+}
+
+fn browser_action_uses_explicit_url(payload: &Map<String, Value>) -> bool {
+    payload
+        .get("action")
+        .and_then(Value::as_str)
+        .map(normalize_browser_action)
+        .is_some_and(|action| {
+            matches!(
+                action.as_str(),
+                "open" | "new" | "navigate" | "openconsolelogs" | "openscreenshot"
+            )
+        })
+}
+
+fn browser_action_has_url(payload: &Map<String, Value>) -> bool {
+    payload
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(|url| !url.trim().is_empty())
+}
+
+fn normalized_browser_session_id(
+    payload: &Map<String, Value>,
+    current_session_id: &Uuid,
+) -> String {
+    if let Some(session_id) = payload
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "current")
+    {
+        session_id.to_string()
+    } else {
+        current_session_id.to_string()
+    }
+}
+
+fn normalize_browser_action(action: &str) -> String {
+    action.trim().replace(['_', '-'], "").to_ascii_lowercase()
+}
+
+pub(crate) fn read_current_tab_context(
+    cwd: &Path,
+    session_id: &str,
+) -> Result<BrowserCurrentTabContext> {
+    #[cfg(test)]
+    if let Some(result) =
+        test_daemon_request("browser_current_tab", &json!({ "sessionId": session_id }))
+    {
+        let response = result?;
+        return serde_json::from_value(response).context("decode Browser current tab context");
+    }
+    let payload = json!({ "sessionId": session_id });
+    let handshakes = read_handshake_candidates(cwd)?;
+    let mut last_error = None;
+    for handshake in &handshakes {
+        match send_daemon_request(handshake, "browser_current_tab", payload.clone()) {
+            Ok(response) => {
+                return serde_json::from_value(response)
+                    .context("decode Browser current tab context");
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+    bail!("Browser current-tab lookup found no daemon handshakes")
+}
+
+/// Runs a closure while Browser daemon requests are served by a test handler.
+#[cfg(test)]
+pub(crate) fn with_browser_daemon_test_handler<R>(
+    handler: impl FnMut(&str, &Value) -> Result<Value> + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    TEST_DAEMON_HANDLER.with(|slot| {
+        let previous = slot.borrow_mut().take();
+        *slot.borrow_mut() = Some(Box::new(handler));
+        let result = run();
+        let _ = slot.borrow_mut().take();
+        *slot.borrow_mut() = previous;
+        result
+    })
+}
+
+#[cfg(test)]
+fn test_daemon_request(method: &str, params: &Value) -> Option<Result<Value>> {
+    TEST_DAEMON_HANDLER.with(|slot| {
+        let mut borrowed = slot.borrow_mut();
+        borrowed.as_mut().map(|handler| handler(method, params))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_missing_current_and_empty_session_ids() {
+        let current = Uuid::parse_str("2ba8b01d-5e7a-46b6-b747-7bfe5f6fa36a").unwrap();
+        let current_string = current.to_string();
+        for value in [None, Some("current"), Some("  ")] {
+            let mut params = BrowserToolInput {
+                action: "list".to_string(),
+                session_id: value.map(ToString::to_string),
+                tab_id: None,
+                label: None,
+                url: None,
+                page: None,
+                query: None,
+                ref_id: None,
+                value: None,
+                text: None,
+                question: None,
+                key: None,
+                script: None,
+                direction: None,
+                px: None,
+                width: None,
+                height: None,
+                activate: None,
+                clear: None,
+                files: None,
+                annotate: None,
+                screenshot_format: None,
+                screenshot_quality: None,
+                idle_ms: None,
+                timeout_ms: None,
+            };
+            normalize_session_id(&mut params, &current);
+            assert_eq!(params.session_id.as_deref(), Some(current_string.as_str()));
+        }
+    }
+
+    #[test]
+    fn preserves_explicit_real_session_id() {
+        let current = Uuid::parse_str("2ba8b01d-5e7a-46b6-b747-7bfe5f6fa36a").unwrap();
+        let explicit = "b4f239fd-1493-4be7-a3a1-9e58fe612576";
+        let mut params = BrowserToolInput {
+            action: "list".to_string(),
+            session_id: Some(explicit.to_string()),
+            tab_id: None,
+            label: None,
+            url: None,
+            page: None,
+            query: None,
+            ref_id: None,
+            value: None,
+            text: None,
+            question: None,
+            key: None,
+            script: None,
+            direction: None,
+            px: None,
+            width: None,
+            height: None,
+            activate: None,
+            clear: None,
+            files: None,
+            annotate: None,
+            screenshot_format: None,
+            screenshot_quality: None,
+            idle_ms: None,
+            timeout_ms: None,
+        };
+        normalize_session_id(&mut params, &current);
+        assert_eq!(params.session_id.as_deref(), Some(explicit));
+    }
+
+    #[test]
+    fn preserves_extended_browser_action_fields() {
+        let params: BrowserToolInput = serde_json::from_value(serde_json::json!({
+            "action": "select",
+            "tabId": "t2",
+            "ref": "@e5",
+            "value": "New York",
+            "direction": "down",
+            "px": 480,
+            "page": {"tabId": "t2"},
+            "clear": true,
+            "files": ["/tmp/upload.txt"],
+            "annotate": true,
+            "screenshotFormat": "jpeg",
+            "screenshotQuality": 70,
+            "query": "button",
+            "question": "What changed visually?",
+            "idleMs": 500,
+            "timeoutMs": 30000
+        }))
+        .unwrap();
+
+        let roundtrip = serde_json::to_value(params).unwrap();
+        assert_eq!(
+            roundtrip.get("value").and_then(Value::as_str),
+            Some("New York")
+        );
+        assert_eq!(
+            roundtrip.get("direction").and_then(Value::as_str),
+            Some("down")
+        );
+        assert_eq!(roundtrip.get("px").and_then(Value::as_u64), Some(480));
+        assert_eq!(
+            roundtrip
+                .get("page")
+                .and_then(|page| page.get("tabId"))
+                .and_then(Value::as_str),
+            Some("t2")
+        );
+        assert_eq!(roundtrip.get("clear").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            roundtrip
+                .get("files")
+                .and_then(Value::as_array)
+                .and_then(|files| files.first())
+                .and_then(Value::as_str),
+            Some("/tmp/upload.txt")
+        );
+        assert_eq!(
+            roundtrip.get("annotate").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            roundtrip.get("screenshotFormat").and_then(Value::as_str),
+            Some("jpeg")
+        );
+        assert_eq!(
+            roundtrip.get("screenshotQuality").and_then(Value::as_u64),
+            Some(70)
+        );
+        assert_eq!(
+            roundtrip.get("query").and_then(Value::as_str),
+            Some("button")
+        );
+        assert_eq!(
+            roundtrip.get("question").and_then(Value::as_str),
+            Some("What changed visually?")
+        );
+        assert_eq!(roundtrip.get("idleMs").and_then(Value::as_u64), Some(500));
+        assert_eq!(
+            roundtrip.get("timeoutMs").and_then(Value::as_u64),
+            Some(30000)
+        );
+    }
+
+    #[test]
+    fn composite_browser_actions_keep_explicit_url() {
+        for action in ["openConsoleLogs", "openScreenshot"] {
+            let payload = serde_json::json!({
+                "action": action,
+                "url": "https://example.com"
+            });
+            assert!(browser_action_uses_explicit_url(
+                payload.as_object().unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn handshake_workspace_filter_accepts_matching_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let handshake = DaemonHandshake {
+            url: "ws://127.0.0.1:1/ws".to_string(),
+            token: "token".to_string(),
+            workspace_root: Some(workspace.path().display().to_string()),
+        };
+        assert!(handshake_matches_workspace(&handshake, workspace.path()));
+    }
+
+    #[test]
+    fn handshake_workspace_filter_rejects_other_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let handshake = DaemonHandshake {
+            url: "ws://127.0.0.1:1/ws".to_string(),
+            token: "token".to_string(),
+            workspace_root: Some(other.path().display().to_string()),
+        };
+        assert!(!handshake_matches_workspace(&handshake, workspace.path()));
+    }
+
+    #[test]
+    fn browser_handshake_prefers_matching_workspace_handshake() {
+        let workspace = tempfile::tempdir().unwrap();
+        let matching = DaemonHandshake {
+            url: "ws://127.0.0.1:1/ws".to_string(),
+            token: "workspace".to_string(),
+            workspace_root: Some(workspace.path().display().to_string()),
+        };
+        let user = DaemonHandshake {
+            url: "ws://127.0.0.1:2/ws".to_string(),
+            token: "user".to_string(),
+            workspace_root: Some("/other/workspace".to_string()),
+        };
+
+        let selected =
+            select_handshake_for_browser(Some(matching), Some(user), workspace.path()).unwrap();
+        assert_eq!(selected.token, "workspace");
+    }
+
+    #[test]
+    fn browser_handshake_keeps_user_fallback_after_matching_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let matching = DaemonHandshake {
+            url: "ws://127.0.0.1:1/ws".to_string(),
+            token: "workspace".to_string(),
+            workspace_root: Some(workspace.path().display().to_string()),
+        };
+        let user = DaemonHandshake {
+            url: "ws://127.0.0.1:2/ws".to_string(),
+            token: "user".to_string(),
+            workspace_root: Some("/desktop/global".to_string()),
+        };
+
+        let selected =
+            select_handshake_candidates_for_browser(Some(matching), Some(user), workspace.path());
+        let tokens = selected
+            .iter()
+            .map(|handshake| handshake.token.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tokens, vec!["workspace", "user"]);
+    }
+
+    #[test]
+    fn browser_handshake_uses_user_handshake_as_global_fallback() {
+        let workspace = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mismatched = DaemonHandshake {
+            url: "ws://127.0.0.1:1/ws".to_string(),
+            token: "workspace".to_string(),
+            workspace_root: Some(other.path().display().to_string()),
+        };
+        let user = DaemonHandshake {
+            url: "ws://127.0.0.1:2/ws".to_string(),
+            token: "user".to_string(),
+            workspace_root: Some("/desktop/global".to_string()),
+        };
+
+        let selected =
+            select_handshake_for_browser(Some(mismatched), Some(user), workspace.path()).unwrap();
+        assert_eq!(selected.token, "user");
+    }
+
+    #[test]
+    fn browser_handshake_ignores_mismatched_workspace_without_user_fallback() {
+        let workspace = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mismatched = DaemonHandshake {
+            url: "ws://127.0.0.1:1/ws".to_string(),
+            token: "workspace".to_string(),
+            workspace_root: Some(other.path().display().to_string()),
+        };
+
+        let selected = select_handshake_for_browser(Some(mismatched), None, workspace.path());
+        assert!(selected.is_none());
+    }
+}

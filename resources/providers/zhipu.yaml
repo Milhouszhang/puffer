@@ -1,0 +1,106 @@
+id: zhipu
+display_name: Zhipu (BigModel)
+# Zhipu's OpenAI-compatible Chat Completions endpoint lives under
+# `/api/paas/v4/chat/completions`, NOT `/v1/chat/completions`. We
+# encode the versioned prefix in `base_url` and override
+# `chat_completions_path` so puffer doesn't construct
+# `…/v4/v1/chat/completions` and 404 the call.
+base_url: https://open.bigmodel.cn/api/paas/v4
+chat_completions_path: /chat/completions
+default_api: openai-completions
+auth_modes:
+  - api_key
+media:
+  image:
+    discovery:
+      adapter: static
+    execution:
+      adapter: images_json
+      path: /images/generations
+      batch:
+        mode: per_image
+    models:
+      - id: glm-image
+        display_name: GLM Image
+        operations:
+          - generate
+        axes:
+          - { id: ratio, label: Ratio, role: param, control: !enum { values: ["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16"], default: "1:1" } }
+        media_map:
+          ratio:
+            field: size
+            values:
+              "1:1": "1280x1280"
+              "3:2": "1568x1056"
+              "2:3": "1056x1568"
+              "4:3": "1472x1088"
+              "3:4": "1088x1472"
+              "16:9": "1728x960"
+              "9:16": "960x1728"
+        variants: { model_id: glm-image, base_params: { quality: hd } }
+      - id: cogview-4-250304
+        display_name: CogView 4 250304
+        operations:
+          - generate
+        axes:
+          - { id: ratio, label: Ratio, role: param, control: !enum { values: ["1:1", "9:16", "3:4", "16:9", "4:3"], default: "1:1" } }
+          - { id: quality, label: Quality, role: param, control: !enum { values: ["standard", "hd"], default: "standard" }, request_field: quality }
+        media_map:
+          ratio:
+            field: size
+            values:
+              "1:1": "1024x1024"
+              "9:16": "768x1344"
+              "3:4": "864x1152"
+              "16:9": "1344x768"
+              "4:3": "1152x864"
+        variants: { model_id: cogview-4-250304 }
+      - id: cogview-4
+        display_name: CogView 4
+        operations:
+          - generate
+        axes:
+          - { id: ratio, label: Ratio, role: param, control: !enum { values: ["1:1", "9:16", "3:4", "16:9", "4:3"], default: "1:1" } }
+          - { id: quality, label: Quality, role: param, control: !enum { values: ["standard", "hd"], default: "standard" }, request_field: quality }
+        media_map:
+          ratio:
+            field: size
+            values:
+              "1:1": "1024x1024"
+              "9:16": "768x1344"
+              "3:4": "864x1152"
+              "16:9": "1344x768"
+              "4:3": "1152x864"
+        variants: { model_id: cogview-4 }
+      - id: cogview-3-flash
+        display_name: CogView 3 Flash
+        operations:
+          - generate
+        axes:
+          - { id: ratio, label: Ratio, role: param, control: !enum { values: ["1:1", "9:16", "3:4", "16:9", "4:3"], default: "1:1" } }
+          - { id: quality, label: Quality, role: param, control: !enum { values: ["standard", "hd"], default: "standard" }, request_field: quality }
+        media_map:
+          ratio:
+            field: size
+            values:
+              "1:1": "1024x1024"
+              "9:16": "768x1344"
+              "3:4": "864x1152"
+              "16:9": "1344x768"
+              "4:3": "1152x864"
+        variants: { model_id: cogview-3-flash }
+models:
+  - id: glm-4.6
+    display_name: GLM-4.6
+    provider: zhipu
+    api: openai-completions
+    context_window: 200000
+    max_output_tokens: 32768
+    supports_reasoning: true
+  - id: glm-4.5
+    display_name: GLM-4.5
+    provider: zhipu
+    api: openai-completions
+    context_window: 128000
+    max_output_tokens: 32768
+    supports_reasoning: true

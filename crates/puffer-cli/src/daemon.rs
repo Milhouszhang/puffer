@@ -236,9 +236,12 @@ async fn run_async(options: DaemonOptions) -> Result<()> {
         yolo,
     )?;
     apply_proxy_env_at_startup(&state.config.lock().unwrap().network.proxy);
-    // Push the startup proxy config into the manager so any subscriber
-    // that is later respawned (e.g. after an auth failure) inherits the
-    // correct proxy configuration even if no save-settings call has occurred.
+    // Overwrite the proxy config the manager received during install() with the
+    // daemon's own startup config. install() already applies the proxy before
+    // autostart_subscribers so the first launch is correct; this call ensures
+    // the manager holds the daemon-local config (which may differ if the config
+    // file was modified between install() and run_async()) so that any future
+    // respawn (e.g. after an auth failure) also uses the right settings.
     if let Ok(manager) = subscription_manager() {
         manager.set_proxy_config(state.config.lock().unwrap().network.proxy.clone());
     }

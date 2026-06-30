@@ -168,9 +168,15 @@ pub fn resolve_api_credentials(
     Ok((DEFAULT_API_ID, DEFAULT_API_HASH.to_string()))
 }
 
-/// grammers requires a `socks5://` proxy URL; reject http/empty/other schemes.
+/// grammers requires a `socks5://` URL; reject http/empty/other schemes.
+/// `socks5h://` (DNS-via-proxy variant) is normalized to `socks5://` so that
+/// operators who configure the system-wide ALL_PROXY with the `h` suffix are
+/// not silently dropped — grammers handles remote DNS resolution internally.
 fn normalize_telegram_proxy(raw: &str) -> Option<String> {
     let value = raw.trim();
+    if let Some(rest) = value.strip_prefix("socks5h://") {
+        return Some(format!("socks5://{rest}"));
+    }
     value.starts_with("socks5://").then(|| value.to_string())
 }
 
@@ -265,8 +271,11 @@ mod tests {
             normalize_telegram_proxy("  socks5://h:1  "),
             Some("socks5://h:1".to_string())
         );
-        // grammers requires socks5 specifically
-        assert_eq!(normalize_telegram_proxy("socks5h://h:1"), None);
+        // socks5h:// (DNS-via-proxy) is normalized to socks5:// for grammers
+        assert_eq!(
+            normalize_telegram_proxy("socks5h://h:1"),
+            Some("socks5://h:1".to_string())
+        );
         assert_eq!(normalize_telegram_proxy("http://127.0.0.1:7890"), None);
         assert_eq!(normalize_telegram_proxy("127.0.0.1:7890"), None);
         assert_eq!(normalize_telegram_proxy(""), None);

@@ -255,7 +255,7 @@ fn run_main() -> Result<()> {
         None
     };
     let _subscription_runtime = if install_subscription_manager {
-        match subscriptions::install(&paths, &auth_store, anthropic_base.as_deref()) {
+        match subscriptions::install(&paths, &auth_store, anthropic_base.as_deref(), config.network.proxy.clone()) {
             Ok(rt) => Some(rt),
             Err(error) => {
                 eprintln!("subscription manager failed to start: {error:#}");

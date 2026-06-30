@@ -3,42 +3,34 @@
 
   import { onDestroy, onMount } from "svelte";
   import {
-    createRuntimeWorkflow,
     deleteWorkflowBinding,
     deployRuntimeWorkflow,
-    executeWorkflowInMemory,
     executeRuntimeWorkflow,
-    listWorkflowNodeDefinitions,
     listWorkflowExecutions,
     loadWorkflowSnapshot,
-    toggleWorkflow,
-    updateRuntimeWorkflow
+    toggleWorkflow
   } from "../api/desktop";
   import Icon from "../design/Icon.svelte";
-  import WorkflowDefinitionEditor from "./WorkflowDefinitionEditor.svelte";
   import type {
     WorkflowBinding,
     WorkflowConnection,
     WorkflowConnector,
-    WorkflowCreateRequest,
-    WorkflowDefinition,
     WorkflowExecutionRecord,
     WorkflowMonitorTask,
-    WorkflowNodeDefinitionLight,
     WorkflowRuntimeRecord,
     WorkflowSnapshot
   } from "../types";
 
-  type Props = {
-    onRunWorkflowCommand?: (command: string) => Promise<boolean>;
+  type AutomationDraft = {
+    name: string;
+    description: string;
   };
 
-  type WorkflowScreen = "overview" | "editor";
+  type WorkflowScreen = "overview" | "detail" | "draft";
 
   const EXECUTION_REFRESH_DELAY_MS = 1500;
   const EXECUTION_REFRESH_ATTEMPTS = 4;
 
-  let props: Props = $props();
   let loading = $state(false);
   let error = $state<string | null>(null);
   let workflowLoadError = $state<string | null>(null);
@@ -59,18 +51,12 @@
   let runtimeActionNotice = $state<string | null>(null);
   let workflowExecutions = $state<Record<string, WorkflowExecutionRecord[]>>({});
   let workflowExecutionErrors = $state<Record<string, string>>({});
-  let editorWorkflowName = $state(newRuntimeWorkflowName());
-  let editorWorkflowDescription = $state("");
-  let editorDefinition = $state<WorkflowDefinition>(newRuntimeWorkflowDefinition());
-  let nodeDefinitions = $state<WorkflowNodeDefinitionLight[]>([]);
-  let nodeDefinitionError = $state<string | null>(null);
-  let editorRunResult = $state<WorkflowExecutionRecord | null>(null);
-  let draftEditorOpen = $state(false);
   let workflowScreen = $state<WorkflowScreen>("overview");
   let createDialogOpen = $state(false);
   let createWorkflowName = $state("");
   let createWorkflowDescription = $state("");
   let createWorkflowNameError = $state<string | null>(null);
+  let automationDraft = $state<AutomationDraft | null>(null);
   let executionRefreshTimers = new Map<string, number>();
 
   const workflows = $derived(snapshot.workflows ?? []);
@@ -98,14 +84,9 @@
   const activeBindings = $derived(bindings.filter((binding) => binding.enabled).length);
   const readyConnections = $derived(connections.filter((connection) => connection.can_trigger_workflow).length);
   const activeMonitorTasks = $derived(monitorTasks.filter((task) => !task.ignored).length);
-  const editorVisible = $derived(draftEditorOpen || selectedWorkflow !== null);
-  const editorTitle = $derived(
-    draftEditorOpen ? "New workflow draft" : selectedWorkflow ? workflowName(selectedWorkflow) : "Workflow editor"
-  );
 
   onMount(() => {
     void refresh();
-    void loadNodeDefinitions();
   });
 
   onDestroy(() => {
@@ -129,15 +110,6 @@
       workflowLoadError = message;
     } finally {
       loading = false;
-    }
-  }
-
-  async function loadNodeDefinitions() {
-    try {
-      nodeDefinitions = await listWorkflowNodeDefinitions();
-      nodeDefinitionError = null;
-    } catch (err) {
-      nodeDefinitionError = workflowRequestErrorText(err, "loading node definitions");
     }
   }
 
@@ -178,19 +150,21 @@
     createWorkflowNameError = null;
   }
 
-  function beginDraftFromCreateDialog() {
+  function startAutomationDraftFromDialog() {
     const name = createWorkflowName.trim();
     if (!name) {
       createWorkflowNameError = "Name is required.";
       return;
     }
-    editorWorkflowName = name;
-    editorWorkflowDescription = createWorkflowDescription.trim();
-    editorDefinition = newRuntimeWorkflowDefinition(name);
-    editorRunResult = null;
+    if (runtimeActionBusy) return;
+    error = null;
+    runtimeActionNotice = null;
+    automationDraft = {
+      name,
+      description: createWorkflowDescription.trim()
+    };
     selectedWorkflowKey = null;
-    draftEditorOpen = true;
-    workflowScreen = "editor";
+    workflowScreen = "draft";
     createDialogOpen = false;
     createWorkflowNameError = null;
   }
@@ -218,66 +192,6 @@
       error = err instanceof Error ? err.message : String(err);
     } finally {
       deletingBindingSlug = null;
-    }
-  }
-
-  async function createWorkflowInRuntime() {
-    if (runtimeActionBusy) return;
-    runtimeActionBusy = "create";
-    error = null;
-    runtimeActionNotice = null;
-    try {
-      const created = await createRuntimeWorkflow(editorWorkflowPayload());
-      upsertRuntimeWorkflow(created);
-      selectedWorkflowKey = workflowKey(created, workflows.length);
-      draftEditorOpen = false;
-      workflowScreen = "editor";
-      loadEditorFromWorkflow(created);
-      runtimeActionNotice = `Created ${workflowName(created)} in the configured workflow runtime.`;
-    } catch (err) {
-      error = workflowRequestErrorText(err, "creating workflow");
-    } finally {
-      runtimeActionBusy = null;
-    }
-  }
-
-  async function saveEditorDraft() {
-    const id = selectedWorkflow ? workflowApiId(selectedWorkflow) : null;
-    if (!id || runtimeActionBusy) return;
-    runtimeActionBusy = `save:${id}`;
-    error = null;
-    runtimeActionNotice = null;
-    try {
-      const updated = await updateRuntimeWorkflow(id, editorWorkflowPayload());
-      upsertRuntimeWorkflow(updated);
-      loadEditorFromWorkflow(updated);
-      runtimeActionNotice = `Saved ${workflowName(updated)} draft.`;
-    } catch (err) {
-      error = workflowRequestErrorText(err, "saving workflow draft");
-    } finally {
-      runtimeActionBusy = null;
-    }
-  }
-
-  async function runEditorInMemory() {
-    if (runtimeActionBusy) return;
-    runtimeActionBusy = "test";
-    error = null;
-    runtimeActionNotice = null;
-    editorRunResult = null;
-    try {
-      const execution = await executeWorkflowInMemory({
-        definition: editorDefinition,
-        input: {
-          source: "puffer-desktop"
-        }
-      });
-      editorRunResult = execution;
-      runtimeActionNotice = `Test run ${executionStatus(execution)}.`;
-    } catch (err) {
-      error = workflowRequestErrorText(err, "testing workflow definition");
-    } finally {
-      runtimeActionBusy = null;
     }
   }
 
@@ -335,15 +249,13 @@
   }
 
   function selectWorkflow(record: WorkflowRuntimeRecord, index: number) {
-    draftEditorOpen = false;
-    workflowScreen = "editor";
+    workflowScreen = "detail";
+    automationDraft = null;
     selectedWorkflowKey = workflowKey(record, index);
-    loadEditorFromWorkflow(record);
   }
 
   function returnToWorkflowOverview() {
     workflowScreen = "overview";
-    editorRunResult = null;
   }
 
   function upsertRuntimeWorkflow(record: WorkflowRuntimeRecord) {
@@ -437,66 +349,6 @@
     return message;
   }
 
-  function editorWorkflowPayload(): WorkflowCreateRequest {
-    const name = editorWorkflowName.trim() || newRuntimeWorkflowName();
-    const description = editorWorkflowDescription.trim();
-    return {
-      name,
-      ...(description ? { description } : {}),
-      definition: editorDefinition
-    };
-  }
-
-  function loadEditorFromWorkflow(record: WorkflowRuntimeRecord | null) {
-    editorRunResult = null;
-    if (!record) {
-      editorWorkflowName = newRuntimeWorkflowName();
-      editorWorkflowDescription = "";
-      editorDefinition = newRuntimeWorkflowDefinition();
-      return;
-    }
-    const name = workflowName(record);
-    editorWorkflowName = name === "-" ? newRuntimeWorkflowName() : name;
-    editorWorkflowDescription = workflowDescription(record);
-    editorDefinition = workflowDefinition(record) ?? newRuntimeWorkflowDefinition();
-  }
-
-  function newRuntimeWorkflowName(): string {
-    const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
-    return `Puffer workflow ${stamp}`;
-  }
-
-  function newRuntimeWorkflowDefinition(name = "puffer manual"): WorkflowDefinition {
-    const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
-    const slugBase = name
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 42);
-    const slug = `${slugBase || "puffer-manual"}-${stamp}`;
-    return {
-      nodes: [
-        {
-          id: "manual_webhook",
-          type: "webhook",
-          name: "Manual webhook",
-          config: {
-            path: slug,
-            methods: ["POST"],
-            authentication: "none"
-          },
-          trusted: false,
-          position: {
-            x: 160,
-            y: 120
-          }
-        }
-      ],
-      edges: []
-    };
-  }
-
   function syncExecutionCache(runs: WorkflowRuntimeRecord[]) {
     const next: Record<string, WorkflowExecutionRecord[]> = {};
     for (const run of runs) {
@@ -546,50 +398,6 @@
   function workflowDescription(record: WorkflowRuntimeRecord): string {
     const description = recordString(record, ["description", "summary"]);
     return description === "-" ? "" : description;
-  }
-
-  function workflowDefinition(record: WorkflowRuntimeRecord): WorkflowDefinition | null {
-    const value = record.definition;
-    if (!isWorkflowDefinition(value)) return null;
-    return {
-      nodes: value.nodes.map((node) => ({
-        id: node.id,
-        type: node.type,
-        ...(node.name ? { name: node.name } : {}),
-        config: isJsonRecord(node.config) ? node.config : {},
-        ...(typeof node.trusted === "boolean" ? { trusted: node.trusted } : {}),
-        ...(isWorkflowPosition(node.position) ? { position: node.position } : {})
-      })),
-      edges: value.edges.map((edge) => ({
-        source: edge.source,
-        target: edge.target,
-        ...(typeof edge.conditionScript === "string"
-          ? { conditionScript: edge.conditionScript }
-          : {})
-      }))
-    };
-  }
-
-  function isWorkflowDefinition(value: unknown): value is WorkflowDefinition {
-    return Boolean(
-      value &&
-        typeof value === "object" &&
-        Array.isArray((value as WorkflowDefinition).nodes) &&
-        Array.isArray((value as WorkflowDefinition).edges)
-    );
-  }
-
-  function isWorkflowPosition(value: unknown): value is { x: number; y: number } {
-    return Boolean(
-      value &&
-        typeof value === "object" &&
-        typeof (value as { x?: unknown }).x === "number" &&
-        typeof (value as { y?: unknown }).y === "number"
-    );
-  }
-
-  function isJsonRecord(value: unknown): value is Record<string, unknown> {
-    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
   }
 
   function workflowStatus(record: WorkflowRuntimeRecord): string {
@@ -775,7 +583,7 @@
         disabled={runtimeActionBusy !== null}
         onclick={openCreateWorkflowDialog}
       >
-        <Icon name="plus" size={12} />Create Workflow
+        <Icon name="plus" size={12} />Create Automation
       </button>
     </div>
   </div>
@@ -792,20 +600,20 @@
         <form
           onsubmit={(event) => {
             event.preventDefault();
-            beginDraftFromCreateDialog();
+            startAutomationDraftFromDialog();
           }}
         >
           <div class="pf-workflow-modal-head">
             <div>
-              <h2 id="pf-workflow-create-title">Create Workflow</h2>
+              <h2 id="pf-workflow-create-title">Create Automation</h2>
               <p id="pf-workflow-create-description">
-                Name the workflow first, then edit its visual graph or JSON definition.
+                Start an automation draft. The draft will be written to the runtime after the builder compiles an AgentEnv definition.
               </p>
             </div>
             <button
               type="button"
               class="sc-icon-btn"
-              aria-label="Close create workflow dialog"
+              aria-label="Close create automation dialog"
               onclick={closeCreateWorkflowDialog}
             >
               <Icon name="x" size={14} />
@@ -815,7 +623,7 @@
             <label>
               <span>Name</span>
               <input
-                aria-label="New workflow name"
+                aria-label="New automation name"
                 value={createWorkflowName}
                 placeholder="e.g., Daily report"
                 oninput={(event) => {
@@ -830,7 +638,7 @@
             <label>
               <span>Description <em>optional</em></span>
               <input
-                aria-label="New workflow description"
+                aria-label="New automation description"
                 value={createWorkflowDescription}
                 placeholder="What should this workflow do?"
                 oninput={(event) => (createWorkflowDescription = event.currentTarget.value)}
@@ -852,9 +660,9 @@
               class="sc-btn"
               data-variant="default"
               data-size="sm"
-              disabled={!createWorkflowName.trim()}
+              disabled={runtimeActionBusy !== null || !createWorkflowName.trim()}
             >
-              Continue
+              Start draft
             </button>
           </div>
         </form>
@@ -869,9 +677,9 @@
     <div class="pf-workflow-alert pf-workflow-notice" role="status">{runtimeActionNotice}</div>
   {/if}
 
-  {#if workflowScreen === "editor" && editorVisible}
-    <div class="pf-workflow-editor-page" aria-label="Workflow editor page">
-      <div class="pf-workflow-editor-page-top">
+  {#if workflowScreen === "draft" && automationDraft}
+    <div class="pf-workflow-detail-page" aria-label="Automation draft page">
+      <div class="pf-workflow-detail-top">
         <button
           type="button"
           class="sc-btn"
@@ -881,115 +689,98 @@
         >
           <Icon name="chevL" size={13} />Back
         </button>
-        <div class="pf-workflow-editor-title">
-          <strong>{editorTitle}</strong>
-          <small>{draftEditorOpen ? "Unsaved draft" : workflowApiId(selectedWorkflow ?? {}) ?? "runtime workflow"}</small>
+        <div class="pf-workflow-detail-title">
+          <strong>{automationDraft.name}</strong>
+          <small>local automation draft</small>
         </div>
-        <div class="pf-workflow-editor-page-actions">
+      </div>
+
+      <div class="pf-workflow-detail-grid">
+        <section class="pf-workflow-panel pf-workflow-detail-panel" aria-label="Automation draft details">
+          <div class="pf-workflow-panel-head">
+            <div>
+              <strong>Details</strong>
+              <small>{automationDraft.description || "No description"}</small>
+            </div>
+          </div>
+          <dl class="pf-workflow-metadata">
+            <div>
+              <dt>Name</dt>
+              <dd>{automationDraft.name}</dd>
+            </div>
+            <div>
+              <dt>Runtime</dt>
+              <dd>Not created</dd>
+            </div>
+            <div>
+              <dt>Definition</dt>
+              <dd>Pending builder</dd>
+            </div>
+          </dl>
+        </section>
+      </div>
+    </div>
+  {:else if workflowScreen === "detail" && selectedWorkflow}
+    <div class="pf-workflow-detail-page" aria-label="Workflow detail page">
+      <div class="pf-workflow-detail-top">
+        <button
+          type="button"
+          class="sc-btn"
+          data-variant="ghost"
+          data-size="sm"
+          onclick={returnToWorkflowOverview}
+        >
+          <Icon name="chevL" size={13} />Back
+        </button>
+        <div class="pf-workflow-detail-title">
+          <strong>{workflowName(selectedWorkflow)}</strong>
+          <small>{workflowApiId(selectedWorkflow) ?? "runtime workflow"}</small>
+        </div>
+        <div class="pf-workflow-detail-actions">
           <button
             type="button"
             class="sc-btn"
             data-variant="ghost"
             data-size="sm"
-            disabled={runtimeActionBusy !== null}
-            aria-busy={runtimeActionBusy === "test"}
-            onclick={() => void runEditorInMemory()}
+            disabled={runtimeActionBusy !== null || !workflowApiId(selectedWorkflow)}
+            aria-busy={runtimeActionBusy === `deploy:${workflowApiId(selectedWorkflow)}`}
+            onclick={() => void deployWorkflow(selectedWorkflow, workflows.indexOf(selectedWorkflow))}
           >
-            <Icon name="test" size={12} />Test run
+            <Icon name="rocket" size={12} />Deploy
           </button>
-          {#if draftEditorOpen}
-            <button
-              type="button"
-              class="sc-btn"
-              data-variant="default"
-              data-size="sm"
-              disabled={runtimeActionBusy !== null || !editorWorkflowName.trim()}
-              aria-busy={runtimeActionBusy === "create"}
-              onclick={() => void createWorkflowInRuntime()}
-            >
-              <Icon name="check" size={12} />Create workflow
-            </button>
-          {:else if selectedWorkflow}
-            <button
-              type="button"
-              class="sc-btn"
-              data-variant="ghost"
-              data-size="sm"
-              disabled={runtimeActionBusy !== null || !workflowApiId(selectedWorkflow)}
-              aria-busy={runtimeActionBusy === `save:${workflowApiId(selectedWorkflow)}`}
-              onclick={() => void saveEditorDraft()}
-            >
-              <Icon name="check" size={12} />Save draft
-            </button>
-            <button
-              type="button"
-              class="sc-btn"
-              data-variant="ghost"
-              data-size="sm"
-              disabled={runtimeActionBusy !== null || !workflowApiId(selectedWorkflow)}
-              aria-busy={runtimeActionBusy === `deploy:${workflowApiId(selectedWorkflow)}`}
-              onclick={() => void deployWorkflow(selectedWorkflow, workflows.indexOf(selectedWorkflow))}
-            >
-              <Icon name="rocket" size={12} />Deploy
-            </button>
-            <button
-              type="button"
-              class="sc-btn"
-              data-variant="ghost"
-              data-size="sm"
-              disabled={runtimeActionBusy !== null || !workflowApiId(selectedWorkflow)}
-              aria-busy={runtimeActionBusy === `run:${workflowApiId(selectedWorkflow)}`}
-              onclick={() => void runWorkflow(selectedWorkflow, workflows.indexOf(selectedWorkflow))}
-            >
-              <Icon name="play" size={12} />Run
-            </button>
-          {/if}
+          <button
+            type="button"
+            class="sc-btn"
+            data-variant="ghost"
+            data-size="sm"
+            disabled={runtimeActionBusy !== null || !workflowApiId(selectedWorkflow)}
+            aria-busy={runtimeActionBusy === `run:${workflowApiId(selectedWorkflow)}`}
+            onclick={() => void runWorkflow(selectedWorkflow, workflows.indexOf(selectedWorkflow))}
+          >
+            <Icon name="play" size={12} />Run
+          </button>
+          <button
+            type="button"
+            class="sc-btn"
+            data-variant="ghost"
+            data-size="sm"
+            disabled={loadingExecutionsFor !== null || !workflowApiId(selectedWorkflow)}
+            aria-busy={loadingExecutionsFor === workflowApiId(selectedWorkflow)}
+            onclick={() => void showExecutions(selectedWorkflow, workflows.indexOf(selectedWorkflow))}
+          >
+            <Icon name="logs" size={12} />Executions
+          </button>
         </div>
       </div>
 
-      <div class="pf-workflow-editor-page-fields" aria-label="Workflow details">
-        <label>
-          <span>Name</span>
-          <input
-            aria-label="Workflow name"
-            value={editorWorkflowName}
-            disabled={runtimeActionBusy !== null}
-            oninput={(event) => (editorWorkflowName = event.currentTarget.value)}
-          />
-        </label>
-        <label>
-          <span>Description <em>optional</em></span>
-          <input
-            aria-label="Workflow description"
-            value={editorWorkflowDescription}
-            disabled={runtimeActionBusy !== null}
-            placeholder="What should this workflow do?"
-            oninput={(event) => (editorWorkflowDescription = event.currentTarget.value)}
-          />
-        </label>
-      </div>
-
-      {#if nodeDefinitionError}
-        <div class="pf-workflow-inline-error" role="alert">{nodeDefinitionError}</div>
-      {/if}
-
-      <WorkflowDefinitionEditor
-        value={editorDefinition}
-        nodeDefinitions={nodeDefinitions}
-        disabled={runtimeActionBusy !== null}
-        onChange={(definition) => (editorDefinition = definition)}
-      />
-
-      {#if editorRunResult}
-        <details class="pf-workflow-disclosure">
-          <summary>Test result</summary>
-          <pre class="pf-workflow-json">{workflowRawJson(editorRunResult)}</pre>
-        </details>
-      {/if}
-
-      {#if selectedWorkflow}
-        <details class="pf-workflow-disclosure">
-          <summary>Runtime metadata</summary>
+      <div class="pf-workflow-detail-grid">
+        <section class="pf-workflow-panel pf-workflow-detail-panel" aria-label="Workflow details">
+          <div class="pf-workflow-panel-head">
+            <div>
+              <strong>Details</strong>
+              <small>{workflowDescription(selectedWorkflow) || "No description"}</small>
+            </div>
+          </div>
           <dl class="pf-workflow-metadata">
             {#each workflowMetadata(selectedWorkflow) as item (item.label)}
               <div>
@@ -998,8 +789,68 @@
               </div>
             {/each}
           </dl>
-        </details>
-      {/if}
+        </section>
+
+        <section class="pf-workflow-panel pf-workflow-detail-panel" aria-label="Recent executions">
+          <div class="pf-workflow-panel-head">
+            <div>
+              <strong>Recent Executions</strong>
+              <small>{executionsForWorkflow(selectedWorkflow).length} loaded</small>
+            </div>
+          </div>
+          <div class="pf-workflow-table">
+            {#if executionErrorFor(selectedWorkflow)}
+              <div class="pf-workflow-empty pf-workflow-runtime-error" role="alert">
+                {executionErrorFor(selectedWorkflow)}
+              </div>
+            {:else if executionsForWorkflow(selectedWorkflow).length === 0}
+              <div class="pf-workflow-empty">No executions loaded.</div>
+            {:else}
+              {#each executionsForWorkflow(selectedWorkflow) as execution, index (executionKey(execution, index))}
+                <div class="pf-workflow-row pf-workflow-execution-row">
+                  <span class="pf-run-pip {executionStatusClass(execution)}"></span>
+                  <span class="pf-workflow-row-main">
+                    <strong>{executionName(execution)}</strong>
+                    <small>{executionStatus(execution)}</small>
+                  </span>
+                </div>
+              {/each}
+            {/if}
+          </div>
+        </section>
+
+        <section class="pf-workflow-panel pf-workflow-detail-panel" aria-label="Related bindings">
+          <div class="pf-workflow-panel-head">
+            <div>
+              <strong>Related Bindings</strong>
+              <small>{relatedBindings(selectedWorkflow).length} matching</small>
+            </div>
+          </div>
+          <div class="pf-workflow-table">
+            {#if relatedBindings(selectedWorkflow).length === 0}
+              <div class="pf-workflow-empty">No event bindings reference this workflow.</div>
+            {:else}
+              {#each relatedBindings(selectedWorkflow) as binding (binding.slug)}
+                <div class="pf-workflow-row">
+                  <span class="pf-run-pip {binding.enabled ? 'completed' : 'skipped'}"></span>
+                  <span class="pf-workflow-row-main">
+                    <strong>{binding.slug}</strong>
+                    <small>{binding.connection_slug} -> {bindingAction(binding)}</small>
+                  </span>
+                  <span class="pf-workflow-row-state" data-enabled={binding.enabled}>{binding.status}</span>
+                </div>
+              {/each}
+            {/if}
+          </div>
+        </section>
+
+        <section class="pf-workflow-panel pf-workflow-detail-panel" aria-label="Runtime configuration">
+          <details class="pf-workflow-disclosure">
+            <summary>Configuration JSON</summary>
+            <pre class="pf-workflow-json">{workflowRawJson(selectedWorkflow)}</pre>
+          </details>
+        </section>
+      </div>
     </div>
   {:else}
   <div class="pf-workflow-overview" aria-label="Workflow overview">
@@ -1161,9 +1012,9 @@
         {/if}
       </div>
       {#if connectors.length > 0}
-        <div class="pf-workflow-node-summary" aria-label="Connector catalog">
+        <div class="pf-workflow-connector-summary" aria-label="Connector catalog">
           {#each connectors.slice(0, 12) as connector (connector.connector_slug)}
-            <span class="pf-workflow-node-pill" title={connectorLabel(connector)}>
+            <span class="pf-workflow-connector-pill" title={connectorLabel(connector)}>
               {connector.connector_slug}
             </span>
           {/each}

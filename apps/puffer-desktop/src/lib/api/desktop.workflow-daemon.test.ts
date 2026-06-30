@@ -107,6 +107,7 @@ test("marks workflow backend and runtime API calls as daemon-only", async () => 
   await api.addMonitorRule({
     connection_slug: "telegram-user",
     mode: "include",
+    kind: "keyword",
     keywords: ["urgent"]
   });
   await api.deleteMonitorRule("telegram-user", "include", { keywords: ["urgent"] });

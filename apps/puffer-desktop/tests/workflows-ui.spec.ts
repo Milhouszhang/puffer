@@ -61,9 +61,9 @@ test("workflow overview lists and searches runtime workflow records", async ({ p
 
   await runtime.getByRole("button", { name: "Select workflow Release workflow" }).click();
 
-  const editor = page.getByLabel("Workflow editor page");
-  await expect(editor).toContainText("Release workflow");
-  await expect(editor.getByLabel("Workflow name")).toHaveValue("Release workflow");
+  const detail = page.getByLabel("Workflow detail page");
+  await expect(detail).toContainText("Release workflow");
+  await expect(detail.getByLabel("Workflow details")).toContainText("Ships runtime releases");
   await expect(page.getByRole("button", { name: "Back" })).toBeVisible();
 
   await page.getByRole("button", { name: "Back" }).click();
@@ -120,10 +120,10 @@ test("workflow runtime rows call AgentEnv runtime actions", async ({ page }) => 
   await row.getByRole("button", { name: "Executions" }).click();
   const listed = await daemon.waitForRequest("workflow_list_executions");
   expect(listed.params).toMatchObject({ workflowId: "wf-release" });
-  await expect(page.getByLabel("Workflow editor page")).toContainText("Release workflow");
+  await expect(page.getByLabel("Workflow detail page")).toContainText("Release workflow");
 });
 
-test("workflow editor creates a runtime workflow with shared AgentEnv JSON", async ({ page }) => {
+test("workflow create flow starts a local automation draft", async ({ page }) => {
   const daemon = new FakeDaemon();
   daemon.setWorkflowSnapshot({
     workflows: [],
@@ -134,220 +134,24 @@ test("workflow editor creates a runtime workflow with shared AgentEnv JSON", asy
 
   await openWorkflows(page);
 
-  const definition = {
-    nodes: [
-      {
-        id: "telegram_trigger",
-        type: "telegram_trigger",
-        name: "Telegram Bot",
-        config: { secretToken: "" },
-        position: { x: 200, y: 150 }
-      },
-      {
-        id: "telegram_message",
-        type: "noop",
-        name: "Send Message",
-        config: {
-          text: "{{ input.text }}",
-          chat_id: "{{ input.chatId }}"
-        },
-        position: { x: 450, y: 150 }
-      }
-    ],
-    edges: [{ source: "telegram_trigger", target: "telegram_message" }]
-  };
-
-  await page.locator(".pf-pipe-top-right").getByRole("button", { name: "Create Workflow" }).click();
-  const dialog = page.getByRole("dialog", { name: "Create Workflow" });
+  await page.locator(".pf-pipe-top-right").getByRole("button", { name: "Create Automation" }).click();
+  const dialog = page.getByRole("dialog", { name: "Create Automation" });
   await expect(dialog).toBeVisible();
-  await dialog.getByLabel("New workflow name").fill("Puffer editor workflow");
-  await dialog.getByRole("button", { name: "Continue" }).click();
+  await dialog.getByLabel("New automation name").fill("Puffer automation");
+  await dialog.getByLabel("New automation description").fill("Linear builder placeholder");
+  await dialog.getByRole("button", { name: "Start draft", exact: true }).click();
 
-  await expect(page.getByLabel("Workflow editor page")).toContainText("New workflow draft");
-  await page.getByRole("tab", { name: "JSON" }).click();
-  await page.getByLabel("Workflow definition JSON").fill(JSON.stringify(definition, null, 2));
-  await page.getByRole("button", { name: "Apply JSON" }).click();
-  await page
-    .locator(".pf-workflow-editor-page-actions")
-    .getByRole("button", { name: "Create workflow", exact: true })
-    .click();
-  const created = await daemon.waitForRequest("workflow_create");
-  expect(created.params.workflow).toMatchObject({
-    name: "Puffer editor workflow",
-    definition
-  });
-  expect(created.params.workflow).not.toHaveProperty("description");
-  expect(created.params.workflow).not.toHaveProperty("id");
+  const draft = page.getByLabel("Automation draft page");
+  await expect(draft).toContainText("Puffer automation");
+  await expect(draft.getByLabel("Automation draft details")).toContainText("Not created");
+  await expect(draft.getByLabel("Automation draft details")).toContainText("Pending builder");
+  expect(daemon.requests.some((request) => request.method === "workflow_create")).toBe(false);
   expect(daemon.requests.some((request) => request.method === "workflow_open_ui")).toBe(false);
-  await expect(page.getByRole("status")).toContainText("Created Puffer editor workflow");
+  expect(daemon.requests.some((request) => request.method === "workflow_node_definitions")).toBe(false);
 
   await page.getByRole("button", { name: "Back" }).click();
   const runtime = page.getByLabel("Runtime workflows");
-  await expect(runtime).toContainText("Puffer editor workflow");
-});
-
-test("workflow editor saves draft and executes current JSON in memory", async ({ page }) => {
-  const daemon = new FakeDaemon();
-  const definition = {
-    nodes: [
-      {
-        id: "manual_webhook",
-        type: "webhook",
-        name: "Manual webhook",
-        config: { path: "manual", methods: ["POST"], authentication: "none" },
-        position: { x: 160, y: 120 }
-      }
-    ],
-    edges: []
-  };
-  daemon.setWorkflowSnapshot({
-    workflows: [
-      {
-        id: "wf-editor",
-        name: "Editor workflow",
-        description: "Draft",
-        status: "draft",
-        definition,
-        updatedAt: "2026-06-18T00:00:00Z"
-      }
-    ],
-    runs: []
-  });
-  await daemon.install(page);
-  await daemon.open(page);
-
-  await openWorkflows(page);
-  await page
-    .getByLabel("Runtime workflows")
-    .getByRole("button", { name: "Select workflow Editor workflow" })
-    .click();
-  await page.getByRole("tab", { name: "JSON" }).click();
-  const editedDefinition = {
-    ...definition,
-    nodes: [
-      {
-        ...definition.nodes[0],
-        config: { path: "edited", methods: ["POST"], authentication: "none" }
-      }
-    ]
-  };
-  await page.getByLabel("Workflow definition JSON").fill(JSON.stringify(editedDefinition, null, 2));
-  await page.getByRole("button", { name: "Apply JSON" }).click();
-
-  await page.getByRole("button", { name: "Test run" }).click();
-  const inMemory = await daemon.waitForRequest("workflow_execute_in_memory");
-  expect(inMemory.params.request).toMatchObject({
-    definition: editedDefinition,
-    input: { source: "puffer-desktop" }
-  });
-  await expect(page.getByRole("status")).toContainText("Test run completed");
-
-  await page.getByRole("tab", { name: "Visual" }).click();
-  const nodeCard = page.getByLabel("Select node Manual webhook");
-  const box = await nodeCard.boundingBox();
-  expect(box).not.toBeNull();
-  await page.mouse.move(box!.x + 24, box!.y + 24);
-  await page.mouse.down();
-  await page.mouse.move(box!.x + 84, box!.y + 54);
-  await page.mouse.up();
-
-  await page.locator(".pf-workflow-canvas-toolbar").getByRole("button", { name: "Add Node" }).click();
-  const addNodeDialog = page.getByRole("dialog", { name: "Add Node" });
-  await expect(addNodeDialog).toBeVisible();
-  await expect(addNodeDialog.getByLabel("Node categories").getByRole("button", { name: /Trigger/ })).toBeVisible();
-  await addNodeDialog.locator(".pf-workflow-node-picker-list").getByRole("button", { name: /Webhook/ }).click();
-  const sourcePort = page.getByLabel("Start connection from Manual webhook");
-  const targetPort = page.getByLabel("Finish connection into Webhook");
-  const sourceBox = await sourcePort.boundingBox();
-  const targetBox = await targetPort.boundingBox();
-  expect(sourceBox).not.toBeNull();
-  expect(targetBox).not.toBeNull();
-  await page.mouse.move(sourceBox!.x + sourceBox!.width / 2, sourceBox!.y + sourceBox!.height / 2);
-  await page.mouse.down();
-  await expect(targetPort).toBeEnabled();
-  await page.mouse.move(targetBox!.x + targetBox!.width / 2, targetBox!.y + targetBox!.height / 2);
-  await page.mouse.up();
-
-  const movedConnectedDefinition = {
-    ...editedDefinition,
-    nodes: [
-      {
-        ...editedDefinition.nodes[0],
-        position: { x: 220, y: 150 }
-      },
-      {
-        id: "webhook",
-        type: "webhook",
-        name: "Webhook",
-        config: { path: "puffer_webhook", methods: ["POST"], authentication: "none" },
-        trusted: false,
-        position: { x: 380, y: 240 }
-      }
-    ],
-    edges: [{ source: "manual_webhook", target: "webhook" }]
-  };
-
-  await page.getByRole("tab", { name: "JSON" }).click();
-  await expect(page.getByLabel("Workflow definition JSON")).toHaveValue(
-    JSON.stringify(movedConnectedDefinition, null, 2)
-  );
-
-  await page.getByRole("button", { name: "Save draft" }).click();
-  const saved = await daemon.waitForRequest("workflow_update");
-  expect(saved.params).toMatchObject({
-    workflowId: "wf-editor",
-    workflow: {
-      name: "Editor workflow",
-      description: "Draft",
-      definition: movedConnectedDefinition
-    }
-  });
-});
-
-test("workflow add node groups executor definitions by service", async ({ page }) => {
-  const daemon = new FakeDaemon();
-  daemon.setWorkflowSnapshot({
-    workflows: [],
-    runs: []
-  });
-  daemon.setWorkflowNodeDefinitions([
-    {
-      type: "github_create_issue_execute_action",
-      category: "executor",
-      name: "Create Issue",
-      description: "Create a GitHub issue.",
-      trusted: false,
-      isBuiltin: false
-    },
-    {
-      type: "github_update_issue_execute_action",
-      category: "executor",
-      name: "Update Issue",
-      description: "Update a GitHub issue.",
-      trusted: false,
-      isBuiltin: false
-    }
-  ]);
-  await daemon.install(page);
-  await daemon.open(page);
-
-  await openWorkflows(page);
-  await page.locator(".pf-pipe-top-right").getByRole("button", { name: "Create Workflow" }).click();
-  const dialog = page.getByRole("dialog", { name: "Create Workflow" });
-  await dialog.getByLabel("New workflow name").fill("Grouped node workflow");
-  await dialog.getByRole("button", { name: "Continue" }).click();
-
-  await page.locator(".pf-workflow-canvas-toolbar").getByRole("button", { name: "Add Node" }).click();
-  const addNodeDialog = page.getByRole("dialog", { name: "Add Node" });
-  await expect(addNodeDialog).toContainText("Executor");
-  await expect(addNodeDialog).toContainText("GitHub");
-  await expect(addNodeDialog).toContainText("2 functions");
-  await expect(addNodeDialog).not.toContainText("github_create_issue_execute_action");
-
-  await addNodeDialog.getByRole("button", { name: /GitHub/ }).click();
-  await addNodeDialog.getByRole("button", { name: /Create Issue/ }).click();
-
-  await expect(page.getByLabel("Workflow canvas")).toContainText("Create Issue");
+  await expect(runtime).not.toContainText("Puffer automation");
 });
 
 test("workflow runtime unavailable renders an explicit error", async ({ page }) => {

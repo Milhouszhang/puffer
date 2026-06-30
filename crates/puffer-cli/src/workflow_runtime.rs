@@ -1420,6 +1420,10 @@ fn authenticated_fallback_provider(
 }
 
 #[cfg(test)]
+#[path = "workflow_runtime_run_workflow_tests.rs"]
+mod run_workflow_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         apply_authenticated_provider_fallback, apply_task_agent_model_default,

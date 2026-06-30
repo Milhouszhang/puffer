@@ -247,7 +247,8 @@ pub trait Outbound: Send + Sync {
 
 /// Trait for triggering workflow runtime actions from subscription events.
 pub trait WorkflowActionRunner: Send + Sync {
-    /// Executes workflow `slug` with `trigger` as the runtime payload.
+    /// Executes the legacy `slug` field as a runtime workflow id with
+    /// `trigger` as the runtime payload.
     fn run_workflow(&self, slug: &str, trigger: serde_json::Value) -> Result<WorkflowActionOutput>;
 
     /// Executes a Puffer tool call from a workflow action.
@@ -727,7 +728,7 @@ impl ActionDispatcher for BuiltinActionDispatcher {
                 target,
                 template,
             } => self.forward_message(platform, target, template.as_deref(), envelope),
-            ActionSpec::RunWorkflow { slug } => self.run_workflow(slug, envelope),
+            ActionSpec::RunWorkflow { workflow_id } => self.run_workflow(workflow_id, envelope),
             ActionSpec::ConnectorAct {
                 connector_slug,
                 action,

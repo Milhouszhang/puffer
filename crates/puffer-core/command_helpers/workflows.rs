@@ -612,7 +612,7 @@ fn workflow_action_target(action: &ActionSpec) -> String {
         } => {
             format!(" platform={platform} target={target}")
         }
-        ActionSpec::RunWorkflow { slug } => format!(" workflow={slug}"),
+        ActionSpec::RunWorkflow { workflow_id } => format!(" workflow={workflow_id}"),
         ActionSpec::ConnectorAct {
             connector_slug,
             action,

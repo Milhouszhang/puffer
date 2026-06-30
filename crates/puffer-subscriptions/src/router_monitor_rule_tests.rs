@@ -39,7 +39,7 @@ mod monitor_rule_tests {
                 classify_prompt: None,
                 classify_model: None,
                 action: ActionSpec::RunWorkflow {
-                    slug: "downstream".into(),
+                    workflow_id: "downstream".into(),
                 },
                 created_at_ms: 0,
             })
@@ -118,7 +118,7 @@ mod monitor_rule_tests {
                 classify_prompt: None,
                 classify_model: None,
                 action: ActionSpec::RunWorkflow {
-                    slug: "downstream".into(),
+                    workflow_id: "downstream".into(),
                 },
                 created_at_ms: 0,
             })

@@ -17,6 +17,10 @@ use crate::daemon_workflow_backend_settings::save_workflow_backend_settings;
 use crate::desktop_api::workflow_backend_settings_dto;
 use crate::desktop_api_types::SaveWorkflowBackendSettingsParams;
 
+#[allow(dead_code)]
+#[path = "workflow_local_runtime.rs"]
+mod workflow_local_runtime;
+
 const WORKFLOW_RUNTIME_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Returns the redacted workflow backend config for desktop callers.
@@ -281,8 +285,39 @@ fn resolve_workflow_runtime_config(
     paths: &ConfigPaths,
     config: &PufferConfig,
 ) -> Result<ResolvedWorkflowRuntimeConfig> {
+    resolve_workflow_runtime_config_with(paths, config, workflow_local_runtime::ensure_ready)
+}
+
+fn resolve_workflow_runtime_config_with<F>(
+    paths: &ConfigPaths,
+    config: &PufferConfig,
+    ensure_local_ready: F,
+) -> Result<ResolvedWorkflowRuntimeConfig>
+where
+    F: FnOnce(
+        &ConfigPaths,
+        &mut PufferConfig,
+    ) -> Result<workflow_local_runtime::LocalWorkflowRuntimeStatus>,
+{
     let mut backend = config.workflow_backend.clone();
     backend.normalize();
+    if backend.mode == WorkflowBackendMode::Local {
+        let mut local_config = config.clone();
+        let status = ensure_local_ready(paths, &mut local_config)
+            .context("ensure local workflow runtime is ready")?;
+        if status.state != workflow_local_runtime::LocalWorkflowRuntimeState::Ready {
+            let detail = status
+                .message
+                .as_deref()
+                .unwrap_or("local workflow runtime is not ready");
+            anyhow::bail!(
+                "local workflow runtime is {}: {detail}",
+                status.state.as_str()
+            );
+        }
+        backend = local_config.workflow_backend.clone();
+        backend.normalize();
+    }
     Ok(ResolvedWorkflowRuntimeConfig {
         api_token: resolve_workflow_runtime_token(
             paths,
@@ -482,7 +517,7 @@ mod tests {
             &paths,
             &mut config,
             SaveWorkflowBackendSettingsParams {
-                mode: WorkflowBackendMode::Local,
+                mode: WorkflowBackendMode::AgentEnvCloud,
                 api_url,
                 ui_url: "http://localhost:5173".to_string(),
                 workspace_id: "workspace-local".to_string(),
@@ -537,6 +572,85 @@ mod tests {
         assert!(error
             .to_string()
             .contains("AgentEnv Cloud workflow runtime token is not configured"));
+    }
+
+    #[test]
+    fn local_runtime_config_resolution_ensures_ready() {
+        let _guard = lock_secret_store();
+        let _secret_store_key = ScopedSecretStoreKey::set();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = temp_paths(&temp);
+        ensure_workspace_dirs(&paths).expect("workspace dirs");
+        let mut config = PufferConfig::default();
+        config.workflow_backend.workspace_id = "workspace-local".to_string();
+        save_workflow_backend_settings(
+            &paths,
+            &mut config,
+            SaveWorkflowBackendSettingsParams {
+                mode: WorkflowBackendMode::Local,
+                api_url: "http://127.0.0.1:3456".to_string(),
+                ui_url: "http://localhost:5173".to_string(),
+                workspace_id: "workspace-local".to_string(),
+                api_token: Some("runtime-token".to_string()),
+                keep_token: false,
+            },
+        )
+        .expect("save backend settings");
+        let called = Arc::new(Mutex::new(false));
+        let observed = Arc::clone(&called);
+
+        let resolved = resolve_workflow_runtime_config_with(&paths, &config, move |_, _| {
+            *observed.lock().expect("called") = true;
+            Ok(workflow_local_runtime::LocalWorkflowRuntimeStatus {
+                state: workflow_local_runtime::LocalWorkflowRuntimeState::Ready,
+                image: "agentenv/api-server:local".to_string(),
+                stack_name: "puffer-workflow-runtime".to_string(),
+                api_base_url: None,
+                compose_file: None,
+                data_dir: None,
+                message: None,
+            })
+        })
+        .expect("resolve runtime config");
+
+        assert_eq!(resolved.api_base_url, "http://127.0.0.1:3456");
+        assert_eq!(resolved.api_token, "runtime-token");
+        assert_eq!(*called.lock().expect("called"), true);
+    }
+
+    #[test]
+    fn cloud_runtime_config_resolution_does_not_ensure_local_runtime() {
+        let _guard = lock_secret_store();
+        let _secret_store_key = ScopedSecretStoreKey::set();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = temp_paths(&temp);
+        ensure_workspace_dirs(&paths).expect("workspace dirs");
+        let mut config = PufferConfig::default();
+        save_workflow_backend_settings(
+            &paths,
+            &mut config,
+            SaveWorkflowBackendSettingsParams {
+                mode: WorkflowBackendMode::AgentEnvCloud,
+                api_url: "https://api.agentenv.io".to_string(),
+                ui_url: "https://agentenv.io".to_string(),
+                workspace_id: "workspace-cloud".to_string(),
+                api_token: Some("cloud-token".to_string()),
+                keep_token: false,
+            },
+        )
+        .expect("save backend settings");
+        let called = Arc::new(Mutex::new(false));
+        let observed = Arc::clone(&called);
+
+        let resolved = resolve_workflow_runtime_config_with(&paths, &config, move |_, _| {
+            *observed.lock().expect("called") = true;
+            unreachable!("cloud mode must not ensure the local Docker runtime")
+        })
+        .expect("resolve runtime config");
+
+        assert_eq!(resolved.api_base_url, "https://api.agentenv.io");
+        assert_eq!(resolved.api_token, "cloud-token");
+        assert_eq!(*called.lock().expect("called"), false);
     }
 
     // `open_ui` normalizes the configured UI URL before appending the stable

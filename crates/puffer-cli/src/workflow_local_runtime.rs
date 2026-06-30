@@ -1,0 +1,934 @@
+//! Local AgentEnv workflow runtime Docker Compose lifecycle management.
+
+use anyhow::{Context, Result};
+use puffer_config::{save_user_config, ConfigPaths, PufferConfig, WorkflowBackendMode};
+use puffer_secrets::{SecretUpsert, SecretVault};
+use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fs;
+use std::io;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
+use url::Url;
+use uuid::Uuid;
+
+#[path = "workflow_local_runtime_bootstrap.rs"]
+mod workflow_local_runtime_bootstrap;
+use workflow_local_runtime_bootstrap::{
+    non_empty_env, read_env_file, valid_uuid_env, write_runtime_files,
+};
+
+const AGENTENV_LOCAL_RUNTIME_IMAGE: &str = "agentenv/api-server:local";
+const LOCAL_WORKFLOW_RUNTIME_PROJECT: &str = "puffer-workflow-runtime";
+const LOCAL_WORKFLOW_RUNTIME_API_PORT: u16 = 3000;
+const LOCAL_WORKFLOW_RUNTIME_READY_PATH: &str = "/v1/health/ready";
+const LOCAL_WORKFLOW_RUNTIME_NODE_DEFINITIONS_PATH: &str = "/v1/workflows/node-definitions";
+const LOCAL_WORKFLOW_RUNTIME_DIR: &str = "workflow-runtime";
+const LOCAL_WORKFLOW_RUNTIME_DATA_DIR: &str = "data";
+const LOCAL_WORKFLOW_RUNTIME_BOOTSTRAP_DIR: &str = "bootstrap";
+const LOCAL_WORKFLOW_RUNTIME_COMPOSE_FILE: &str = "docker-compose.yml";
+const LOCAL_WORKFLOW_RUNTIME_ENV_FILE: &str = ".env";
+const LOCAL_WORKFLOW_RUNTIME_SEED_FILE: &str = "seed.sql";
+const POSTGRES_IMAGE: &str = "postgres:14-alpine";
+const REDIS_IMAGE: &str = "redis:7-alpine";
+const POSTGRES_URL: &str = "postgres://tintin:tintin@postgres:5432/tintin_cloud";
+const REDIS_URL: &str = "redis://redis:6379";
+const WORKFLOW_RUNTIME_TOKEN_LABEL: &str = "Workflow runtime API token";
+const WORKFLOW_RUNTIME_TOKEN_DESCRIPTION: &str =
+    "API token for the local AgentEnv workflow runtime.";
+const READY_WAIT_ATTEMPTS: usize = 60;
+const READY_WAIT_DELAY: Duration = Duration::from_millis(500);
+
+/// Lifecycle state for the Puffer-managed local workflow runtime stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LocalWorkflowRuntimeState {
+    /// Docker or Docker Compose could not be executed successfully.
+    DockerMissing,
+    /// The AgentEnv API image is not present locally.
+    ImageMissing,
+    /// Core services are being started.
+    Starting,
+    /// AgentEnv database migrations are being applied.
+    Migrating,
+    /// Puffer-owned local auth/workspace rows are being seeded.
+    Seeding,
+    /// The API is healthy and exposes AgentEnv workflow node definitions.
+    Ready,
+    /// The AgentEnv image or migrated schema does not match Puffer bootstrap.
+    IncompatibleRuntime,
+    /// The local runtime manager hit an unrecoverable local failure.
+    Failed,
+    /// The Compose project exists but the API is not running.
+    Stopped,
+}
+
+impl LocalWorkflowRuntimeState {
+    /// Returns the stable snake_case state label.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DockerMissing => "docker_missing",
+            Self::ImageMissing => "image_missing",
+            Self::Starting => "starting",
+            Self::Migrating => "migrating",
+            Self::Seeding => "seeding",
+            Self::Ready => "ready",
+            Self::IncompatibleRuntime => "incompatible_runtime",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// Status snapshot for the Puffer-managed local workflow runtime stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalWorkflowRuntimeStatus {
+    /// Current lifecycle state.
+    pub(crate) state: LocalWorkflowRuntimeState,
+    /// AgentEnv API image used by `migrate` and `api`.
+    pub(crate) image: String,
+    /// Fixed Docker Compose project name.
+    pub(crate) stack_name: String,
+    /// Configured local API base URL when available.
+    pub(crate) api_base_url: Option<String>,
+    /// Generated Compose file path when available.
+    pub(crate) compose_file: Option<PathBuf>,
+    /// Local data directory mounted into Postgres and Redis.
+    pub(crate) data_dir: Option<PathBuf>,
+    /// Optional diagnostic detail.
+    pub(crate) message: Option<String>,
+}
+
+/// Returns the current local workflow runtime status without changing config.
+pub(crate) fn status(
+    paths: &ConfigPaths,
+    config: &PufferConfig,
+) -> Result<LocalWorkflowRuntimeStatus> {
+    let runner = SystemCommandRunner;
+    let health = ReqwestHealthChecker::new()?;
+    status_with(&runner, &health, paths, config)
+}
+
+/// Ensures the local workflow runtime is bootstrapped, started, and healthy.
+pub(crate) fn ensure_ready(
+    paths: &ConfigPaths,
+    config: &mut PufferConfig,
+) -> Result<LocalWorkflowRuntimeStatus> {
+    start(paths, config)
+}
+
+/// Starts the Puffer-managed AgentEnv Docker Compose workflow runtime stack.
+pub(crate) fn start(
+    paths: &ConfigPaths,
+    config: &mut PufferConfig,
+) -> Result<LocalWorkflowRuntimeStatus> {
+    let runner = SystemCommandRunner;
+    let health = ReqwestHealthChecker::new()?;
+    start_with(
+        &runner,
+        &health,
+        paths,
+        config,
+        WaitPolicy::new(READY_WAIT_ATTEMPTS, READY_WAIT_DELAY),
+    )
+}
+
+/// Stops the Puffer-managed local workflow runtime stack containers.
+pub(crate) fn stop() -> Result<LocalWorkflowRuntimeStatus> {
+    let runner = SystemCommandRunner;
+    let paths =
+        ConfigPaths::discover(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    stop_with(&runner, &local_runtime_compose_file(&paths))
+}
+
+/// Returns Docker Compose logs for the Puffer-managed local workflow runtime stack.
+pub(crate) fn logs() -> Result<String> {
+    let runner = SystemCommandRunner;
+    let paths =
+        ConfigPaths::discover(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    logs_with(&runner, &local_runtime_compose_file(&paths))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeContext {
+    api_base_url: String,
+    api_key: String,
+    api_key_pepper: String,
+    jwt_secret: String,
+    jwt_refresh_secret: String,
+    user_id: String,
+    workspace_id: String,
+    stack_dir: PathBuf,
+    compose_file: PathBuf,
+    env_file: PathBuf,
+    seed_file: PathBuf,
+    data_dir: PathBuf,
+    bootstrap_dir: PathBuf,
+    host_port: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WaitPolicy {
+    attempts: usize,
+    delay: Duration,
+}
+
+impl WaitPolicy {
+    fn new(attempts: usize, delay: Duration) -> Self {
+        Self { attempts, delay }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandOutput {
+    status_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl CommandOutput {
+    fn success(stdout: impl Into<String>) -> Self {
+        Self {
+            status_code: 0,
+            stdout: stdout.into(),
+            stderr: String::new(),
+        }
+    }
+
+    fn failure(stderr: impl Into<String>) -> Self {
+        Self {
+            status_code: 1,
+            stdout: String::new(),
+            stderr: stderr.into(),
+        }
+    }
+
+    fn is_success(&self) -> bool {
+        self.status_code == 0
+    }
+}
+
+trait CommandRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        env: &[(&str, String)],
+    ) -> io::Result<CommandOutput>;
+}
+
+struct SystemCommandRunner;
+
+impl CommandRunner for SystemCommandRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        env: &[(&str, String)],
+    ) -> io::Result<CommandOutput> {
+        let mut command = Command::new(program);
+        command.args(args);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let output = command.output()?;
+        Ok(CommandOutput {
+            status_code: output.status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
+    }
+}
+
+trait HealthChecker {
+    fn ready(&self, api_base_url: &str) -> Result<bool>;
+
+    fn node_definitions(
+        &self,
+        api_base_url: &str,
+        workspace_id: &str,
+        api_key: &str,
+    ) -> Result<bool>;
+}
+
+struct ReqwestHealthChecker {
+    client: Client,
+}
+
+impl ReqwestHealthChecker {
+    fn new() -> Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .context("build local workflow runtime health client")?;
+        Ok(Self { client })
+    }
+}
+
+impl HealthChecker for ReqwestHealthChecker {
+    fn ready(&self, api_base_url: &str) -> Result<bool> {
+        let response = self
+            .client
+            .get(runtime_url(
+                api_base_url,
+                LOCAL_WORKFLOW_RUNTIME_READY_PATH,
+            )?)
+            .send()
+            .context("check local workflow runtime readiness")?;
+        Ok(response.status().is_success())
+    }
+
+    fn node_definitions(
+        &self,
+        api_base_url: &str,
+        workspace_id: &str,
+        api_key: &str,
+    ) -> Result<bool> {
+        let response = self
+            .client
+            .get(runtime_url(
+                api_base_url,
+                LOCAL_WORKFLOW_RUNTIME_NODE_DEFINITIONS_PATH,
+            )?)
+            .header("X-API-Key", api_key)
+            .header("X-Workspace-ID", workspace_id)
+            .send()
+            .context("check local workflow runtime node definitions")?;
+        Ok(response.status().is_success())
+    }
+}
+
+fn status_with<R, H>(
+    runner: &R,
+    health: &H,
+    paths: &ConfigPaths,
+    config: &PufferConfig,
+) -> Result<LocalWorkflowRuntimeStatus>
+where
+    R: CommandRunner,
+    H: HealthChecker,
+{
+    if config.workflow_backend.mode != WorkflowBackendMode::Local {
+        return Ok(base_status(LocalWorkflowRuntimeState::Failed)
+            .with_message("local workflow runtime requires workflow_backend.mode = local"));
+    }
+    let runtime = runtime_context_from_config(paths, config).ok();
+    inspect_status(runner, health, runtime.as_ref())
+}
+
+fn start_with<R, H>(
+    runner: &R,
+    health: &H,
+    paths: &ConfigPaths,
+    config: &mut PufferConfig,
+    wait: WaitPolicy,
+) -> Result<LocalWorkflowRuntimeStatus>
+where
+    R: CommandRunner,
+    H: HealthChecker,
+{
+    if config.workflow_backend.mode != WorkflowBackendMode::Local {
+        return Ok(base_status(LocalWorkflowRuntimeState::Failed)
+            .with_message("local workflow runtime requires workflow_backend.mode = local"));
+    }
+
+    let runtime = bootstrap_runtime_config(paths, config)?;
+    if !docker_available(runner) {
+        return Ok(status_for_runtime(
+            LocalWorkflowRuntimeState::DockerMissing,
+            Some(&runtime),
+        ));
+    }
+    if !image_exists(runner)? {
+        return Ok(status_for_runtime(
+            LocalWorkflowRuntimeState::ImageMissing,
+            Some(&runtime),
+        ));
+    }
+
+    let status = run_compose_step(
+        runner,
+        &runtime,
+        &["up", "-d", "postgres", "redis"],
+        LocalWorkflowRuntimeState::Starting,
+        LocalWorkflowRuntimeState::Failed,
+        "docker compose up -d postgres redis failed",
+    )?;
+    if status.state != LocalWorkflowRuntimeState::Starting {
+        return Ok(status);
+    }
+    let status = run_compose_step(
+        runner,
+        &runtime,
+        &["run", "--rm", "migrate"],
+        LocalWorkflowRuntimeState::Migrating,
+        LocalWorkflowRuntimeState::IncompatibleRuntime,
+        "docker compose run --rm migrate failed",
+    )?;
+    if status.state != LocalWorkflowRuntimeState::Migrating {
+        return Ok(status);
+    }
+    let status = run_compose_step(
+        runner,
+        &runtime,
+        &["run", "--rm", "seed"],
+        LocalWorkflowRuntimeState::Seeding,
+        LocalWorkflowRuntimeState::IncompatibleRuntime,
+        "docker compose run --rm seed failed",
+    )?;
+    if status.state != LocalWorkflowRuntimeState::Seeding {
+        return Ok(status);
+    }
+    let status = run_compose_step(
+        runner,
+        &runtime,
+        &["up", "-d", "api"],
+        LocalWorkflowRuntimeState::Starting,
+        LocalWorkflowRuntimeState::Failed,
+        "docker compose up -d api failed",
+    )?;
+    if status.state != LocalWorkflowRuntimeState::Starting {
+        return Ok(status);
+    }
+
+    wait_until_ready(health, &runtime, wait)
+}
+
+fn stop_with<R>(runner: &R, compose_file: &Path) -> Result<LocalWorkflowRuntimeStatus>
+where
+    R: CommandRunner,
+{
+    if !docker_available(runner) {
+        return Ok(base_status(LocalWorkflowRuntimeState::DockerMissing));
+    }
+    let output = compose_at(runner, compose_file, &["stop"])?;
+    if output.is_success() {
+        Ok(base_status(LocalWorkflowRuntimeState::Stopped))
+    } else {
+        Ok(base_status(LocalWorkflowRuntimeState::Failed).with_message(output.stderr))
+    }
+}
+
+fn logs_with<R>(runner: &R, compose_file: &Path) -> Result<String>
+where
+    R: CommandRunner,
+{
+    let output = compose_at(runner, compose_file, &["logs", "--no-color"])?;
+    if output.is_success() {
+        Ok(output.stdout)
+    } else {
+        anyhow::bail!(
+            "docker compose logs failed: {}",
+            trim_diagnostic(&output.stderr)
+        );
+    }
+}
+
+fn inspect_status<R, H>(
+    runner: &R,
+    health: &H,
+    runtime: Option<&RuntimeContext>,
+) -> Result<LocalWorkflowRuntimeStatus>
+where
+    R: CommandRunner,
+    H: HealthChecker,
+{
+    if !docker_available(runner) {
+        return Ok(status_for_runtime(
+            LocalWorkflowRuntimeState::DockerMissing,
+            runtime,
+        ));
+    }
+    if !image_exists(runner)? {
+        return Ok(status_for_runtime(
+            LocalWorkflowRuntimeState::ImageMissing,
+            runtime,
+        ));
+    }
+    let Some(runtime) = runtime else {
+        return Ok(base_status(LocalWorkflowRuntimeState::Failed)
+            .with_message("local workflow runtime config is incomplete"));
+    };
+    let output = compose(
+        runner,
+        runtime,
+        &["ps", "--services", "--status", "running"],
+    )?;
+    if !output.is_success() {
+        return Ok(
+            status_for_runtime(LocalWorkflowRuntimeState::Stopped, Some(runtime))
+                .with_message(output.stderr),
+        );
+    }
+    let running = output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<BTreeSet<_>>();
+    if !running.contains("api") {
+        return Ok(status_for_runtime(
+            LocalWorkflowRuntimeState::Stopped,
+            Some(runtime),
+        ));
+    }
+    if !["postgres", "redis", "api"]
+        .into_iter()
+        .all(|service| running.contains(service))
+    {
+        return Ok(status_for_runtime(
+            LocalWorkflowRuntimeState::Starting,
+            Some(runtime),
+        ));
+    }
+    runtime_ready_status(health, runtime)
+}
+
+fn runtime_ready_status<H>(
+    health: &H,
+    runtime: &RuntimeContext,
+) -> Result<LocalWorkflowRuntimeStatus>
+where
+    H: HealthChecker,
+{
+    match health.ready(&runtime.api_base_url) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(status_for_runtime(
+                LocalWorkflowRuntimeState::Starting,
+                Some(runtime),
+            ));
+        }
+        Err(error) => {
+            return Ok(
+                status_for_runtime(LocalWorkflowRuntimeState::Starting, Some(runtime))
+                    .with_message(error.to_string()),
+            );
+        }
+    }
+    match health.node_definitions(
+        &runtime.api_base_url,
+        &runtime.workspace_id,
+        &runtime.api_key,
+    ) {
+        Ok(true) => Ok(status_for_runtime(
+            LocalWorkflowRuntimeState::Ready,
+            Some(runtime),
+        )),
+        Ok(false) => Ok(status_for_runtime(
+            LocalWorkflowRuntimeState::IncompatibleRuntime,
+            Some(runtime),
+        )
+        .with_message("AgentEnv node definitions endpoint rejected local credentials")),
+        Err(error) => Ok(status_for_runtime(
+            LocalWorkflowRuntimeState::IncompatibleRuntime,
+            Some(runtime),
+        )
+        .with_message(error.to_string())),
+    }
+}
+
+fn wait_until_ready<H>(
+    health: &H,
+    runtime: &RuntimeContext,
+    wait: WaitPolicy,
+) -> Result<LocalWorkflowRuntimeStatus>
+where
+    H: HealthChecker,
+{
+    let attempts = wait.attempts.max(1);
+    let mut last_message = None;
+    for index in 0..attempts {
+        match health.ready(&runtime.api_base_url) {
+            Ok(true) => return runtime_ready_status(health, runtime),
+            Ok(false) => last_message = Some("local workflow runtime is not ready yet".to_string()),
+            Err(error) => last_message = Some(error.to_string()),
+        }
+        if index + 1 < attempts && !wait.delay.is_zero() {
+            thread::sleep(wait.delay);
+        }
+    }
+    let mut status = status_for_runtime(LocalWorkflowRuntimeState::Starting, Some(runtime));
+    if let Some(message) = last_message {
+        status = status.with_message(message);
+    }
+    Ok(status)
+}
+
+fn run_compose_step<R>(
+    runner: &R,
+    runtime: &RuntimeContext,
+    args: &[&str],
+    running_state: LocalWorkflowRuntimeState,
+    failed_state: LocalWorkflowRuntimeState,
+    failed_label: &str,
+) -> Result<LocalWorkflowRuntimeStatus>
+where
+    R: CommandRunner,
+{
+    let output = compose(runner, runtime, args)?;
+    Ok(if output.is_success() {
+        status_for_runtime(running_state, Some(runtime))
+    } else {
+        status_for_runtime(failed_state, Some(runtime)).with_message(format!(
+            "{failed_label}: {}",
+            trim_diagnostic(&output.stderr)
+        ))
+    })
+}
+
+fn docker_available<R>(runner: &R) -> bool
+where
+    R: CommandRunner,
+{
+    docker(runner, &["info"]).is_ok_and(|output| output.is_success())
+        && docker(runner, &["compose", "version"]).is_ok_and(|output| output.is_success())
+}
+
+fn image_exists<R>(runner: &R) -> Result<bool>
+where
+    R: CommandRunner,
+{
+    Ok(docker(runner, &["image", "inspect", AGENTENV_LOCAL_RUNTIME_IMAGE])?.is_success())
+}
+
+fn compose<R>(
+    runner: &R,
+    runtime: &RuntimeContext,
+    command_args: &[&str],
+) -> io::Result<CommandOutput>
+where
+    R: CommandRunner,
+{
+    compose_at(runner, &runtime.compose_file, command_args)
+}
+
+fn compose_at<R>(
+    runner: &R,
+    compose_file: &Path,
+    command_args: &[&str],
+) -> io::Result<CommandOutput>
+where
+    R: CommandRunner,
+{
+    let mut args = vec![
+        "compose".to_string(),
+        "-f".to_string(),
+        compose_file.display().to_string(),
+        "-p".to_string(),
+        LOCAL_WORKFLOW_RUNTIME_PROJECT.to_string(),
+    ];
+    args.extend(command_args.iter().map(|arg| (*arg).to_string()));
+    runner.run("docker", &args, &[])
+}
+
+fn docker<R>(runner: &R, args: &[&str]) -> io::Result<CommandOutput>
+where
+    R: CommandRunner,
+{
+    let args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    runner.run("docker", &args, &[])
+}
+
+fn bootstrap_runtime_config(
+    paths: &ConfigPaths,
+    config: &mut PufferConfig,
+) -> Result<RuntimeContext> {
+    let mut changed = false;
+    if config.workflow_backend.mode != WorkflowBackendMode::Local {
+        config.workflow_backend.mode = WorkflowBackendMode::Local;
+        changed = true;
+    }
+
+    let stack_dir = local_runtime_stack_dir(paths);
+    let bootstrap_dir = stack_dir.join(LOCAL_WORKFLOW_RUNTIME_BOOTSTRAP_DIR);
+    let data_dir = stack_dir.join(LOCAL_WORKFLOW_RUNTIME_DATA_DIR);
+    fs::create_dir_all(data_dir.join("postgres")).with_context(|| {
+        format!(
+            "create local workflow runtime postgres data dir {}",
+            data_dir.join("postgres").display()
+        )
+    })?;
+    fs::create_dir_all(data_dir.join("redis")).with_context(|| {
+        format!(
+            "create local workflow runtime redis data dir {}",
+            data_dir.join("redis").display()
+        )
+    })?;
+    fs::create_dir_all(&bootstrap_dir).with_context(|| {
+        format!(
+            "create local workflow runtime bootstrap dir {}",
+            bootstrap_dir.display()
+        )
+    })?;
+
+    let existing_env = read_env_file(&stack_dir.join(LOCAL_WORKFLOW_RUNTIME_ENV_FILE))?;
+    let workspace_id =
+        local_workspace_id(&config.workflow_backend.workspace_id).unwrap_or_else(|| {
+            changed = true;
+            Uuid::new_v4().to_string()
+        });
+    if config.workflow_backend.workspace_id != workspace_id {
+        config.workflow_backend.workspace_id = workspace_id.clone();
+        changed = true;
+    }
+
+    let first_bootstrap = config
+        .workflow_backend
+        .api_token_secret_id
+        .trim()
+        .is_empty()
+        && config.workflow_backend.workspace_id == workspace_id;
+    let (api_base_url, host_port) = match local_api_base_url(&config.workflow_backend.api_base_url)
+    {
+        Some(value)
+            if !(first_bootstrap
+                && value.0
+                    == puffer_config::WorkflowBackendConfig::default_api_base_url(
+                        WorkflowBackendMode::Local,
+                    )) =>
+        {
+            value
+        }
+        _ => {
+            changed = true;
+            allocated_local_api_base_url()?
+        }
+    };
+    if config.workflow_backend.api_base_url != api_base_url {
+        config.workflow_backend.api_base_url = api_base_url.clone();
+        changed = true;
+    }
+
+    let (api_key, secret_id, secret_changed) =
+        resolve_or_create_api_token(paths, config, &api_base_url)?;
+    if secret_changed || config.workflow_backend.api_token_secret_id != secret_id {
+        config.workflow_backend.api_token_secret_id = secret_id;
+        changed = true;
+    }
+
+    if changed {
+        save_user_config(paths, config).context("save local workflow runtime config")?;
+    }
+
+    let user_id = valid_uuid_env(&existing_env, "LOCAL_USER_ID")
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let api_key_pepper =
+        non_empty_env(&existing_env, "API_KEY_PEPPER").unwrap_or_else(generated_api_key_pepper);
+    let jwt_secret =
+        non_empty_env(&existing_env, "JWT_SECRET").unwrap_or_else(generated_runtime_secret);
+    let jwt_refresh_secret =
+        non_empty_env(&existing_env, "JWT_REFRESH_SECRET").unwrap_or_else(generated_runtime_secret);
+    let runtime = RuntimeContext {
+        api_base_url,
+        api_key,
+        api_key_pepper,
+        jwt_secret,
+        jwt_refresh_secret,
+        user_id,
+        workspace_id,
+        compose_file: stack_dir.join(LOCAL_WORKFLOW_RUNTIME_COMPOSE_FILE),
+        env_file: stack_dir.join(LOCAL_WORKFLOW_RUNTIME_ENV_FILE),
+        seed_file: bootstrap_dir.join(LOCAL_WORKFLOW_RUNTIME_SEED_FILE),
+        stack_dir,
+        data_dir,
+        bootstrap_dir,
+        host_port,
+    };
+    write_runtime_files(&runtime)?;
+    Ok(runtime)
+}
+
+fn runtime_context_from_config(
+    paths: &ConfigPaths,
+    config: &PufferConfig,
+) -> Result<RuntimeContext> {
+    let stack_dir = local_runtime_stack_dir(paths);
+    let bootstrap_dir = stack_dir.join(LOCAL_WORKFLOW_RUNTIME_BOOTSTRAP_DIR);
+    let data_dir = stack_dir.join(LOCAL_WORKFLOW_RUNTIME_DATA_DIR);
+    let env_file = stack_dir.join(LOCAL_WORKFLOW_RUNTIME_ENV_FILE);
+    let env = read_env_file(&env_file)?;
+    let (api_base_url, host_port) = local_api_base_url(&config.workflow_backend.api_base_url)
+        .context("local workflow runtime API URL is not configured for localhost")?;
+    let workspace_id = local_workspace_id(&config.workflow_backend.workspace_id)
+        .context("local workflow runtime workspace id is not a UUID")?;
+    let user_id = valid_uuid_env(&env, "LOCAL_USER_ID")
+        .context("local workflow runtime user id is not configured")?;
+    let api_key_pepper = non_empty_env(&env, "API_KEY_PEPPER")
+        .context("local workflow runtime API key pepper is not configured")?;
+    let jwt_secret = non_empty_env(&env, "JWT_SECRET").unwrap_or_default();
+    let jwt_refresh_secret = non_empty_env(&env, "JWT_REFRESH_SECRET").unwrap_or_default();
+    let secret_id = trimmed(&config.workflow_backend.api_token_secret_id)
+        .context("local workflow runtime token is not configured")?;
+    let vault = SecretVault::open(SecretVault::default_path(&paths.user_config_dir))
+        .context("open encrypted secret store")?;
+    let api_key = vault
+        .reveal(secret_id)
+        .context("load local workflow runtime token from secret store")?
+        .value;
+    Ok(RuntimeContext {
+        api_base_url,
+        api_key,
+        api_key_pepper,
+        jwt_secret,
+        jwt_refresh_secret,
+        user_id,
+        workspace_id,
+        compose_file: stack_dir.join(LOCAL_WORKFLOW_RUNTIME_COMPOSE_FILE),
+        env_file,
+        seed_file: bootstrap_dir.join(LOCAL_WORKFLOW_RUNTIME_SEED_FILE),
+        stack_dir,
+        data_dir,
+        bootstrap_dir,
+        host_port,
+    })
+}
+
+fn resolve_or_create_api_token(
+    paths: &ConfigPaths,
+    config: &PufferConfig,
+    api_base_url: &str,
+) -> Result<(String, String, bool)> {
+    let vault = SecretVault::open(SecretVault::default_path(&paths.user_config_dir))
+        .context("open encrypted secret store")?;
+    if let Some(secret_id) = trimmed(&config.workflow_backend.api_token_secret_id) {
+        let resolved = vault
+            .reveal(secret_id)
+            .context("load local workflow runtime token from secret store")?;
+        return Ok((resolved.value, secret_id.to_string(), false));
+    }
+    let token = generated_api_token();
+    let summary = vault.put(SecretUpsert {
+        id: None,
+        label: WORKFLOW_RUNTIME_TOKEN_LABEL.to_string(),
+        description: Some(WORKFLOW_RUNTIME_TOKEN_DESCRIPTION.to_string()),
+        value: token.clone(),
+        username: None,
+        origin: Some(api_base_url.to_string()),
+        source: "local_workflow_runtime".to_string(),
+    })?;
+    Ok((token, summary.id, true))
+}
+
+fn local_runtime_stack_dir(paths: &ConfigPaths) -> PathBuf {
+    paths.user_config_dir.join(LOCAL_WORKFLOW_RUNTIME_DIR)
+}
+
+fn local_runtime_compose_file(paths: &ConfigPaths) -> PathBuf {
+    local_runtime_stack_dir(paths).join(LOCAL_WORKFLOW_RUNTIME_COMPOSE_FILE)
+}
+
+fn local_api_base_url(value: &str) -> Option<(String, u16)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = Url::parse(trimmed).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || !is_loopback_host(parsed.host_str()?) {
+        return None;
+    }
+    let port = parsed.port()?;
+    Some((parsed.origin().ascii_serialization(), port))
+}
+
+fn local_workspace_id(value: &str) -> Option<String> {
+    let trimmed = trimmed(value)?;
+    Uuid::parse_str(trimmed).ok()?;
+    Some(trimmed.to_string())
+}
+
+fn allocated_local_api_base_url() -> Result<(String, u16)> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).context("allocate local workflow port")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok((format!("http://127.0.0.1:{port}"), port))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn generated_api_token() -> String {
+    format!(
+        "pufw_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn generated_api_key_pepper() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+fn generated_runtime_secret() -> String {
+    format!(
+        "{}{}{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn runtime_url(api_base_url: &str, path: &str) -> Result<Url> {
+    let mut url = Url::parse(api_base_url).context("parse local workflow runtime API URL")?;
+    url.set_path(path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn base_status(state: LocalWorkflowRuntimeState) -> LocalWorkflowRuntimeStatus {
+    LocalWorkflowRuntimeStatus {
+        state,
+        image: AGENTENV_LOCAL_RUNTIME_IMAGE.to_string(),
+        stack_name: LOCAL_WORKFLOW_RUNTIME_PROJECT.to_string(),
+        api_base_url: None,
+        compose_file: None,
+        data_dir: None,
+        message: None,
+    }
+}
+
+fn status_for_runtime(
+    state: LocalWorkflowRuntimeState,
+    runtime: Option<&RuntimeContext>,
+) -> LocalWorkflowRuntimeStatus {
+    let mut status = base_status(state);
+    if let Some(runtime) = runtime {
+        status.api_base_url = Some(runtime.api_base_url.clone());
+        status.compose_file = Some(runtime.compose_file.clone());
+        status.data_dir = Some(runtime.data_dir.clone());
+    }
+    status
+}
+
+impl LocalWorkflowRuntimeStatus {
+    fn with_message(mut self, message: impl Into<String>) -> Self {
+        let message = message.into();
+        if !message.trim().is_empty() {
+            self.message = Some(message);
+        }
+        self
+    }
+}
+
+fn trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn trim_diagnostic(value: &str) -> String {
+    value.trim().to_string()
+}
+
+#[cfg(test)]
+#[path = "workflow_local_runtime_tests.rs"]
+mod tests;

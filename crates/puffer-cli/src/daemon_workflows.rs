@@ -1,6 +1,9 @@
 //! Workflow daemon RPC helpers.
 
+mod binding_create;
 mod binding_delete;
+#[cfg(test)]
+mod binding_snapshot_tests;
 mod connection_delete;
 mod monitor_create;
 mod monitor_history;
@@ -19,7 +22,10 @@ mod runtime;
 mod snapshot_json;
 mod task_snapshot;
 mod telegram_diagnostics;
+#[cfg(test)]
+mod telegram_diagnostics_export_tests;
 
+pub(crate) use binding_create::handle_workflow_binding_create;
 pub(crate) use binding_delete::handle_workflow_binding_delete;
 pub(crate) use connection_delete::handle_workflow_connection_delete;
 pub(crate) use monitor_create::handle_monitor_create;
@@ -83,49 +89,6 @@ pub(crate) fn handle_workflow_list(paths: &ConfigPaths) -> Result<Value> {
         );
     }
     Ok(snapshot)
-}
-
-/// Creates or updates a simple connection-triggered file append workflow binding.
-pub(crate) fn handle_workflow_binding_create(paths: &ConfigPaths, params: &Value) -> Result<Value> {
-    let parsed: WorkflowBindingCreateParams =
-        serde_json::from_value(params.clone()).context("invalid workflow binding create params")?;
-    let manager = subscription_manager()?;
-    let (connection, connector_slug, template) = resolve_binding_trigger(
-        paths,
-        manager.as_ref(),
-        &parsed.connection_slug,
-        parsed.connector_slug.as_deref(),
-    )?;
-    let binding = file_append_binding_from_params(parsed, connector_slug)?;
-    let enabled = binding.status == WorkflowBindingStatus::Enabled;
-    let binding_slug = binding.slug.clone();
-    let previous = manager.store().get(&binding_slug);
-    manager.store().upsert(binding.clone())?;
-    let setup_result = (|| -> Result<()> {
-        if enabled {
-            if let Some(connection) = connection.as_ref() {
-                ensure_workflow_subscriber_started(manager.as_ref(), paths, connection, &template)?;
-            }
-        }
-        manager.refresh_connection_consumers()?;
-        Ok(())
-    })();
-    if let Err(error) = setup_result {
-        let rollback_result = if let Some(previous) = previous {
-            manager.store().upsert(previous).map(|_| ())
-        } else {
-            manager.store().delete(&binding_slug)
-        };
-        if let Err(rollback_error) = rollback_result {
-            anyhow::bail!(
-                "workflow binding `{binding_slug}` setup failed: {error:#}; rollback failed: {rollback_error:#}"
-            );
-        }
-        manager.refresh_connection_consumers()?;
-        return Err(error)
-            .with_context(|| format!("workflow binding `{binding_slug}` setup failed"));
-    }
-    handle_workflow_list(paths)
 }
 
 /// Toggles a workflow binding.
@@ -272,12 +235,13 @@ fn workflow_binding_json(paths: &ConfigPaths, binding: WorkflowBindingSpec) -> V
     let action_type = workflow_action_type(&binding.action);
     let action_path = workflow_action_path(&binding.action);
     let action_format = workflow_action_format(&binding.action);
+    let action = serde_json::to_value(&binding.action).unwrap_or(Value::Null);
     let model = workflow_action_model(&binding.action).map(ToOwned::to_owned);
     let filter_pattern = workflow_filter_pattern(binding.filter.as_ref());
     let ignore_filters =
         serde_json::to_value(&binding.ignore_filters).unwrap_or(Value::Array(vec![]));
     let monitor = binding.slug.starts_with("monitor-")
-        || (matches!(binding.action, ActionSpec::TriageAgent { .. })
+        || (matches!(&binding.action, ActionSpec::TriageAgent { .. })
             && binding.description.to_ascii_lowercase().contains("monitor"));
     let monitor_memory_path = monitor.then(|| {
         paths
@@ -296,6 +260,7 @@ fn workflow_binding_json(paths: &ConfigPaths, binding: WorkflowBindingSpec) -> V
         "status": workflow_status_label(binding.status),
         "enabled": binding.status == WorkflowBindingStatus::Enabled,
         "action_type": action_type,
+        "action": action,
         "action_path": action_path,
         "action_format": action_format,
         "model": model,
@@ -372,23 +337,6 @@ fn workflow_status_label(status: WorkflowBindingStatus) -> &'static str {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct WorkflowBindingCreateParams {
-    #[serde(default)]
-    slug: Option<String>,
-    connection_slug: String,
-    #[serde(default)]
-    connector_slug: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    pattern: Option<String>,
-    #[serde(default, alias = "path")]
-    file_append_path: Option<String>,
-    #[serde(default)]
-    enabled: Option<bool>,
-}
-
 fn resolve_binding_trigger(
     paths: &ConfigPaths,
     manager: &puffer_subscriptions::SubscriptionManager,
@@ -433,99 +381,6 @@ fn resolve_binding_trigger(
         connector_slug,
     )?;
     Ok((None, connector_slug, template))
-}
-
-fn file_append_binding_from_params(
-    params: WorkflowBindingCreateParams,
-    connector_slug: String,
-) -> Result<WorkflowBindingSpec> {
-    let connection_slug = params.connection_slug.trim();
-    if connection_slug.is_empty() {
-        anyhow::bail!("connection_slug must not be empty");
-    }
-    let path = params
-        .file_append_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .context("missing file_append_path")?
-        .to_string();
-    let slug = params
-        .slug
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| default_file_append_slug(connection_slug, &path));
-    let pattern = params
-        .pattern
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != ".*")
-        .map(ToOwned::to_owned);
-    let action = serde_json::from_value::<ActionSpec>(json!({
-        "type": "file_append",
-        "path": path,
-        "format": "text",
-    }))
-    .context("build file_append action")?;
-    Ok(WorkflowBindingSpec {
-        slug,
-        description: params.description.unwrap_or_else(|| {
-            format!(
-                "Append {connection_slug} messages to {}",
-                workflow_action_path(&action).unwrap_or("")
-            )
-        }),
-        connection_slug: connection_slug.to_string(),
-        connector_slug: Some(connector_slug),
-        status: workflow_status(params.enabled.unwrap_or(true)),
-        filter: pattern.map(|pattern| {
-            FilterSpec::Tagged(TaggedFilterSpec::Regex {
-                pattern,
-                case_insensitive: true,
-            })
-        }),
-        ignore_filters: Vec::new(),
-        contact_ids: Vec::new(),
-        classify_prompt: None,
-        classify_model: None,
-        action,
-        created_at_ms: puffer_subscriptions::now_ms(),
-    })
-}
-
-fn default_file_append_slug(connection_slug: &str, path: &str) -> String {
-    let path_leaf = path
-        .rsplit('/')
-        .find(|part| !part.trim().is_empty())
-        .unwrap_or("events");
-    format!("append-{connection_slug}-{}", slug_fragment(path_leaf))
-}
-
-fn slug_fragment(value: &str) -> String {
-    let mut slug = String::new();
-    let mut last_was_dash = false;
-    for ch in value.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
-            slug.push(ch);
-            last_was_dash = false;
-        } else if !last_was_dash && !slug.is_empty() {
-            slug.push('-');
-            last_was_dash = true;
-        }
-        if slug.len() >= 48 {
-            break;
-        }
-    }
-    while slug.ends_with('-') {
-        slug.pop();
-    }
-    if slug.is_empty() {
-        "events".to_string()
-    } else {
-        slug
-    }
 }
 
 fn connector_stream_supported(template: &ConnectorTemplate) -> bool {
@@ -1084,62 +939,28 @@ mod tests {
     }
 
     #[test]
-    fn file_append_binding_params_build_regex_filtered_spec() {
-        let binding = file_append_binding_from_params(
-            WorkflowBindingCreateParams {
-                slug: Some("append-telegram-user-hi".to_string()),
-                connection_slug: "telegram-user".to_string(),
-                connector_slug: Some("telegram-login".to_string()),
-                description: None,
-                pattern: Some("hi".to_string()),
-                file_append_path: Some("/tmp/hi".to_string()),
-                enabled: Some(true),
-            },
-            "telegram-login".to_string(),
-        )
-        .unwrap();
-
-        assert_eq!(binding.slug, "append-telegram-user-hi");
-        assert_eq!(
-            binding.description,
-            "Append telegram-user messages to /tmp/hi"
-        );
-        assert_eq!(binding.connection_slug, "telegram-user");
-        assert_eq!(binding.connector_slug.as_deref(), Some("telegram-login"));
-        assert_eq!(binding.status, WorkflowBindingStatus::Enabled);
-        assert!(matches!(
-            binding.filter,
-            Some(FilterSpec::Tagged(TaggedFilterSpec::Regex {
-                ref pattern,
-                case_insensitive: true
-            })) if pattern == "hi"
-        ));
-        assert!(matches!(
-            binding.action,
-            ActionSpec::FileAppend {
-                ref path,
-                ..
-            } if path == "/tmp/hi"
-        ));
-    }
-
-    #[test]
     fn workflow_binding_json_includes_file_append_details() {
         let tempdir = tempfile::tempdir().unwrap();
         let paths = ConfigPaths::discover(tempdir.path());
-        let binding = file_append_binding_from_params(
-            WorkflowBindingCreateParams {
-                slug: None,
-                connection_slug: "telegram-user".to_string(),
-                connector_slug: None,
-                description: Some("Capture hellos".to_string()),
-                pattern: Some(".*".to_string()),
-                file_append_path: Some("/tmp/hi".to_string()),
-                enabled: Some(false),
-            },
-            "telegram-login".to_string(),
-        )
-        .unwrap();
+        let binding = WorkflowBindingSpec {
+            slug: "append-telegram-user-hi".to_string(),
+            description: "Capture hellos".to_string(),
+            connection_slug: "telegram-user".to_string(),
+            connector_slug: Some("telegram-login".to_string()),
+            status: WorkflowBindingStatus::Paused,
+            filter: None,
+            ignore_filters: Vec::new(),
+            contact_ids: Vec::new(),
+            classify_prompt: None,
+            classify_model: None,
+            action: serde_json::from_value(json!({
+                "type": "file_append",
+                "path": "/tmp/hi",
+                "format": "text"
+            }))
+            .unwrap(),
+            created_at_ms: 42,
+        };
 
         let value = workflow_binding_json(&paths, binding);
 
@@ -1162,166 +983,5 @@ mod tests {
 
         assert_eq!(snapshot["monitor_tasks"].as_array().unwrap().len(), 0);
         assert_eq!(snapshot["monitor_task_error"], Value::Null);
-    }
-}
-
-#[cfg(test)]
-mod telegram_diagnostics_export_tests {
-    use super::*;
-    use puffer_config::ConfigPaths;
-    use serde_json::{json, Value};
-
-    #[test]
-    fn telegram_diagnostics_export_writes_downloadable_message_observability_report() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ConfigPaths {
-            workspace_root: temp.path().join("workspace"),
-            workspace_config_dir: temp.path().join("workspace/.puffer"),
-            user_config_dir: temp.path().join("home/.puffer"),
-            builtin_resources_dir: temp.path().join("resources"),
-        };
-        let output_dir = temp.path().join("Downloads");
-        std::fs::create_dir_all(
-            paths
-                .user_config_dir
-                .join("telegram-accounts/telegram-user"),
-        )
-        .unwrap();
-        std::fs::write(
-            paths
-                .user_config_dir
-                .join("telegram-accounts/telegram-user/message-diagnostics.ndjson"),
-            [
-                json!({
-                    "at_ms": 1_700_000_010_000i64,
-                    "stage": "emitted",
-                    "chat_id": 42,
-                    "message_id": 7,
-                    "date_ms": 1_700_000_000_000i64,
-                    "source_received_at_ms": 1_700_000_005_000i64,
-                    "text_prefix": "please help"
-                })
-                .to_string(),
-                json!({
-                    "at_ms": 1_700_000_020_000i64,
-                    "stage": "suppressed",
-                    "chat_id": 42,
-                    "message_id": 8,
-                    "date_ms": 1_700_000_015_000i64,
-                    "notification_muted": true,
-                    "suppressed": true,
-                    "text_prefix": "muted message"
-                })
-                .to_string(),
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-        std::fs::write(
-            paths
-                .user_config_dir
-                .join("telegram-accounts/telegram-user/message-diagnostics.ndjson.1"),
-            json!({
-                "at_ms": 1_700_000_001_000i64,
-                "stage": "emitted",
-                "chat_id": 42,
-                "message_id": 6,
-                "date_ms": 1_699_999_990_000i64,
-                "source_received_at_ms": 1_699_999_995_000i64,
-                "text_prefix": "rotated"
-            })
-            .to_string(),
-        )
-        .unwrap();
-        std::fs::write(
-            paths.user_config_dir.join("workflow_history.json"),
-            serde_json::to_vec_pretty(&json!({
-                "next_idx": 2,
-                "runs": [{
-                    "idx": 1,
-                    "run_id": "run-1",
-                    "workflow_slug": "monitor-telegram-user",
-                    "trigger_info": {
-                        "connection_slug": "telegram-user",
-                        "connector_slug": "telegram-login",
-                        "envelope_id": "env-1",
-                        "received_at_ms": 1_700_000_011_000i64,
-                        "topic": "telegram-user",
-                        "kind": "message",
-                        "dedup_key": "42:7",
-                        "text": "please help with my private launch plan",
-                        "payload": {
-                            "chat_id": 42,
-                            "message_id": 7,
-                            "date_ms": 1_700_000_000_000i64,
-                            "subscriber_received_at_ms": 1_700_000_005_000i64
-                        }
-                    },
-                    "action_summary": {
-                        "status": "completed",
-                        "action": "triage_agent",
-                        "summary": "Created task #1."
-                    },
-                    "action_log": [{
-                        "action": "triage_agent",
-                        "status": "completed",
-                        "summary": "Created task #1.",
-                        "started_at_ms": 1_700_000_012_000i64,
-                        "ended_at_ms": 1_700_000_013_000i64
-                    }],
-                    "status": "completed",
-                    "started_at_ms": 1_700_000_011_000i64,
-                    "ended_at_ms": 1_700_000_013_000i64
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let result = handle_telegram_diagnostics_export(
-            &paths,
-            &json!({ "output_dir": output_dir, "limit": 10 }),
-        )
-        .unwrap();
-        let path = result.get("path").and_then(Value::as_str).unwrap();
-        let report: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        assert!(report["privacy_note"]
-            .as_str()
-            .unwrap()
-            .contains("message snippets"));
-        assert!(!serde_json::to_string(&report)
-            .unwrap()
-            .contains("private launch plan"));
-        let messages = report.get("messages").and_then(Value::as_array).unwrap();
-
-        let acted = messages
-            .iter()
-            .find(|message| message.get("dedup_key").and_then(Value::as_str) == Some("42:7"))
-            .unwrap();
-        assert_eq!(acted["message_time_ms"], json!(1_700_000_000_000i64));
-        assert_eq!(acted["received_time_ms"], json!(1_700_000_005_000i64));
-        assert_eq!(acted["subscriber"]["received"], json!(true));
-        assert_eq!(acted["filter"]["filtered"], json!(false));
-        assert_eq!(acted["trust_ai"]["entered"], json!(true));
-        assert_eq!(acted["trust_ai"]["result"], json!("Created task #1."));
-
-        let suppressed = messages
-            .iter()
-            .find(|message| message.get("dedup_key").and_then(Value::as_str) == Some("42:8"))
-            .unwrap();
-        assert_eq!(suppressed["subscriber"]["received"], json!(true));
-        assert_eq!(suppressed["filter"]["filtered"], json!(true));
-        assert_eq!(
-            suppressed["filter"]["stage"],
-            json!("subscriber_suppressed")
-        );
-        assert_eq!(suppressed["trust_ai"]["entered"], json!(false));
-
-        let rotated = messages
-            .iter()
-            .find(|message| message.get("dedup_key").and_then(Value::as_str) == Some("42:6"))
-            .unwrap();
-        assert_eq!(rotated["subscriber"]["received"], json!(true));
-        assert_eq!(rotated["filter"]["stage"], json!("no_router_history"));
     }
 }

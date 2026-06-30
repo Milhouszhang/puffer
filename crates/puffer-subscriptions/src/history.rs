@@ -486,7 +486,7 @@ mod tests {
             classify_prompt: None,
             classify_model: None,
             action: ActionSpec::RunWorkflow {
-                slug: "native".into(),
+                workflow_id: "native".into(),
             },
             created_at_ms: 0,
         }
@@ -530,7 +530,7 @@ mod tests {
                 &binding(),
                 &envelope(),
                 &ActionSpec::RunWorkflow {
-                    slug: "native".into(),
+                    workflow_id: "native".into(),
                 },
                 &result,
                 1,

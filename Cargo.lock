@@ -4988,6 +4988,7 @@ name = "puffer-subscriptions"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "puffer-config",
  "puffer-subscriber-runtime",
  "regex",
  "rusqlite",

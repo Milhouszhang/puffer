@@ -1171,3 +1171,55 @@ fn manager_injects_proxy_env_into_supervisor_config() {
     assert!(cfg.env_unset.is_empty());
     manager.shutdown();
 }
+
+#[test]
+fn respawn_proxy_sensitive_restarts_running_telegram() {
+    let temp = tempdir().unwrap();
+    let subscriber_dir = temp.path().join("subscriber");
+    std::fs::create_dir_all(&subscriber_dir).unwrap();
+    std::fs::write(
+        subscriber_dir.join("manifest.toml"),
+        r#"manifest_version = 1
+id = "telegram-user"
+kind = "subscriber"
+topic = "telegram-user"
+
+[run]
+cmd = ["sh", "run.sh"]
+"#,
+    )
+    .unwrap();
+    // Exit immediately: child exits quickly, run_loop enters its restart
+    // backoff where it checks the shutdown watch channel.  A blocking script
+    // would deadlock because spawn_once holds child.wait() while the child
+    // holds stdin open, and stdin is only closed *after* spawn_once returns.
+    std::fs::write(subscriber_dir.join("run.sh"), "exit 0\n").unwrap();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let manager = SubscriptionManagerBuilder::new(temp.path().join("subscriptions.json"))
+        .build(runtime.handle().clone())
+        .unwrap();
+    let manifest = Manifest::load(&subscriber_dir).unwrap();
+
+    manager.start_subscriber(manifest).unwrap();
+    assert!(
+        manager
+            .subscriber_ids()
+            .contains(&"telegram-user".to_string()),
+        "telegram-user should be registered after start_subscriber"
+    );
+
+    manager.respawn_proxy_sensitive_subscribers().unwrap();
+    assert!(
+        manager
+            .subscriber_ids()
+            .contains(&"telegram-user".to_string()),
+        "telegram-user should still be registered after respawn"
+    );
+
+    manager.shutdown();
+}

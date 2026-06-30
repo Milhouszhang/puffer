@@ -272,6 +272,7 @@
   let workspaceMentionItems = $state<WorkspaceMentionItem[]>([]);
   let workspaceMentionRequestSeq = 0;
   let loadedWorkspaceMentionKey = $state<string | null>(null);
+  let composerTextareaScrollTop = $state(0);
   let submitInFlightSessionIds = $state<string[]>([]);
   const submitInFlightGuards = new Set<string>();
   let thinkingProviderId = $state<string | null>(null);
@@ -296,6 +297,7 @@
   let mentionSuggestions = $derived(buildMentionSuggestions());
   let commandSuggestions = $derived(buildCommandSuggestions());
   let composerSuggestions = $derived(filteredComposerSuggestions(composerTrigger));
+  let highlightedComposerSegments = $derived(buildHighlightedComposerSegments(draft, composerTrigger));
 
   let fastModeAvailable = $derived(modelSupportsFastMode(selectedModelId));
   let selectedProviderModelSourceId = $derived.by(() => {
@@ -767,6 +769,24 @@
       composerTextareaEl?.focus();
       composerTextareaEl?.setSelectionRange(cursor, cursor);
     });
+  }
+
+  function buildHighlightedComposerSegments(
+    value: string,
+    trigger: ComposerTrigger | null
+  ): Array<{ text: string; active: boolean }> {
+    if (!trigger || trigger.start < 0 || trigger.end <= trigger.start) {
+      return [{ text: value || " ", active: false }];
+    }
+    return [
+      { text: value.slice(0, trigger.start), active: false },
+      { text: value.slice(trigger.start, trigger.end), active: true },
+      { text: value.slice(trigger.end) || " ", active: false }
+    ].filter((segment) => segment.text.length > 0);
+  }
+
+  function syncComposerTextareaScroll() {
+    composerTextareaScrollTop = composerTextareaEl?.scrollTop ?? 0;
   }
 
   function normalizePermissionMode(value: string | null): AgentPermissionMode {
@@ -1454,6 +1474,7 @@
   function handleAttachmentDragEnter(event: DragEvent) {
     if (!canAcceptAttachmentDrop || !dataTransferHasFiles(event.dataTransfer)) return;
     event.preventDefault();
+    event.stopPropagation();
     attachmentDragDepth += 1;
     attachmentDropActive = true;
   }
@@ -1461,12 +1482,14 @@
   function handleAttachmentDragOver(event: DragEvent) {
     if (!canAcceptAttachmentDrop || !dataTransferHasFiles(event.dataTransfer)) return;
     event.preventDefault();
+    event.stopPropagation();
     event.dataTransfer!.dropEffect = "copy";
     attachmentDropActive = true;
   }
 
   function handleAttachmentDragLeave(event: DragEvent) {
     if (!dataTransferHasFiles(event.dataTransfer)) return;
+    event.stopPropagation();
     attachmentDragDepth = Math.max(0, attachmentDragDepth - 1);
     if (attachmentDragDepth === 0) attachmentDropActive = false;
   }
@@ -1474,6 +1497,7 @@
   function handleAttachmentDrop(event: DragEvent) {
     if (!dataTransferHasFiles(event.dataTransfer)) return;
     event.preventDefault();
+    event.stopPropagation();
     const files = filesFromDataTransfer(event.dataTransfer);
     resetAttachmentDropState();
     if (!canAcceptAttachmentDrop || files.length === 0) return;
@@ -2953,8 +2977,13 @@
   <div class="pf-composer-wrap">
     <div
       class="pf-composer"
+      class:drop-active={attachmentDropActive}
       role="group"
       aria-label="Message composer"
+      ondragenter={handleAttachmentDragEnter}
+      ondragover={handleAttachmentDragOver}
+      ondragleave={handleAttachmentDragLeave}
+      ondrop={handleAttachmentDrop}
     >
       <input
         bind:this={fileInputEl}
@@ -3008,14 +3037,32 @@
           {/each}
         </div>
       {/if}
-      <textarea
-        bind:this={composerTextareaEl}
-        value={draft}
-        placeholder={session ? `Reply to ${engineerName}…` : "Select a session to continue"}
-        oninput={(event) => updateDraft(event.currentTarget.value)}
-        onkeydown={onKeydown}
-        disabled={composerDisabled}
-      ></textarea>
+      <div class="pf-composer-input-shell">
+        <div
+          class="pf-composer-highlight"
+          aria-hidden="true"
+          style={`transform: translateY(-${composerTextareaScrollTop}px);`}
+        >
+          {#each highlightedComposerSegments as segment, segmentIndex (`${segmentIndex}-${segment.active}-${segment.text}`)}
+            <span class:active={segment.active}>{segment.text}</span>
+          {/each}
+        </div>
+        <textarea
+          bind:this={composerTextareaEl}
+          value={draft}
+          placeholder={session ? `Reply to ${engineerName}…` : "Select a session to continue"}
+          oninput={(event) => updateDraft(event.currentTarget.value)}
+          onkeydown={onKeydown}
+          onscroll={syncComposerTextareaScroll}
+          disabled={composerDisabled}
+        ></textarea>
+        {#if attachmentDropActive}
+          <div class="pf-composer-drop-hint" aria-hidden="true">
+            <span><Icon name="paperclip" size={14} /></span>
+            Drop files to attach
+          </div>
+        {/if}
+      </div>
       <div class="pf-composer-foot">
         <div class="pf-attachment-menu" bind:this={attachmentMenuEl}>
           <button
@@ -3203,12 +3250,81 @@
     margin: 0 auto;
     position: relative;
   }
-  .pf-chat.drop-active .pf-composer {
+  .pf-chat.drop-active .pf-composer,
+  .pf-composer.drop-active {
     border-color: var(--puffer-accent);
     box-shadow: 0 0 0 3px color-mix(in oklab, var(--puffer-accent) 18%, transparent);
   }
   .pf-chat .pf-composer textarea {
     overflow-y: hidden;
+  }
+  .pf-composer-input-shell {
+    position: relative;
+    min-width: 0;
+  }
+  .pf-composer-highlight {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    min-height: 100%;
+    overflow: hidden;
+    padding: 4px 4px 6px;
+    pointer-events: none;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    font-size: var(--pf-chat-text-size);
+    line-height: 1.5;
+  }
+  .pf-composer-highlight span.active {
+    border-radius: 5px;
+    background: color-mix(in oklab, var(--puffer-accent) 20%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in oklab, var(--puffer-accent) 24%, transparent);
+  }
+  .pf-composer-input-shell textarea {
+    position: relative;
+    z-index: 1;
+    width: 100%;
+    color: transparent;
+    caret-color: var(--foreground);
+    background: transparent;
+  }
+  .pf-composer-input-shell textarea::placeholder {
+    color: var(--muted-foreground);
+  }
+  .pf-composer-input-shell textarea::selection {
+    color: var(--foreground);
+    background: color-mix(in oklab, var(--puffer-accent) 32%, transparent);
+  }
+  .pf-composer-drop-hint {
+    position: absolute;
+    right: 12px;
+    bottom: 12px;
+    z-index: 3;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 10px;
+    border: 1px dashed color-mix(in oklab, var(--puffer-accent) 60%, var(--border));
+    border-radius: 8px;
+    background: color-mix(in oklab, var(--background) 90%, var(--puffer-accent));
+    color: var(--foreground);
+    box-shadow: var(--shadow-sm);
+    font-size: 12px;
+    line-height: 16px;
+    font-weight: 700;
+    pointer-events: none;
+  }
+  .pf-composer-drop-hint span {
+    width: 20px;
+    height: 20px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    background: color-mix(in oklab, var(--puffer-accent) 20%, transparent);
+    color: var(--puffer-accent);
   }
   .pf-attachment-input {
     display: none;

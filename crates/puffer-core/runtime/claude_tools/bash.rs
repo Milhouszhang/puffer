@@ -281,10 +281,9 @@ fn execute_background(
     let stderr = stdout
         .try_clone()
         .with_context(|| format!("failed to clone {}", pending_output_file.display()))?;
-    let mut command = Command::new(puffer_tools::detected_shell());
+    let (mut command, shell_label) =
+        shell_command(&command_with_internal_tool_helpers(&input.command)?);
     command
-        .arg("-lc")
-        .arg(command_with_internal_tool_helpers(&input.command)?)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
@@ -294,8 +293,9 @@ fn execute_background(
     }
     let mut child = command.spawn().with_context(|| {
         format!(
-            "failed to start background bash command in {}",
-            cwd.display()
+            "failed to start background bash command in {} using {}",
+            cwd.display(),
+            shell_label
         )
     })?;
     let pid = child.id();
@@ -430,19 +430,21 @@ fn run_bash_command(
     mut internal_permissions: Option<&mut InternalPermissionHandler<'_>>,
 ) -> Result<TimedCommandOutput> {
     let mut broker = InternalPermissionBroker::start(internal_permissions.is_some())?;
-    let mut command_builder = Command::new(puffer_tools::detected_shell());
+    let (mut command_builder, shell_label) = shell_command(command);
     command_builder
-        .arg("-lc")
-        .arg(command)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (key, value) in broker.envs() {
         command_builder.env(key, value);
     }
-    let mut child = command_builder
-        .spawn()
-        .with_context(|| format!("failed to execute bash command in {}", cwd.display()))?;
+    let mut child = command_builder.spawn().with_context(|| {
+        format!(
+            "failed to execute bash command in {} using {}",
+            cwd.display(),
+            shell_label
+        )
+    })?;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         broker.drain_pending(internal_permissions.as_deref_mut())?;
@@ -477,7 +479,30 @@ fn run_bash_command(
 }
 
 fn command_with_internal_tool_helpers(command: &str) -> Result<String> {
+    #[cfg(windows)]
+    {
+        Ok(command.to_string())
+    }
+
+    #[cfg(not(windows))]
     Ok(format!("{}\n{command}", internal_tool_shell_helpers()?))
+}
+
+#[cfg(windows)]
+fn shell_command(command: &str) -> (Command, String) {
+    let shell =
+        std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+    let mut cmd = Command::new(&shell);
+    cmd.arg("/C").arg(command);
+    (cmd, shell)
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> (Command, String) {
+    let shell = puffer_tools::detected_shell();
+    let mut cmd = Command::new(&shell);
+    cmd.arg("-lc").arg(command);
+    (cmd, shell)
 }
 
 fn internal_tool_shell_helpers() -> Result<String> {

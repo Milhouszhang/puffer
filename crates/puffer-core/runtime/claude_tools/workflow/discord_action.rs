@@ -181,7 +181,9 @@ fn search_channel_ids(
     let mut seen = BTreeSet::new();
     ids.retain(|id| seen.insert(id.clone()));
     if ids.is_empty() {
-        bail!("DiscordAction searchMessages needs channelId, channelIds, or a guild with text channels");
+        bail!(
+            "DiscordAction searchMessages needs channelId, channelIds, or a guild with text channels"
+        );
     }
     Ok(ids)
 }

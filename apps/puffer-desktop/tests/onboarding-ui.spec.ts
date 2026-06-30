@@ -57,7 +57,7 @@ test("skip flag does not bypass provider login when auth is empty", async ({ pag
   });
   await daemon.open(page);
 
-  await expect(page.getByLabel("API key for Anthropic")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Popular providers" })).toBeVisible();
   await expect(page.getByRole("button", { name: "New agent in puffer" })).toHaveCount(0);
 });
 
@@ -66,7 +66,7 @@ test("force onboarding does not bypass provider login when auth is empty", async
   await daemon.install(page);
   await daemon.open(page, { forceOnboarding: true, skipOnboarding: false });
 
-  await expect(page.getByLabel("API key for Anthropic")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Popular providers" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Workspace is ready" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /Continue/ })).toHaveCount(0);
 });
@@ -93,6 +93,15 @@ test("auth-free local provider satisfies onboarding provider requirement", async
   await expect(page.getByRole("heading", { name: "Workspace is ready" })).toBeVisible();
   await expect(page.getByText("1 agent provider ready")).toBeVisible();
   await expect(page.getByLabel("API key for Anthropic")).toHaveCount(0);
+});
+
+test("ready onboarding includes remote execution setup", async ({ page }) => {
+  await openForcedOnboarding(page);
+
+  await expect(page.getByRole("heading", { name: "Workspace is ready" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Remote Execution" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "AgentEnv account" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Save remote settings" })).toBeVisible();
 });
 
 test("skip flag does not bypass provider login with only non-agent auth", async ({ page }) => {
@@ -137,7 +146,7 @@ test("skip flag does not bypass provider login with only non-agent auth", async 
   });
   await daemon.open(page);
 
-  await expect(page.getByLabel("API key for Anthropic")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Popular providers" })).toBeVisible();
   await expect(page.getByText("Workspace is ready")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "New agent in puffer" })).toHaveCount(0);
 });

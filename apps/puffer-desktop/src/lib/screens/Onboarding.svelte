@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import LoginView from "../components/LoginView.svelte";
   import LocalModelSetupCard from "../components/LocalModelSetupCard.svelte";
+  import RemoteSettings from "./settings/RemoteSettings.svelte";
   import BrandLogo from "../design/BrandLogo.svelte";
   import Puffer from "../design/Puffer.svelte";
   import Icon from "../design/Icon.svelte";
@@ -33,6 +34,7 @@
     onLogout: (providerId: string) => void;
     onImportExternal: (providerId: string, source: "claude" | "codex") => void;
     onRefresh: () => void;
+    onRemoteSettingsSaved: (snapshot: SettingsSnapshot) => void;
     onFinish: () => void;
   };
 
@@ -158,6 +160,15 @@
         </div>
       </div>
       <LocalModelSetupCard compact={true} onRefresh={props.onRefresh} />
+
+      <div class="pf-onboard-remote">
+        <RemoteSettings
+          snapshot={props.snapshot}
+          daemonReachable={!props.loading}
+          onSaved={props.onRemoteSettingsSaved}
+          onRefresh={props.onRefresh}
+        />
+      </div>
 
       <div style="display: flex; margin-top: 28px; gap: 10px; justify-content: flex-end;">
         <button type="button" class="sc-btn" data-variant="default" onclick={props.onFinish}>
@@ -351,4 +362,9 @@
     word-break: break-all;
   }
   .pf-mcp .sc-btn { align-self: flex-start; }
+
+  .pf-onboard-remote {
+    margin-top: 24px;
+    max-width: 900px;
+  }
 </style>

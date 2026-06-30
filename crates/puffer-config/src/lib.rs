@@ -67,6 +67,8 @@ pub struct PufferConfig {
     pub network: NetworkConfig,
     #[serde(default)]
     pub media: MediaConfig,
+    #[serde(default)]
+    pub remote: RemoteConfig,
     pub mascot: MascotConfig,
     pub ui: UiConfig,
     /// When set, the runtime constructs a remote `RemoteToolRunner` against
@@ -103,6 +105,99 @@ pub struct RemoteRunnerConfig {
     /// block first-token latency when no tool is needed.
     #[serde(default = "default_remote_runner_wait_for_ready")]
     pub wait_for_ready: bool,
+}
+
+/// User-managed remote execution targets. This is separate from
+/// `remote_runner`, which is the low-level gRPC endpoint selected after a
+/// concrete target has been entered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RemoteConfig {
+    #[serde(default)]
+    pub default_target: Option<String>,
+    #[serde(default)]
+    pub ssh_hosts: Vec<SshHostConfig>,
+    #[serde(default)]
+    pub agentenv: Option<AgentEnvAccountConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshHostConfig {
+    pub id: String,
+    pub label: String,
+    pub target: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentEnvAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_agentenv_api_url")]
+    pub api_url: String,
+    /// Public host or IP that AgentEnv exposes sandbox ports on when the API
+    /// returns only a host port.
+    #[serde(default)]
+    pub runner_host: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub credential_secret_id: Option<String>,
+    #[serde(default = "default_agentenv_auth_method")]
+    pub auth_method: String,
+    #[serde(default)]
+    pub defaults: AgentEnvSandboxDefaults,
+}
+
+impl Default for AgentEnvAccountConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: default_agentenv_api_url(),
+            runner_host: None,
+            workspace: None,
+            credential_secret_id: None,
+            auth_method: default_agentenv_auth_method(),
+            defaults: AgentEnvSandboxDefaults::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentEnvSandboxDefaults {
+    #[serde(default = "default_agentenv_sandbox_type")]
+    pub sandbox_type: String,
+    #[serde(default = "default_agentenv_image")]
+    pub image: String,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub cpu_millis: Option<u32>,
+    #[serde(default)]
+    pub memory_mb: Option<u32>,
+    #[serde(default)]
+    pub gpu_count: Option<u32>,
+    #[serde(default)]
+    pub gpu_type: Option<String>,
+    #[serde(default)]
+    pub max_lifetime_seconds: Option<u32>,
+}
+
+impl Default for AgentEnvSandboxDefaults {
+    fn default() -> Self {
+        Self {
+            sandbox_type: default_agentenv_sandbox_type(),
+            image: default_agentenv_image(),
+            region: None,
+            cpu_millis: None,
+            memory_mb: None,
+            gpu_count: Some(0),
+            gpu_type: None,
+            max_lifetime_seconds: None,
+        }
+    }
 }
 
 impl RemoteRunnerConfig {
@@ -301,6 +396,7 @@ impl Default for PufferConfig {
             browser: BrowserConfig::default(),
             network: NetworkConfig::default(),
             media: MediaConfig::default(),
+            remote: RemoteConfig::default(),
             mascot: MascotConfig {
                 id: "clawd".to_string(),
                 display_name: "Clawd".to_string(),
@@ -350,6 +446,22 @@ fn default_editor_mode() -> String {
 
 fn default_remote_runner_wait_for_ready() -> bool {
     true
+}
+
+fn default_agentenv_api_url() -> String {
+    "https://api.agentenv.io".to_string()
+}
+
+fn default_agentenv_auth_method() -> String {
+    "api_key".to_string()
+}
+
+fn default_agentenv_sandbox_type() -> String {
+    "small".to_string()
+}
+
+fn default_agentenv_image() -> String {
+    "python:3.11-slim".to_string()
 }
 
 fn default_memory_enabled() -> bool {
@@ -1064,5 +1176,46 @@ tmux_golden_mode = false
         let config: PufferConfig = toml::from_str(&raw).expect("config");
 
         assert!(!config.remote_runner.expect("remote runner").wait_for_ready);
+    }
+
+    #[test]
+    fn remote_agentenv_account_config_round_trips_secret_reference() {
+        let mut config = PufferConfig::default();
+        config.remote.agentenv = Some(AgentEnvAccountConfig {
+            enabled: true,
+            api_url: "https://api.agentenv.io".to_string(),
+            runner_host: Some("runner.agentenv.example".to_string()),
+            workspace: Some("wk_demo".to_string()),
+            credential_secret_id: Some("secret-agentenv".to_string()),
+            auth_method: "api_key".to_string(),
+            defaults: AgentEnvSandboxDefaults {
+                sandbox_type: "small".to_string(),
+                image: "docker.io/acme/puffer-tool-runner:latest".to_string(),
+                region: Some("us-west-2".to_string()),
+                cpu_millis: Some(2000),
+                memory_mb: Some(4096),
+                gpu_count: Some(0),
+                gpu_type: None,
+                max_lifetime_seconds: Some(3600),
+            },
+        });
+
+        let raw = toml::to_string(&config).expect("serialize");
+        assert!(raw.contains("credential_secret_id = \"secret-agentenv\""));
+        assert!(!raw.contains("sk-live"));
+
+        let loaded: PufferConfig = toml::from_str(&raw).expect("deserialize");
+        let agentenv = loaded.remote.agentenv.expect("agentenv config");
+        assert!(agentenv.enabled);
+        assert_eq!(
+            agentenv.runner_host.as_deref(),
+            Some("runner.agentenv.example")
+        );
+        assert_eq!(agentenv.workspace.as_deref(), Some("wk_demo"));
+        assert_eq!(
+            agentenv.credential_secret_id.as_deref(),
+            Some("secret-agentenv")
+        );
+        assert_eq!(agentenv.defaults.region.as_deref(), Some("us-west-2"));
     }
 }

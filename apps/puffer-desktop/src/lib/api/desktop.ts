@@ -27,6 +27,7 @@ import type {
   RepoStatus,
   ChromeSecretsImportResult,
   SaveBrowserSettingsInput,
+  SaveRemoteSettingsInput,
   SaveSecretInput,
   SaveProxySettingsInput,
   SessionDetail,
@@ -304,6 +305,7 @@ type BackendProviderSummary = ProviderSummary;
 type BackendNetworkProxySettings = SettingsSnapshot["networkProxy"];
 type BackendSecretsSettings = SettingsSnapshot["secrets"];
 type BackendBrowserSettings = SettingsSnapshot["browser"];
+type BackendRemoteSettings = SettingsSnapshot["remote"];
 
 type BackendSettingsSnapshot = {
   workspaceRoot: string;
@@ -318,6 +320,7 @@ type BackendSettingsSnapshot = {
   providers: BackendProviderSummary[];
   browser: BackendBrowserSettings;
   networkProxy: BackendNetworkProxySettings;
+  remote: BackendRemoteSettings;
   secrets: BackendSecretsSettings;
 };
 
@@ -965,6 +968,13 @@ export async function saveBrowserSettings(
 ): Promise<SettingsSnapshot> {
   const client = await ensureLocalDaemonClient();
   return client.request<BackendSettingsSnapshot>("save_browser_settings", input);
+}
+
+export async function saveRemoteSettings(
+  input: SaveRemoteSettingsInput
+): Promise<SettingsSnapshot> {
+  const client = await ensureLocalDaemonClient();
+  return client.request<BackendSettingsSnapshot>("save_remote_settings", input);
 }
 
 export async function saveSecret(input: SaveSecretInput): Promise<SettingsSnapshot> {
@@ -1728,6 +1738,30 @@ export type AgentTurnOptions = {
 export type AgentTurnSubmitOptions = AgentTurnOptions & {
   displayAttachments?: ChatAttachmentUpload[];
 };
+export type CommandSurfaceItem = {
+  name: string;
+  aliases: string[];
+  description: string;
+  argumentHint: string | null;
+  kind: "Prompt" | "Local" | "Ui";
+  hidden: boolean;
+};
+type BackendCommandSurfaceItem = Omit<CommandSurfaceItem, "argumentHint"> & {
+  argumentHint?: string | null;
+  argument_hint?: string | null;
+};
+export type WorkspaceMentionItem = {
+  kind: "file" | "directory";
+  path: string;
+  absolutePath: string;
+  name: string;
+  parent: string;
+  size: number;
+};
+type BackendWorkspaceMentionItem = Omit<WorkspaceMentionItem, "absolutePath"> & {
+  absolutePath?: string;
+  absolute_path?: string;
+};
 export type StaleTurnRecoveryResult =
   | { recovery: "retry_started"; turnId: string }
   | { recovery: "already_retried" }
@@ -1859,6 +1893,43 @@ export async function dispatchSlashCommand(
     message
   });
   return result.turnId;
+}
+
+export async function listCommandSurface(): Promise<CommandSurfaceItem[]> {
+  const client = await ensureLocalDaemonClient();
+  const commands = await client.request<BackendCommandSurfaceItem[]>("list_command_surface", {});
+  return commands.map((command) => ({
+    name: command.name,
+    aliases: command.aliases ?? [],
+    description: command.description,
+    argumentHint: command.argumentHint ?? command.argument_hint ?? null,
+    kind: command.kind,
+    hidden: command.hidden
+  }));
+}
+
+export async function listWorkspaceMentions(
+  query: string,
+  cwd?: string | null,
+  limit = 40
+): Promise<WorkspaceMentionItem[]> {
+  const client = await ensureLocalDaemonClient();
+  const result = await client.request<{ items: BackendWorkspaceMentionItem[] }>(
+    "list_workspace_mentions",
+    {
+      query,
+      limit,
+      ...(cwd ? { cwd } : {})
+    }
+  );
+  return result.items.map((item) => ({
+    kind: item.kind,
+    path: item.path,
+    absolutePath: item.absolutePath ?? item.absolute_path ?? "",
+    name: item.name,
+    parent: item.parent,
+    size: item.size
+  }));
 }
 
 /** Runs deterministic connector setup without creating a persisted session.

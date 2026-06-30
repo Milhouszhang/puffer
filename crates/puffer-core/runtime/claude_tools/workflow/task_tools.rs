@@ -5357,8 +5357,7 @@ mod tests {
 
         assert_eq!(task_json["status"], "completed");
         assert_eq!(
-            task_json["completed_via"],
-            "reply",
+            task_json["completed_via"], "reply",
             "completed_via must not be clobbered by a metadata-only update on an already-completed task"
         );
     }

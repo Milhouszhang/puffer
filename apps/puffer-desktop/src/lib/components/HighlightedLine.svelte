@@ -84,4 +84,19 @@
     box-shadow: 0 0 0 1px color-mix(in oklab, var(--puffer-accent, #f59e0b) 32%, transparent) inset;
     border-radius: 3px;
   }
+
+  /* The token colors above are tuned for light backgrounds; in dark mode they
+     read as dark-on-dark. Use a brighter palette that stays legible on the dark
+     diff/code surfaces. Untokenized text inherits --foreground and is fine. */
+  :global(.dark) .tok.keyword { color: #ff7b72; }
+  :global(.dark) .tok.string { color: #a5d6ff; }
+  :global(.dark) .tok.number { color: #79c0ff; }
+  :global(.dark) .tok.comment { color: #8b949e; }
+  :global(.dark) .tok.property,
+  :global(.dark) .tok.attribute { color: #79c0ff; }
+  :global(.dark) .tok.operator { color: #adbac7; }
+  :global(.dark) .tok.punctuation { color: #8b949e; }
+  :global(.dark) .tok.function { color: #d2a8ff; }
+  :global(.dark) .tok.type { color: #ffa657; }
+  :global(.dark) .tok.tag { color: #7ee787; }
 </style>

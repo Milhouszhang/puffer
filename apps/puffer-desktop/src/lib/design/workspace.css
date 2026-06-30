@@ -6,7 +6,8 @@
   flex: 1;
   display: flex; flex-direction: column;
   min-height: 0;
-  background: #fff;
+  background: var(--background);
+  color: var(--foreground);
   overflow: hidden;
 }
 
@@ -15,8 +16,8 @@
   display: flex; align-items: center; gap: 12px;
   height: 49px;
   padding: 0 14px 0 15px;
-  border-bottom: 1px solid #e9e9e9;
-  background: #fff;
+  border-bottom: 1px solid var(--border);
+  background: var(--background);
 }
 .pf-pw-top-left { display: flex; align-items: baseline; gap: 10px; min-width: 0; flex: 1; }
 .pf-pw-top-left h1 { font-size: 14px; font-weight: 700; letter-spacing: 0; margin: 0; white-space: nowrap; }
@@ -27,7 +28,7 @@
   padding: 0;
   border: 1px solid transparent;
   border-radius: 7px;
-  background: #f6f6f6;
+  background: var(--secondary);
   color: var(--muted-foreground);
   display: inline-flex;
   align-items: center;
@@ -45,7 +46,7 @@
   display: flex; align-items: center; gap: 6px;
   height: 30px;
   padding: 0 10px;
-  background: #f6f6f6;
+  background: var(--secondary);
   border-radius: 7px;
   border: 1px solid transparent;
   transition: border-color 120ms, background 120ms;
@@ -72,8 +73,8 @@
   flex-direction: column;
   flex-shrink: 0;
   min-width: 0;
-  background: #fff;
-  border: 1px solid #e6e6e6;
+  background: var(--card);
+  border: 1px solid var(--border);
   border-radius: 8px;
   overflow: hidden;
 }
@@ -148,7 +149,7 @@
   opacity: 0.45;
 }
 .pf-pw-icon-btn[data-pinned="true"] {
-  color: #8b4de8;
+  color: var(--puffer-accent);
 }
 .pf-pw-icon-btn[data-pinned="true"] svg {
   fill: currentColor;
@@ -162,14 +163,14 @@
   min-width: 0;
   min-height: 62px;
   padding: 13px 16px 16px;
-  background: #fafafa;
-  border-top: 1px solid #e6e6e6;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
 }
 
 .pf-pw-agent {
   text-align: left;
-  border: 1px solid #e6e6e6;
-  background: #fff;
+  border: 1px solid var(--border);
+  background: var(--card);
   border-radius: 8px;
   min-height: 36px;
   padding: 0 10px;
@@ -192,12 +193,12 @@
   font-size: 10px; font-weight: 700;
   font-family: var(--font-sans);
   padding: 2px 7px; border-radius: 999px;
-  background: #f1f1f1; color: #7f7f7f;
+  background: var(--muted); color: var(--muted-foreground);
   text-transform: lowercase;
   white-space: nowrap;
   flex: 0 0 auto;
 }
-.pf-pw-agent .status-pill[data-status="running"]  { background: #f8eddd; color: #a65e00; }
+.pf-pw-agent .status-pill[data-status="running"]  { background: color-mix(in oklab, oklch(0.72 0.18 70) 16%, var(--background)); color: oklch(0.6 0.16 70); }
 .pf-pw-agent .status-pill[data-status="awaiting"] { background: color-mix(in oklab, oklch(0.72 0.18 30) 16%, var(--background)); color: oklch(0.55 0.2 30); }
 .pf-pw-agent .status-pill[data-status="review"]   { background: color-mix(in oklab, oklch(0.7 0.16 40) 15%, var(--background));  color: oklch(0.55 0.17 40); }
 
@@ -219,18 +220,18 @@
 }
 
 .pf-pw-agent[data-status="awaiting"] {
-  border-color: #e6e6e6;
-  background: #fff;
+  border-color: var(--border);
+  background: var(--card);
 }
 .pf-pw-agent[data-status="review"] {
-  border-color: #e6e6e6;
+  border-color: var(--border);
 }
 
 .pf-pw-agent-add {
   width: 36px;
   height: 36px;
   border: 1px dashed var(--border);
-  background: #fff;
+  background: var(--card);
   border-radius: 8px;
   color: var(--muted-foreground);
   cursor: pointer;
@@ -258,7 +259,7 @@
   font-size: 12px;
   border: 1px dashed var(--border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--card);
 }
 .pf-pw-agents-empty .icon {
   width: 26px; height: 26px; border-radius: 6px;
@@ -885,7 +886,7 @@
   align-items: center;
   justify-content: center;
   padding: 48px 24px;
-  background: #ffffffb3;
+  background: color-mix(in srgb, var(--background) 70%, transparent);
   animation: pf-modal-scrim-in 140ms ease-out;
 }
 .pf-project-delete-modal {
@@ -896,9 +897,9 @@
   flex-direction: column;
   overflow: hidden;
   border-radius: 14px;
-  border: 1px solid #e4e4e7;
-  background: #fff;
-  color: #111;
+  border: 1px solid var(--border);
+  background: var(--popover);
+  color: var(--popover-foreground);
   box-shadow: 0 24px 64px #00000042, 0 4px 16px #00000024;
   animation: pf-modal-in 160ms cubic-bezier(0.2, 0.9, 0.3, 1);
 }
@@ -923,7 +924,7 @@
   line-height: 22px;
   font-weight: 600;
   letter-spacing: 0;
-  color: #111;
+  color: var(--popover-foreground);
 }
 .pf-project-delete-close {
   width: 28px;
@@ -934,7 +935,7 @@
   border-radius: 7px;
   border: 1px solid transparent;
   background: transparent;
-  color: #111;
+  color: var(--popover-foreground);
   cursor: pointer;
   flex-shrink: 0;
 }
@@ -959,14 +960,14 @@
   line-height: 22px;
   font-weight: 600;
   letter-spacing: 0;
-  color: #111;
+  color: var(--popover-foreground);
 }
 .pf-modal-close {
   width: 28px; height: 28px;
   display: inline-flex; align-items: center; justify-content: center;
   border: 1px solid transparent;
   background: transparent;
-  color: #111;
+  color: var(--popover-foreground);
   border-radius: 7px;
   cursor: pointer;
   flex-shrink: 0;
@@ -1202,7 +1203,7 @@
   height: 80px;
   padding: 20px;
   gap: 12px;
-  background: #fff;
+  background: var(--popover);
   flex-shrink: 0;
 }
 .pf-project-delete-icon {
@@ -1213,9 +1214,9 @@
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
-  color: #dc2626;
-  background: #fdf0f0;
-  border: 1px solid #f2c8c8;
+  color: var(--destructive);
+  background: color-mix(in oklab, var(--destructive) 14%, var(--background));
+  border: 1px solid color-mix(in oklab, var(--destructive) 35%, var(--border));
 }
 .pf-project-delete-copy {
   min-width: 0;
@@ -1229,7 +1230,7 @@
   margin: 0;
   font-size: 13px;
   line-height: 20px;
-  color: #111;
+  color: var(--popover-foreground);
 }
 .pf-project-delete-copy strong {
   font-weight: 700;
@@ -1265,10 +1266,10 @@
 }
 .pf-project-delete-cancel {
   background: transparent;
-  color: #111;
+  color: var(--popover-foreground);
 }
 .pf-project-delete-confirm {
-  background: #dc2626;
+  background: var(--destructive);
   color: #fff;
 }
 .pf-project-delete-cancel:disabled,
@@ -1315,9 +1316,9 @@
   display: none;
   gap: 2px;
   padding: 2px;
-  border: 1px solid #e6e6e6;
+  border: 1px solid var(--border);
   border-radius: 7px;
-  background: #fff;
+  background: var(--popover);
   box-shadow: 0 8px 18px -14px rgba(0, 0, 0, 0.28);
 }
 .pf-pw-agent-wrap:hover .pf-pw-agent-actions,

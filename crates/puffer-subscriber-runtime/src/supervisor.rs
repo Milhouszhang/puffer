@@ -33,6 +33,12 @@ pub struct SupervisorConfig {
     /// Whether to automatically restart the child when it exits. Set to
     /// false for one-shot subscribers (most shouldn't be).
     pub restart_on_exit: bool,
+    /// Env vars to set on every spawned child (proxy routing). Override
+    /// both the parent env and any same-named vars in the manifest `[run.env]`.
+    pub env_set: Vec<(String, String)>,
+    /// Env vars to remove from every spawned child (so a disabled proxy is
+    /// direct). Applied after `env_set`, so listing a key in both removes it.
+    pub env_unset: Vec<String>,
 }
 
 impl Default for SupervisorConfig {
@@ -41,6 +47,8 @@ impl Default for SupervisorConfig {
             min_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(60),
             restart_on_exit: true,
+            env_set: Vec::new(),
+            env_unset: Vec::new(),
         }
     }
 }
@@ -151,6 +159,8 @@ async fn run_loop(
             &bus,
             &commands,
             &mut first_start,
+            &config.env_set,
+            &config.env_unset,
         )
         .await
         {
@@ -187,6 +197,8 @@ async fn spawn_once(
     bus: &EventBus,
     commands: &CommandSender,
     first_start: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
+    env_set: &[(String, String)],
+    env_unset: &[String],
 ) -> Result<std::process::ExitStatus> {
     let program = resolve_manifest_program(&manifest.spec.run.cmd[0]);
     let args = &manifest.spec.run.cmd[1..];
@@ -204,6 +216,12 @@ async fn spawn_once(
     }
     for entry in &manifest.spec.run.env {
         cmd.env(&entry.name, &entry.value);
+    }
+    for (key, value) in env_set {
+        cmd.env(key, value);
+    }
+    for key in env_unset {
+        cmd.env_remove(key);
     }
     let mut child = cmd.spawn().with_context(|| {
         format!(
@@ -370,6 +388,74 @@ printf '%s\n' '{"topic":"test-topic","kind":"message","text":"ready"}'
             .unwrap();
         assert_eq!(envelope.subscriber_id, "test-subscriber");
         assert_eq!(envelope.event.text, "ready");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_applies_env_set_and_unset() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("manifest.toml"),
+            r#"manifest_version = 1
+id = "env-probe"
+kind = "subscriber"
+topic = "test-topic"
+
+[run]
+cmd = ["sh", "run.sh"]
+"#,
+        )
+        .unwrap();
+        // Read one stdin line (so the supervisor knows the channel is open),
+        // then emit the two env vars in the event text.
+        std::fs::write(
+            dir.path().join("run.sh"),
+            "IFS= read -r _line || true\n\
+             printf '%s\\n' \"{\\\"topic\\\":\\\"test-topic\\\",\\\"kind\\\":\\\"message\\\",\\\"text\\\":\\\"A=${PROXY_TEST_SET} U=${PROXY_TEST_INHERITED}\\\"}\"\n",
+        )
+        .unwrap();
+
+        // Contaminate the parent env; env_unset must strip it from the child.
+        std::env::set_var("PROXY_TEST_INHERITED", "leaked");
+
+        let manifest = Manifest::load(dir.path()).unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe_topic("test-topic");
+        let handle = SubscriberSupervisor::spawn(
+            manifest,
+            bus,
+            SupervisorConfig {
+                restart_on_exit: false,
+                env_set: vec![("PROXY_TEST_SET".into(), "applied".into())],
+                env_unset: vec!["PROXY_TEST_INHERITED".into()],
+                ..SupervisorConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Kick the shell past its `read -r` so it emits the event.
+        handle
+            .commands
+            .send(&SubscriberCommand::Custom {
+                op: "ping".into(),
+                args: Value::Null,
+            })
+            .await
+            .unwrap();
+
+        let envelope = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for env-probe event")
+            .expect("channel closed before event arrived");
+
+        let text = &envelope.event.text;
+        assert!(text.contains("A=applied"), "env_set not applied; got: {text}");
+        assert!(
+            text.contains("U= ") || text.trim_end().ends_with("U="),
+            "env_unset not applied; got: {text}"
+        );
 
         handle.shutdown().await;
     }

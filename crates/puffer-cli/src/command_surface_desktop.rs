@@ -77,6 +77,12 @@ pub(crate) fn import_claude_desktop_mcp_servers_from_file(
             endpoint: String::new(),
             target: stdio_target(&server.command, &server.args),
             description: "Imported from Claude Desktop".to_string(),
+            env: std::collections::BTreeMap::new(),
+            inherit_env: true,
+            timeout: None,
+            connect_timeout: None,
+            headers: std::collections::BTreeMap::new(),
+            oauth: None,
         };
         write_yaml(&dir.join(format!("{name}.yaml")), &spec)?;
         imported.push(name);

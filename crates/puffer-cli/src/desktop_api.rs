@@ -1,17 +1,34 @@
 use anyhow::{Context, Result};
-use puffer_config::{ConfigPaths, PufferConfig};
-use puffer_provider_registry::{AuthMode, AuthStore, ProviderRegistry, StoredCredential};
+use puffer_config::{
+    load_config, save_user_config, ConfigPaths, MediaGenerationConfig, PufferConfig,
+};
+use puffer_media::{generated_media_timeline_attachments, GeneratedMediaTimelineAttachment};
+use puffer_provider_registry::{
+    detect_import_candidates, AuthMode, AuthStore, ExternalImportCandidate, ExternalImportFamily,
+    ExternalImportSource, ProviderRegistry, StoredCredential,
+};
 use puffer_resources::LoadedResources;
-use puffer_session_store::{GitDiffSnapshot, SessionRecord, SessionStore, TranscriptEvent};
+use puffer_secrets::{SecretSummary, SecretVault};
+use puffer_session_store::{
+    GitDiffSnapshot, MessageActor, SessionRecord, SessionStore, SessionSummary, TranscriptEvent,
+    TranscriptRewrite, TurnBoundaryState,
+};
+use puffer_workflow::WorkflowStore;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::cli_args::DesktopApiCommand;
+use crate::desktop_activity::session_activity_status;
 use crate::desktop_api_types::{
-    AuthProviderStatusDto, DiffSummaryDto, FolderGroupDto, ProviderSummaryDto, RepoActionResultDto,
-    RepoPullRequestDto, RepoStatusDto, ResourceCountsDto, SessionDetailDto, SessionListItemDto,
+    AgentDiffDto, AgentDiffEntryDto, AgentDiffFileDto, AuthProviderStatusDto,
+    BrowserCaptchaSettingsDto, BrowserCaptchaSolverDto, BrowserExtensionDto, BrowserSettingsDto,
+    ChatAttachmentDto, ChatAttachmentSourceDto, DiffSummaryDto, DivergenceReportDto,
+    ExternalCredentialDto, FolderGroupDto, MediaGenerationSettingsDto, MediaSettingsDto,
+    NetworkProxySettingsDto, ProviderSummaryDto, RepoActionResultDto, RepoPullRequestDto,
+    RepoStatusDto, ResourceCountsDto, SanitizedProxyEndpointDto, SecretSummaryDto,
+    SecretSourceDto, SecretsSettingsDto, SessionDetailDto, SessionGroupsPageDto, SessionListItemDto,
     SettingsConfigDto, SettingsSessionSummaryDto, SettingsSnapshotDto, TimelineItemDto,
 };
 
@@ -27,9 +44,18 @@ pub(crate) fn run_desktop_api(
     match command {
         DesktopApiCommand::SessionGroups => {
             let session_store = SessionStore::from_paths(paths)?;
+            let project_tags = crate::project_metadata::ProjectMetadataStore::from_paths(paths)
+                .all()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(key, meta)| (key, meta.tags))
+                .collect::<BTreeMap<String, Vec<String>>>();
             println!(
                 "{}",
-                serde_json::to_string_pretty(&list_grouped_sessions(&session_store)?)?
+                serde_json::to_string_pretty(&list_grouped_sessions(
+                    &session_store,
+                    &project_tags
+                )?)?
             );
         }
         DesktopApiCommand::SessionDetail { session_id } => {
@@ -145,14 +171,60 @@ pub(crate) fn run_desktop_api(
             )?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
+        DesktopApiCommand::WorkflowList => {
+            let store = WorkflowStore::new(&paths.workspace_config_dir);
+            println!("{}", serde_json::to_string_pretty(&store.snapshot()?)?);
+        }
+        DesktopApiCommand::WorkflowRunsList { workflow_slug } => {
+            let store = WorkflowStore::new(&paths.workspace_config_dir);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.list_runs_for(&workflow_slug)?)?
+            );
+        }
+        DesktopApiCommand::WorkflowRunsShow { idx } => {
+            let store = WorkflowStore::new(&paths.workspace_config_dir);
+            println!("{}", serde_json::to_string_pretty(&store.get_run(idx)?)?);
+        }
     }
     Ok(())
 }
 
-fn list_grouped_sessions(session_store: &SessionStore) -> Result<Vec<FolderGroupDto>> {
+pub(crate) fn list_grouped_sessions(
+    session_store: &SessionStore,
+    project_tags: &BTreeMap<String, Vec<String>>,
+) -> Result<Vec<FolderGroupDto>> {
     let sessions = session_store.list_sessions()?;
+    group_session_summaries(session_store, project_tags, sessions)
+}
+
+pub(crate) fn list_grouped_sessions_page(
+    session_store: &SessionStore,
+    project_tags: &BTreeMap<String, Vec<String>>,
+    offset: usize,
+    limit: usize,
+) -> Result<SessionGroupsPageDto> {
+    let page = session_store.list_sessions_page(offset, limit)?;
+    let returned_sessions = page.sessions.len();
+    let has_more = page.has_more();
+    Ok(SessionGroupsPageDto {
+        groups: group_session_summaries(session_store, project_tags, page.sessions)?,
+        offset: page.offset,
+        limit: page.limit,
+        returned_sessions,
+        total_sessions: page.total_sessions,
+        has_more,
+    })
+}
+
+fn group_session_summaries(
+    session_store: &SessionStore,
+    project_tags: &BTreeMap<String, Vec<String>>,
+    sessions: Vec<SessionSummary>,
+) -> Result<Vec<FolderGroupDto>> {
     let mut groups = BTreeMap::<String, Vec<SessionListItemDto>>::new();
     for session in sessions {
+        let record = session_store.load_session(session.id)?;
         let folder_path = session_group_root(&session.cwd).display().to_string();
         groups
             .entry(folder_path.clone())
@@ -160,8 +232,10 @@ fn list_grouped_sessions(session_store: &SessionStore) -> Result<Vec<FolderGroup
             .push(SessionListItemDto {
                 session_id: session.id.to_string(),
                 display_name: session.display_name.clone(),
+                generated_title: session.generated_title.clone(),
                 title: session_title(
                     session.display_name.as_ref(),
+                    session.generated_title.as_ref(),
                     session.slug.as_ref(),
                     &session.cwd,
                     &session.id.to_string(),
@@ -171,30 +245,54 @@ fn list_grouped_sessions(session_store: &SessionStore) -> Result<Vec<FolderGroup
                 updated_at_ms: session.updated_at_ms,
                 created_at_ms: session.created_at_ms,
                 event_count: session.event_count,
+                activity_status: session_activity_status(&record.events).to_string(),
                 slug: session.slug.clone(),
                 tags: session.tags.clone(),
                 note: session.note.clone(),
                 parent_session_id: session.parent_session_id.map(|value| value.to_string()),
+                provider_id: None,
+                model_id: None,
             });
     }
     let mut folders = groups
         .into_iter()
         .map(|(folder_path, mut sessions)| {
             sessions.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+            let tags = project_tags.get(&folder_path).cloned().unwrap_or_default();
             FolderGroupDto {
                 folder_id: folder_path.clone(),
                 folder_label: folder_label(Path::new(&folder_path)),
                 folder_path: folder_path.clone(),
                 session_count: sessions.len(),
                 sessions,
+                tags,
             }
         })
         .collect::<Vec<_>>();
-    folders.sort_by(|left, right| left.folder_label.cmp(&right.folder_label));
+    folders.sort_by(|left, right| {
+        let left_latest = left
+            .sessions
+            .iter()
+            .map(|session| session.updated_at_ms)
+            .max()
+            .unwrap_or(0);
+        let right_latest = right
+            .sessions
+            .iter()
+            .map(|session| session.updated_at_ms)
+            .max()
+            .unwrap_or(0);
+        right_latest
+            .cmp(&left_latest)
+            .then_with(|| left.folder_label.cmp(&right.folder_label))
+    });
     Ok(folders)
 }
 
-fn load_session_detail(session_store: &SessionStore, session_id: &str) -> Result<SessionDetailDto> {
+pub(crate) fn load_session_detail(
+    session_store: &SessionStore,
+    session_id: &str,
+) -> Result<SessionDetailDto> {
     let session_uuid = Uuid::parse_str(session_id).context("invalid session id")?;
     let record = session_store.load_session(session_uuid)?;
     let folder_path = session_group_root(&record.metadata.cwd)
@@ -202,12 +300,16 @@ fn load_session_detail(session_store: &SessionStore, session_id: &str) -> Result
         .to_string();
     let diff_history = diff_history(&record);
     let latest_diff = diff_history.first().cloned();
-    let repo_status = repo_status(&record.metadata.id.to_string(), &record.metadata.cwd);
+    let repo_status = deferred_repo_status(&record.metadata.id.to_string(), &record.metadata.cwd);
+    let agent_diff = build_agent_diff(&record);
+    let divergence = compute_divergence(&agent_diff, latest_diff.as_ref(), &record.metadata.cwd);
     Ok(SessionDetailDto {
         session_id: record.metadata.id.to_string(),
         display_name: record.metadata.display_name.clone(),
+        generated_title: record.metadata.generated_title.clone(),
         title: session_title(
             record.metadata.display_name.as_ref(),
+            record.metadata.generated_title.as_ref(),
             record.metadata.slug.as_ref(),
             &record.metadata.cwd,
             &record.metadata.id.to_string(),
@@ -216,6 +318,9 @@ fn load_session_detail(session_store: &SessionStore, session_id: &str) -> Result
         folder_path,
         updated_at_ms: record.metadata.updated_at_ms,
         created_at_ms: record.metadata.created_at_ms,
+        event_count: record.events.len(),
+        activity_status: session_activity_status(&record.events).to_string(),
+        active_turn_id: None,
         slug: record.metadata.slug.clone(),
         tags: record.metadata.tags.clone(),
         note: record.metadata.note.clone(),
@@ -223,20 +328,48 @@ fn load_session_detail(session_store: &SessionStore, session_id: &str) -> Result
             .metadata
             .parent_session_id
             .map(|value| value.to_string()),
-        timeline: timeline_items(&record),
+        provider_id: None,
+        model_id: None,
+        timeline: timeline_items(session_store, &record),
         latest_diff,
         diff_history,
         repo_status,
+        agent_diff,
+        divergence,
     })
 }
 
-fn load_session_cwd(session_store: &SessionStore, session_id: &str) -> Result<PathBuf> {
+pub(crate) fn load_session_cwd(session_store: &SessionStore, session_id: &str) -> Result<PathBuf> {
     let session_uuid = Uuid::parse_str(session_id).context("invalid session id")?;
     let record = session_store.load_session(session_uuid)?;
     Ok(record.metadata.cwd)
 }
 
-fn load_settings_snapshot(
+fn deferred_repo_status(session_id: &str, cwd: &Path) -> RepoStatusDto {
+    RepoStatusDto {
+        session_id: session_id.to_string(),
+        cwd: cwd.display().to_string(),
+        repo_root: None,
+        branch: None,
+        head_sha: None,
+        is_clean: true,
+        status_lines: Vec::new(),
+        has_gh: false,
+        gh_authenticated: false,
+        can_create_pull_request: false,
+        can_merge_pull_request: false,
+        create_pull_request_reason: Some(
+            "Repository status has not been refreshed yet.".to_string(),
+        ),
+        merge_pull_request_reason: Some(
+            "Repository status has not been refreshed yet.".to_string(),
+        ),
+        open_pull_request: None,
+        warnings: Vec::new(),
+    }
+}
+
+pub(crate) fn load_settings_snapshot(
     paths: &ConfigPaths,
     config: &PufferConfig,
     resources: &LoadedResources,
@@ -271,7 +404,9 @@ fn load_settings_snapshot(
             default_provider: config.default_provider.clone(),
             default_model: config.default_model.clone(),
             openai_base_url: config.openai_base_url.clone(),
+            openai_display_name: config.openai_display_name.clone(),
             theme: config.theme.clone(),
+            media: media_settings_dto(config),
             mascot_id: config.mascot.id.clone(),
             mascot_display_name: config.mascot.display_name.clone(),
             mascot_enabled: config.mascot.enabled,
@@ -281,6 +416,7 @@ fn load_settings_snapshot(
         resources: ResourceCountsDto {
             providers: resources.providers.len(),
             tools: resources.tools.len(),
+            internal_tools: resources.internal_tools.len(),
             agents: resources.agents.len(),
             prompts: resources.prompts.len(),
             hooks: resources.hooks.len(),
@@ -296,7 +432,156 @@ fn load_settings_snapshot(
         },
         auth: auth_statuses(auth_store),
         providers: providers.provider_entries().map(provider_summary).collect(),
+        browser: browser_settings_dto(paths, config),
+        network_proxy: network_proxy_settings_dto(config),
+        secrets: secrets_settings_dto(paths)?,
     })
+}
+
+fn media_settings_dto(config: &PufferConfig) -> MediaSettingsDto {
+    MediaSettingsDto {
+        image: media_selection_dto(&config.media.image),
+        video: media_selection_dto(&config.media.video),
+    }
+}
+
+fn media_selection_dto(
+    selection: &Option<MediaGenerationConfig>,
+) -> Option<MediaGenerationSettingsDto> {
+    selection
+        .as_ref()
+        .map(|selection| MediaGenerationSettingsDto {
+            provider_id: selection.provider_id.clone(),
+            logical_model_id: selection.logical_model_id.clone(),
+            selections: selection.selections.clone(),
+        })
+}
+
+fn browser_settings_dto(paths: &ConfigPaths, config: &PufferConfig) -> BrowserSettingsDto {
+    let mut captcha = config.browser.captcha.clone();
+    captcha.normalize();
+    BrowserSettingsDto {
+        extensions_enabled: config.browser.extensions_enabled,
+        extensions: config
+            .browser
+            .extensions
+            .iter()
+            .map(|extension| BrowserExtensionDto {
+                id: extension.id.clone(),
+                display_name: extension.display_name.clone(),
+                path: extension.path.clone(),
+                enabled: extension.enabled,
+                manifest_present: Path::new(&extension.path).join("manifest.json").exists(),
+                source: "custom".to_string(),
+            })
+            .collect(),
+        captcha: BrowserCaptchaSettingsDto {
+            enabled: captcha.enabled,
+            selected_solver: captcha.selected_solver.clone(),
+            solvers: puffer_config::builtin_captcha_solvers()
+                .iter()
+                .map(|solver| {
+                    let configured = captcha.solvers.get(solver.id).cloned();
+                    let extension_path = paths.builtin_resources_dir.join(solver.extension_path);
+                    BrowserCaptchaSolverDto {
+                        id: solver.id.to_string(),
+                        display_name: solver.display_name.to_string(),
+                        description: solver.description.to_string(),
+                        enabled: solver.id == captcha.selected_solver.as_str(),
+                        base_url: configured
+                            .as_ref()
+                            .and_then(|item| item.base_url.clone())
+                            .unwrap_or_else(|| solver.default_base_url.to_string()),
+                        has_api_key: configured
+                            .as_ref()
+                            .and_then(|item| item.api_key_secret_id.as_ref())
+                            .is_some(),
+                        api_key_secret_id: configured.and_then(|item| item.api_key_secret_id),
+                        version: solver.version.to_string(),
+                        bundled: extension_path.join("manifest.json").exists(),
+                        extension_path: extension_path.display().to_string(),
+                        release_url: solver.release_url.to_string(),
+                        download_url: solver.download_url.to_string(),
+                        sha256: solver.sha256.to_string(),
+                        license: solver.license.to_string(),
+                    }
+                })
+                .collect(),
+        },
+    }
+}
+
+fn secrets_settings_dto(paths: &ConfigPaths) -> Result<SecretsSettingsDto> {
+    let store_file = SecretVault::default_path(&paths.user_config_dir);
+    let items = SecretVault::list_metadata(&store_file)?
+        .into_iter()
+        .map(secret_summary_dto)
+        .collect::<Vec<_>>();
+    let sources = puffer_secrets::available_browser_sources()
+        .into_iter()
+        .map(|source| SecretSourceDto {
+            id: source.id,
+            label: source.label,
+            available: source.available,
+        })
+        .collect();
+    Ok(SecretsSettingsDto {
+        store_file: store_file.display().to_string(),
+        key_source: secret_key_source().to_string(),
+        chrome_import_supported: cfg!(target_os = "macos"),
+        sources,
+        items,
+    })
+}
+
+fn secret_key_source() -> &'static str {
+    if std::env::var_os("PUFFER_SECRET_STORE_KEY").is_some() {
+        "env"
+    } else if cfg!(target_os = "macos") {
+        "macos-keychain"
+    } else {
+        "local-key-file"
+    }
+}
+
+fn secret_summary_dto(summary: SecretSummary) -> SecretSummaryDto {
+    SecretSummaryDto {
+        id: summary.id,
+        label: summary.label,
+        description: summary.description,
+        username: summary.username,
+        origin: summary.origin,
+        source: summary.source,
+        created_at_ms: summary.created_at_ms,
+        updated_at_ms: summary.updated_at_ms,
+    }
+}
+
+fn network_proxy_settings_dto(config: &PufferConfig) -> NetworkProxySettingsDto {
+    NetworkProxySettingsDto {
+        enabled: config.network.proxy.enabled,
+        selected: config.network.proxy.selected.clone(),
+        bypass: config.network.proxy.bypass.clone(),
+        proxies: config
+            .network
+            .proxy
+            .proxies
+            .iter()
+            .map(|endpoint| {
+                let sanitized = endpoint.sanitized();
+                SanitizedProxyEndpointDto {
+                    id: sanitized.id,
+                    scheme: sanitized.scheme.as_uri_scheme().to_string(),
+                    host: sanitized.host,
+                    port: sanitized.port,
+                    username: sanitized.username,
+                    has_password: sanitized.has_password,
+                    uri: sanitized.uri,
+                }
+            })
+            .collect(),
+        last_test: None,
+    }
 }
 
 fn auth_statuses(auth_store: &AuthStore) -> Vec<AuthProviderStatusDto> {
@@ -355,7 +640,7 @@ fn auth_mode_label(mode: &AuthMode) -> String {
     }
 }
 
-fn store_api_key(
+pub(crate) fn store_api_key(
     auth_store: &mut AuthStore,
     providers: &ProviderRegistry,
     auth_path: &Path,
@@ -376,6 +661,166 @@ fn store_api_key(
     auth_store
         .save(auth_path)
         .context("failed to save auth store")
+}
+
+/// Lists importable `.claude` and `.codex` credentials for all compatible providers.
+pub(crate) fn list_external_credentials(
+    providers: &ProviderRegistry,
+) -> Result<Vec<ExternalCredentialDto>> {
+    let mut out = Vec::new();
+    for entry in providers.provider_entries() {
+        let Some(family) = import_family(&entry.descriptor.default_api) else {
+            continue;
+        };
+        let candidates = detect_import_candidates(family).unwrap_or_default();
+        for candidate in candidates {
+            out.push(ExternalCredentialDto {
+                provider_id: entry.descriptor.id.clone(),
+                source: source_label(candidate.source).to_string(),
+                kind: credential_kind(&candidate.credential).to_string(),
+                description: candidate.description.clone(),
+                source_path: candidate.source_path.display().to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Imports a `.claude` or `.codex` credential into Puffer's auth store.
+pub(crate) fn import_external_credential(
+    paths: &ConfigPaths,
+    auth_store: &mut AuthStore,
+    providers: &ProviderRegistry,
+    auth_path: &Path,
+    provider_id: &str,
+    source: &str,
+) -> Result<()> {
+    let provider = providers
+        .provider(provider_id)
+        .with_context(|| format!("unknown provider `{provider_id}`"))?;
+    let family = import_family(&provider.default_api)
+        .with_context(|| format!("provider `{provider_id}` has no importable credential family"))?;
+    let source_kind = match source {
+        "claude" => ExternalImportSource::Claude,
+        "codex" => ExternalImportSource::Codex,
+        other => anyhow::bail!("unknown import source `{other}`"),
+    };
+    let candidate = detect_import_candidates(family)?
+        .into_iter()
+        .find(|candidate| candidate.source == source_kind)
+        .with_context(|| {
+            format!("no `{source}` credential available on disk for provider `{provider_id}`")
+        })?;
+    apply_imported_credential(paths, auth_store, provider_id, candidate)?;
+    auth_store
+        .save(auth_path)
+        .context("failed to save auth store")
+}
+
+/// Ensures a freshly authenticated provider becomes the default route when needed.
+pub(crate) fn ensure_default_routing(
+    paths: &ConfigPaths,
+    providers: &ProviderRegistry,
+    auth_store: &AuthStore,
+    just_authed: &str,
+) -> Result<()> {
+    let mut config = load_config(paths)?;
+    let mut changed = false;
+
+    let default_has_creds = config
+        .default_provider
+        .as_deref()
+        .map(|id| auth_store.get(id).is_some())
+        .unwrap_or(false);
+    if !default_has_creds {
+        config.default_provider = Some(just_authed.to_string());
+        changed = true;
+    }
+
+    let default_provider_id = config.default_provider.clone().unwrap_or_default();
+    let provider_models = providers
+        .provider(&default_provider_id)
+        .map(|provider| provider.models.clone())
+        .unwrap_or_default();
+    let default_model_belongs = config
+        .default_model
+        .as_deref()
+        .map(|model_id| provider_models.iter().any(|model| model.id == model_id))
+        .unwrap_or(false);
+    if !default_model_belongs {
+        if let Some(first) = provider_models.first() {
+            config.default_model = Some(first.id.clone());
+            changed = true;
+        }
+    }
+
+    if changed {
+        save_user_config(paths, &config)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn logout_provider(
+    auth_store: &mut AuthStore,
+    auth_path: &Path,
+    provider_id: &str,
+) -> Result<()> {
+    auth_store.remove(provider_id);
+    auth_store
+        .save(auth_path)
+        .context("failed to save auth store")
+}
+
+fn import_family(default_api: &str) -> Option<ExternalImportFamily> {
+    match default_api {
+        "anthropic-messages" => Some(ExternalImportFamily::Anthropic),
+        "openai-responses"
+        | "openai-completions"
+        | "openai-codex-responses"
+        | "azure-openai-responses" => Some(ExternalImportFamily::OpenAi),
+        _ => None,
+    }
+}
+
+fn source_label(source: ExternalImportSource) -> &'static str {
+    match source {
+        ExternalImportSource::Claude => "claude",
+        ExternalImportSource::Codex => "codex",
+    }
+}
+
+fn credential_kind(credential: &StoredCredential) -> &'static str {
+    match credential {
+        StoredCredential::ApiKey { .. } => "api_key",
+        StoredCredential::OAuth(_) => "oauth",
+    }
+}
+
+fn apply_imported_credential(
+    paths: &ConfigPaths,
+    auth_store: &mut AuthStore,
+    provider_id: &str,
+    candidate: ExternalImportCandidate,
+) -> Result<()> {
+    let openai_base_url = candidate.openai_base_url.clone();
+    let openai_headers = candidate.openai_headers.clone();
+    let openai_query_params = candidate.openai_query_params.clone();
+    match candidate.credential {
+        StoredCredential::ApiKey { key } => {
+            auth_store.set_api_key(provider_id.to_string(), key);
+        }
+        StoredCredential::OAuth(credential) => {
+            auth_store.set_oauth(provider_id.to_string(), credential);
+        }
+    }
+    if provider_id == "openai" {
+        let mut config = load_config(paths)?;
+        config.openai_base_url = openai_base_url;
+        config.openai_headers = openai_headers;
+        config.openai_query_params = openai_query_params;
+        save_user_config(paths, &config)?;
+    }
+    Ok(())
 }
 
 fn store_credential(
@@ -409,18 +854,20 @@ fn store_credential(
         .context("failed to save auth store")
 }
 
-fn session_group_root(cwd: &Path) -> PathBuf {
-    cwd.parent().unwrap_or(cwd).to_path_buf()
+pub(crate) fn session_group_root(cwd: &Path) -> PathBuf {
+    cwd.to_path_buf()
 }
 
 fn session_title(
     display_name: Option<&String>,
+    generated_title: Option<&String>,
     slug: Option<&String>,
     cwd: &Path,
     fallback: &str,
 ) -> String {
     display_name
         .cloned()
+        .or_else(|| generated_title.cloned())
         .or_else(|| slug.cloned())
         .or_else(|| {
             cwd.file_name()
@@ -467,61 +914,619 @@ fn diff_summary(index: usize, snapshot: &GitDiffSnapshot) -> DiffSummaryDto {
     }
 }
 
-fn timeline_items(record: &SessionRecord) -> Vec<TimelineItemDto> {
+/// Reconstructs the agent's intended edits from the transcript. Walks
+/// every successful `ToolInvocation` event for builtin file-editing
+/// tools and builds two views: an ordered per-call entry list (so the
+/// UI can show edits in sequence) and a per-file rollup keyed by path.
+///
+/// Tool input is JSON we parse opportunistically — we never error out
+/// on a malformed call, since transcripts can outlive schema changes.
+/// Failed calls are still recorded (success=false) so the user can see
+/// "the agent tried to edit X but the tool call failed".
+fn build_agent_diff(record: &SessionRecord) -> AgentDiffDto {
+    let mut entries: Vec<AgentDiffEntryDto> = Vec::new();
+    let mut by_path: BTreeMap<String, AgentDiffFileDto> = BTreeMap::new();
+
+    for event in record.events.iter() {
+        let TranscriptEvent::ToolInvocation {
+            call_id,
+            tool_id,
+            input,
+            success,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let Some(intent) = agent_edit_intent(tool_id, input) else {
+            continue;
+        };
+
+        let entry = AgentDiffEntryDto {
+            call_id: call_id.clone(),
+            tool_id: tool_id.clone(),
+            kind: intent.kind.to_string(),
+            path: intent.path.clone(),
+            success: *success,
+            summary: intent.summary.clone(),
+        };
+
+        // Only successful edits update the per-file rollup — a failed
+        // edit didn't change anything, even if the agent tried.
+        if *success {
+            by_path
+                .entry(intent.path.clone())
+                .and_modify(|file| {
+                    file.edit_count += 1;
+                    file.latest_kind = intent.kind.to_string();
+                    file.latest_summary = intent.summary.clone();
+                })
+                .or_insert_with(|| AgentDiffFileDto {
+                    path: intent.path.clone(),
+                    latest_kind: intent.kind.to_string(),
+                    edit_count: 1,
+                    latest_summary: intent.summary.clone(),
+                });
+        }
+
+        entries.push(entry);
+    }
+
+    AgentDiffDto {
+        files: by_path.into_values().collect(),
+        entries,
+    }
+}
+
+struct AgentEditIntent {
+    kind: &'static str,
+    path: String,
+    summary: String,
+}
+
+fn agent_edit_intent(tool_id: &str, raw_input: &str) -> Option<AgentEditIntent> {
+    let value: Value = serde_json::from_str(raw_input).ok()?;
+    let obj = value.as_object()?;
+    match tool_id {
+        "write_file" | "Write" => {
+            let path = obj
+                .get("path")
+                .or_else(|| obj.get("file_path"))
+                .and_then(Value::as_str)?
+                .to_string();
+            let contents = obj
+                .get("contents")
+                .or_else(|| obj.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Some(AgentEditIntent {
+                kind: "write",
+                path,
+                summary: render_write_summary(&contents),
+            })
+        }
+        "replace_in_file" | "edit_file" | "Edit" => {
+            let path = obj
+                .get("path")
+                .or_else(|| obj.get("file_path"))
+                .and_then(Value::as_str)?
+                .to_string();
+            // `replace_in_file` uses old/new; some custom tools mirror
+            // the Anthropic-style old_string/new_string. Accept both.
+            let old = obj
+                .get("old")
+                .or_else(|| obj.get("old_string"))
+                .or_else(|| obj.get("oldText"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let new_text = obj
+                .get("new")
+                .or_else(|| obj.get("new_string"))
+                .or_else(|| obj.get("newText"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Some(AgentEditIntent {
+                kind: "replace",
+                path,
+                summary: render_replace_summary(old, new_text),
+            })
+        }
+        "move_path" => {
+            let from = obj.get("from").and_then(Value::as_str)?.to_string();
+            let to = obj.get("to").and_then(Value::as_str)?.to_string();
+            Some(AgentEditIntent {
+                kind: "move",
+                path: to.clone(),
+                summary: format!("renamed {from} → {to}"),
+            })
+        }
+        "remove_path" => {
+            let path = obj.get("path").and_then(Value::as_str)?.to_string();
+            Some(AgentEditIntent {
+                kind: "remove",
+                path: path.clone(),
+                summary: format!("removed {path}"),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn render_write_summary(contents: &str) -> String {
+    // Show a unified-diff-ish prefix with `+` so it's obvious the agent
+    // is writing the whole file. Cap at ~80 lines so a giant generated
+    // file doesn't blow up the response.
+    const MAX_LINES: usize = 80;
+    let mut out = String::new();
+    let mut lines = 0;
+    for line in contents.lines() {
+        if lines >= MAX_LINES {
+            out.push_str("... (truncated)\n");
+            break;
+        }
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+        lines += 1;
+    }
+    out
+}
+
+fn render_replace_summary(old: &str, new_text: &str) -> String {
+    // Best-effort unified-diff rendering: line-by-line `-`/`+`. Like
+    // git's --no-context output but with the safety cap from above.
+    const MAX_LINES: usize = 200;
+    let mut out = String::new();
+    let mut lines = 0;
+    for line in old.lines() {
+        if lines >= MAX_LINES {
+            out.push_str("... (truncated)\n");
+            break;
+        }
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+        lines += 1;
+    }
+    for line in new_text.lines() {
+        if lines >= MAX_LINES {
+            out.push_str("... (truncated)\n");
+            break;
+        }
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+        lines += 1;
+    }
+    out
+}
+
+/// Compares the agent's claimed file set with the git diff snapshot.
+/// `git_only` files surface hand-edits, post-tool hook rewrites, or
+/// build artifacts. `agent_only` files surface edits the agent made
+/// that were rolled back, never landed, or were committed (and so are
+/// no longer in the working-tree diff).
+fn compute_divergence(
+    agent_diff: &AgentDiffDto,
+    latest_git_diff: Option<&DiffSummaryDto>,
+    cwd: &Path,
+) -> DivergenceReportDto {
+    let agent_paths: BTreeSet<String> = agent_diff.files.iter().map(|f| f.path.clone()).collect();
+    let git_paths = latest_git_diff
+        .map(|d| extract_paths_from_patch(&d.patch, cwd))
+        .unwrap_or_default();
+
+    // Normalize agent paths through the same canonicalizer git uses
+    // (relative to cwd) so a tool-call that took an absolute path
+    // doesn't look "agent-only" just because git emits relative paths.
+    let agent_relative: BTreeSet<String> = agent_paths
+        .iter()
+        .map(|p| relativize_path(p, cwd))
+        .collect();
+
+    let agent_only: Vec<String> = agent_relative.difference(&git_paths).cloned().collect();
+    let git_only: Vec<String> = git_paths.difference(&agent_relative).cloned().collect();
+
+    DivergenceReportDto {
+        agent_total: agent_relative.len(),
+        git_total: git_paths.len(),
+        agent_only,
+        git_only,
+    }
+}
+
+fn relativize_path(path: &str, cwd: &Path) -> String {
+    let trimmed = path.trim();
+    if let Ok(stripped) = Path::new(trimmed).strip_prefix(cwd) {
+        return stripped.display().to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Pulls file paths out of a unified diff patch. Recognizes the `diff
+/// --git a/<path> b/<path>` header git emits — the `b/` side is the
+/// post-image, which is what we compare against (matches what's on
+/// disk now). Renames produce two header paths; we keep the new one.
+fn extract_paths_from_patch(patch: &str, _cwd: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for line in patch.lines() {
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            // "a/<path> b/<path>" — take the b/<path> side.
+            if let Some(b_index) = rest.find(" b/") {
+                let after = &rest[b_index + 3..];
+                let path = after.split_whitespace().next().unwrap_or("").to_string();
+                if !path.is_empty() {
+                    out.insert(path);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn timeline_items(session_store: &SessionStore, record: &SessionRecord) -> Vec<TimelineItemDto> {
     let mut items = Vec::new();
+    let mut pending_assistant = None;
+    let mut pending_generated_attachments: Vec<ChatAttachmentDto> = Vec::new();
+    let mut current_turn_id: Option<String> = None;
     for (index, event) in record.events.iter().enumerate() {
         match event {
-            TranscriptEvent::UserMessage { text } => items.push(TimelineItemDto::UserMessage {
-                id: format!("timeline-{index}"),
-                text: text.clone(),
-            }),
-            TranscriptEvent::AssistantMessage { text } => {
-                items.push(TimelineItemDto::AssistantMessage {
+            TranscriptEvent::UserMessage {
+                text,
+                attachments,
+                actor,
+            } => {
+                flush_pending_assistant(&mut items, &mut pending_assistant);
+                flush_pending_generated_attachments(
+                    &mut items,
+                    &mut pending_generated_attachments,
+                    index,
+                );
+                items.push(TimelineItemDto::UserMessage {
                     id: format!("timeline-{index}"),
                     text: text.clone(),
-                })
+                    attachments: attachment_dtos(session_store, record.metadata.id, attachments),
+                    turn_id: current_turn_id.clone(),
+                    actor: actor.clone(),
+                });
             }
-            TranscriptEvent::SystemMessage { text } => {
-                items.extend(parse_system_message(index, text))
+            TranscriptEvent::AssistantMessage { text, actor } => {
+                flush_pending_assistant(&mut items, &mut pending_assistant);
+                pending_assistant = Some(TimelineItemDto::AssistantMessage {
+                    id: format!("timeline-{index}"),
+                    text: text.clone(),
+                    attachments: std::mem::take(&mut pending_generated_attachments),
+                    turn_id: current_turn_id.clone(),
+                    actor: actor.clone(),
+                });
             }
-            TranscriptEvent::CommandInvoked { name, args } => {
+            TranscriptEvent::SystemMessage { text, actor } => {
+                let parsed =
+                    parse_system_message(index, text, actor.clone(), current_turn_id.clone());
+                if parse_tool_message(text).is_none() {
+                    flush_pending_assistant(&mut items, &mut pending_assistant);
+                    flush_pending_generated_attachments(
+                        &mut items,
+                        &mut pending_generated_attachments,
+                        index,
+                    );
+                }
+                items.extend(parsed);
+            }
+            TranscriptEvent::CommandInvoked { name, args, actor } => {
+                flush_pending_assistant(&mut items, &mut pending_assistant);
+                flush_pending_generated_attachments(
+                    &mut items,
+                    &mut pending_generated_attachments,
+                    index,
+                );
                 items.push(TimelineItemDto::Command {
                     id: format!("timeline-{index}"),
                     command_name: name.clone(),
                     command_args: args.clone(),
+                    turn_id: current_turn_id.clone(),
+                    actor: actor.clone(),
                 })
             }
             TranscriptEvent::GitDiffSnapshot { snapshot } => {
+                flush_pending_assistant(&mut items, &mut pending_assistant);
+                flush_pending_generated_attachments(
+                    &mut items,
+                    &mut pending_generated_attachments,
+                    index,
+                );
                 items.push(TimelineItemDto::DiffSnapshot {
                     id: format!("timeline-{index}"),
                     snapshot: diff_summary(index, snapshot),
+                    turn_id: current_turn_id.clone(),
                 })
             }
             TranscriptEvent::SessionRenamed { name } => {
+                flush_pending_assistant(&mut items, &mut pending_assistant);
+                flush_pending_generated_attachments(
+                    &mut items,
+                    &mut pending_generated_attachments,
+                    index,
+                );
                 items.push(TimelineItemDto::SystemMessage {
                     id: format!("timeline-{index}"),
                     text: format!("Session renamed to {name}."),
+                    turn_id: current_turn_id.clone(),
+                    actor: None,
                 })
             }
+            TranscriptEvent::TurnBoundary { turn_id, state } => {
+                flush_pending_assistant(&mut items, &mut pending_assistant);
+                match state {
+                    TurnBoundaryState::Started => current_turn_id = Some(turn_id.clone()),
+                    TurnBoundaryState::Finished => {
+                        if current_turn_id.as_deref() == Some(turn_id.as_str()) {
+                            current_turn_id = None;
+                        }
+                    }
+                }
+            }
             TranscriptEvent::ToolInvocation {
-                call_id: _,
+                call_id,
                 tool_id,
                 input,
                 output,
                 success,
+                actor,
+                subject,
+                metadata,
             } => {
+                if let Some(text) = send_user_message_text(tool_id, input) {
+                    flush_pending_assistant(&mut items, &mut pending_assistant);
+                    items.push(TimelineItemDto::AssistantMessage {
+                        id: format!("tool-{call_id}-message"),
+                        text,
+                        attachments: std::mem::take(&mut pending_generated_attachments),
+                        turn_id: current_turn_id.clone(),
+                        actor: actor.clone(),
+                    });
+                    continue;
+                }
                 let status = if *success { "ok" } else { "error" };
-                let text = format!("Tool {tool_id} [{status}]\ninput: {input}\n{output}");
-                items.extend(parse_system_message(index, &text))
+                let summary = summarize_tool_input(tool_id, input);
+                items.push(TimelineItemDto::ToolCall {
+                    id: format!("tool-{call_id}"),
+                    tool_id: tool_id.clone(),
+                    status: status.to_string(),
+                    summary: summary.clone(),
+                    input_text: input.clone(),
+                    input_json: serde_json::from_str(input).ok(),
+                    output_text: output.clone(),
+                    turn_id: current_turn_id.clone(),
+                    metadata: metadata.clone(),
+                    actor: actor.clone(),
+                    subject: subject.clone(),
+                });
+                if let Some(text) = lambda_gate_timeline_text(metadata, tool_id) {
+                    items.push(TimelineItemDto::SystemMessage {
+                        id: format!("tool-{call_id}-lambda-gate"),
+                        text,
+                        turn_id: current_turn_id.clone(),
+                        actor: actor.clone(),
+                    });
+                }
+                if let Some((state, reason)) = permission_state(output) {
+                    items.push(TimelineItemDto::PermissionDialog {
+                        id: format!("tool-{call_id}-permission"),
+                        tool_id: tool_id.clone(),
+                        state: state.to_string(),
+                        summary,
+                        reason: reason.to_string(),
+                        input_text: Some(input.clone()),
+                        turn_id: current_turn_id.clone(),
+                        actor: actor.clone(),
+                    });
+                }
+                if *success {
+                    pending_generated_attachments.extend(generated_media_attachments(
+                        &record.metadata.cwd,
+                        tool_id,
+                        input,
+                        output,
+                    ));
+                }
             }
-            TranscriptEvent::TranscriptRewritten { .. } | TranscriptEvent::StateSnapshot { .. } => {
+            TranscriptEvent::TranscriptRewritten { rewrite } => {
+                flush_pending_generated_attachments(
+                    &mut items,
+                    &mut pending_generated_attachments,
+                    index,
+                );
+                apply_timeline_rewrite(&mut items, &mut pending_assistant, rewrite);
             }
+            TranscriptEvent::StateSnapshot { .. } => {}
         }
     }
+    flush_pending_generated_attachments(
+        &mut items,
+        &mut pending_generated_attachments,
+        record.events.len(),
+    );
+    flush_pending_assistant(&mut items, &mut pending_assistant);
     items
 }
 
-fn parse_system_message(index: usize, text: &str) -> Vec<TimelineItemDto> {
+fn generated_media_attachments(
+    cwd: &Path,
+    tool_id: &str,
+    input: &str,
+    output: &str,
+) -> Vec<ChatAttachmentDto> {
+    generated_media_timeline_attachments(cwd, tool_id, input, output)
+        .into_iter()
+        .map(generated_media_attachment_dto)
+        .collect()
+}
+
+fn generated_media_attachment_dto(
+    attachment: GeneratedMediaTimelineAttachment,
+) -> ChatAttachmentDto {
+    ChatAttachmentDto {
+        id: attachment.id,
+        name: attachment.name,
+        mime_type: attachment.mime_type,
+        size: attachment.byte_count,
+        extension: attachment.extension,
+        kind: attachment.kind.as_str().to_string(),
+        state: attachment.state,
+        source: ChatAttachmentSourceDto::GeneratedMedia {
+            job_id: attachment.job_id,
+            artifact_id: attachment.artifact_id,
+            index: attachment.index,
+            local_path: attachment.local_path,
+            remote_source_url: attachment.remote_source_url,
+        },
+    }
+}
+
+fn attachment_dtos(
+    session_store: &SessionStore,
+    session_id: Uuid,
+    attachments: &[puffer_session_store::StoredAttachment],
+) -> Vec<ChatAttachmentDto> {
+    attachments
+        .iter()
+        .map(|attachment| ChatAttachmentDto::from_stored(session_store, session_id, attachment))
+        .collect()
+}
+
+fn apply_timeline_rewrite(
+    items: &mut Vec<TimelineItemDto>,
+    pending_assistant: &mut Option<TimelineItemDto>,
+    rewrite: &TranscriptRewrite,
+) {
+    match rewrite {
+        TranscriptRewrite::Clear => {
+            pending_assistant.take();
+            items.clear();
+        }
+        TranscriptRewrite::PopLast { count } => {
+            for _ in 0..*count {
+                if pending_assistant.take().is_some() {
+                    continue;
+                }
+                if items.pop().is_none() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn flush_pending_assistant(
+    items: &mut Vec<TimelineItemDto>,
+    pending_assistant: &mut Option<TimelineItemDto>,
+) {
+    if let Some(item) = pending_assistant.take() {
+        items.push(item);
+    }
+}
+
+fn flush_pending_generated_attachments(
+    items: &mut Vec<TimelineItemDto>,
+    pending: &mut Vec<ChatAttachmentDto>,
+    index: usize,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    items.push(TimelineItemDto::AssistantMessage {
+        id: format!("timeline-{index}-generated-media"),
+        text: String::new(),
+        attachments: std::mem::take(pending),
+        turn_id: None,
+        actor: None,
+    });
+}
+
+fn lambda_gate_timeline_text(metadata: &Option<Value>, tool_id: &str) -> Option<String> {
+    let lambda = metadata.as_ref()?.get("lambda_skill")?;
+    let event = lambda.get("event").and_then(Value::as_str)?;
+    let host_tool = lambda.get("host_tool").and_then(Value::as_str);
+    let concrete_tool = lambda.get("concrete_tool").and_then(Value::as_str);
+    let host_tool_label = host_tool.unwrap_or("host call");
+    let concrete_tool_label = concrete_tool.unwrap_or(tool_id);
+    let mut lines = vec!["Verified Skill Gate".to_string(), format!("event: {event}")];
+    if event == "gate_rejected" {
+        lines.push(
+            "check: Compared the attempted tool call against the active LambdaHostCall gate."
+                .to_string(),
+        );
+        if let Some(reason) = lambda.get("reason").and_then(Value::as_str) {
+            lines.push(format!("reason: {reason}"));
+        }
+        if let Some(retry) = lambda.get("retry_tool").and_then(Value::as_str) {
+            lines.push(format!("retry_tool: {retry}"));
+        }
+        lines.push(
+            "confirmation: Puffer rejected this call before committing the Lambda gate. Retry by opening LambdaHostCall with the formal host tool, host args, concrete tool, and exact concrete input."
+                .to_string(),
+        );
+        return Some(lines.join("\n"));
+    }
+    if event == "host_call_committed" {
+        lines.push(format!(
+            "check: Confirmed the concrete {concrete_tool_label} call matched the pending LambdaHostCall bridge for formal host tool {host_tool_label}."
+        ));
+    } else {
+        lines.push(format!(
+            "check: Verified LambdaHostCall may bind formal host tool {host_tool_label} to concrete tool {concrete_tool_label}, and recorded the exact concrete input that must run next."
+        ));
+    }
+    lines.push(format!("host_tool: {host_tool_label}"));
+    if let Some(args) = lambda.get("host_args").map(compact_json_text) {
+        lines.push(format!("host_args: {args}"));
+    }
+    lines.push(format!("concrete_tool: {concrete_tool_label}"));
+    if let Some(input) = lambda.get("concrete_input").map(compact_json_text) {
+        lines.push(format!("concrete_input: {input}"));
+    }
+    if let Some(facts) = lambda.get("registered_facts").map(compact_json_text) {
+        lines.push(format!("registered_facts: {facts}"));
+    }
+    if event == "host_call_committed" {
+        lines.push(
+            "confirmation: Puffer observed the declared concrete tool succeed, then committed the Lambda gate and any registered facts."
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "confirmation: Compare concrete_tool with the next activity row's tool name and concrete_input with that tool's input. Puffer only allows the next concrete call when both match exactly."
+                .to_string(),
+        );
+    }
+    Some(lines.join("\n"))
+}
+
+fn compact_json_text(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn send_user_message_text(tool_id: &str, input: &str) -> Option<String> {
+    if !matches!(tool_id, "SendUserMessage" | "Brief") {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(input).ok()?;
+    let message = parsed.get("message")?.as_str()?.to_string();
+    if message.trim().is_empty() {
+        return None;
+    }
+    Some(message)
+}
+
+fn parse_system_message(
+    index: usize,
+    text: &str,
+    actor: Option<MessageActor>,
+    turn_id: Option<String>,
+) -> Vec<TimelineItemDto> {
     if let Some(parsed) = parse_tool_message(text) {
         let summary = summarize_tool_input(&parsed.tool_id, &parsed.input_text);
         let mut items = vec![TimelineItemDto::ToolCall {
@@ -532,6 +1537,10 @@ fn parse_system_message(index: usize, text: &str) -> Vec<TimelineItemDto> {
             input_text: parsed.input_text.clone(),
             input_json: parsed.input_json,
             output_text: parsed.output_text.clone(),
+            turn_id: turn_id.clone(),
+            metadata: None,
+            actor: actor.clone(),
+            subject: None,
         }];
         if let Some((state, reason)) = permission_state(&parsed.output_text) {
             items.push(TimelineItemDto::PermissionDialog {
@@ -541,6 +1550,8 @@ fn parse_system_message(index: usize, text: &str) -> Vec<TimelineItemDto> {
                 summary,
                 reason: reason.to_string(),
                 input_text: Some(parsed.input_text),
+                turn_id: turn_id.clone(),
+                actor: actor.clone(),
             });
         }
         return items;
@@ -548,6 +1559,8 @@ fn parse_system_message(index: usize, text: &str) -> Vec<TimelineItemDto> {
     vec![TimelineItemDto::SystemMessage {
         id: format!("timeline-{index}"),
         text: text.to_string(),
+        turn_id,
+        actor,
     }]
 }
 
@@ -621,7 +1634,7 @@ fn summarize_tool_input(tool_id: &str, input_text: &str) -> Option<String> {
     }
 }
 
-fn repo_status(session_id: &str, cwd: &Path) -> RepoStatusDto {
+pub(crate) fn repo_status(session_id: &str, cwd: &Path) -> RepoStatusDto {
     let cwd_text = cwd.display().to_string();
     let repo_root = git_output(cwd, &["rev-parse", "--show-toplevel"]).ok();
     let branch = git_output(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).ok();
@@ -690,7 +1703,7 @@ fn repo_status(session_id: &str, cwd: &Path) -> RepoStatusDto {
     }
 }
 
-fn create_pull_request(
+pub(crate) fn create_pull_request(
     session_id: &str,
     cwd: &Path,
     title: Option<String>,
@@ -763,7 +1776,7 @@ fn create_pull_request(
     }
 }
 
-fn merge_pull_request(
+pub(crate) fn merge_pull_request(
     session_id: &str,
     cwd: &Path,
     pull_request_number: Option<u64>,
@@ -997,4 +2010,688 @@ fn command_exists(command: &str) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_session_detail, timeline_items, ChatAttachmentSourceDto, TimelineItemDto};
+    use puffer_config::ConfigPaths;
+    use puffer_session_store::{
+        SessionMetadata, SessionRecord, SessionStore, TranscriptEvent, TranscriptRewrite,
+        TurnBoundaryState,
+    };
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+    use uuid::Uuid;
+
+    fn record(events: Vec<TranscriptEvent>) -> SessionRecord {
+        SessionRecord {
+            metadata: SessionMetadata {
+                id: Uuid::nil(),
+                display_name: None,
+                generated_title: None,
+                cwd: PathBuf::from("/tmp"),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                parent_session_id: None,
+                slug: None,
+                tags: Vec::new(),
+                note: None,
+            },
+            events,
+        }
+    }
+
+    fn test_store() -> (tempfile::TempDir, SessionStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::discover(temp.path());
+        let store = SessionStore::from_paths(&paths).unwrap();
+        (temp, store)
+    }
+
+    fn record_with_cwd(cwd: PathBuf, events: Vec<TranscriptEvent>) -> SessionRecord {
+        let mut record = record(events);
+        record.metadata.cwd = cwd;
+        record
+    }
+
+    fn write_generated_image_artifact(
+        workspace: &Path,
+        artifact_id: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) {
+        let image_dir = workspace.join(".puffer/media/images").join(artifact_id);
+        std::fs::create_dir_all(&image_dir).unwrap();
+        let image_path = image_dir.join(filename);
+        std::fs::write(&image_path, bytes).unwrap();
+        let sidecar_dir = workspace.join(".puffer/media/artifact-sidecars");
+        std::fs::create_dir_all(&sidecar_dir).unwrap();
+        std::fs::write(
+            sidecar_dir.join(format!("{artifact_id}.json")),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": artifact_id,
+                "jobId": "job-1",
+                "kind": "image",
+                "path": image_path,
+                "mimeType": "image/jpeg",
+                "byteCount": bytes.len(),
+                "metadata": {},
+                "createdAtMs": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_generated_video_artifact(
+        workspace: &Path,
+        artifact_id: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) -> PathBuf {
+        let video_dir = workspace.join(".puffer/media/videos").join(artifact_id);
+        std::fs::create_dir_all(&video_dir).unwrap();
+        let video_path = video_dir.join(filename);
+        std::fs::write(&video_path, bytes).unwrap();
+        let sidecar_dir = workspace.join(".puffer/media/artifact-sidecars");
+        std::fs::create_dir_all(&sidecar_dir).unwrap();
+        std::fs::write(
+            sidecar_dir.join(format!("{artifact_id}.json")),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": artifact_id,
+                "jobId": "job-video-1",
+                "kind": "video",
+                "path": video_path,
+                "mimeType": "video/mp4",
+                "byteCount": bytes.len(),
+                "metadata": {},
+                "createdAtMs": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        video_path
+    }
+
+    fn bash_media_tool_invocation(
+        call_id: &str,
+        command: &str,
+        media_output: serde_json::Value,
+    ) -> TranscriptEvent {
+        TranscriptEvent::ToolInvocation {
+            call_id: call_id.to_string(),
+            tool_id: "Bash".to_string(),
+            input: json!({"command": command, "timeout": 600000}).to_string(),
+            output: json!({
+                "stdout": media_output.to_string(),
+                "stderr": "",
+                "interrupted": false
+            })
+            .to_string(),
+            success: true,
+            actor: None,
+            subject: None,
+            metadata: None,
+        }
+    }
+
+    fn item_kind(item: &TimelineItemDto) -> &'static str {
+        match item {
+            TimelineItemDto::UserMessage { .. } => "user",
+            TimelineItemDto::AssistantMessage { .. } => "assistant",
+            TimelineItemDto::SystemMessage { .. } => "system",
+            TimelineItemDto::Command { .. } => "command",
+            TimelineItemDto::ToolCall { .. } => "tool",
+            TimelineItemDto::PermissionDialog { .. } => "permission",
+            TimelineItemDto::DiffSnapshot { .. } => "diff",
+        }
+    }
+
+    #[test]
+    fn timeline_user_message_includes_attachment_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::discover(temp.path());
+        let store = SessionStore::from_paths(&paths).unwrap();
+        let session = store.create_session(temp.path().to_path_buf()).unwrap();
+        let attachment = store
+            .stage_attachment(
+                session.id,
+                puffer_session_store::StageAttachmentInput {
+                    name: "pixel.png".to_string(),
+                    mime_type: "image/png".to_string(),
+                    extension: "PNG".to_string(),
+                    kind: puffer_session_store::StoredAttachmentKind::Image,
+                    bytes: vec![1, 2, 3],
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                session.id,
+                TranscriptEvent::UserMessage {
+                    text: "[Image: pixel.png]".to_string(),
+                    attachments: vec![attachment],
+                    actor: None,
+                },
+            )
+            .unwrap();
+
+        let detail = load_session_detail(&store, &session.id.to_string()).unwrap();
+        let user = detail
+            .timeline
+            .iter()
+            .find(|item| matches!(item, TimelineItemDto::UserMessage { .. }))
+            .unwrap();
+
+        match user {
+            TimelineItemDto::UserMessage { attachments, .. } => {
+                assert_eq!(attachments.len(), 1);
+                assert_eq!(attachments[0].name, "pixel.png");
+                assert_eq!(attachments[0].state, "available");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn timeline_synthesizes_multiple_generated_attachments_from_one_tool_output() {
+        let (temp, store) = test_store();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        write_generated_image_artifact(&workspace, "artifact-1", "image.png", b"\x89PNG\r\n\x1a\n");
+        write_generated_image_artifact(&workspace, "artifact-2", "image.png", b"\x89PNG\r\n\x1a\n");
+        let session = record_with_cwd(
+            workspace,
+            vec![
+                bash_media_tool_invocation(
+                    "call-img",
+                    "imagegen --prompt draw --count 2",
+                    serde_json::json!({
+                        "jobId": "job-1",
+                        "requestedCount": 2,
+                        "status": "succeeded",
+                        "artifacts": [
+                            {"artifactId": "artifact-1", "index": 0, "path": "/ignored-1.png", "mimeType": "image/png", "size": 8},
+                            {"artifactId": "artifact-2", "index": 1, "path": "/ignored-2.png", "mimeType": "image/png", "size": 8}
+                        ]
+                    }),
+                ),
+                TranscriptEvent::AssistantMessage {
+                    text: "Done".to_string(),
+                    actor: None,
+                },
+            ],
+        );
+
+        let items = timeline_items(&store, &session);
+
+        let Some(TimelineItemDto::AssistantMessage { attachments, .. }) = items
+            .iter()
+            .find(|item| matches!(item, TimelineItemDto::AssistantMessage { .. }))
+        else {
+            panic!("assistant message exists");
+        };
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].id, "generated-image:artifact-1");
+        assert_eq!(attachments[1].id, "generated-image:artifact-2");
+        assert!(matches!(
+            attachments[0].source,
+            ChatAttachmentSourceDto::GeneratedMedia { ref job_id, ref artifact_id, index, .. }
+                if job_id == "job-1" && artifact_id == "artifact-1" && index == 0
+        ));
+        let value = serde_json::to_value(&attachments[0]).unwrap();
+        assert!(value["source"]["localPath"]
+            .as_str()
+            .unwrap()
+            .ends_with("artifact-1/image.png"));
+    }
+
+    #[test]
+    fn timeline_keeps_generated_attachment_when_sidecar_is_missing() {
+        let (temp, store) = test_store();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let session = record_with_cwd(
+            workspace,
+            vec![
+                bash_media_tool_invocation(
+                    "call-img",
+                    "imagegen --prompt draw --count 1",
+                    serde_json::json!({
+                        "jobId": "job-1",
+                        "requestedCount": 1,
+                        "status": "succeeded",
+                        "artifacts": [
+                            {"artifactId": "artifact-1", "index": 0, "path": "/missing.png", "mimeType": "image/webp", "size": 42}
+                        ]
+                    }),
+                ),
+                TranscriptEvent::AssistantMessage {
+                    text: "Done".to_string(),
+                    actor: None,
+                },
+            ],
+        );
+
+        let items = timeline_items(&store, &session);
+
+        let Some(TimelineItemDto::AssistantMessage { attachments, .. }) = items
+            .iter()
+            .find(|item| matches!(item, TimelineItemDto::AssistantMessage { .. }))
+        else {
+            panic!("assistant message exists");
+        };
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].id, "generated-image:artifact-1");
+        assert_eq!(attachments[0].state, "missing");
+        assert_eq!(attachments[0].mime_type, "image/webp");
+        assert_eq!(attachments[0].extension, "WEBP");
+        assert_eq!(attachments[0].size, 42);
+    }
+
+    #[test]
+    fn timeline_synthesizes_video_generation_attachment_from_tool_output() {
+        let (temp, store) = test_store();
+        let workspace = temp.path().join("workspace");
+        let video_path = write_generated_video_artifact(
+            &workspace,
+            "artifact-video-1",
+            "generated.mp4",
+            b"mp4-bytes",
+        );
+        let session = record_with_cwd(
+            workspace,
+            vec![
+                bash_media_tool_invocation(
+                    "call-video",
+                    "videogen --prompt make-video",
+                    serde_json::json!({
+                        "jobId": "job-video-1",
+                        "kind": "video",
+                        "requestedCount": 1,
+                        "status": "succeeded",
+                        "artifacts": [
+                            {
+                                "artifactId": "artifact-video-1",
+                                "index": 0,
+                                "path": video_path,
+                                "mimeType": "video/mp4",
+                                "size": 9
+                            }
+                        ]
+                    }),
+                ),
+                TranscriptEvent::AssistantMessage {
+                    text: "Done".to_string(),
+                    actor: None,
+                },
+            ],
+        );
+
+        let items = timeline_items(&store, &session);
+
+        let Some(TimelineItemDto::AssistantMessage { attachments, .. }) = items
+            .iter()
+            .find(|item| matches!(item, TimelineItemDto::AssistantMessage { .. }))
+        else {
+            panic!("assistant message exists");
+        };
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].id, "generated-video:artifact-video-1");
+        assert_eq!(attachments[0].name, "Generated video");
+        assert_eq!(attachments[0].kind, "video");
+        assert_eq!(attachments[0].mime_type, "video/mp4");
+        assert_eq!(attachments[0].extension, "MP4");
+        assert_eq!(attachments[0].state, "available");
+        assert_eq!(attachments[0].size, 9);
+        assert!(matches!(
+            attachments[0].source,
+            ChatAttachmentSourceDto::GeneratedMedia { ref job_id, ref artifact_id, index, .. }
+                if job_id == "job-video-1" && artifact_id == "artifact-video-1" && index == 0
+        ));
+    }
+
+    #[test]
+    fn timeline_flushes_generated_image_without_following_assistant() {
+        let (temp, store) = test_store();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        write_generated_image_artifact(&workspace, "artifact-1", "image.jpeg", b"\xff\xd8\xff\xd9");
+        let session = record_with_cwd(
+            workspace,
+            vec![bash_media_tool_invocation(
+                "call-img",
+                "imagegen --prompt draw --count 1",
+                serde_json::json!({
+                    "jobId": "job-1",
+                    "requestedCount": 1,
+                    "status": "succeeded",
+                    "artifacts": [
+                        {"artifactId": "artifact-1", "index": 0, "path": "/ignored-1.png", "mimeType": "image/png", "size": 8}
+                    ]
+                }),
+            )],
+        );
+
+        let items = timeline_items(&store, &session);
+
+        assert!(items.iter().any(|item| matches!(
+            item,
+            TimelineItemDto::AssistantMessage { text, attachments, .. }
+                if text.is_empty() && attachments.len() == 1
+        )));
+    }
+
+    #[test]
+    fn generated_media_ignores_arbitrary_bash_stdout_json() {
+        let (temp, store) = test_store();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        write_generated_image_artifact(&workspace, "artifact-1", "image.jpeg", b"\xff\xd8\xff\xd9");
+        let session = record_with_cwd(
+            workspace,
+            vec![
+                bash_media_tool_invocation(
+                    "call-img",
+                    "cat generated-media.json",
+                    serde_json::json!({
+                        "jobId": "job-1",
+                        "requestedCount": 1,
+                        "status": "succeeded",
+                        "artifacts": [
+                            {"artifactId": "artifact-1", "index": 0, "path": "/ignored-1.png", "mimeType": "image/png", "size": 8}
+                        ]
+                    }),
+                ),
+                TranscriptEvent::AssistantMessage {
+                    text: "Done".to_string(),
+                    actor: None,
+                },
+            ],
+        );
+
+        let items = timeline_items(&store, &session);
+
+        let Some(TimelineItemDto::AssistantMessage { attachments, .. }) = items
+            .iter()
+            .find(|item| matches!(item, TimelineItemDto::AssistantMessage { .. }))
+        else {
+            panic!("assistant message exists");
+        };
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn timeline_surfaces_lambda_gate_metadata_as_system_event() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![TranscriptEvent::ToolInvocation {
+                call_id: "call-1".to_string(),
+                tool_id: "LambdaHostCall".to_string(),
+                input: "{}".to_string(),
+                output: "admitted".to_string(),
+                success: true,
+                metadata: Some(json!({
+                    "lambda_skill": {
+                        "event": "host_call_admitted",
+                        "host_tool": "gh_pr_view",
+                        "host_args": {"number": 42},
+                        "concrete_tool": "Bash",
+                        "concrete_input": {"command": "gh pr view 42"}
+                    }
+                })),
+                actor: None,
+                subject: None,
+            }]),
+        );
+
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], TimelineItemDto::ToolCall { .. }));
+        match &items[1] {
+            TimelineItemDto::SystemMessage { text, .. } => {
+                assert!(text.contains("Verified Skill Gate"));
+                assert!(text.contains("event: host_call_admitted"));
+                assert!(text.contains("host_tool: gh_pr_view"));
+                assert!(text.contains(r#"host_args: {"number":42}"#));
+                assert!(text.contains("concrete_tool: Bash"));
+                assert!(text.contains(r#"concrete_input: {"command":"gh pr view 42"}"#));
+                assert!(
+                    text.contains("Compare concrete_tool with the next activity row's tool name")
+                );
+            }
+            other => panic!("expected lambda gate system event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_invocation_ids_use_call_id_scheme() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![TranscriptEvent::ToolInvocation {
+                call_id: "call-1".to_string(),
+                tool_id: "LambdaHostCall".to_string(),
+                input: "{}".to_string(),
+                output: "Permission required: approve gh_pr_view".to_string(),
+                success: true,
+                metadata: Some(json!({
+                    "lambda_skill": {
+                        "event": "host_call_admitted",
+                        "host_tool": "gh_pr_view",
+                        "host_args": {"number": 42},
+                        "concrete_tool": "Bash",
+                        "concrete_input": {"command": "gh pr view 42"}
+                    }
+                })),
+                actor: None,
+                subject: None,
+            }]),
+        );
+
+        assert_eq!(items.len(), 3);
+        let TimelineItemDto::ToolCall { id, .. } = &items[0] else {
+            panic!("expected tool call, got {:?}", items[0]);
+        };
+        assert_eq!(id, "tool-call-1");
+        let TimelineItemDto::SystemMessage { id, .. } = &items[1] else {
+            panic!("expected lambda gate system message, got {:?}", items[1]);
+        };
+        assert_eq!(id, "tool-call-1-lambda-gate");
+        let TimelineItemDto::PermissionDialog { id, .. } = &items[2] else {
+            panic!("expected permission dialog, got {:?}", items[2]);
+        };
+        assert_eq!(id, "tool-call-1-permission");
+    }
+
+    #[test]
+    fn send_user_message_item_id_uses_call_id_scheme() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![TranscriptEvent::ToolInvocation {
+                call_id: "call-msg-1".to_string(),
+                tool_id: "SendUserMessage".to_string(),
+                input: r#"{"message":"Starting Phase 1.","status":"normal"}"#.to_string(),
+                output: "{}".to_string(),
+                success: true,
+                metadata: None,
+                actor: None,
+                subject: None,
+            }]),
+        );
+
+        assert_eq!(items.len(), 1);
+        let TimelineItemDto::AssistantMessage { id, .. } = &items[0] else {
+            panic!("expected assistant message, got {:?}", items[0]);
+        };
+        assert_eq!(id, "tool-call-msg-1-message");
+    }
+
+    #[test]
+    fn timeline_places_persisted_tool_invocations_before_assistant_text() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![
+                TranscriptEvent::UserMessage {
+                    text: "inspect this".to_string(),
+                    attachments: Vec::new(),
+                    actor: None,
+                },
+                TranscriptEvent::AssistantMessage {
+                    text: "Here is what I found.".to_string(),
+                    actor: None,
+                },
+                TranscriptEvent::ToolInvocation {
+                    call_id: "call-1".to_string(),
+                    tool_id: "Read".to_string(),
+                    input: r#"{"path":"Cargo.toml"}"#.to_string(),
+                    output: "contents".to_string(),
+                    success: true,
+                    metadata: None,
+                    actor: None,
+                    subject: None,
+                },
+            ]),
+        );
+
+        let kinds = items.iter().map(item_kind).collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["user", "tool", "assistant"]);
+    }
+
+    #[test]
+    fn timeline_keeps_new_tool_before_assistant_order() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![
+                TranscriptEvent::UserMessage {
+                    text: "inspect this".to_string(),
+                    attachments: Vec::new(),
+                    actor: None,
+                },
+                TranscriptEvent::ToolInvocation {
+                    call_id: "call-1".to_string(),
+                    tool_id: "Read".to_string(),
+                    input: r#"{"path":"Cargo.toml"}"#.to_string(),
+                    output: "contents".to_string(),
+                    success: true,
+                    metadata: None,
+                    actor: None,
+                    subject: None,
+                },
+                TranscriptEvent::AssistantMessage {
+                    text: "Here is what I found.".to_string(),
+                    actor: None,
+                },
+            ]),
+        );
+
+        let kinds = items.iter().map(item_kind).collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["user", "tool", "assistant"]);
+    }
+
+    #[test]
+    fn timeline_renders_send_user_message_as_assistant_text() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![
+                TranscriptEvent::TurnBoundary {
+                    turn_id: "turn-1".to_string(),
+                    state: TurnBoundaryState::Started,
+                },
+                TranscriptEvent::ToolInvocation {
+                    call_id: "call-msg-1".to_string(),
+                    tool_id: "SendUserMessage".to_string(),
+                    input: r#"{"message":"Starting Phase 1.","status":"normal"}"#.to_string(),
+                    output: "{}".to_string(),
+                    success: true,
+                    metadata: None,
+                    actor: None,
+                    subject: None,
+                },
+                TranscriptEvent::TurnBoundary {
+                    turn_id: "turn-1".to_string(),
+                    state: TurnBoundaryState::Finished,
+                },
+            ]),
+        );
+
+        let kinds = items.iter().map(item_kind).collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["assistant"]);
+        assert!(matches!(
+            &items[0],
+            TimelineItemDto::AssistantMessage { text, turn_id, .. }
+                if text == "Starting Phase 1." && turn_id.as_deref() == Some("turn-1")
+        ));
+    }
+
+    #[test]
+    fn timeline_clear_discards_prior_messages() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![
+                TranscriptEvent::UserMessage {
+                    text: "old prompt".to_string(),
+                    attachments: Vec::new(),
+                    actor: None,
+                },
+                TranscriptEvent::AssistantMessage {
+                    text: "old answer".to_string(),
+                    actor: None,
+                },
+                TranscriptEvent::TranscriptRewritten {
+                    rewrite: TranscriptRewrite::Clear,
+                },
+                TranscriptEvent::SystemMessage {
+                    text: "Transcript cleared.".to_string(),
+                    actor: None,
+                },
+            ]),
+        );
+
+        let kinds = items.iter().map(item_kind).collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["system"]);
+        assert!(matches!(
+            &items[0],
+            TimelineItemDto::SystemMessage { text, .. } if text == "Transcript cleared."
+        ));
+    }
+
+    #[test]
+    fn timeline_pop_discards_latest_visible_message() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![
+                TranscriptEvent::UserMessage {
+                    text: "keep prompt".to_string(),
+                    attachments: Vec::new(),
+                    actor: None,
+                },
+                TranscriptEvent::AssistantMessage {
+                    text: "remove answer".to_string(),
+                    actor: None,
+                },
+                TranscriptEvent::TranscriptRewritten {
+                    rewrite: TranscriptRewrite::PopLast { count: 1 },
+                },
+                TranscriptEvent::SystemMessage {
+                    text: "Removed the latest rendered transcript item.".to_string(),
+                    actor: None,
+                },
+            ]),
+        );
+
+        let kinds = items.iter().map(item_kind).collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["user", "system"]);
+        assert!(matches!(
+            &items[0],
+            TimelineItemDto::UserMessage { text, .. } if text == "keep prompt"
+        ));
+    }
 }

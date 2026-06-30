@@ -38,6 +38,7 @@ fn usage_command_reports_runtime_and_resource_counts() {
             display_name_field: Some("display_name".to_string()),
             headers: Default::default(),
         }),
+        media: None,
         models: vec![puffer_provider_registry::ModelDescriptor {
             id: "claude-sonnet-4-5".to_string(),
             display_name: "Claude Sonnet 4.5".to_string(),
@@ -46,7 +47,11 @@ fn usage_command_reports_runtime_and_resource_counts() {
             context_window: 200_000,
             max_output_tokens: 8_192,
             supports_reasoning: true,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
         }],
+        chat_completions_path: None,
     });
     let mut auth_store = AuthStore::default();
     auth_store.set_api_key("anthropic", "sk-ant");
@@ -62,6 +67,8 @@ fn usage_command_reports_runtime_and_resource_counts() {
                 model_override: None,
                 mode: None,
                 chained_from: Vec::new(),
+                for_provider: None,
+                for_model: None,
             },
             source_info: puffer_resources::SourceInfo {
                 path: PathBuf::from("prompts/review.yaml"),
@@ -363,6 +370,7 @@ fn anthropic_provider() -> ProviderDescriptor {
             display_name_field: Some("display_name".to_string()),
             headers: Default::default(),
         }),
+        media: None,
         models: vec![puffer_provider_registry::ModelDescriptor {
             id: "claude-sonnet-4-5".to_string(),
             display_name: "Claude Sonnet 4.5".to_string(),
@@ -371,7 +379,11 @@ fn anthropic_provider() -> ProviderDescriptor {
             context_window: 200_000,
             max_output_tokens: 8_192,
             supports_reasoning: true,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
         }],
+        chat_completions_path: None,
     }
 }
 
@@ -385,6 +397,7 @@ fn openai_provider() -> ProviderDescriptor {
         headers: Default::default(),
         query_params: Default::default(),
         discovery: None,
+        media: None,
         models: vec![puffer_provider_registry::ModelDescriptor {
             id: "gpt-5".to_string(),
             display_name: "GPT-5".to_string(),
@@ -393,7 +406,11 @@ fn openai_provider() -> ProviderDescriptor {
             context_window: 272_000,
             max_output_tokens: 16_384,
             supports_reasoning: true,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
         }],
+        chat_completions_path: None,
     }
 }
 
@@ -410,6 +427,8 @@ fn sample_resources() -> LoadedResources {
                 model_override: None,
                 mode: None,
                 chained_from: Vec::new(),
+                for_provider: None,
+                for_model: None,
             },
             source_info: puffer_resources::SourceInfo {
                 path: PathBuf::from("prompts/review.yaml"),

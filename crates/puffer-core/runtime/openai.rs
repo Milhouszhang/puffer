@@ -1,34 +1,34 @@
 use super::{
     execute_tool_call, is_parallel_safe_tool, parse_http_json_response, resolve_tool_permission,
-    run_turn_hooks, send_http_request_raw, PermissionOutcome, ToolExecutionBackend, ToolInvocation,
-    TurnStreamEvent, APP_VERSION,
+    PermissionOutcome, RetryAttemptKind, ToolExecutionBackend, ToolInvocation, TurnStreamEvent,
+    APP_VERSION, OPENAI_CODEX_COMPAT_VERSION,
 };
-use crate::permissions::load_runtime_permission_context;
-use crate::workspace_paths;
+mod adapters;
+mod completions_session;
 pub(crate) mod conversation;
+mod legacy_streaming;
+mod responses_session;
 mod support;
+mod websocket;
+mod websocket_state;
 
+pub(crate) use self::adapters::{OpenAICompletionsAdapter, OpenAIResponsesAdapter};
 pub(super) use self::support::build_codex_openai_request_body;
 use self::support::{
-    append_default_openai_headers, apply_previous_response_id, is_codex_openai_provider,
-    is_openai_structured_output_error, openai_base_url_for_auth, openai_model_supports_reasoning,
-    openai_registry_credential, openai_responses_path, openai_stream_read_timeout,
-    prefer_native_structured_output, retry_openai_transport, structured_output_endpoint_id,
-    trace_openai_http_request, trace_openai_http_response_headers, OPENAI_STRUCTURED_OUTPUT_FAMILY,
+    append_default_openai_headers, is_codex_openai_provider, openai_base_url_for_auth,
+    openai_registry_credential, openai_stream_read_timeout, retry_openai_transport,
+    trace_openai_http_request, trace_openai_http_response_headers,
 };
-use super::structured_output_support::{
-    openai_chat_completion_tools_for_request, openai_chat_response_format,
-    openai_responses_text_config, openai_tool_definitions_for_request, StructuredOutputConfig,
-};
-use super::system_prompt::render_runtime_system_prompt;
+#[cfg(test)]
+pub(super) use self::websocket_state::reset_openai_websocket_http_fallbacks;
+use super::structured_output_support::StructuredOutputConfig;
 use crate::AppState;
 use anyhow::{anyhow, bail, Context, Result};
+use puffer_config::ProxyConfig;
 use puffer_provider_openai::{
-    build_chat_completions_request, build_json_post_request, extract_chat_completions_text,
-    extract_chat_completions_tool_calls, extract_responses_text, extract_responses_tool_calls,
-    parse_chat_completions_response, parse_responses_response, refresh_oauth_token, OpenAIAuth,
-    OpenAIChatCompletionsRequest, OpenAIRequestConfig, OpenAIResponseToolCall,
-    OpenAIResponsesFunctionCallOutput, OpenAIResponsesResponse, OpenAIResponsesToolChoiceMode,
+    extract_responses_text, extract_responses_tool_calls, refresh_oauth_token,
+    refresh_oauth_token_with_client, OpenAIAuth, OpenAIRequestConfig, OpenAIResponseToolCall,
+    OpenAIResponsesFunctionCallOutput, OpenAIResponsesResponse,
 };
 use puffer_provider_registry::{AuthStore, ProviderDescriptor, ProviderRegistry, StoredCredential};
 use puffer_resources::LoadedResources;
@@ -37,9 +37,12 @@ use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::io::{BufRead, Read};
 
-pub(super) use super::openai_sse::{
-    is_event_stream, parse_openai_sse_reader_with_metadata, parse_openai_sse_response,
+pub(super) use super::openai_sse::{is_event_stream, parse_openai_sse_response};
+use super::openai_sse::{
+    is_openai_sse_api_error, openai_response_incomplete_error, parse_openai_sse_reader_typed,
+    OpenAISseResult,
 };
 
 #[cfg(test)]
@@ -63,583 +66,11 @@ pub(super) struct OpenAIToolResults {
     pub(super) invocations: Vec<ToolInvocation>,
 }
 
-#[derive(Debug)]
-struct OpenAIStreamResponse {
-    body: Value,
-    emitted_tool_call_ids: HashSet<String>,
-}
-
-pub(super) fn execute_openai(
-    state: &mut AppState,
-    resources: &LoadedResources,
-    providers: &ProviderRegistry,
-    provider: &ProviderDescriptor,
-    model_id: String,
-    auth_store: &mut AuthStore,
-    input: &str,
-    options: super::TurnRequestOptions<'_>,
-) -> Result<super::TurnExecution> {
-    let structured_output = options.structured_output;
-    let use_native = prefer_native_structured_output(state, provider, &model_id, structured_output);
-    match execute_openai_once(
-        state,
-        resources,
-        providers,
-        provider,
-        model_id.clone(),
-        auth_store,
-        input,
-        options,
-        use_native,
-    ) {
-        Ok(turn) => Ok(turn),
-        Err(error) if use_native && is_openai_structured_output_error(&error) => {
-            state.mark_native_structured_output_unsupported(
-                OPENAI_STRUCTURED_OUTPUT_FAMILY,
-                provider.id.as_str(),
-                &model_id,
-                structured_output_endpoint_id(provider),
-            );
-            execute_openai_once(
-                state, resources, providers, provider, model_id, auth_store, input, options, false,
-            )
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn execute_openai_once(
-    state: &mut AppState,
-    resources: &LoadedResources,
-    providers: &ProviderRegistry,
-    provider: &ProviderDescriptor,
-    model_id: String,
-    auth_store: &mut AuthStore,
-    input: &str,
-    options: super::TurnRequestOptions<'_>,
-    use_native: bool,
-) -> Result<super::TurnExecution> {
-    use self::conversation::{
-        append_tool_results, compact_conversation, inject_post_compact_context,
-        items_to_responses_input, transcript_to_items, ConversationItem,
-    };
-
-    let structured_output = options.structured_output;
-    let mut execution = resolve_openai_execution_config(state, auth_store, provider)?;
-    let registry = ToolRegistry::from_resources(resources);
-    let permission_context = load_runtime_permission_context(&state.cwd, resources, state)?;
-    let text = openai_responses_text_config(structured_output, use_native);
-    let tools = openai_tool_definitions_for_request(
-        &registry,
-        structured_output,
-        use_native,
-        Some(&permission_context),
-        options.tool_filter,
-    )?;
-    let system_prompt = render_runtime_system_prompt(
-        state,
-        resources,
-        &model_id,
-        &tools
-            .iter()
-            .map(|tool| tool.name.clone())
-            .collect::<std::collections::BTreeSet<_>>(),
-    )?;
-    let instructions = openai_request_instructions(state, resources, Some(&system_prompt))?;
-    // Unified: all internal logic on Vec<ConversationItem>.
-    let mut items = transcript_to_items(state, input);
-    let mut invocations = Vec::new();
-    let supports_reasoning = openai_model_supports_reasoning(provider, &model_id);
-    let mut previous_response_id = None;
-    // Index where "continuation" items start — used for previous_response_id optimization.
-    // When previous_response_id is set, only items[start..] are sent as wire input.
-    let mut continuation_start: Option<usize> = None;
-
-    loop {
-        // Wire boundary: ConversationItem → Responses API input.
-        let wire_input = match (previous_response_id.as_ref(), continuation_start) {
-            (Some(_), Some(start)) => items_to_responses_input(&items[start..]),
-            _ => items_to_responses_input(&items),
-        };
-
-        let response =
-            send_openai_request_with_refresh(auth_store, &mut execution, |request_config| {
-                let mut body = build_codex_openai_request_body(
-                    state,
-                    &model_id,
-                    &instructions,
-                    wire_input.clone(),
-                    &tools,
-                    supports_reasoning,
-                    text.clone(),
-                    false,
-                );
-                apply_previous_response_id(&mut body, previous_response_id.as_deref());
-                build_json_post_request(
-                    request_config,
-                    openai_responses_path(&request_config.base_url),
-                    &body,
-                )
-            })?;
-
-        let parsed = parse_responses_response(&serde_json::to_string(&response)?)?;
-        previous_response_id = parsed.id.clone();
-        // Extract server-reported input token count for precise compaction & context display.
-        let input_tokens = response
-            .pointer("/usage/input_tokens")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize);
-        if let Some(tokens) = input_tokens {
-            state.last_input_tokens = Some(tokens as u32);
-        }
-        let tool_calls = extract_responses_tool_calls(&parsed)?;
-        if tool_calls.is_empty() {
-            let assistant_text = parse_openai_assistant_text(&parsed, &response, state)?;
-            run_turn_hooks(resources, &state.cwd, &assistant_text, invocations.len());
-            return Ok(super::TurnExecution {
-                assistant_text,
-                tool_invocations: invocations,
-            });
-        }
-
-        // Add assistant text from this round (if any) to maintain full history.
-        let assistant_text = extract_responses_text(&parsed);
-        if !assistant_text.trim().is_empty() {
-            items.push(ConversationItem::assistant_message(&assistant_text));
-        }
-        // Record where continuation starts (tool calls + outputs for next request).
-        continuation_start = Some(items.len());
-
-        let cwd = state.cwd.clone();
-        let tool_results = execute_openai_tool_calls(
-            state,
-            resources,
-            providers,
-            auth_store,
-            &tool_calls,
-            &registry,
-            &cwd,
-            &execution.request_config,
-            &model_id,
-            structured_output,
-            options.tool_filter,
-        )?;
-
-        // Shared: append tool calls + outputs to canonical items.
-        append_tool_results(&mut items, &tool_results.invocations);
-        invocations.extend(tool_results.invocations);
-
-        // Shared: unified compaction.
-        let compacted = compact_conversation(
-            &mut items,
-            provider,
-            &model_id,
-            &execution.request_config,
-            input_tokens,
-        );
-        if compacted {
-            previous_response_id = None;
-            continuation_start = None;
-            inject_post_compact_context(&mut items, &cwd);
-        }
-    }
-}
-
-pub(super) fn execute_openai_streaming<F>(
-    state: &mut AppState,
-    resources: &LoadedResources,
-    providers: &ProviderRegistry,
-    provider: &ProviderDescriptor,
-    model_id: String,
-    auth_store: &mut AuthStore,
-    input: &str,
-    options: super::TurnRequestOptions<'_>,
-    on_event: &mut F,
-) -> Result<super::TurnExecution>
-where
-    F: FnMut(TurnStreamEvent),
-{
-    let structured_output = options.structured_output;
-    let use_native = prefer_native_structured_output(state, provider, &model_id, structured_output);
-    match execute_openai_streaming_once(
-        state,
-        resources,
-        providers,
-        provider,
-        model_id.clone(),
-        auth_store,
-        input,
-        options,
-        use_native,
-        on_event,
-    ) {
-        Ok(turn) => Ok(turn),
-        Err(error) if use_native && is_openai_structured_output_error(&error) => {
-            state.mark_native_structured_output_unsupported(
-                OPENAI_STRUCTURED_OUTPUT_FAMILY,
-                provider.id.as_str(),
-                &model_id,
-                structured_output_endpoint_id(provider),
-            );
-            execute_openai_streaming_once(
-                state, resources, providers, provider, model_id, auth_store, input, options, false,
-                on_event,
-            )
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn execute_openai_streaming_once<F>(
-    state: &mut AppState,
-    resources: &LoadedResources,
-    providers: &ProviderRegistry,
-    provider: &ProviderDescriptor,
-    model_id: String,
-    auth_store: &mut AuthStore,
-    input: &str,
-    options: super::TurnRequestOptions<'_>,
-    use_native: bool,
-    on_event: &mut F,
-) -> Result<super::TurnExecution>
-where
-    F: FnMut(TurnStreamEvent),
-{
-    use self::conversation::{
-        append_tool_results, compact_conversation, inject_post_compact_context,
-        items_to_responses_input, transcript_to_items, ConversationItem,
-    };
-
-    let structured_output = options.structured_output;
-    let mut execution = resolve_openai_execution_config(state, auth_store, provider)?;
-    let registry = ToolRegistry::from_resources(resources);
-    let permission_context = load_runtime_permission_context(&state.cwd, resources, state)?;
-    let text = openai_responses_text_config(structured_output, use_native);
-    let tools = openai_tool_definitions_for_request(
-        &registry,
-        structured_output,
-        use_native,
-        Some(&permission_context),
-        options.tool_filter,
-    )?;
-    let system_prompt = render_runtime_system_prompt(
-        state,
-        resources,
-        &model_id,
-        &tools
-            .iter()
-            .map(|tool| tool.name.clone())
-            .collect::<std::collections::BTreeSet<_>>(),
-    )?;
-    let instructions = openai_request_instructions(state, resources, Some(&system_prompt))?;
-    // Unified: all internal logic on Vec<ConversationItem>.
-    let mut items = transcript_to_items(state, input);
-    let mut invocations = Vec::new();
-    let supports_reasoning = openai_model_supports_reasoning(provider, &model_id);
-    let mut previous_response_id: Option<String> = None;
-    // Index where "continuation" items start — used for previous_response_id optimization.
-    // When previous_response_id is set, only items[start..] are sent as wire input.
-    let mut continuation_start: Option<usize> = None;
-
-    loop {
-        // Check for background tasks that completed since the last turn and inject
-        // a system reminder so the model learns about them without needing to poll.
-        let completed = super::claude_tools::workflow::drain_completed_shell_tasks(&state.cwd);
-        if !completed.is_empty() {
-            let notice = format!(
-                "<system-reminder>\n{}\nUse TaskOutput to retrieve the full output if needed.\n</system-reminder>",
-                completed.join("\n")
-            );
-            items.push(ConversationItem::user_message(&notice));
-        }
-
-        // Wire boundary: ConversationItem → Responses API input.
-        // When previous_response_id is set, only send continuation items.
-        let wire_input = match (previous_response_id.as_ref(), continuation_start) {
-            (Some(_), Some(start)) => items_to_responses_input(&items[start..]),
-            _ => items_to_responses_input(&items),
-        };
-
-        let prev_resp_id = previous_response_id.clone();
-        let response = retry_openai_transport(|| {
-            send_openai_request_with_refresh_streaming(
-                auth_store,
-                &mut execution,
-                |request_config| {
-                    let mut body = build_codex_openai_request_body(
-                        state,
-                        &model_id,
-                        &instructions,
-                        wire_input.clone(),
-                        &tools,
-                        supports_reasoning,
-                        text.clone(),
-                        true,
-                    );
-                    apply_previous_response_id(&mut body, prev_resp_id.as_deref());
-                    build_json_post_request(
-                        request_config,
-                        openai_responses_path(&request_config.base_url),
-                        &body,
-                    )
-                },
-                on_event,
-            )
-        })?;
-
-        let parsed = parse_responses_response(&serde_json::to_string(&response.body)?)?;
-        previous_response_id = parsed.id.clone();
-        // Extract server-reported input token count for context display & compaction.
-        let input_tokens = response
-            .body
-            .pointer("/usage/input_tokens")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize);
-        if let Some(tokens) = input_tokens {
-            state.last_input_tokens = Some(tokens as u32);
-        }
-        let tool_calls = extract_responses_tool_calls(&parsed)?;
-        if tool_calls.is_empty() {
-            let assistant_text = parse_openai_assistant_text(&parsed, &response.body, state)?;
-            run_turn_hooks(resources, &state.cwd, &assistant_text, invocations.len());
-            return Ok(super::TurnExecution {
-                assistant_text,
-                tool_invocations: invocations,
-            });
-        }
-
-        let pending_tool_calls = tool_calls
-            .iter()
-            .filter(|tool_call| !response.emitted_tool_call_ids.contains(&tool_call.call_id))
-            .map(|tool_call| super::ToolCallRequest {
-                tool_id: tool_call.name.clone(),
-                input: serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
-            })
-            .collect::<Vec<_>>();
-        if !pending_tool_calls.is_empty() {
-            on_event(TurnStreamEvent::ToolCallsRequested(pending_tool_calls));
-        }
-
-        // Add assistant text from this round to maintain full history.
-        let assistant_text = extract_responses_text(&parsed);
-        if !assistant_text.trim().is_empty() {
-            items.push(ConversationItem::assistant_message(&assistant_text));
-        }
-        // Record where continuation starts (tool calls + outputs for next request).
-        continuation_start = Some(items.len());
-
-        let cwd = state.cwd.clone();
-        let tool_results = execute_openai_tool_calls(
-            state,
-            resources,
-            providers,
-            auth_store,
-            &tool_calls,
-            &registry,
-            &cwd,
-            &execution.request_config,
-            &model_id,
-            structured_output,
-            options.tool_filter,
-        )?;
-        if !tool_results.invocations.is_empty() {
-            on_event(TurnStreamEvent::ToolInvocations(
-                tool_results.invocations.clone(),
-            ));
-        }
-
-        // Shared: append tool calls + outputs to canonical items.
-        append_tool_results(&mut items, &tool_results.invocations);
-        invocations.extend(tool_results.invocations);
-
-        // Shared: unified compaction.
-        let compacted = compact_conversation(
-            &mut items,
-            provider,
-            &model_id,
-            &execution.request_config,
-            input_tokens,
-        );
-        if compacted {
-            previous_response_id = None;
-            continuation_start = None;
-            inject_post_compact_context(&mut items, &cwd);
-        }
-    }
-}
-
-pub(super) fn execute_openai_completions(
-    state: &mut AppState,
-    resources: &LoadedResources,
-    providers: &ProviderRegistry,
-    provider: &ProviderDescriptor,
-    model_id: String,
-    auth_store: &mut AuthStore,
-    input: &str,
-    options: super::TurnRequestOptions<'_>,
-) -> Result<super::TurnExecution> {
-    let structured_output = options.structured_output;
-    let use_native = prefer_native_structured_output(state, provider, &model_id, structured_output);
-    match execute_openai_completions_once(
-        state,
-        resources,
-        providers,
-        provider,
-        model_id.clone(),
-        auth_store,
-        input,
-        options,
-        use_native,
-    ) {
-        Ok(turn) => Ok(turn),
-        Err(error) if use_native && is_openai_structured_output_error(&error) => {
-            state.mark_native_structured_output_unsupported(
-                OPENAI_STRUCTURED_OUTPUT_FAMILY,
-                provider.id.as_str(),
-                &model_id,
-                structured_output_endpoint_id(provider),
-            );
-            execute_openai_completions_once(
-                state, resources, providers, provider, model_id, auth_store, input, options, false,
-            )
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn execute_openai_completions_once(
-    state: &mut AppState,
-    resources: &LoadedResources,
-    providers: &ProviderRegistry,
-    provider: &ProviderDescriptor,
-    model_id: String,
-    auth_store: &mut AuthStore,
-    input: &str,
-    options: super::TurnRequestOptions<'_>,
-    use_native: bool,
-) -> Result<super::TurnExecution> {
-    use self::conversation::{
-        append_tool_results, build_system_reminder, compact_conversation,
-        inject_post_compact_context, items_to_chat_messages, transcript_to_items, ConversationItem,
-    };
-
-    let structured_output = options.structured_output;
-    let mut execution = resolve_openai_execution_config(state, auth_store, provider)?;
-    let registry = ToolRegistry::from_resources(resources);
-    let permission_context = load_runtime_permission_context(&state.cwd, resources, state)?;
-    let response_format = openai_chat_response_format(structured_output, use_native);
-    let tools = openai_chat_completion_tools_for_request(
-        &registry,
-        structured_output,
-        use_native,
-        Some(&permission_context),
-        options.tool_filter,
-    )?;
-    let system_prompt = render_runtime_system_prompt(
-        state,
-        resources,
-        &model_id,
-        &tools
-            .iter()
-            .map(|tool| tool.function.name.clone())
-            .collect::<std::collections::BTreeSet<_>>(),
-    )?;
-    let plan_mode_context = crate::plan_mode::take_plan_mode_context_message(state, resources)?;
-    let system_reminder = build_system_reminder(&super::git_status_context());
-
-    // Unified: all internal logic on Vec<ConversationItem>.
-    let mut items = transcript_to_items(state, input);
-    let mut invocations = Vec::new();
-
-    loop {
-        // Check for background tasks that completed since the last turn.
-        let completed = super::claude_tools::workflow::drain_completed_shell_tasks(&state.cwd);
-        if !completed.is_empty() {
-            let notice = format!(
-                "<system-reminder>\n{}\nUse TaskOutput to retrieve the full output if needed.\n</system-reminder>",
-                completed.join("\n")
-            );
-            items.push(ConversationItem::user_message(&notice));
-        }
-
-        // Wire boundary: ConversationItem → Chat Completions messages.
-        let messages = items_to_chat_messages(
-            &items,
-            Some(&system_prompt),
-            plan_mode_context.as_deref(),
-            Some(&system_reminder),
-        );
-        let response =
-            send_openai_request_with_refresh(auth_store, &mut execution, |request_config| {
-                build_chat_completions_request(
-                    request_config,
-                    &OpenAIChatCompletionsRequest {
-                        model: model_id.clone(),
-                        messages: messages.clone(),
-                        tools: tools.clone(),
-                        tool_choice: if tools.is_empty() {
-                            None
-                        } else {
-                            Some(OpenAIResponsesToolChoiceMode::Auto)
-                        },
-                        response_format: response_format.clone(),
-                    },
-                )
-            })?;
-        let parsed = parse_chat_completions_response(&serde_json::to_string(&response)?)?;
-        let tool_calls = extract_chat_completions_tool_calls(&parsed)?;
-        if tool_calls.is_empty() {
-            let text = extract_chat_completions_text(&parsed);
-            let assistant_text = if text.trim().is_empty() {
-                parse_openai_text(&response)
-                    .or_else(|_| parse_openai_text_fallback(&response, state))?
-            } else {
-                text
-            };
-            run_turn_hooks(resources, &state.cwd, &assistant_text, invocations.len());
-            return Ok(super::TurnExecution {
-                assistant_text,
-                tool_invocations: invocations,
-            });
-        }
-
-        // Preserve assistant text from this round (the model may emit text
-        // alongside tool calls, e.g. "Let me check that file.").
-        let assistant_text = extract_chat_completions_text(&parsed);
-        if !assistant_text.trim().is_empty() {
-            items.push(ConversationItem::assistant_message(&assistant_text));
-        }
-
-        let cwd = state.cwd.clone();
-        let tool_results = execute_openai_tool_calls(
-            state,
-            resources,
-            providers,
-            auth_store,
-            &tool_calls,
-            &registry,
-            &cwd,
-            &execution.request_config,
-            &model_id,
-            structured_output,
-            options.tool_filter,
-        )?;
-
-        // Shared: append tool calls + outputs to canonical items.
-        append_tool_results(&mut items, &tool_results.invocations);
-        invocations.extend(tool_results.invocations);
-
-        // Shared: unified compaction (previously missing post-compact context).
-        let compacted = compact_conversation(
-            &mut items,
-            provider,
-            &model_id,
-            &execution.request_config,
-            None, // Chat Completions doesn't return input_tokens
-        );
-        if compacted {
-            inject_post_compact_context(&mut items, &cwd);
-        }
+fn openai_request_version(provider: &ProviderDescriptor, oauth: bool) -> String {
+    if is_codex_openai_provider(provider) || (oauth && provider.id == "openai") {
+        OPENAI_CODEX_COMPAT_VERSION.to_string()
+    } else {
+        APP_VERSION.to_string()
     }
 }
 
@@ -656,6 +87,21 @@ pub(super) fn execute_openai_tool_calls(
     structured_output: Option<&StructuredOutputConfig>,
     tool_filter: Option<&super::RequestToolFilter>,
 ) -> Result<OpenAIToolResults> {
+    if state.lambda_gate.is_some() || tool_calls.iter().any(|tc| tc.name == "Skill") {
+        return execute_openai_tool_calls_serial(
+            state,
+            resources,
+            providers,
+            auth_store,
+            tool_calls,
+            registry,
+            cwd,
+            request_config,
+            model_id,
+            structured_output,
+            tool_filter,
+        );
+    }
     // Count how many parallel-safe tools we have.
     let parallel_count = tool_calls
         .iter()
@@ -687,6 +133,8 @@ pub(super) fn execute_openai_tool_calls(
         permissions.push(resolve_tool_permission(
             state,
             resources,
+            providers,
+            auth_store,
             registry,
             cwd,
             &tc.name,
@@ -696,53 +144,128 @@ pub(super) fn execute_openai_tool_calls(
     }
 
     // ---------- Phase 2: Execute tools ----------
+    // Media-capability snapshot for parallel Bash workers, captured only when the
+    // batch contains a permitted Bash call (avoids a permission-file read on
+    // Bash-free batches). The owned snapshot outlives `thread::scope`.
+    let has_permitted_bash = tool_calls.iter().enumerate().any(|(i, tc)| {
+        tc.name == "Bash" && matches!(permissions[i], PermissionOutcome::Allowed(_))
+    });
+    let mut media_snapshot = if has_permitted_bash {
+        Some(super::internal_tool_permissions::MediaCapabilitySnapshot::capture(
+            cwd, resources, state, registry,
+        )?)
+    } else {
+        None
+    };
+    // Media authorization gate: detect which media kinds this batch's permitted
+    // Bash calls demand and prompt once per kind here, on the main thread. The
+    // `&mut state` borrow must end before `provider_context` takes its long-lived
+    // immutable borrow of `state` (captured by the workers), so the gate runs first.
+    if let Some(snapshot) = media_snapshot.as_mut() {
+        super::internal_tool_permissions::authorize_parallel_media_batch(
+            snapshot,
+            state,
+            resources,
+            registry,
+            cwd,
+            tool_calls,
+            &permissions,
+            |tc| {
+                if tc.name != "Bash" {
+                    return None;
+                }
+                tc.arguments
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            },
+        );
+    }
+
     // Clone immutable data needed by parallel tools.
-    let working_dirs = state.working_dirs.clone();
-    let allow_all_paths = workspace_paths::sandbox_allows_all_paths(&state.sandbox_mode);
     let provider_context = super::claude_tools::ProviderToolContext::OpenAI {
         request_config,
         model_id,
+        proxy: &state.config.network.proxy,
         structured_output,
     };
+    // Cloned before `thread::scope` so each worker can route through the
+    // active `ToolRunner` (e.g. `RemoteToolRunner`) without touching `state`.
+    let runner = state.tool_runner.clone();
+
+    // Borrow the (possibly upgraded) snapshot into the shared worker context.
+    // `auth_store` (`&mut`) is reborrowed as `&` inside `context()` — NLL ends
+    // the `&mut` borrow first — and neither field touches `state`.
+    let media_ctx = media_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.context(providers, auth_store));
+    let media_ctx_ref = media_ctx.as_ref();
 
     // Pre-allocate results array; each slot filled by either parallel or serial exec.
-    let mut results: Vec<Option<(String, bool)>> = vec![None; tool_calls.len()];
+    let mut results: Vec<Option<(String, bool, Value)>> = vec![None; tool_calls.len()];
 
     // Execute parallel-safe permitted tools concurrently.
     std::thread::scope(|s| {
-        let mut handles: Vec<(usize, std::thread::ScopedJoinHandle<'_, (String, bool)>)> =
-            Vec::new();
+        let mut handles: Vec<(
+            usize,
+            std::thread::ScopedJoinHandle<'_, (String, bool, Value)>,
+        )> = Vec::new();
         for (i, tc) in tool_calls.iter().enumerate() {
             // Skip denied tools and non-parallel tools.
             if !is_parallel_safe_tool(&tc.name) {
                 continue;
             }
             if let PermissionOutcome::Denied(ref denied) = permissions[i] {
-                results[i] = Some((denied.output.stdout.clone(), denied.success));
+                results[i] = Some((
+                    denied.output.stdout.clone(),
+                    denied.success,
+                    denied.output.metadata.clone(),
+                ));
                 continue;
             }
+            let filesystem_policy = match &permissions[i] {
+                PermissionOutcome::Allowed(policy) => policy.clone(),
+                PermissionOutcome::Denied(_) => unreachable!(),
+            };
             let definition = match registry.definition(&tc.name) {
                 Some(d) => d.clone(),
                 None => {
-                    results[i] = Some((format!("unknown tool {}", tc.name), false));
+                    results[i] = Some((format!("unknown tool {}", tc.name), false, Value::Null));
                     continue;
                 }
             };
-            let args = tc.arguments.clone();
-            let wd = &working_dirs;
+            let args = match super::secrets::expand_secret_placeholders(state, &tc.arguments) {
+                Ok(args) => args,
+                Err(error) => {
+                    results[i] = Some((
+                        super::secrets::redact_known_secrets(
+                            state,
+                            &format!("Tool execution failed: {error}"),
+                        ),
+                        false,
+                        Value::Null,
+                    ));
+                    continue;
+                }
+            };
             let pc = &provider_context;
+            let sid = &state.session.id;
+            let runner_clone = runner.clone();
             handles.push((
                 i,
                 s.spawn(move || {
                     match super::claude_tools::execute_parallel_tool(
                         &definition,
                         cwd,
-                        wd,
-                        allow_all_paths,
+                        &filesystem_policy.workspace_roots,
+                        &filesystem_policy,
+                        sid,
                         args,
                         resources,
                         registry,
                         pc,
+                        &runner_clone,
+                        media_ctx_ref,
                     ) {
                         Ok(exec) => {
                             let output = if exec.output.stderr.is_empty() {
@@ -752,19 +275,22 @@ pub(super) fn execute_openai_tool_calls(
                             } else {
                                 format!("{}\n{}", exec.output.stdout, exec.output.stderr)
                             };
-                            (output, exec.success)
+                            (output, exec.success, exec.output.metadata)
                         }
-                        Err(error) => (format!("Tool execution failed: {error}"), false),
+                        Err(error) => (
+                            format!("Tool execution failed: {error}"),
+                            false,
+                            Value::Null,
+                        ),
                     }
                 }),
             ));
         }
         for (i, handle) in handles {
-            results[i] = Some(
-                handle
-                    .join()
-                    .unwrap_or_else(|_| ("Tool execution panicked".to_string(), false)),
-            );
+            results[i] =
+                Some(handle.join().unwrap_or_else(|_| {
+                    ("Tool execution panicked".to_string(), false, Value::Null)
+                }));
         }
     });
 
@@ -774,11 +300,15 @@ pub(super) fn execute_openai_tool_calls(
             continue; // Already executed in parallel or denied.
         }
         if let PermissionOutcome::Denied(ref denied) = permissions[i] {
-            results[i] = Some((denied.output.stdout.clone(), denied.success));
+            results[i] = Some((
+                denied.output.stdout.clone(),
+                denied.success,
+                denied.output.metadata.clone(),
+            ));
             continue;
         }
         // Serial execution with full &mut state access.
-        let (output, success) = match execute_tool_call(
+        let (output, success, metadata) = match execute_tool_call(
             state,
             resources,
             providers,
@@ -802,11 +332,15 @@ pub(super) fn execute_openai_tool_calls(
                 } else {
                     format!("{}\n{}", exec.output.stdout, exec.output.stderr)
                 };
-                (output, exec.success)
+                (output, exec.success, exec.output.metadata)
             }
-            Err(error) => (format!("Tool execution failed: {error}"), false),
+            Err(error) => (
+                format!("Tool execution failed: {error}"),
+                false,
+                Value::Null,
+            ),
         };
-        results[i] = Some((output, success));
+        results[i] = Some((output, success, metadata));
     }
 
     // ---------- Phase 3: Assemble outputs in original order ----------
@@ -814,9 +348,11 @@ pub(super) fn execute_openai_tool_calls(
     let mut outputs = Vec::with_capacity(tool_calls.len());
     let mut invocations = Vec::with_capacity(tool_calls.len());
     for (i, tc) in tool_calls.iter().enumerate() {
-        let (raw_output, success) = results[i]
+        let (raw_output, success, metadata) = results[i]
             .take()
-            .unwrap_or_else(|| ("Tool was not executed".to_string(), false));
+            .unwrap_or_else(|| ("Tool was not executed".to_string(), false, Value::Null));
+        let raw_output = super::secrets::redact_known_secrets(state, &raw_output);
+        let metadata = super::secrets::redact_json_value(state, &metadata);
         let output =
             super::process_tool_result(&raw_output, super::MAX_TOOL_RESULT_CHARS, session_id);
         outputs.push(OpenAIResponsesFunctionCallOutput {
@@ -830,6 +366,8 @@ pub(super) fn execute_openai_tool_calls(
             input: serde_json::to_string(&tc.arguments)?,
             output,
             success,
+            metadata,
+            terminate: false,
         });
     }
 
@@ -866,7 +404,7 @@ fn execute_openai_tool_calls_serial(
     let mut outputs = Vec::new();
     let mut invocations = Vec::new();
     for tool_call in tool_calls {
-        let (output, success) = match execute_tool_call(
+        let (output, success, metadata) = match execute_tool_call(
             state,
             resources,
             providers,
@@ -890,10 +428,16 @@ fn execute_openai_tool_calls_serial(
                 } else {
                     format!("{}\n{}", execution.output.stdout, execution.output.stderr)
                 };
-                (output, execution.success)
+                (output, execution.success, execution.output.metadata)
             }
-            Err(error) => (format!("Tool execution failed: {error}"), false),
+            Err(error) => (
+                format!("Tool execution failed: {error}"),
+                false,
+                Value::Null,
+            ),
         };
+        let output = super::secrets::redact_known_secrets(state, &output);
+        let metadata = super::secrets::redact_json_value(state, &metadata);
         let output =
             super::process_tool_result(&output, super::MAX_TOOL_RESULT_CHARS, &state.session.id);
         outputs.push(OpenAIResponsesFunctionCallOutput {
@@ -907,6 +451,8 @@ fn execute_openai_tool_calls_serial(
             input: serde_json::to_string(&tool_call.arguments)?,
             output,
             success,
+            metadata,
+            terminate: false,
         });
     }
 
@@ -926,7 +472,7 @@ fn execute_openai_tool_calls_serial(
     })
 }
 
-fn parse_openai_text(response: &Value) -> Result<String> {
+pub(super) fn parse_openai_text(response: &Value) -> Result<String> {
     if let Some(text) = response.get("output_text").and_then(Value::as_str) {
         return Ok(text.to_string());
     }
@@ -955,7 +501,7 @@ fn parse_openai_text(response: &Value) -> Result<String> {
     Ok(parts.join("\n"))
 }
 
-fn openai_request_instructions(
+pub(super) fn openai_request_instructions(
     state: &mut AppState,
     resources: &LoadedResources,
     system_prompt: Option<&str>,
@@ -974,17 +520,28 @@ fn openai_request_instructions(
     {
         sections.push(plan_mode_context);
     }
-    // Inject system reminder (current date + git status) matching Anthropic path.
-    let now = time::OffsetDateTime::now_utc();
-    let date_str = format!("{}-{:02}-{:02}", now.year(), now.month() as u8, now.day());
-    let git_status = super::git_status_context();
-    let mut reminder = format!("# currentDate\nToday's date is {date_str}.");
-    if !git_status.is_empty() {
-        reminder.push_str(&format!("\n\n# gitStatus\n{git_status}"));
-    }
-    sections.push(reminder);
+    // Dynamic context (date, git status, CLAUDE.md) is now injected as a
+    // context user message in the `input` array, not here.  This keeps
+    // `instructions` static and cacheable (matching Codex's design where
+    // `instructions` = pure developer instructions, and contextual data
+    // lives in `input` items).
     Ok(sections.join("\n\n"))
 }
+
+/// Builds the dynamic context message injected into the `input` array.
+///
+/// This follows CC/Codex's pattern of separating static instructions
+/// (in `instructions`) from dynamic context (in `input` messages).
+/// The `<system-reminder>` XML tag helps the model distinguish
+/// system-injected context from user-authored messages.
+pub(super) fn build_context_reminder_message(state: &AppState) -> String {
+    let reminder = self::conversation::build_system_reminder(state, &super::git_status_context());
+    format!(
+        "<system-reminder>\n{}\n\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>",
+        reminder
+    )
+}
+
 pub(super) fn parse_openai_assistant_text(
     parsed: &OpenAIResponsesResponse,
     response: &Value,
@@ -1039,7 +596,12 @@ pub(super) fn resolve_openai_execution_config(
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Vec<_>>();
-    append_default_openai_headers(&mut custom_headers, provider.id.as_str());
+    // The execution config is built once per session (no model_id in
+    // scope); compat-driven version-header gating consults the
+    // descriptor in `support::append_default_openai_headers` only when
+    // a model is supplied. Pass `None` here — auto-detect handles the
+    // canonical providers (`provider.id == "openai"`).
+    append_default_openai_headers(&mut custom_headers, provider.id.as_str(), None);
     let session_id = Some(state.session.id.to_string());
     let originator = OPENAI_CODEX_ORIGINATOR.to_string();
     match auth_store.get(provider.id.as_str()) {
@@ -1047,7 +609,7 @@ pub(super) fn resolve_openai_execution_config(
             provider_id: provider.id.clone(),
             request_config: OpenAIRequestConfig {
                 base_url: provider.base_url.clone(),
-                version: APP_VERSION.to_string(),
+                version: openai_request_version(provider, false),
                 auth: OpenAIAuth::ApiKey(key.clone()),
                 originator,
                 session_id,
@@ -1058,6 +620,8 @@ pub(super) fn resolve_openai_execution_config(
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
+                chat_completions_path: provider.chat_completions_path.clone(),
+                responses_path: None,
             },
             refresh_token: None,
             codex_style: codex_style_for_provider(provider, false),
@@ -1066,7 +630,7 @@ pub(super) fn resolve_openai_execution_config(
             provider_id: provider.id.clone(),
             request_config: OpenAIRequestConfig {
                 base_url: openai_base_url_for_auth(provider, true),
-                version: APP_VERSION.to_string(),
+                version: openai_request_version(provider, true),
                 auth: OpenAIAuth::OAuthBearer(credential.access_token.clone()),
                 originator,
                 session_id,
@@ -1077,6 +641,8 @@ pub(super) fn resolve_openai_execution_config(
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
+                chat_completions_path: provider.chat_completions_path.clone(),
+                responses_path: None,
             },
             refresh_token: Some(credential.refresh_token.clone()),
             codex_style: codex_style_for_provider(provider, true),
@@ -1085,7 +651,7 @@ pub(super) fn resolve_openai_execution_config(
             provider_id: provider.id.clone(),
             request_config: OpenAIRequestConfig {
                 base_url: provider.base_url.clone(),
-                version: APP_VERSION.to_string(),
+                version: openai_request_version(provider, false),
                 auth: OpenAIAuth::None,
                 originator,
                 session_id,
@@ -1096,6 +662,8 @@ pub(super) fn resolve_openai_execution_config(
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
+                chat_completions_path: provider.chat_completions_path.clone(),
+                responses_path: None,
             },
             refresh_token: None,
             codex_style: codex_style_for_provider(provider, false),
@@ -1121,29 +689,39 @@ fn codex_style_for_provider(provider: &ProviderDescriptor, oauth: bool) -> bool 
             != Some("1")
 }
 
+/// Sends a blocking OpenAI request and refreshes OAuth credentials once after a 401.
 pub(super) fn send_openai_request_with_refresh<F>(
     auth_store: &mut AuthStore,
     execution: &mut OpenAIExecutionConfig,
+    proxy: &ProxyConfig,
     build_request: F,
 ) -> Result<Value>
 where
     F: Fn(&OpenAIRequestConfig) -> Result<puffer_provider_openai::BuiltOpenAIRequest>,
 {
-    retry_openai_transport(|| {
-        send_openai_request_with_refresh_once(auth_store, execution, &build_request)
-    })
+    retry_openai_transport(
+        || send_openai_request_with_refresh_once(auth_store, execution, proxy, &build_request),
+        |_, _, _| {},
+    )
 }
 
 fn send_openai_request_with_refresh_once<F>(
     auth_store: &mut AuthStore,
     execution: &mut OpenAIExecutionConfig,
+    proxy: &ProxyConfig,
     build_request: &F,
 ) -> Result<Value>
 where
     F: Fn(&OpenAIRequestConfig) -> Result<puffer_provider_openai::BuiltOpenAIRequest>,
 {
     let request = build_request(&execution.request_config)?;
-    let response = send_http_request_raw(&request.url, &request.headers, &request.body, false)?;
+    let response = super::send_http_request_raw_with_proxy(
+        &request.url,
+        &request.headers,
+        &request.body,
+        false,
+        proxy,
+    )?;
     if response.status != StatusCode::UNAUTHORIZED || execution.refresh_token.is_none() {
         return parse_http_json_response(&request.url, false, response);
     }
@@ -1152,8 +730,16 @@ where
         .refresh_token
         .clone()
         .ok_or_else(|| anyhow!("missing refresh token for OpenAI OAuth retry"))?;
-    let refreshed = refresh_oauth_token(&refresh_token)
-        .context("failed to refresh OpenAI OAuth credentials after 401")?;
+    let refreshed = match crate::network::blocking_client_for_url(
+        proxy,
+        crate::network::HttpPurpose::OAuth,
+        puffer_provider_openai::OPENAI_TOKEN_URL,
+        std::time::Duration::from_secs(60),
+    ) {
+        Ok(client) => refresh_oauth_token_with_client(&client, &refresh_token),
+        Err(_) => refresh_oauth_token(&refresh_token),
+    }
+    .context("failed to refresh OpenAI OAuth credentials after 401")?;
     let stored = openai_registry_credential(refreshed);
     execution.request_config.auth = OpenAIAuth::OAuthBearer(stored.access_token.clone());
     execution.request_config.account_id = stored.account_id.clone();
@@ -1161,24 +747,65 @@ where
     auth_store.set_oauth(execution.provider_id.clone(), stored);
 
     let retry = build_request(&execution.request_config)?;
-    let retry_response = send_http_request_raw(&retry.url, &retry.headers, &retry.body, false)?;
+    let retry_response = super::send_http_request_raw_with_proxy(
+        &retry.url,
+        &retry.headers,
+        &retry.body,
+        false,
+        proxy,
+    )?;
     parse_http_json_response(&retry.url, false, retry_response)
 }
 
-fn send_openai_request_with_refresh_streaming<F, G>(
+/// Sends a streaming OpenAI request with OAuth refresh and transport-level retries.
+pub(super) fn send_openai_request_with_refresh_streaming<F, G>(
     auth_store: &mut AuthStore,
     execution: &mut OpenAIExecutionConfig,
+    proxy: &ProxyConfig,
     build_request: F,
     on_event: &mut G,
-) -> Result<OpenAIStreamResponse>
+) -> Result<OpenAISseResult>
 where
     F: Fn(&OpenAIRequestConfig) -> Result<puffer_provider_openai::BuiltOpenAIRequest>,
     G: FnMut(TurnStreamEvent),
 {
     let request = build_request(&execution.request_config)?;
-    let response = retry_openai_transport(|| {
-        send_openai_request_stream_raw(&request.url, &request.headers, &request.body)
-    })?;
+    // Layered retry: inner = connection-level (`retry_openai_transport`)
+    // surfaces `RetryAttempt` events on `on_event`; outer =
+    // HTTP 5xx response status (`runtime::retry_on_5xx`) traces
+    // via `tracing::warn!` to avoid the closure borrow conflict
+    // (both branches would otherwise want `&mut on_event`).
+    // CC's SDK retries on >=500 the same way (`shouldRetry` in
+    // claude-2.1.133 bundle).
+    let response = super::retry_on_5xx(
+        || {
+            retry_openai_transport(
+                || {
+                    send_openai_request_stream_raw(
+                        &request.url,
+                        &request.headers,
+                        &request.body,
+                        proxy,
+                    )
+                },
+                |attempt, max, error| {
+                    on_event(TurnStreamEvent::RetryAttempt {
+                        attempt,
+                        max_attempts: max,
+                        error: error.to_string(),
+                        kind: RetryAttemptKind::Transport,
+                    });
+                },
+            )
+        },
+        |attempt, max, status| {
+            tracing::warn!(
+                target: "puffer::runtime::openai",
+                "5xx retry: attempt {attempt}/{max}, HTTP {}, sleeping before retry",
+                status.as_u16()
+            );
+        },
+    )?;
     if response.status() != StatusCode::UNAUTHORIZED || execution.refresh_token.is_none() {
         return parse_openai_stream_response(&request.url, response, on_event);
     }
@@ -1187,8 +814,16 @@ where
         .refresh_token
         .clone()
         .ok_or_else(|| anyhow!("missing refresh token for OpenAI OAuth retry"))?;
-    let refreshed = refresh_oauth_token(&refresh_token)
-        .context("failed to refresh OpenAI OAuth credentials after 401")?;
+    let refreshed = match crate::network::blocking_client_for_url(
+        proxy,
+        crate::network::HttpPurpose::OAuth,
+        puffer_provider_openai::OPENAI_TOKEN_URL,
+        std::time::Duration::from_secs(60),
+    ) {
+        Ok(client) => refresh_oauth_token_with_client(&client, &refresh_token),
+        Err(_) => refresh_oauth_token(&refresh_token),
+    }
+    .context("failed to refresh OpenAI OAuth credentials after 401")?;
     let stored = openai_registry_credential(refreshed);
     execution.request_config.auth = OpenAIAuth::OAuthBearer(stored.access_token.clone());
     execution.request_config.account_id = stored.account_id.clone();
@@ -1196,9 +831,28 @@ where
     auth_store.set_oauth(execution.provider_id.clone(), stored);
 
     let retry = build_request(&execution.request_config)?;
-    let retry_response = retry_openai_transport(|| {
-        send_openai_request_stream_raw(&retry.url, &retry.headers, &retry.body)
-    })?;
+    let retry_response = super::retry_on_5xx(
+        || {
+            retry_openai_transport(
+                || send_openai_request_stream_raw(&retry.url, &retry.headers, &retry.body, proxy),
+                |attempt, max, error| {
+                    on_event(TurnStreamEvent::RetryAttempt {
+                        attempt,
+                        max_attempts: max,
+                        error: error.to_string(),
+                        kind: RetryAttemptKind::Transport,
+                    });
+                },
+            )
+        },
+        |attempt, max, status| {
+            tracing::warn!(
+                target: "puffer::runtime::openai",
+                "5xx retry (post-401-refresh): attempt {attempt}/{max}, HTTP {}",
+                status.as_u16()
+            );
+        },
+    )?;
     parse_openai_stream_response(&retry.url, retry_response, on_event)
 }
 
@@ -1206,11 +860,16 @@ fn send_openai_request_stream_raw(
     url: &str,
     headers: &[(String, String)],
     body: &str,
+    proxy: &ProxyConfig,
 ) -> Result<Response> {
     trace_openai_http_request(url, headers, body);
-    let client = Client::builder()
-        .timeout(openai_stream_read_timeout())
-        .build()?;
+    let client = crate::network::blocking_client_for_url(
+        proxy,
+        crate::network::HttpPurpose::Model,
+        url,
+        openai_stream_read_timeout(),
+    )
+    .unwrap_or_else(|_| Client::new());
     let mut request = client.post(url);
     for (key, value) in headers {
         request = request.header(key, value);
@@ -1240,7 +899,7 @@ fn parse_openai_stream_response<G>(
     url: &str,
     response: Response,
     on_event: &mut G,
-) -> Result<OpenAIStreamResponse>
+) -> Result<OpenAISseResult>
 where
     G: FnMut(TurnStreamEvent),
 {
@@ -1251,22 +910,74 @@ where
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
     if !status.is_success() {
-        let text = response.text()?;
+        // Use lossy decode (`unwrap_or_default`) instead of `?` so a
+        // non-UTF8 / partially-truncated body still reaches the
+        // classifier — for the quota-error path losing a byte or two
+        // is preferable to surfacing a UTF-8 error and missing the
+        // 429/403 promotion entirely. Mirrors anthropic.rs:266.
+        let text = response.text().unwrap_or_default();
+        // Promote 429 / 403-access-terminated to a typed `QuotaError`
+        // so the benchmark CLI can exit with a distinct code instead
+        // of letting the orchestration layer burn its retry budget on
+        // a quota window. See `runtime::quota` for design notes.
+        if let Some(quota) = super::quota::classify_response("openai", status.as_u16(), &text) {
+            return Err(anyhow::Error::new(quota));
+        }
         bail!("request failed with status {}: {}", status, text);
     }
-    if is_event_stream(content_type.as_deref(), "") {
-        return parse_openai_sse_reader_with_metadata(std::io::BufReader::new(response), on_event)
-            .map(|parsed| OpenAIStreamResponse {
-                body: parsed.response,
-                emitted_tool_call_ids: parsed.emitted_tool_call_ids,
-            })
-            .with_context(|| format!("failed to parse SSE response from {url}"));
+    let mut reader = std::io::BufReader::new(response);
+    let looks_like_sse = if is_event_stream(content_type.as_deref(), "") {
+        true
+    } else {
+        let prefix = reader.fill_buf()?;
+        let prefix = std::str::from_utf8(prefix).unwrap_or_default();
+        is_event_stream(content_type.as_deref(), prefix)
+    };
+    if looks_like_sse {
+        return match parse_openai_sse_reader_typed(reader, on_event) {
+            Ok(result) => Ok(result),
+            Err(error) if is_openai_sse_api_error(&error) => Err(error),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to parse SSE response from {url}"))
+            }
+        };
     }
-    let text = response.text()?;
-    serde_json::from_str::<Value>(&text)
-        .map(|body| OpenAIStreamResponse {
-            body,
-            emitted_tool_call_ids: HashSet::new(),
+    // Non-SSE fallback: parse JSON directly into typed struct — one parse, no roundtrip.
+    let mut text = String::new();
+    reader.read_to_string(&mut text)?;
+    let raw: Value = serde_json::from_str(&text)
+        .with_context(|| format!("response from {url} was not valid JSON"))?;
+    if let Some(error) = openai_response_incomplete_error(&raw) {
+        return Err(error);
+    }
+    let response_id = raw.get("id").and_then(Value::as_str).map(str::to_string);
+    let input_tokens = raw
+        .pointer("/usage/input_tokens")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize);
+    let parsed: OpenAIResponsesResponse = serde_json::from_value(raw.clone())
+        .with_context(|| format!("response from {url} was not a valid Responses payload"))?;
+    let assistant_text = extract_responses_text(&parsed);
+    let tool_calls = extract_responses_tool_calls(&parsed)?;
+    let reasoning_items: Vec<Value> = raw
+        .pointer("/output")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+                .cloned()
+                .collect()
         })
-        .with_context(|| format!("response from {url} was not valid JSON"))
+        .unwrap_or_default();
+    Ok(OpenAISseResult {
+        response_id,
+        input_tokens,
+        output_tokens: None,
+        cached_tokens: None,
+        assistant_text,
+        tool_calls,
+        emitted_tool_call_ids: HashSet::new(),
+        reasoning_items,
+        raw_response: raw,
+    })
 }

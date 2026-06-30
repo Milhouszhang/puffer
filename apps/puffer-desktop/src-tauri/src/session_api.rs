@@ -1,6 +1,6 @@
 use crate::dto::{
-    DiffSnapshotDto, FolderGroupDto, PermissionDialogDto, SessionDiffsDto, SessionListItemDto,
-    SessionTimelineDto, TimelineItemDto,
+    ChatAttachmentDto, DiffSnapshotDto, FolderGroupDto, PermissionDialogDto, SessionDiffsDto,
+    SessionListItemDto, SessionTimelineDto, TimelineItemDto,
 };
 use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
@@ -48,10 +48,11 @@ pub(crate) fn list_grouped_sessions() -> Result<Vec<FolderGroupDto>> {
 
 /// Loads one session timeline with conversation, tool, and snapshot items.
 pub(crate) fn load_session_timeline(session_id: &str) -> Result<SessionTimelineDto> {
-    let record = load_session_record(session_id)?;
+    let store = session_store()?;
+    let record = load_session_record_from_store(&store, session_id)?;
     Ok(SessionTimelineDto {
         session: metadata_to_dto(&record.metadata, record.events.len()),
-        items: timeline_items(&record),
+        items: timeline_items(&store, &record),
     })
 }
 
@@ -105,8 +106,13 @@ fn find_repo_root(path: &Path) -> Option<PathBuf> {
 }
 
 fn load_session_record(session_id: &str) -> Result<SessionRecord> {
+    let store = session_store()?;
+    load_session_record_from_store(&store, session_id)
+}
+
+fn load_session_record_from_store(store: &SessionStore, session_id: &str) -> Result<SessionRecord> {
     let id = Uuid::parse_str(session_id).context("invalid session id")?;
-    session_store()?.load_session(id)
+    store.load_session(id)
 }
 
 fn normalize_session_path(path: &Path) -> String {
@@ -129,6 +135,7 @@ fn summary_to_dto(summary: &SessionSummary) -> SessionListItemDto {
         id: summary.id.to_string(),
         title: session_title(summary),
         display_name: summary.display_name.clone(),
+        generated_title: summary.generated_title.clone(),
         cwd: normalize_session_path(&summary.cwd),
         created_at_ms: summary.created_at_ms,
         updated_at_ms: summary.updated_at_ms,
@@ -146,9 +153,11 @@ fn metadata_to_dto(metadata: &SessionMetadata, event_count: usize) -> SessionLis
         title: metadata
             .display_name
             .clone()
+            .or(metadata.generated_title.clone())
             .or(metadata.slug.clone())
             .unwrap_or_else(|| metadata.id.to_string()),
         display_name: metadata.display_name.clone(),
+        generated_title: metadata.generated_title.clone(),
         cwd: normalize_session_path(&metadata.cwd),
         created_at_ms: metadata.created_at_ms,
         updated_at_ms: metadata.updated_at_ms,
@@ -164,6 +173,7 @@ fn session_title(summary: &SessionSummary) -> String {
     summary
         .display_name
         .clone()
+        .or(summary.generated_title.clone())
         .or(summary.slug.clone())
         .unwrap_or_else(|| summary.id.to_string())
 }
@@ -195,27 +205,76 @@ fn snapshot_to_dto(snapshot: &GitDiffSnapshot) -> DiffSnapshotDto {
     }
 }
 
-fn timeline_items(record: &SessionRecord) -> Vec<TimelineItemDto> {
-    record
-        .events
-        .iter()
-        .enumerate()
-        .filter_map(|(index, event)| timeline_item(index, event))
-        .collect()
+fn timeline_items(store: &SessionStore, record: &SessionRecord) -> Vec<TimelineItemDto> {
+    let mut items = Vec::new();
+    let mut pending_assistant = None;
+    for (index, event) in record.events.iter().enumerate() {
+        match event {
+            TranscriptEvent::AssistantMessage { text, actor } => {
+                flush_pending_assistant(&mut items, &mut pending_assistant);
+                pending_assistant = Some(TimelineItemDto::AssistantMessage {
+                    id: format!("event-{index}"),
+                    text: text.clone(),
+                    actor: actor.clone(),
+                });
+            }
+            TranscriptEvent::SystemMessage { text, .. } if parse_tool_message(text).is_some() => {
+                if let Some(item) = timeline_item(store, record.metadata.id, index, event) {
+                    items.push(item);
+                }
+            }
+            TranscriptEvent::ToolInvocation { .. } => {
+                if let Some(item) = timeline_item(store, record.metadata.id, index, event) {
+                    items.push(item);
+                }
+            }
+            _ => {
+                flush_pending_assistant(&mut items, &mut pending_assistant);
+                if let Some(item) = timeline_item(store, record.metadata.id, index, event) {
+                    items.push(item);
+                }
+            }
+        }
+    }
+    flush_pending_assistant(&mut items, &mut pending_assistant);
+    items
 }
 
-fn timeline_item(index: usize, event: &TranscriptEvent) -> Option<TimelineItemDto> {
+fn flush_pending_assistant(
+    items: &mut Vec<TimelineItemDto>,
+    pending_assistant: &mut Option<TimelineItemDto>,
+) {
+    if let Some(item) = pending_assistant.take() {
+        items.push(item);
+    }
+}
+
+fn timeline_item(
+    store: &SessionStore,
+    session_id: Uuid,
+    index: usize,
+    event: &TranscriptEvent,
+) -> Option<TimelineItemDto> {
     let id = format!("event-{index}");
     match event {
-        TranscriptEvent::UserMessage { text } => Some(TimelineItemDto::UserMessage {
+        TranscriptEvent::UserMessage {
+            text,
+            attachments,
+            actor,
+        } => Some(TimelineItemDto::UserMessage {
             id,
             text: text.clone(),
+            attachments: attachment_dtos(store, session_id, attachments),
+            actor: actor.clone(),
         }),
-        TranscriptEvent::AssistantMessage { text } => Some(TimelineItemDto::AssistantMessage {
-            id,
-            text: text.clone(),
-        }),
-        TranscriptEvent::SystemMessage { text } => {
+        TranscriptEvent::AssistantMessage { text, actor } => {
+            Some(TimelineItemDto::AssistantMessage {
+                id,
+                text: text.clone(),
+                actor: actor.clone(),
+            })
+        }
+        TranscriptEvent::SystemMessage { text, actor } => {
             if let Some(tool) = parse_tool_message(text) {
                 Some(TimelineItemDto::ToolCall {
                     id,
@@ -225,19 +284,49 @@ fn timeline_item(index: usize, event: &TranscriptEvent) -> Option<TimelineItemDt
                     input_json: tool.input_json,
                     output_text: tool.output_text.clone(),
                     permission_dialog: permission_dialog(&tool.output_text),
+                    actor: actor.clone(),
+                    subject: None,
                 })
             } else {
                 Some(TimelineItemDto::SystemMessage {
                     id,
                     text: text.clone(),
+                    actor: actor.clone(),
                 })
             }
         }
-        TranscriptEvent::CommandInvoked { name, args } => Some(TimelineItemDto::CommandInvoked {
-            id,
-            name: name.clone(),
-            args: args.clone(),
+        TranscriptEvent::ToolInvocation {
+            call_id,
+            tool_id,
+            input,
+            output,
+            success,
+            metadata: _,
+            actor,
+            subject,
+        } => Some(TimelineItemDto::ToolCall {
+            id: format!("{id}-{call_id}"),
+            tool_id: tool_id.clone(),
+            status: if *success {
+                "success".to_string()
+            } else {
+                "error".to_string()
+            },
+            input_text: input.clone(),
+            input_json: serde_json::from_str(input).ok(),
+            output_text: output.clone(),
+            permission_dialog: permission_dialog(output),
+            actor: actor.clone(),
+            subject: subject.clone(),
         }),
+        TranscriptEvent::CommandInvoked { name, args, actor } => {
+            Some(TimelineItemDto::CommandInvoked {
+                id,
+                name: name.clone(),
+                args: args.clone(),
+                actor: actor.clone(),
+            })
+        }
         TranscriptEvent::SessionRenamed { name } => Some(TimelineItemDto::SessionRenamed {
             id,
             name: name.clone(),
@@ -269,8 +358,19 @@ fn timeline_item(index: usize, event: &TranscriptEvent) -> Option<TimelineItemDt
             statusline_enabled: *statusline_enabled,
             working_dirs: working_dirs.clone(),
         }),
-        TranscriptEvent::TranscriptRewritten { .. } => None,
+        TranscriptEvent::TurnBoundary { .. } | TranscriptEvent::TranscriptRewritten { .. } => None,
     }
+}
+
+fn attachment_dtos(
+    store: &SessionStore,
+    session_id: Uuid,
+    attachments: &[puffer_session_store::StoredAttachment],
+) -> Vec<ChatAttachmentDto> {
+    attachments
+        .iter()
+        .map(|attachment| ChatAttachmentDto::from_stored(store, session_id, attachment))
+        .collect()
 }
 
 struct ParsedToolMessage {
@@ -328,7 +428,7 @@ mod tests {
     #[test]
     fn parses_tool_messages_with_permission_output() {
         let parsed = parse_tool_message(
-            "Tool Bash [error]\ninput: {\"command\":\"git push\"}\nPermission required: shell command matches sandbox exclusion `git push`",
+            "Tool Bash [error]\ninput: {\"command\":\"git push\"}\nPermission required: shell command matches project shell exclusion `git push`",
         )
         .unwrap();
         let dialog = permission_dialog(&parsed.output_text).unwrap();

@@ -1,4 +1,8 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
+use std::fmt;
+use uuid::Uuid;
 
 /// Describes one append-only transcript rewrite operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,8 +35,126 @@ pub struct GitDiffSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ClaudeReadSnapshotEvent {
     pub path: String,
+    #[serde(
+        serialize_with = "serialize_json_u128",
+        deserialize_with = "deserialize_json_u128"
+    )]
     pub timestamp_ms: u128,
     pub is_partial_view: bool,
+}
+
+fn serialize_json_u128<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if let Ok(number) = u64::try_from(*value) {
+        serializer.serialize_u64(number)
+    } else {
+        serializer.serialize_str(&value.to_string())
+    }
+}
+
+fn deserialize_json_u128<'de, D>(deserializer: D) -> Result<u128, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct JsonU128Visitor;
+
+    impl<'de> Visitor<'de> for JsonU128Visitor {
+        type Value = u128;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a non-negative integer as a JSON number or decimal string")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(u128::from(value))
+        }
+
+        fn visit_u128<E>(self, value: u128) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            u128::try_from(value).map_err(|_| E::custom("timestamp_ms must not be negative"))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            value.parse::<u128>().map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_any(JsonU128Visitor)
+}
+
+/// Identifies the actor that produced or owns a transcript message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageActor {
+    pub kind: MessageActorKind,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<Uuid>,
+}
+
+/// Coarse category for a transcript actor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageActorKind {
+    User,
+    Assistant,
+    Agent,
+    Subagent,
+    TeamLead,
+    System,
+    Runtime,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Stored kind for a chat attachment referenced by a transcript user message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StoredAttachmentKind {
+    /// Image attachment that can be previewed when the backing file exists.
+    Image,
+    /// Non-image file attachment shown as metadata in chat.
+    File,
+}
+
+/// Durable metadata for a staged chat attachment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredAttachment {
+    /// Stable attachment id scoped to one session.
+    pub id: String,
+    /// Display name shown in chat and prompt fallback text.
+    pub name: String,
+    /// MIME type recorded when the file was staged.
+    pub mime_type: String,
+    /// Byte length recorded when the file was staged.
+    pub size: u64,
+    /// Uppercase file extension used by attachment cards.
+    pub extension: String,
+    /// Attachment rendering and preview category.
+    pub kind: StoredAttachmentKind,
+    /// Session-store-relative key used to locate the stored file.
+    pub storage_key: String,
 }
 
 /// Stores a transcript event in append-only session history.
@@ -41,12 +163,20 @@ pub struct ClaudeReadSnapshotEvent {
 pub enum TranscriptEvent {
     UserMessage {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<StoredAttachment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageActor>,
     },
     AssistantMessage {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageActor>,
     },
     SystemMessage {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageActor>,
     },
     /// Structured tool invocation — preserves call_id, tool name, input/output
     /// so the Responses API can reconstruct FunctionCall/FunctionCallOutput
@@ -57,10 +187,18 @@ pub enum TranscriptEvent {
         input: String,
         output: String,
         success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageActor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<MessageActor>,
     },
     CommandInvoked {
         name: String,
         args: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageActor>,
     },
     SessionRenamed {
         name: String,
@@ -68,10 +206,20 @@ pub enum TranscriptEvent {
     GitDiffSnapshot {
         snapshot: GitDiffSnapshot,
     },
+    TurnBoundary {
+        turn_id: String,
+        state: TurnBoundaryState,
+    },
     TranscriptRewritten {
         #[serde(flatten)]
         rewrite: TranscriptRewrite,
     },
+    /// Stores a persisted UI/runtime snapshot for session resume.
+    ///
+    /// This is not a full `AppState` dump. Session permissions are serialized
+    /// here only through a legacy-compatible projection so resume can restore
+    /// the subset of grants representable as session-wide allow-all plus
+    /// whole-tool approvals.
     StateSnapshot {
         current_model: Option<String>,
         current_provider: Option<String>,
@@ -106,5 +254,223 @@ pub enum TranscriptEvent {
         working_dirs: Vec<String>,
         #[serde(default)]
         claude_read_state: Vec<ClaudeReadSnapshotEvent>,
+        #[serde(default)]
+        session_allow_all: bool,
+        #[serde(default)]
+        session_tool_permissions: std::collections::HashMap<String, String>,
     },
+}
+
+/// Marks the beginning or end of a provider turn in the append-only log.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnBoundaryState {
+    Started,
+    Finished,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ClaudeReadSnapshotEvent, MessageActor, MessageActorKind, StoredAttachment,
+        StoredAttachmentKind, TranscriptEvent,
+    };
+
+    #[test]
+    fn user_message_without_actor_deserializes_for_old_sessions() {
+        let event: TranscriptEvent =
+            serde_json::from_str(r#"{"type":"user_message","text":"hello"}"#).unwrap();
+        assert_eq!(
+            event,
+            TranscriptEvent::UserMessage {
+                text: "hello".to_string(),
+                attachments: Vec::new(),
+                actor: None,
+            }
+        );
+    }
+
+    #[test]
+    fn user_message_serializes_stored_attachments() {
+        let event = TranscriptEvent::UserMessage {
+            text: "inspect this".to_string(),
+            attachments: vec![StoredAttachment {
+                id: "att-1".to_string(),
+                name: "diagram.png".to_string(),
+                mime_type: "image/png".to_string(),
+                size: 68,
+                extension: "PNG".to_string(),
+                kind: StoredAttachmentKind::Image,
+                storage_key: "att-1/original".to_string(),
+            }],
+            actor: None,
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "user_message");
+        assert_eq!(value["attachments"][0]["id"], "att-1");
+        assert_eq!(value["attachments"][0]["kind"], "image");
+        assert_eq!(value["attachments"][0]["storage_key"], "att-1/original");
+    }
+
+    #[test]
+    fn changed_variants_without_actor_deserialize_for_old_sessions() {
+        let assistant: TranscriptEvent =
+            serde_json::from_str(r#"{"type":"assistant_message","text":"hello"}"#).unwrap();
+        assert_eq!(
+            assistant,
+            TranscriptEvent::AssistantMessage {
+                text: "hello".to_string(),
+                actor: None,
+            }
+        );
+
+        let system: TranscriptEvent =
+            serde_json::from_str(r#"{"type":"system_message","text":"note"}"#).unwrap();
+        assert_eq!(
+            system,
+            TranscriptEvent::SystemMessage {
+                text: "note".to_string(),
+                actor: None,
+            }
+        );
+
+        let tool: TranscriptEvent = serde_json::from_str(
+            r#"{"type":"tool_invocation","call_id":"call-1","tool_id":"Read","input":"{}","output":"ok","success":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            tool,
+            TranscriptEvent::ToolInvocation {
+                call_id: "call-1".to_string(),
+                tool_id: "Read".to_string(),
+                input: "{}".to_string(),
+                output: "ok".to_string(),
+                success: true,
+                metadata: None,
+                actor: None,
+                subject: None,
+            }
+        );
+
+        let command: TranscriptEvent =
+            serde_json::from_str(r#"{"type":"command_invoked","name":"help","args":""}"#).unwrap();
+        assert_eq!(
+            command,
+            TranscriptEvent::CommandInvoked {
+                name: "help".to_string(),
+                args: String::new(),
+                actor: None,
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_actor_kind_deserializes_for_future_compatibility() {
+        let event: TranscriptEvent = serde_json::from_str(
+            r#"{"type":"assistant_message","text":"hello","actor":{"kind":"external_agent","id":"agent-x"}}"#,
+        )
+        .unwrap();
+        let TranscriptEvent::AssistantMessage {
+            actor: Some(actor), ..
+        } = event
+        else {
+            panic!("expected assistant message with actor");
+        };
+        assert_eq!(actor.kind, MessageActorKind::Unknown);
+        assert_eq!(actor.id, "agent-x");
+    }
+
+    #[test]
+    fn message_actor_round_trips_on_tool_invocation() {
+        let actor = MessageActor {
+            kind: MessageActorKind::Subagent,
+            id: "agent-1".to_string(),
+            agent_id: Some("agent-1".to_string()),
+            agent_type: Some("reviewer".to_string()),
+            name: Some("Reviewer".to_string()),
+            team_name: Some("team".to_string()),
+            session_id: None,
+            parent_session_id: None,
+        };
+        let event = TranscriptEvent::ToolInvocation {
+            call_id: "call-1".to_string(),
+            tool_id: "Read".to_string(),
+            input: "{}".to_string(),
+            output: "ok".to_string(),
+            success: true,
+            metadata: None,
+            actor: Some(actor),
+            subject: None,
+        };
+
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(encoded.contains(r#""agentId":"agent-1""#));
+        let decoded: TranscriptEvent = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn tool_invocation_metadata_round_trips() {
+        let event = TranscriptEvent::ToolInvocation {
+            call_id: "call-1".to_string(),
+            tool_id: "ToolSearch".to_string(),
+            input: r#"{"query":"skills"}"#.to_string(),
+            output: "ok".to_string(),
+            success: true,
+            metadata: Some(serde_json::json!({
+                "lambda_skill": {
+                    "event": "host_call_committed",
+                    "host_tool": "formal_search"
+                }
+            })),
+            actor: None,
+            subject: None,
+        };
+
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(encoded.contains(r#""metadata""#));
+        let decoded: TranscriptEvent = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn state_snapshot_claude_read_timestamp_is_json_compatible() {
+        let raw = concat!(
+            r#"{"type":"state_snapshot","current_model":null,"current_provider":"anthropic","#,
+            r#""theme":"puffer","prompt_color":"default","effort_level":"auto","#,
+            r#""fast_mode":false,"sandbox_mode":"workspace-write","remote_name":null,"#,
+            r#""remote_environment":null,"statusline_enabled":true,"working_dirs":[],"#,
+            r#""claude_read_state":[{"path":"src/lib.rs","timestamp_ms":1780032433023,"#,
+            r#""is_partial_view":false}]}"#
+        );
+        let event: TranscriptEvent = serde_json::from_str(raw).unwrap();
+        let TranscriptEvent::StateSnapshot {
+            claude_read_state, ..
+        } = &event
+        else {
+            panic!("expected state snapshot");
+        };
+        assert_eq!(claude_read_state[0].timestamp_ms, 1_780_032_433_023);
+
+        let encoded = serde_json::to_string(&event).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            value["claude_read_state"][0]["timestamp_ms"],
+            serde_json::json!(1_780_032_433_023u64)
+        );
+    }
+
+    #[test]
+    fn claude_read_timestamp_supports_large_decimal_strings() {
+        let raw = format!(
+            r#"{{"path":"src/lib.rs","timestamp_ms":"{}","is_partial_view":true}}"#,
+            u128::MAX
+        );
+        let event: ClaudeReadSnapshotEvent = serde_json::from_str(&raw).unwrap();
+        assert_eq!(event.timestamp_ms, u128::MAX);
+
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(encoded.contains(&format!(r#""timestamp_ms":"{}""#, u128::MAX)));
+    }
 }

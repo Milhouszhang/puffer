@@ -1,10 +1,22 @@
+mod attachments;
 mod events;
 mod metadata;
 mod store;
 
+pub use attachments::{AttachmentPreviewBytes, AttachmentState, StageAttachmentInput};
 pub use events::ClaudeReadSnapshotEvent;
 pub use events::GitDiffSnapshot;
+pub use events::MessageActor;
+pub use events::MessageActorKind;
+pub use events::StoredAttachment;
+pub use events::StoredAttachmentKind;
 pub use events::TranscriptEvent;
 pub use events::TranscriptRewrite;
+pub use events::TurnBoundaryState;
 pub use metadata::{SessionMetadata, SessionRecord, SessionSummary};
-pub use store::SessionStore;
+pub use store::{SessionListPage, SessionStore, BACKGROUND_SESSION_TAG};
+
+/// Trace-name tag used by the reflection runtime for the per-session sidecar
+/// JSONL file (`{session-id}.runtime_trace.jsonl`). Kept as a shared constant
+/// so every producer/consumer references the same string.
+pub const TRACE_RUNTIME: &str = "runtime_trace";

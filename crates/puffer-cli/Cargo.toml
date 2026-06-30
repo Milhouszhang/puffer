@@ -10,23 +10,93 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+tracing.workspace = true
 clap.workspace = true
 indexmap.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+sha2.workspace = true
+time.workspace = true
 toml.workspace = true
 uuid.workspace = true
 url = "2.5.7"
 puffer-config = { path = "../puffer-config" }
 puffer-core = { path = "../puffer-core" }
+puffer-logging = { path = "../puffer-logging" }
+puffer-media = { path = "../puffer-media" }
+puffer-mcp-oauth = { path = "../puffer-mcp-oauth" }
+puffer-observability = { path = "../puffer-observability" }
 puffer-provider-openai = { path = "../puffer-provider-openai" }
 puffer-provider-registry = { path = "../puffer-provider-registry" }
 puffer-resources = { path = "../puffer-resources" }
+puffer-runner-api = { path = "../puffer-runner-api" }
+puffer-runner-grpc = { path = "../puffer-runner-grpc" }
+puffer-runner-local = { path = "../puffer-runner-local" }
 puffer-session-store = { path = "../puffer-session-store" }
+puffer-secrets = { path = "../puffer-secrets" }
+puffer-slack = { path = "../puffer-slack" }
+puffer-subscriber-email = { path = "../puffer-subscriber-email" }
+puffer-subscriber-runtime = { path = "../puffer-subscriber-runtime" }
+puffer-subscriber-telegram-user = { path = "../puffer-subscriber-telegram-user" }
+puffer-subscriptions = { path = "../puffer-subscriptions" }
 puffer-transport-anthropic = { path = "../puffer-transport-anthropic" }
 puffer-tools = { path = "../puffer-tools" }
 puffer-tui = { path = "../puffer-tui" }
+puffer-workflow = { path = "../puffer-workflow" }
+reqwest.workspace = true
+regex.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "process", "io-util", "io-std"] }
+tungstenite.workspace = true
+webbrowser = "1.0"
+
+# Daemon subcommand dependencies — WebSocket server + tower-layered HTTP
+axum = { version = "0.7", features = ["ws"] }
+futures = "0.3"
+fslock.workspace = true
+grammers-session = "0.7"
+rand = "0.8"
+tokio-util = { version = "0.7", features = ["io"] }
+tower = "0.5"
+
+# Connector support (opt-in per platform). The `serve` subcommand is
+# compiled in unconditionally, but each platform connector is gated
+# behind its own feature so users don't pay for SDK bloat they don't
+# want. Enable `connectors-all` to get the full set.
+puffer-connector-core = { path = "../puffer-connector-core" }
+puffer-connector-telegram = { path = "../puffer-connector-telegram", optional = true }
+puffer-connector-discord = { path = "../puffer-connector-discord", optional = true }
+puffer-connector-slack = { path = "../puffer-connector-slack", optional = true }
+puffer-connector-matrix = { path = "../puffer-connector-matrix", optional = true }
+puffer-connector-email = { path = "../puffer-connector-email", optional = true }
+ctrlc = "3"
+
+# PTY-backed user terminal tab. `portable-pty` spawns a real shell in the
+# session cwd and lets us fan the output onto the daemon event bus; base64
+# keeps the NDJSON frames ASCII-safe regardless of shell output.
+portable-pty = "0.8"
+base64 = { workspace = true }
+
+# Filesystem watcher — backs the Files pane's auto-refresh. `notify` picks the
+# best native backend per OS (FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW
+# on Windows); we stick to the 6.x line for its simple synchronous callback API.
+notify = "6"
+
+[features]
+default = []
+connector-telegram = ["dep:puffer-connector-telegram"]
+connector-discord = ["dep:puffer-connector-discord"]
+connector-slack = ["dep:puffer-connector-slack"]
+connector-matrix = ["dep:puffer-connector-matrix"]
+connector-email = ["dep:puffer-connector-email"]
+connectors-all = [
+    "connector-telegram",
+    "connector-discord",
+    "connector-slack",
+    "connector-matrix",
+    "connector-email",
+]
 
 [dev-dependencies]
 puffer-config = { path = "../puffer-config" }

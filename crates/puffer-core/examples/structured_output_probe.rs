@@ -13,7 +13,8 @@ fn main() -> Result<()> {
     let config = load_config(&paths)?;
     let auth_path = paths.user_config_dir.join("auth.json");
     let mut auth_store = puffer_provider_registry::AuthStore::load(&auth_path)?;
-    let mut resources = load_resources(&paths)?;
+    let mut resources =
+        load_resources(&paths, &puffer_core::runner_adapter::LocalToolRunner::new())?;
 
     let mut providers = ProviderRegistry::new();
     for provider in &resources.providers {
@@ -75,6 +76,7 @@ fn main() -> Result<()> {
     let session = SessionMetadata {
         id: Uuid::new_v4(),
         display_name: Some("structured-output-probe".to_string()),
+        generated_title: None,
         cwd: cwd.clone(),
         created_at_ms: 0,
         updated_at_ms: 0,

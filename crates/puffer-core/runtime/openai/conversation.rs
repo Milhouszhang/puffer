@@ -114,9 +114,51 @@ pub enum ConversationItem {
         call_id: String,
         output: ToolOutputPayload,
     },
+    /// Assistant reasoning chain returned by the Responses API when `include`
+    /// contains `reasoning.encryptedcontent`, or by the Anthropic Messages
+    /// API as a `thinking` / `redacted_thinking` content block. Aligned
+    /// with Codex `ResponseItem::Reasoning`. Carrying this across turns
+    /// lets the model resume its prior thought process instead of
+    /// re-thinking from scratch, which is essential for multi-turn tool
+    /// loops with high reasoning effort.
+    Reasoning {
+        /// Summary blocks echoed back verbatim to the server.
+        #[serde(default)]
+        summary: Vec<ReasoningSummary>,
+        /// Opaque encrypted thinking chain — provider-specific blob.
+        /// On the Anthropic path this stores the `signature` for
+        /// regular `thinking` blocks, OR the `data` payload for
+        /// `redacted_thinking` blocks (depending on `redacted`). On the
+        /// OpenAI Responses path this is the `encrypted_content` field
+        /// surfaced via `include: ["reasoning.encryptedcontent"]`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+        /// Pi-mono parity: when true, the upstream returned this as a
+        /// `redacted_thinking` content block (encrypted reasoning that
+        /// was blocked from display by safety filters). The next-turn
+        /// replay must echo `{type:"redacted_thinking", data}` instead
+        /// of `{type:"thinking", thinking, signature}` — emitting a
+        /// regular thinking block with the redacted opaque payload as
+        /// `signature` would fail upstream signature verification. See
+        /// `pi-mono/packages/ai/src/providers/anthropic.ts:511,1015`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        redacted: bool,
+    },
     /// Compaction marker — replaces summarized older messages.
     /// Aligned with Codex `Compaction { encrypted_content }`.
     Compaction { summary: String },
+}
+
+/// A reasoning summary block. Aligned with Codex `ReasoningItemReasoningSummary`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReasoningSummary {
+    SummaryText { text: String },
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ConversationItem {
@@ -186,6 +228,23 @@ impl ConversationItem {
                 arguments, name, ..
             } => estimate_text_tokens(name) + estimate_text_tokens(arguments),
             Self::FunctionCallOutput { output, .. } => estimate_text_tokens(&output.text),
+            Self::Reasoning {
+                summary,
+                encrypted_content,
+                redacted: _,
+            } => {
+                let summary_tokens: usize = summary
+                    .iter()
+                    .map(|s| match s {
+                        ReasoningSummary::SummaryText { text } => estimate_text_tokens(text),
+                    })
+                    .sum();
+                let encrypted_tokens = encrypted_content
+                    .as_ref()
+                    .map(|s| estimate_text_tokens(s))
+                    .unwrap_or(0);
+                summary_tokens + encrypted_tokens
+            }
             Self::Compaction { summary } => estimate_text_tokens(summary),
         }
     }
@@ -270,7 +329,24 @@ pub(crate) fn transcript_to_items(state: &AppState, input: &str) -> Vec<Conversa
         .transcript
         .iter()
         .flat_map(|message| match message.role {
-            crate::MessageRole::User => vec![ConversationItem::user_message(&message.text)],
+            crate::MessageRole::User => {
+                let mut content = vec![ContentPart::Text {
+                    text: message.text.clone(),
+                }];
+                for attachment in &message.attachments {
+                    if attachment.attachment.kind
+                        == puffer_session_store::StoredAttachmentKind::Image
+                    {
+                        if let Some(url) = attachment.model_url.as_ref() {
+                            content.push(ContentPart::Image { url: url.clone() });
+                        }
+                    }
+                }
+                vec![ConversationItem::Message {
+                    role: "user".to_string(),
+                    content,
+                }]
+            }
             crate::MessageRole::Assistant => {
                 vec![ConversationItem::assistant_message(&message.text)]
             }
@@ -299,11 +375,83 @@ pub(crate) fn transcript_to_items(state: &AppState, input: &str) -> Vec<Conversa
         })
         .collect();
 
-    // Always append the current user input.
-    if items.is_empty() || !input.trim().is_empty() {
-        items.push(ConversationItem::user_message(input));
+    // Append the current user input unless the transcript already ends with it
+    // (callers like command.rs and flow.rs push the user message to the
+    // transcript *before* calling execute, so it would be double-counted).
+    if !input.trim().is_empty() {
+        let already_present = matches!(
+            items.last(),
+            Some(ConversationItem::Message { role, content })
+                if role == "user"
+                    && matches!(
+                        content.first(),
+                        Some(ContentPart::Text { text }) if text == input
+                    )
+        );
+        if !already_present {
+            items.push(ConversationItem::user_message(input));
+        }
     }
     items
+}
+
+/// Converts a raw reasoning output item (as returned by the Responses API
+/// `response.output_item.done` event or the non-streaming response body)
+/// into a `ConversationItem::Reasoning`. Returns `None` if the item is not
+/// a reasoning item or has no useful payload.
+///
+/// Aligned with Codex: the server may include either `summary` items,
+/// `encrypted_content`, or both. We preserve whichever is present so the
+/// next turn's request can replay them verbatim.
+pub(crate) fn reasoning_item_from_value(item: &Value) -> Option<ConversationItem> {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return None;
+    }
+    let summary: Vec<ReasoningSummary> = item
+        .get("summary")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    if s.get("type").and_then(Value::as_str) == Some("summary_text") {
+                        s.get("text").and_then(Value::as_str).map(|text| {
+                            ReasoningSummary::SummaryText {
+                                text: text.to_string(),
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let encrypted_content = item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    // Skip empty reasoning items (no summary, no encrypted content) to avoid
+    // sending useless payloads.
+    if summary.is_empty() && encrypted_content.is_none() {
+        return None;
+    }
+    Some(ConversationItem::Reasoning {
+        summary,
+        encrypted_content,
+        redacted: false,
+    })
+}
+
+/// Appends reasoning items (captured from a response) to the conversation.
+/// Call this BEFORE `append_tool_results` so reasoning items precede the
+/// function calls they preceded on the wire — matching Codex's history order.
+pub(crate) fn append_reasoning_items(items: &mut Vec<ConversationItem>, raw_items: &[Value]) {
+    for raw in raw_items {
+        if let Some(reasoning) = reasoning_item_from_value(raw) {
+            items.push(reasoning);
+        }
+    }
 }
 
 /// Appends tool call items and their outputs to the conversation.
@@ -341,25 +489,121 @@ pub(crate) fn items_to_responses_input(items: &[ConversationItem]) -> Value {
     if items.is_empty() {
         return Value::Array(Vec::new());
     }
-    Value::Array(items.iter().map(item_to_responses_value).collect())
+    Value::Array(
+        drop_transient_system_messages(items)
+            .into_iter()
+            .map(item_to_responses_value)
+            .collect(),
+    )
+}
+
+pub(crate) fn managed_system_prompt_1_from_env() -> Option<String> {
+    std::env::var("PUFFER_SYSTEM_PROMPT_1")
+        .ok()
+        .map(|prompt| prompt.trim().to_string())
+        .filter(|prompt| !prompt.is_empty())
+}
+
+pub(crate) fn append_managed_system_prompt_1_to_instructions(
+    instructions: &mut String,
+    prompt: Option<&str>,
+) {
+    if let Some(prompt) = prompt.map(str::trim).filter(|prompt| !prompt.is_empty()) {
+        if !instructions.trim().is_empty() {
+            instructions.push_str("\n\n");
+        }
+        instructions.push_str(prompt);
+    }
+}
+
+pub(crate) fn insert_managed_system_prompt_1(
+    items: &mut Vec<ConversationItem>,
+    prompt: Option<&str>,
+) {
+    if let Some(prompt) = prompt.map(str::trim).filter(|prompt| !prompt.is_empty()) {
+        items.insert(0, ConversationItem::system_message(prompt));
+    }
+}
+
+/// Inserts the per-turn synthetic context reminder at the right position
+/// in `items`: after any leading run of `role:"system"` items, so the
+/// boundary filter's first-position exemption keeps preserving the
+/// sub-agent identity prompt that `agents.rs:319` pushes at transcript[0].
+///
+/// **TODO(phase3): delete this helper and revert call sites to
+/// `items.insert(0, …)` once sub-agent identity moves into top-level
+/// `Prompt::base_instructions` (codex parity). At that point no
+/// legitimate `role:"system"` exists in transcript, so no leading-system
+/// run to navigate around.**
+///
+/// Naive `items.insert(0, …)` would push the identity to position 1,
+/// past the exemption, and `drop_transient_system_messages()` would then
+/// strip it. Inserting after the leading system run keeps both the
+/// reminder and the identity in their right slots.
+pub(crate) fn insert_context_reminder_preserving_legacy_leading_system(
+    items: &mut Vec<ConversationItem>,
+    reminder_text: &str,
+) {
+    let insert_pos = items
+        .iter()
+        .take_while(
+            |item| matches!(item, ConversationItem::Message { role, .. } if role == "system"),
+        )
+        .count();
+    items.insert(insert_pos, ConversationItem::user_message(reminder_text));
+}
+
+/// Strips transient `role:"system"` items that appear after the first
+/// non-system item — these are local UI notifications (slash command
+/// output, "Provider request failed: ...", "Interrupted by user.")
+/// that leaked into the transcript via `emit_system_message` and have
+/// no business reaching the model.
+///
+/// Items at the head of the list are preserved so legitimate system
+/// content (e.g. a sub-agent identity prompt pushed by `agents.rs:321`)
+/// still reaches the wire — until we move that to top-level
+/// `instructions` in a follow-up.
+///
+/// Without this filter:
+/// - ChatGPT Codex backend (`chatgpt.com/backend-api/codex/responses`)
+///   rejects with `400` on any role:"system" inside `input`.
+/// - Permissive proxies silently merge the leaked content into the
+///   top-level `instructions`, corrupting the system prompt.
+/// - On Chat Completions, the leaked entry shows up mid-conversation
+///   which strict providers reject and lenient ones treat as a real
+///   instruction switch.
+fn drop_transient_system_messages(items: &[ConversationItem]) -> Vec<&ConversationItem> {
+    let mut out = Vec::with_capacity(items.len());
+    let mut seen_non_system = false;
+    for item in items {
+        let is_system = matches!(
+            item,
+            ConversationItem::Message { role, .. } if role == "system"
+        );
+        if is_system && seen_non_system {
+            continue;
+        }
+        if !is_system {
+            seen_non_system = true;
+        }
+        out.push(item);
+    }
+    out
 }
 
 fn item_to_responses_value(item: &ConversationItem) -> Value {
     match item {
         ConversationItem::Message { role, content } => {
-            let text = content_parts_to_text(content);
-            let content_block = if role == "assistant" {
-                json!([{"type": "output_text", "text": text, "annotations": []}])
-            } else if role == "system" {
-                json!(text)
+            let wire_role = if role == "system" {
+                "user"
             } else {
-                json!([{"type": "input_text", "text": text}])
+                role.as_str()
             };
 
             let mut val = json!({
                 "type": "message",
-                "role": role,
-                "content": content_block,
+                "role": wire_role,
+                "content": responses_content_value(role, content),
             });
             if role == "assistant" {
                 val["status"] = json!("completed");
@@ -381,6 +625,20 @@ fn item_to_responses_value(item: &ConversationItem) -> Value {
             "call_id": call_id,
             "output": output.text,
         }),
+        ConversationItem::Reasoning {
+            summary,
+            encrypted_content,
+            redacted: _,
+        } => {
+            let mut val = json!({
+                "type": "reasoning",
+                "summary": summary,
+            });
+            if let Some(encrypted) = encrypted_content {
+                val["encrypted_content"] = Value::String(encrypted.clone());
+            }
+            val
+        }
         ConversationItem::Compaction { summary } => {
             // Compaction markers are rendered as user messages on the wire.
             json!({
@@ -390,6 +648,33 @@ fn item_to_responses_value(item: &ConversationItem) -> Value {
             })
         }
     }
+}
+
+fn responses_content_value(role: &str, content: &[ContentPart]) -> Value {
+    let has_images = content
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image { .. }));
+    if role != "user" || !has_images {
+        let text = content_parts_to_text(content);
+        if role == "assistant" {
+            return json!([{"type": "output_text", "text": text, "annotations": []}]);
+        }
+        return json!([{"type": "input_text", "text": text}]);
+    }
+
+    let parts = content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } if !text.is_empty() => {
+                Some(json!({ "type": "input_text", "text": text }))
+            }
+            ContentPart::Image { url } if role == "user" => {
+                Some(json!({ "type": "input_image", "image_url": url }))
+            }
+            ContentPart::Text { .. } | ContentPart::Image { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    json!(parts)
 }
 
 /// Extract plain text from ContentPart array (joining Text blocks with newline).
@@ -419,6 +704,7 @@ fn content_parts_to_text(parts: &[ContentPart]) -> String {
 pub(crate) fn items_to_chat_messages(
     items: &[ConversationItem],
     system_prompt: Option<&str>,
+    managed_system_prompt_1: Option<&str>,
     plan_mode_context: Option<&str>,
     system_reminder: Option<&str>,
 ) -> Vec<OpenAIChatMessage> {
@@ -426,6 +712,9 @@ pub(crate) fn items_to_chat_messages(
 
     // System prompt as first message.
     if let Some(prompt) = system_prompt.filter(|p| !p.trim().is_empty()) {
+        messages.push(chat_message("system", prompt));
+    }
+    if let Some(prompt) = managed_system_prompt_1.filter(|p| !p.trim().is_empty()) {
         messages.push(chat_message("system", prompt));
     }
     if let Some(ctx) = plan_mode_context.filter(|c| !c.trim().is_empty()) {
@@ -438,12 +727,18 @@ pub(crate) fn items_to_chat_messages(
         messages.push(chat_message("system", reminder));
     }
 
+    // Same boundary filter as items_to_responses_input — strip transient
+    // role:"system" items emitted by `flow.rs::emit_system_message` so they
+    // don't appear mid-conversation on the wire (which strict Chat
+    // Completions providers reject).
+    let filtered: Vec<&ConversationItem> = drop_transient_system_messages(items);
+    let items_owned: Vec<ConversationItem> = filtered.into_iter().cloned().collect();
+    let items: &[ConversationItem] = &items_owned;
     let mut i = 0;
     while i < items.len() {
         match &items[i] {
             ConversationItem::Message { role, content } => {
-                let text = content_parts_to_text(content);
-                messages.push(chat_message(role, &text));
+                messages.push(chat_message_value(role, chat_content_value(role, content)));
                 i += 1;
             }
             ConversationItem::FunctionCall { .. } => {
@@ -476,6 +771,7 @@ pub(crate) fn items_to_chat_messages(
                     content: None,
                     tool_call_id: None,
                     tool_calls,
+                    reasoning_content: None,
                 });
             }
             ConversationItem::FunctionCallOutput { call_id, output } => {
@@ -484,13 +780,18 @@ pub(crate) fn items_to_chat_messages(
                     content: Some(json!(output.text)),
                     tool_call_id: Some(call_id.clone()),
                     tool_calls: Vec::new(),
+                    reasoning_content: None,
                 });
                 i += 1;
             }
+            ConversationItem::Reasoning { .. } => {
+                // Chat Completions has no concept of reasoning items on the
+                // wire — they exist only in the Responses API. Drop them here.
+                i += 1;
+            }
             ConversationItem::Compaction { summary } => {
-                let text = format!(
-                    "[Conversation compacted — prior context summarized]\n\n{summary}"
-                );
+                let text =
+                    format!("[Conversation compacted — prior context summarized]\n\n{summary}");
                 messages.push(chat_message("user", &text));
                 i += 1;
             }
@@ -506,12 +807,40 @@ pub(crate) fn items_to_chat_messages(
 }
 
 fn chat_message(role: &str, content: &str) -> OpenAIChatMessage {
+    chat_message_value(role, json!(content))
+}
+
+fn chat_message_value(role: &str, content: Value) -> OpenAIChatMessage {
     OpenAIChatMessage {
         role: role.to_string(),
-        content: Some(json!(content)),
+        content: Some(content),
         tool_call_id: None,
         tool_calls: Vec::new(),
+        reasoning_content: None,
     }
+}
+
+fn chat_content_value(role: &str, content: &[ContentPart]) -> Value {
+    let has_images = content
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image { .. }));
+    if role != "user" || !has_images {
+        return json!(content_parts_to_text(content));
+    }
+
+    let parts = content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } if !text.is_empty() => {
+                Some(json!({ "type": "text", "text": text }))
+            }
+            ContentPart::Image { url } => {
+                Some(json!({ "type": "image_url", "image_url": { "url": url } }))
+            }
+            ContentPart::Text { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    json!(parts)
 }
 
 // ---------------------------------------------------------------------------
@@ -542,8 +871,7 @@ pub(crate) fn items_to_anthropic_messages(items: &[ConversationItem]) -> Vec<Val
                     i += 1;
                     continue;
                 }
-                let text = content_parts_to_text(content);
-                push_or_merge(&mut messages, role, json!(text));
+                push_or_merge(&mut messages, role, anthropic_content_value(content));
                 i += 1;
             }
             ConversationItem::FunctionCall { .. } => {
@@ -557,8 +885,7 @@ pub(crate) fn items_to_anthropic_messages(items: &[ConversationItem]) -> Vec<Val
                         arguments,
                     } = &items[i]
                     {
-                        let input_val: Value =
-                            serde_json::from_str(arguments).unwrap_or(json!({}));
+                        let input_val: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
                         tool_uses.push(json!({
                             "type": "tool_use",
                             "id": call_id,
@@ -594,10 +921,77 @@ pub(crate) fn items_to_anthropic_messages(items: &[ConversationItem]) -> Vec<Val
                 }
                 push_or_merge(&mut messages, "user", Value::Array(tool_results));
             }
+            ConversationItem::Reasoning {
+                summary,
+                encrypted_content,
+                redacted,
+            } => {
+                // On the Anthropic path, Reasoning items carry the
+                // upstream's thinking block: `summary` holds the prose
+                // and `encrypted_content` holds the `signature` token
+                // for normal thinking blocks, or the opaque `data`
+                // payload for redacted thinking. With a signature,
+                // emit a verifiable `thinking` block so providers like
+                // `kimi-coding/k2p5` accept the next-turn replay
+                // (otherwise they reject with "reasoning_content is
+                // missing in assistant tool call message"). Without a
+                // signature (aborted stream), fall back to a plain
+                // `text` block so the model still sees its prior
+                // reasoning. Pi-mono parity:
+                // `packages/ai/src/providers/anthropic.ts:1015`.
+                if *redacted {
+                    // Redacted reasoning: re-emit the opaque data
+                    // payload as `redacted_thinking`. The upstream
+                    // expects this exact shape — emitting the data as
+                    // a regular thinking signature would fail crypto
+                    // verification.
+                    let Some(data) = encrypted_content.as_deref() else {
+                        i += 1;
+                        continue;
+                    };
+                    let block = json!({
+                        "type": "redacted_thinking",
+                        "data": data,
+                    });
+                    push_or_merge(&mut messages, "assistant", Value::Array(vec![block]));
+                    i += 1;
+                    continue;
+                }
+                let thinking_text: String = summary
+                    .iter()
+                    .map(|s| match s {
+                        ReasoningSummary::SummaryText { text } => text.as_str(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let signature_present = encrypted_content
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                let block = if signature_present {
+                    json!({
+                        "type": "thinking",
+                        "thinking": thinking_text,
+                        "signature": encrypted_content.as_deref().unwrap(),
+                    })
+                } else if !thinking_text.trim().is_empty() {
+                    // Aborted thinking — preserve content as plain text
+                    // to avoid losing chain-of-thought. Anthropic accepts
+                    // text blocks unconditionally.
+                    json!({
+                        "type": "text",
+                        "text": thinking_text,
+                    })
+                } else {
+                    i += 1;
+                    continue;
+                };
+                push_or_merge(&mut messages, "assistant", Value::Array(vec![block]));
+                i += 1;
+            }
             ConversationItem::Compaction { summary } => {
-                let text = format!(
-                    "[Conversation compacted — prior context summarized]\n\n{summary}"
-                );
+                let text =
+                    format!("[Conversation compacted — prior context summarized]\n\n{summary}");
                 push_or_merge(&mut messages, "user", json!(text));
                 i += 1;
             }
@@ -619,6 +1013,45 @@ pub(crate) fn items_to_anthropic_messages(items: &[ConversationItem]) -> Vec<Val
     }
 
     messages
+}
+
+fn anthropic_image_source_from_data_url(url: &str) -> Option<Value> {
+    let (header, data) = url.strip_prefix("data:")?.split_once(";base64,")?;
+    match header {
+        "image/jpeg" | "image/png" | "image/webp" | "image/gif" => Some(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": header,
+                "data": data,
+            }
+        })),
+        _ => None,
+    }
+}
+
+fn anthropic_content_value(content: &[ContentPart]) -> Value {
+    let has_images = content
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image { .. }));
+    if !has_images {
+        return json!(content_parts_to_text(content));
+    }
+
+    let parts = content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } if !text.is_empty() => {
+                Some(json!({ "type": "text", "text": text }))
+            }
+            ContentPart::Image { url } => Some(
+                anthropic_image_source_from_data_url(url)
+                    .expect("native image gate validates Anthropic image data URLs"),
+            ),
+            ContentPart::Text { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    json!(parts)
 }
 
 /// Pushes a content value to the message list, merging with the last message
@@ -687,6 +1120,41 @@ pub(crate) fn compact_conversation_with(
     input_tokens_hint: Option<usize>,
     summary_fn: &dyn Fn(&str, &str) -> Option<String>,
 ) -> bool {
+    compact_conversation_inner(items, provider, model_id, input_tokens_hint, summary_fn, false)
+}
+
+/// Like [`compact_conversation_with`] but ignores the context-window
+/// threshold and always attempts to shrink the transcript.
+///
+/// Reactive context-overflow recovery uses this. When an endpoint rejects
+/// a request as too large (e.g. an OpenAI-compatible proxy whose real
+/// window is smaller than the model catalog's `context_window`), the
+/// threshold-gated [`compact_conversation_with`] no-ops because the
+/// estimated token count is below the catalog-derived threshold. Forcing
+/// past the threshold shrinks the transcript so the turn can be retried.
+pub(crate) fn force_compact_conversation_with(
+    items: &mut Vec<ConversationItem>,
+    provider: &ProviderDescriptor,
+    model_id: &str,
+    summary_fn: &dyn Fn(&str, &str) -> Option<String>,
+) -> bool {
+    compact_conversation_inner(items, provider, model_id, None, summary_fn, true)
+}
+
+/// Shared implementation for threshold-gated and forced compaction.
+///
+/// When `force` is true the two context-window threshold early-returns are
+/// skipped and the Phase 3 drop loop targets an empty transcript, so a
+/// compaction always happens regardless of the catalog window. Phase 2
+/// (AI summary) is unaffected and remains the primary reducer either way.
+fn compact_conversation_inner(
+    items: &mut Vec<ConversationItem>,
+    provider: &ProviderDescriptor,
+    model_id: &str,
+    input_tokens_hint: Option<usize>,
+    summary_fn: &dyn Fn(&str, &str) -> Option<String>,
+    force: bool,
+) -> bool {
     if items.len() <= 3 {
         return false;
     }
@@ -707,7 +1175,7 @@ pub(crate) fn compact_conversation_with(
     };
 
     let current_tokens = input_tokens_hint.unwrap_or_else(|| estimate(items));
-    if current_tokens <= threshold {
+    if !force && current_tokens <= threshold {
         return false;
     }
 
@@ -731,7 +1199,7 @@ pub(crate) fn compact_conversation_with(
     } else {
         estimate(items)
     };
-    if after_snip <= threshold {
+    if !force && after_snip <= threshold {
         return false;
     }
 
@@ -756,9 +1224,13 @@ pub(crate) fn compact_conversation_with(
         }
     }
 
-    // Phase 3 (fallback): Drop oldest items with circuit breaker.
+    // Phase 3 (fallback): Drop oldest items with circuit breaker. Under
+    // `force` the catalog threshold is meaningless (the endpoint's real
+    // window is smaller), so drop toward an empty transcript instead —
+    // the circuit breaker still bounds how many we shed per pass.
+    let phase3_target = if force { 0 } else { threshold };
     let mut cycles = 0;
-    while items.len() > 3 && estimate(items) > threshold && cycles < MAX_COMPACT_CYCLES {
+    while items.len() > 3 && estimate(items) > phase3_target && cycles < MAX_COMPACT_CYCLES {
         items.remove(0);
         cycles += 1;
     }
@@ -797,22 +1269,24 @@ pub(crate) fn compact_conversation(
     input_tokens_hint: Option<usize>,
 ) -> bool {
     let summary_fn = |old_context: &str, mid: &str| {
-        generate_summary(old_context, mid, provider, request_config)
+        let _ = provider;
+        generate_openai_summary(old_context, mid, request_config)
     };
     compact_conversation_with(items, provider, model_id, input_tokens_hint, &summary_fn)
 }
 
 /// Injects a context-restoration message after compaction.
 /// Previously only applied to Responses path — now shared by both.
-pub(crate) fn inject_post_compact_context(
-    items: &mut Vec<ConversationItem>,
-    cwd: &std::path::Path,
-) {
-    let reminder = format!(
+pub(crate) fn inject_post_compact_context(items: &mut Vec<ConversationItem>, state: &AppState) {
+    let mut reminder = format!(
         "[Context restored after compaction]\nCurrent working directory: {}\n\
          Continue the task from where you left off.",
-        cwd.display()
+        state.cwd.display()
     );
+    if let Some(project_memory) = crate::memory::project_memory_skill_reminder(state) {
+        reminder.push_str("\n\n");
+        reminder.push_str(&project_memory);
+    }
     let pos = 1.min(items.len());
     items.insert(pos, ConversationItem::user_message(reminder));
 }
@@ -842,15 +1316,45 @@ fn find_valid_keep_boundary(items: &[ConversationItem], min_keep: usize) -> usiz
 // System reminder (shared — previously Responses-only)
 // ---------------------------------------------------------------------------
 
-/// Builds the system reminder text (currentDate + gitStatus).
+/// Builds the system reminder text (currentDate, currentTime, and gitStatus).
 /// Previously only injected into Responses API `instructions` field.
 /// Now available to both paths via ConversationItem pipeline.
-pub(crate) fn build_system_reminder(git_status: &str) -> String {
-    let now = time::OffsetDateTime::now_utc();
+pub(crate) fn build_system_reminder(state: &AppState, git_status: &str) -> String {
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     let date_str = format!("{}-{:02}-{:02}", now.year(), now.month() as u8, now.day());
-    let mut reminder = format!("# currentDate\nToday's date is {date_str}.");
+    let time_str = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| now.to_string());
+    let mut reminder =
+        format!("# currentDate\nToday's date is {date_str}.\n\n# currentTime\nCurrent computer time is {time_str}.");
     if !git_status.is_empty() {
         reminder.push_str(&format!("\n\n# gitStatus\n{git_status}"));
+    }
+    // Real browser-tab state from the daemon (issue #560). Without this the
+    // model's only browser signal is tool output replayed from the
+    // transcript, which still claims `connected:true` after a restart.
+    if let Some(browser_status) = state
+        .browser_status
+        .as_deref()
+        .filter(|status| !status.trim().is_empty())
+    {
+        reminder.push_str(&format!("\n\n# browserStatus\n{browser_status}"));
+    }
+    if let Some(project_memory) = crate::memory::project_memory_skill_reminder(state) {
+        reminder.push_str("\n\n");
+        reminder.push_str(&project_memory);
+    }
+    // Agent identity (soul.md) + durable user facts (user.md) ride here, in the
+    // per-turn reminder AFTER the cache breakpoint, NOT in the cached system
+    // prompt: user.md is agent-mutable, so injecting it into the system prompt
+    // would bust the prompt cache on every change.
+    if let Some(soul) = crate::runtime::system_prompt::load_soul_prompt(&state.cwd) {
+        reminder.push_str("\n\n");
+        reminder.push_str(&soul);
+    }
+    if let Some(user) = crate::runtime::system_prompt::load_user_prompt(&state.cwd) {
+        reminder.push_str("\n\n");
+        reminder.push_str(&user);
     }
     reminder
 }
@@ -865,7 +1369,7 @@ pub(crate) fn build_summary_text(items: &[ConversationItem]) -> String {
     for item in items {
         match item {
             ConversationItem::Message { role, content } => {
-                let full = content_parts_to_text(content);
+                let full = content_parts_summary_text(content);
                 let preview: String = full.chars().take(500).collect();
                 text.push_str(&format!("[{role}]: {preview}\n\n"));
             }
@@ -879,6 +1383,9 @@ pub(crate) fn build_summary_text(items: &[ConversationItem]) -> String {
                 let preview: String = output.text.chars().take(300).collect();
                 text.push_str(&format!("[tool_result]: {preview}\n\n"));
             }
+            ConversationItem::Reasoning { .. } => {
+                // Opaque to summarization — skip.
+            }
             ConversationItem::Compaction { summary } => {
                 let preview: String = summary.chars().take(300).collect();
                 text.push_str(&format!("[compaction]: {preview}\n\n"));
@@ -888,11 +1395,31 @@ pub(crate) fn build_summary_text(items: &[ConversationItem]) -> String {
     text
 }
 
+fn content_parts_summary_text(content: &[ContentPart]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } if !text.is_empty() => Some(text.clone()),
+            ContentPart::Image { url } => Some(image_summary_marker(url)),
+            ContentPart::Text { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn image_summary_marker(url: &str) -> String {
+    let media_type = url
+        .strip_prefix("data:")
+        .and_then(|value| value.split_once(";base64,"))
+        .map(|(media_type, _)| media_type)
+        .unwrap_or("image");
+    format!("[image attachment: {media_type}]")
+}
+
 /// Generates an AI summary of old context via the Responses API.
-fn generate_summary(
+pub(crate) fn generate_openai_summary(
     old_context: &str,
     model_id: &str,
-    _provider: &ProviderDescriptor,
     request_config: &OpenAIRequestConfig,
 ) -> Option<String> {
     use puffer_provider_openai::OpenAIAuth;
@@ -984,6 +1511,7 @@ mod tests {
         let meta = SessionMetadata {
             id: uuid::Uuid::new_v4(),
             display_name: Some("test".to_string()),
+            generated_title: None,
             cwd: PathBuf::from("/tmp"),
             created_at_ms: 0,
             updated_at_ms: 0,
@@ -993,6 +1521,128 @@ mod tests {
             note: None,
         };
         AppState::new(PufferConfig::default(), PathBuf::from("/tmp"), meta)
+    }
+
+    fn image_item() -> ConversationItem {
+        ConversationItem::Message {
+            role: "user".to_string(),
+            content: vec![
+                ContentPart::Text {
+                    text: "read it".to_string(),
+                },
+                ContentPart::Image {
+                    url: "data:image/png;base64,AQID".to_string(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn native_image_transcript_to_items_emits_image_parts() {
+        let mut state = crate::runtime::tests::state();
+        let attachment = puffer_session_store::StoredAttachment {
+            id: "11111111-1111-1111-1111-111111111111".to_string(),
+            name: "pixel.png".to_string(),
+            mime_type: "image/png".to_string(),
+            size: 3,
+            extension: "PNG".to_string(),
+            kind: puffer_session_store::StoredAttachmentKind::Image,
+            storage_key: "11111111-1111-1111-1111-111111111111/original".to_string(),
+        };
+        state.push_user_message_with_attachments(
+            "read it",
+            vec![crate::RenderedAttachment::from_stored(attachment)
+                .with_model_url("data:image/png;base64,AQID".to_string())],
+        );
+
+        let items = transcript_to_items(&state, "read it");
+
+        let ConversationItem::Message { content, .. } = &items[0] else {
+            panic!("expected user message");
+        };
+        assert!(matches!(content[0], ContentPart::Text { .. }));
+        assert_eq!(
+            content[1],
+            ContentPart::Image {
+                url: "data:image/png;base64,AQID".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn native_image_transcript_to_items_deduplicates_current_input_with_image_parts() {
+        let mut state = crate::runtime::tests::state();
+        let attachment = puffer_session_store::StoredAttachment {
+            id: "11111111-1111-1111-1111-111111111111".to_string(),
+            name: "pixel.png".to_string(),
+            mime_type: "image/png".to_string(),
+            size: 3,
+            extension: "PNG".to_string(),
+            kind: puffer_session_store::StoredAttachmentKind::Image,
+            storage_key: "11111111-1111-1111-1111-111111111111/original".to_string(),
+        };
+        state.push_user_message_with_attachments(
+            "read it",
+            vec![crate::RenderedAttachment::from_stored(attachment)
+                .with_model_url("data:image/png;base64,AQID".to_string())],
+        );
+
+        let items = transcript_to_items(&state, "read it");
+
+        let user_messages = items
+            .iter()
+            .filter(|item| matches!(item, ConversationItem::Message { role, .. } if role == "user"))
+            .count();
+        assert_eq!(user_messages, 1);
+    }
+
+    #[test]
+    fn native_image_chat_messages_serializes_image_url() {
+        let items = vec![image_item()];
+
+        let messages = items_to_chat_messages(&items, None, None, None, None);
+
+        let content = messages[0].content.as_ref().expect("content");
+        assert_eq!(content[0]["type"], json!("text"));
+        assert_eq!(content[0]["text"], json!("read it"));
+        assert_eq!(content[1]["type"], json!("image_url"));
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            json!("data:image/png;base64,AQID")
+        );
+    }
+
+    #[test]
+    fn native_image_responses_input_serializes_input_image() {
+        let input = items_to_responses_input(&[image_item()]);
+
+        let content = input[0]["content"].as_array().expect("content array");
+        assert_eq!(content[0]["type"], json!("input_text"));
+        assert_eq!(content[0]["text"], json!("read it"));
+        assert_eq!(content[1]["type"], json!("input_image"));
+        assert_eq!(content[1]["image_url"], json!("data:image/png;base64,AQID"));
+    }
+
+    #[test]
+    fn native_image_anthropic_messages_serializes_image_block() {
+        let messages = items_to_anthropic_messages(&[image_item()]);
+
+        let content = messages[0]["content"].as_array().expect("content array");
+        assert_eq!(content[0]["type"], json!("text"));
+        assert_eq!(content[0]["text"], json!("read it"));
+        assert_eq!(content[1]["type"], json!("image"));
+        assert_eq!(content[1]["source"]["type"], json!("base64"));
+        assert_eq!(content[1]["source"]["media_type"], json!("image/png"));
+        assert_eq!(content[1]["source"]["data"], json!("AQID"));
+    }
+
+    #[test]
+    fn native_image_build_summary_text_uses_marker_without_data_url() {
+        let summary = build_summary_text(&[image_item()]);
+
+        assert!(summary.contains("[image attachment: image/png]"));
+        assert!(!summary.contains("data:image/png;base64"));
+        assert!(!summary.contains("AQID"));
     }
 
     #[test]
@@ -1014,6 +1664,29 @@ mod tests {
         assert!(matches!(&items[0], ConversationItem::Message { role, .. } if role == "user"));
         assert!(matches!(&items[1], ConversationItem::Message { role, .. } if role == "assistant"));
         assert!(matches!(&items[2], ConversationItem::Message { role, .. } if role == "user"));
+        assert_eq!(items[2].text_content().unwrap(), "second");
+    }
+
+    #[test]
+    fn transcript_to_items_deduplicates_when_already_in_transcript() {
+        let mut state = test_state();
+        // Simulate what command.rs / flow.rs does: push the user message
+        // to the transcript *before* calling execute with the same text.
+        state.push_message(crate::MessageRole::User, "hello world");
+        let items = transcript_to_items(&state, "hello world");
+        // Should appear only once, not twice.
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text_content().unwrap(), "hello world");
+    }
+
+    #[test]
+    fn transcript_to_items_appends_new_input_after_assistant() {
+        let mut state = test_state();
+        state.push_message(crate::MessageRole::User, "first");
+        state.push_message(crate::MessageRole::Assistant, "reply");
+        // Different input than last transcript entry — should be appended.
+        let items = transcript_to_items(&state, "second");
+        assert_eq!(items.len(), 3);
         assert_eq!(items[2].text_content().unwrap(), "second");
     }
 
@@ -1045,6 +1718,236 @@ mod tests {
         assert_eq!(arr[3]["output"], "file.txt");
     }
 
+    /// Regression: a `MessageRole::System` item pushed by
+    /// `flow.rs::emit_system_message` after the conversation has already
+    /// started (e.g. "Interrupted by user.", "Provider request failed: ...")
+    /// must be stripped before reaching the Responses API `input` array,
+    /// because (a) ChatGPT Codex backend rejects it with 400, and
+    /// (b) permissive proxies silently merge it into the top-level
+    /// `instructions`, polluting the system prompt.
+    #[test]
+    fn responses_input_drops_transient_system_messages() {
+        let items = vec![
+            ConversationItem::user_message("first user message"),
+            ConversationItem::assistant_message("first reply"),
+            ConversationItem::system_message("Interrupted by user."),
+            ConversationItem::user_message("second user message"),
+        ];
+        let value = items_to_responses_input(&items);
+        let arr = value.as_array().unwrap();
+        assert_eq!(arr.len(), 3, "transient system entry must be dropped");
+        assert!(
+            !arr.iter().any(|m| m["role"] == "system"),
+            "no system role should appear after the first non-system item: {arr:?}"
+        );
+        assert_eq!(arr[0]["role"], "user");
+        assert_eq!(arr[1]["role"], "assistant");
+        assert_eq!(arr[2]["role"], "user");
+        assert_eq!(arr[2]["content"][0]["text"], "second user message");
+    }
+
+    /// Regression: same scenario for Chat Completions wire format. Strict
+    /// providers (and some Anthropic-via-OpenAI shims like GLM coding plan
+    /// when routed through chat completions) reject mid-conversation
+    /// `role:"system"`; lenient ones treat it as an instruction switch
+    /// and behave unpredictably.
+    #[test]
+    fn chat_messages_drops_transient_system_messages() {
+        let items = vec![
+            ConversationItem::user_message("first user message"),
+            ConversationItem::assistant_message("first reply"),
+            ConversationItem::system_message("Interrupted by user."),
+            ConversationItem::user_message("second user message"),
+        ];
+        let msgs = items_to_chat_messages(&items, Some("real system prompt"), None, None, None);
+        // Position 0 is the explicit top-level system_prompt; positions
+        // 1..N must contain no further `system` role.
+        assert_eq!(msgs[0].role, "system");
+        for (i, m) in msgs.iter().enumerate().skip(1) {
+            assert_ne!(
+                m.role, "system",
+                "transient system leaked into chat messages at position {i}: {m:?}"
+            );
+        }
+        // Sanity: message order is user, assistant, user.
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[2].role, "assistant");
+        assert_eq!(msgs[3].role, "user");
+    }
+
+    /// Responses rejects `role:"system"` entries in `input`; legacy leading
+    /// system transcript items are preserved as user-role context instead.
+    #[test]
+    fn responses_input_converts_leading_system_message_to_user_context() {
+        let items = vec![
+            ConversationItem::system_message("You are the bug-bounty subagent."),
+            ConversationItem::user_message("audit this"),
+        ];
+        let value = items_to_responses_input(&items);
+        let arr = value.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["role"], "user");
+        assert_eq!(arr[0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            arr[0]["content"][0]["text"],
+            "You are the bug-bounty subagent."
+        );
+        assert_eq!(arr[1]["role"], "user");
+    }
+
+    /// Anthropic boundary already strips role:"system" entirely (the
+    /// protocol disallows it in messages) — keep that contract under
+    /// the same scenario the Responses-side regression covers.
+    #[test]
+    fn anthropic_messages_never_contain_system_role() {
+        let items = vec![
+            ConversationItem::user_message("first user message"),
+            ConversationItem::assistant_message("first reply"),
+            ConversationItem::system_message("Interrupted by user."),
+            ConversationItem::user_message("second user message"),
+        ];
+        let msgs = items_to_anthropic_messages(&items);
+        for m in &msgs {
+            assert_ne!(
+                m["role"], "system",
+                "system role leaked into Anthropic messages: {m:?}"
+            );
+        }
+    }
+
+    /// Regression for the gap that codex-review R2 surfaced: the runtime
+    /// path used to do `items.insert(0, user_message(context_reminder))`
+    /// before the wire boundary, which pushed the sub-agent identity
+    /// prompt that `agents.rs:319` puts at transcript[0] to items[1] —
+    /// past `drop_transient_system_messages`'s first-position exemption,
+    /// where it then got stripped.
+    ///
+    /// The fix lives in `insert_context_reminder_preserving_legacy_leading_system()` (this file): it
+    /// inserts the reminder *after* any leading run of `role:"system"`
+    /// items, preserving the sub-agent identity at the head where the
+    /// boundary expects it.
+    #[test]
+    fn responses_input_keeps_subagent_identity_after_runtime_prepend() {
+        let mut items = vec![
+            ConversationItem::system_message("You are the bug-bounty subagent."),
+            ConversationItem::user_message("audit this"),
+        ];
+        // Mimic the runtime call site (openai.rs / websocket.rs).
+        insert_context_reminder_preserving_legacy_leading_system(
+            &mut items,
+            "[context: cwd=/foo, ts=...]",
+        );
+        let value = items_to_responses_input(&items);
+        let arr = value.as_array().unwrap();
+        let identity_count = arr
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .get(0)
+                    .and_then(|part| part.get("text"))
+                    .and_then(|text| text.as_str())
+                    .map(|text| text.contains("bug-bounty subagent"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            identity_count, 1,
+            "sub-agent identity prompt must survive the runtime context-reminder prepend: {arr:?}"
+        );
+        // And the reminder itself must still be present, immediately after
+        // the legacy identity context.
+        assert_eq!(arr[0]["role"], "user");
+        assert_eq!(arr[1]["role"], "user");
+        assert!(
+            !arr.iter().any(|m| m["role"] == "system"),
+            "Responses input must not include system roles: {arr:?}"
+        );
+        assert!(
+            arr[1]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("context"),
+            "reminder text expected at position 1"
+        );
+    }
+
+    /// Chat Completions still accepts leading system messages, so keep that
+    /// boundary unchanged.
+    #[test]
+    fn chat_messages_preserves_leading_system_message() {
+        let items = vec![
+            ConversationItem::system_message("You are the bug-bounty subagent."),
+            ConversationItem::user_message("audit this"),
+        ];
+        let msgs = items_to_chat_messages(&items, Some("real system prompt"), None, None, None);
+        // Position 0 = explicit top-level system prompt; position 1 = the
+        // sub-agent identity from items[0]; position 2 = the user message.
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "system");
+        assert_eq!(
+            msgs[1].content.as_ref().and_then(|v| v.as_str()),
+            Some("You are the bug-bounty subagent.")
+        );
+        assert_eq!(msgs[2].role, "user");
+    }
+
+    #[test]
+    fn managed_system_prompt_1_is_second_chat_system_message() {
+        let items = vec![ConversationItem::user_message("audit this")];
+        let msgs = items_to_chat_messages(
+            &items,
+            Some("base system prompt"),
+            Some("managed system prompt"),
+            None,
+            None,
+        );
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(
+            msgs[0].content.as_ref().and_then(|v| v.as_str()),
+            Some("base system prompt")
+        );
+        assert_eq!(msgs[1].role, "system");
+        assert_eq!(
+            msgs[1].content.as_ref().and_then(|v| v.as_str()),
+            Some("managed system prompt")
+        );
+        assert_eq!(msgs[2].role, "user");
+    }
+
+    #[test]
+    fn managed_system_prompt_1_appends_to_responses_instructions() {
+        let mut instructions = "base system prompt".to_string();
+        append_managed_system_prompt_1_to_instructions(
+            &mut instructions,
+            Some("managed system prompt"),
+        );
+
+        assert_eq!(instructions, "base system prompt\n\nmanaged system prompt");
+    }
+
+    /// Mid-conversation transient system items get dropped even when a
+    /// stale UI `MessageRole::System` was reloaded from session_store at
+    /// startup. The reload path is `state.rs:197`; when followed by any
+    /// user/assistant content the new entry lands at items[1+] where the
+    /// boundary filter strips it.
+    ///
+    /// This is the core safety net for the "session reload after a
+    /// crash that left a `Provider request failed: ...` system in the
+    /// transcript" scenario that motivated PR#46.
+    #[test]
+    fn responses_input_drops_replayed_ui_system_when_followed_by_user() {
+        let items = vec![
+            ConversationItem::user_message("first user message"),
+            ConversationItem::system_message("Provider request failed: 400 ..."),
+            ConversationItem::user_message("retry"),
+        ];
+        let value = items_to_responses_input(&items);
+        let arr = value.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "stale UI system must be dropped");
+        assert_eq!(arr[0]["role"], "user");
+        assert_eq!(arr[1]["role"], "user");
+    }
+
     #[test]
     fn items_to_chat_messages_groups_tool_calls() {
         let items = vec![
@@ -1068,7 +1971,7 @@ mod tests {
                 output: ToolOutputPayload::success("content2".into()),
             },
         ];
-        let msgs = items_to_chat_messages(&items, Some("sys prompt"), None, None);
+        let msgs = items_to_chat_messages(&items, Some("sys prompt"), None, None, None);
         // system + user + assistant(tool_calls) + tool + tool = 5
         assert_eq!(msgs.len(), 5);
         assert_eq!(msgs[0].role, "system");
@@ -1085,6 +1988,7 @@ mod tests {
         let msgs = items_to_chat_messages(
             &items,
             Some("base prompt"),
+            None,
             None,
             Some("# currentDate\nToday is 2026-04-12."),
         );
@@ -1105,6 +2009,8 @@ mod tests {
             input: r#"{"command":"ls"}"#.into(),
             output: "result".into(),
             success: true,
+            metadata: Value::Null,
+            terminate: false,
         }];
         append_tool_results(&mut items, &invocations);
         assert_eq!(items.len(), 3);
@@ -1123,6 +2029,8 @@ mod tests {
             input: r#"{"command":"bad"}"#.into(),
             output: "command not found".into(),
             success: false,
+            metadata: Value::Null,
+            terminate: false,
         }];
         append_tool_results(&mut items, &invocations);
         assert!(
@@ -1136,7 +2044,9 @@ mod tests {
             ConversationItem::user_message("summary"),
             ConversationItem::user_message("recent"),
         ];
-        inject_post_compact_context(&mut items, std::path::Path::new("/work"));
+        let mut state = crate::runtime::tests::state();
+        state.cwd = std::path::PathBuf::from("/work");
+        inject_post_compact_context(&mut items, &state);
         assert_eq!(items.len(), 3);
         let text = items[1].text_content().unwrap();
         assert!(text.contains("Context restored after compaction"));
@@ -1144,17 +2054,100 @@ mod tests {
     }
 
     #[test]
+    fn inject_post_compact_context_repeats_project_memory_skill_guidance() {
+        let mut items = vec![ConversationItem::user_message("summary")];
+        let mut state = crate::runtime::tests::state();
+        state.cwd = std::path::PathBuf::from("/work");
+        state.project_memory = Some(crate::memory::ProjectMemoryContext {
+            project_name: "demo".to_string(),
+            project_root: std::path::PathBuf::from("/work"),
+            memory_file: std::path::PathBuf::from("/tmp/MEMORY.md"),
+            char_limit: 6_000,
+        });
+
+        inject_post_compact_context(&mut items, &state);
+        let text = items[1].text_content().unwrap();
+        assert!(text.contains("skill: \"project-memory\""));
+        assert!(text.contains("/tmp/MEMORY.md"));
+    }
+
+    #[test]
     fn build_system_reminder_includes_date() {
-        let reminder = build_system_reminder("");
+        let state = crate::runtime::tests::state();
+        let reminder = build_system_reminder(&state, "");
         assert!(reminder.contains("currentDate"));
         assert!(reminder.contains("Today's date is"));
+        assert!(reminder.contains("currentTime"));
+        assert!(reminder.contains("Current computer time is"));
     }
 
     #[test]
     fn build_system_reminder_includes_git_status() {
-        let reminder = build_system_reminder("On branch main");
+        let state = crate::runtime::tests::state();
+        let reminder = build_system_reminder(&state, "On branch main");
         assert!(reminder.contains("gitStatus"));
         assert!(reminder.contains("On branch main"));
+    }
+
+    #[test]
+    fn build_system_reminder_carries_soul_and_user_not_system_prompt() {
+        // soul.md + user.md ride in the per-turn reminder (after the cache
+        // breakpoint), so a mutating user.md never busts the system-prompt cache.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("soul.md"), "SOUL_REMINDER_MARKER").unwrap();
+        std::fs::write(
+            tmp.path().join("user.md"),
+            "## addr\n\nUSER_REMINDER_MARKER",
+        )
+        .unwrap();
+        let mut state = crate::runtime::tests::state();
+        state.cwd = tmp.path().to_path_buf();
+        let reminder = build_system_reminder(&state, "");
+        assert!(
+            reminder.contains("SOUL_REMINDER_MARKER"),
+            "soul.md must be in the reminder"
+        );
+        assert!(
+            reminder.contains("USER_REMINDER_MARKER"),
+            "user.md must be in the reminder"
+        );
+    }
+
+    #[test]
+    fn build_system_reminder_includes_project_memory_skill_guidance() {
+        let mut state = crate::runtime::tests::state();
+        state.project_memory = Some(crate::memory::ProjectMemoryContext {
+            project_name: "demo".to_string(),
+            project_root: std::path::PathBuf::from("/workspace/demo"),
+            memory_file: std::path::PathBuf::from("/tmp/MEMORY.md"),
+            char_limit: 6_000,
+        });
+
+        let reminder = build_system_reminder(&state, "");
+        assert!(reminder.contains("projectMemory"));
+        assert!(reminder.contains("skill: \"project-memory\""));
+        assert!(reminder.contains("/tmp/MEMORY.md"));
+    }
+
+    #[test]
+    fn build_system_reminder_includes_browser_status_when_set() {
+        // Issue #560: after a daemon restart the transcript still carries old
+        // browser tool output (connected:true), so the per-turn reminder must
+        // surface the daemon's real browser state.
+        let mut state = crate::runtime::tests::state();
+        state.browser_status =
+            Some("No browser tab is currently open in this session.".to_string());
+        let reminder = build_system_reminder(&state, "");
+        assert!(reminder.contains("# browserStatus"));
+        assert!(reminder.contains("No browser tab is currently open in this session."));
+    }
+
+    #[test]
+    fn build_system_reminder_omits_browser_status_when_unset() {
+        // Pure coding sessions never set browser_status — no block emitted.
+        let state = crate::runtime::tests::state();
+        let reminder = build_system_reminder(&state, "");
+        assert!(!reminder.contains("browserStatus"));
     }
 
     #[test]
@@ -1189,6 +2182,69 @@ mod tests {
         let compacted = compact_conversation(&mut items, &provider, "gpt-5", &config, None);
         assert!(!compacted);
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn force_compact_runs_below_threshold_via_summary() {
+        // A transcript far below the catalog threshold: the normal
+        // threshold-gated path no-ops, but the forced path (reactive
+        // context-overflow recovery) must still compact.
+        let provider = test_provider(1_041_920, 16_384); // gpt-5.5-sized window
+        let summarize = |_old: &str, _mid: &str| Some("PRIOR CONTEXT SUMMARY".to_string());
+        let make = || {
+            let mut v = Vec::new();
+            for i in 0..8 {
+                v.push(ConversationItem::user_message(format!("user {i}")));
+                v.push(ConversationItem::assistant_message(format!("assistant {i}")));
+            }
+            v
+        };
+
+        // Baseline: threshold-gated compaction is a no-op here.
+        let mut items = make();
+        let before = items.len();
+        assert!(!compact_conversation_with(
+            &mut items, &provider, "gpt-5", None, &summarize
+        ));
+        assert_eq!(items.len(), before);
+
+        // Forced: compaction happens despite being far below threshold.
+        let mut items = make();
+        assert!(force_compact_conversation_with(
+            &mut items, &provider, "gpt-5", &summarize
+        ));
+        assert!(
+            items.len() < before,
+            "forced compaction must shrink the transcript"
+        );
+        assert!(
+            matches!(
+                items.first(),
+                Some(ConversationItem::Message { .. } | ConversationItem::Compaction { .. })
+            ),
+            "kept transcript must start with a Message/Compaction to stay valid"
+        );
+    }
+
+    #[test]
+    fn force_compact_falls_back_to_dropping_when_summary_unavailable() {
+        // When summary generation fails, force mode must still shrink via
+        // the Phase 3 drop loop (otherwise threshold-gated to a no-op).
+        let provider = test_provider(1_041_920, 16_384);
+        let summarize = |_old: &str, _mid: &str| None;
+        let mut items = Vec::new();
+        for i in 0..8 {
+            items.push(ConversationItem::user_message(format!("user {i}")));
+            items.push(ConversationItem::assistant_message(format!("assistant {i}")));
+        }
+        let before = items.len();
+        assert!(force_compact_conversation_with(
+            &mut items, &provider, "gpt-5", &summarize
+        ));
+        assert!(
+            items.len() < before,
+            "drop fallback must shed items under force"
+        );
     }
 
     #[test]
@@ -1234,6 +2290,7 @@ mod tests {
             headers: indexmap::IndexMap::new(),
             query_params: indexmap::IndexMap::new(),
             discovery: None,
+            media: None,
             models: vec![puffer_provider_registry::ModelDescriptor {
                 id: "gpt-5".into(),
                 display_name: "GPT-5".into(),
@@ -1242,7 +2299,11 @@ mod tests {
                 context_window,
                 max_output_tokens: max_output,
                 supports_reasoning: false,
+                compat: None,
+                input: vec![puffer_provider_registry::Modality::Text],
+                cost: None,
             }],
+            chat_completions_path: None,
         }
     }
 
@@ -1256,6 +2317,8 @@ mod tests {
             account_id: None,
             custom_headers: Vec::new(),
             query_params: Vec::new(),
+            chat_completions_path: None,
+            responses_path: None,
         }
     }
 
@@ -1313,7 +2376,10 @@ mod tests {
         let recovered: ConversationItem = serde_json::from_str(&json).unwrap();
         if let ConversationItem::FunctionCallOutput { output, .. } = &recovered {
             assert_eq!(output.text, "permission denied");
-            assert!(!output.is_error, "is_error should default to false after deserialization");
+            assert!(
+                !output.is_error,
+                "is_error should default to false after deserialization"
+            );
         } else {
             panic!("expected FunctionCallOutput");
         }
@@ -1427,7 +2493,11 @@ mod tests {
         ];
         let original_len = items.len();
         normalize_items(&mut items);
-        assert_eq!(items.len(), original_len, "paired items should not be modified");
+        assert_eq!(
+            items.len(),
+            original_len,
+            "paired items should not be modified"
+        );
     }
 
     #[test]
@@ -1490,7 +2560,7 @@ mod tests {
     fn token_estimation_function_call() {
         let item = ConversationItem::FunctionCall {
             call_id: "c1".into(),
-            name: "Bash".into(),             // 4 chars → 1 token
+            name: "Bash".into(),                 // 4 chars → 1 token
             arguments: r#"{"cmd":"ls"}"#.into(), // 12 chars → 3 tokens
         };
         // name(1) + arguments(3) = 4
@@ -1601,7 +2671,7 @@ mod tests {
             },
             ConversationItem::user_message("next question"),
         ];
-        let msgs = items_to_chat_messages(&items, Some("sys"), None, None);
+        let msgs = items_to_chat_messages(&items, Some("sys"), None, None, None);
         // system + compaction(user) + user = 3
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[1].role, "user");
@@ -1664,20 +2734,25 @@ mod tests {
         // Push a tool call + failed tool result
         state.transcript.push(crate::state::RenderedMessage {
             text: "error output".into(),
+            thinking: None,
             role: crate::MessageRole::ToolResult,
             call_id: Some("c1".into()),
             tool_id: None,
             tool_input: None,
             success: Some(false),
+            attachments: Vec::new(),
         });
         let items = transcript_to_items(&state, "");
         // Find the FunctionCallOutput
-        let output_item = items.iter().find(|i| {
-            matches!(i, ConversationItem::FunctionCallOutput { .. })
-        });
+        let output_item = items
+            .iter()
+            .find(|i| matches!(i, ConversationItem::FunctionCallOutput { .. }));
         assert!(output_item.is_some(), "should have a FunctionCallOutput");
         if let ConversationItem::FunctionCallOutput { output, .. } = output_item.unwrap() {
-            assert!(output.is_error, "is_error should be true for failed tool result");
+            assert!(
+                output.is_error,
+                "is_error should be true for failed tool result"
+            );
             assert_eq!(output.text, "error output");
         }
     }
@@ -1730,7 +2805,11 @@ mod tests {
             },
         ];
         let msgs = items_to_anthropic_messages(&items);
-        assert_eq!(msgs.len(), 3, "user + assistant(tool_use) + user(tool_result)");
+        assert_eq!(
+            msgs.len(),
+            3,
+            "user + assistant(tool_use) + user(tool_result)"
+        );
 
         // Assistant message with tool_use
         assert_eq!(msgs[1]["role"], "assistant");
@@ -1746,7 +2825,10 @@ mod tests {
         assert_eq!(tool_result["type"], "tool_result");
         assert_eq!(tool_result["tool_use_id"], "c1");
         assert_eq!(tool_result["content"], "file.rs");
-        assert!(tool_result.get("is_error").is_none(), "is_error should be absent when false");
+        assert!(
+            tool_result.get("is_error").is_none(),
+            "is_error should be absent when false"
+        );
     }
 
     #[test]
@@ -1954,9 +3036,12 @@ mod tests {
         assert_eq!(r[7]["role"], "assistant");
 
         // === Chat Completions (OpenAI legacy pattern) ===
-        let chat = items_to_chat_messages(&items, None, None, None);
+        let chat = items_to_chat_messages(&items, None, None, None, None);
         // user → assistant(tool_calls) → tool → assistant → user → assistant(tool_calls) → tool → assistant
-        assert!(chat.len() >= 4, "Chat Completions: should have role-based messages");
+        assert!(
+            chat.len() >= 4,
+            "Chat Completions: should have role-based messages"
+        );
         assert_eq!(chat[0].role, "user");
         // Function calls become assistant with tool_calls
         assert_eq!(chat[1].role, "assistant");
@@ -1972,7 +3057,8 @@ mod tests {
         // Verify alternation
         for i in 1..anthropic.len() {
             assert_ne!(
-                anthropic[i]["role"], anthropic[i - 1]["role"],
+                anthropic[i]["role"],
+                anthropic[i - 1]["role"],
                 "Anthropic: strict alternation violated at index {i}"
             );
         }
@@ -1986,7 +3072,10 @@ mod tests {
                     .map(|c| c.iter().any(|b| b["type"] == "tool_use"))
                     .unwrap_or(false)
         });
-        assert!(assistant_with_tool.is_some(), "Anthropic: should have assistant with tool_use");
+        assert!(
+            assistant_with_tool.is_some(),
+            "Anthropic: should have assistant with tool_use"
+        );
         let tool_use_block = assistant_with_tool.unwrap()["content"]
             .as_array()
             .unwrap()
@@ -2004,7 +3093,10 @@ mod tests {
                     .map(|c| c.iter().any(|b| b["type"] == "tool_result"))
                     .unwrap_or(false)
         });
-        assert!(user_with_result.is_some(), "Anthropic: should have user with tool_result");
+        assert!(
+            user_with_result.is_some(),
+            "Anthropic: should have user with tool_result"
+        );
         let tool_result_block = user_with_result.unwrap()["content"]
             .as_array()
             .unwrap()
@@ -2014,13 +3106,27 @@ mod tests {
         assert_eq!(tool_result_block["tool_use_id"], "call_1");
 
         // Find is_error propagation in Turn 2
-        let error_result = anthropic.iter().flat_map(|m| {
-            m["content"].as_array().unwrap_or(&vec![]).iter().filter(|b| {
-                b["type"] == "tool_result" && b["tool_use_id"] == "call_2"
-            }).cloned().collect::<Vec<_>>()
-        }).next();
-        assert!(error_result.is_some(), "Anthropic: should have tool_result for call_2");
-        assert_eq!(error_result.unwrap()["is_error"], true, "Anthropic: is_error should propagate");
+        let error_result = anthropic
+            .iter()
+            .flat_map(|m| {
+                m["content"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter(|b| b["type"] == "tool_result" && b["tool_use_id"] == "call_2")
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .next();
+        assert!(
+            error_result.is_some(),
+            "Anthropic: should have tool_result for call_2"
+        );
+        assert_eq!(
+            error_result.unwrap()["is_error"],
+            true,
+            "Anthropic: is_error should propagate"
+        );
     }
 
     /// Dumps the actual wire-format JSON for visual inspection.
@@ -2058,7 +3164,7 @@ mod tests {
         eprintln!("{}", serde_json::to_string_pretty(&responses).unwrap());
 
         // 2. Chat Completions
-        let chat = items_to_chat_messages(&items, None, None, None);
+        let chat = items_to_chat_messages(&items, None, None, None, None);
         let chat_json: Vec<Value> = chat
             .iter()
             .map(|m| {
@@ -2081,5 +3187,183 @@ mod tests {
         let anthropic = items_to_anthropic_messages(&items);
         eprintln!("\n========== Anthropic Messages API (CC-style) ==========");
         eprintln!("{}", serde_json::to_string_pretty(&anthropic).unwrap());
+    }
+
+    /// Verifies that a reasoning item from the Responses API is captured and
+    /// re-emitted verbatim in the next turn's `input` array.
+    ///
+    /// Without this, high-effort models re-think from scratch every turn,
+    /// causing minutes-long delays per request on proxies that don't support
+    /// server-side `previous_response_id` threading.
+    #[test]
+    fn reasoning_items_round_trip_through_conversation_history() {
+        let raw_reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_abc123",
+            "summary": [
+                {"type": "summary_text", "text": "Analyzing the task..."},
+                {"type": "summary_text", "text": "Plan: read file, write solution."}
+            ],
+            "encrypted_content": "OPAQUE_BLOB_XYZ"
+        });
+
+        let item = reasoning_item_from_value(&raw_reasoning).expect("reasoning item parsed");
+        let ConversationItem::Reasoning {
+            summary,
+            encrypted_content,
+            redacted: _,
+        } = &item
+        else {
+            panic!("expected Reasoning variant, got {item:?}");
+        };
+        assert_eq!(summary.len(), 2);
+        assert!(matches!(
+            &summary[0],
+            ReasoningSummary::SummaryText { text } if text == "Analyzing the task..."
+        ));
+        assert_eq!(encrypted_content.as_deref(), Some("OPAQUE_BLOB_XYZ"));
+
+        // Serialize back to Responses API wire format.
+        let items = vec![item];
+        let wire = items_to_responses_input(&items);
+        let arr = wire.as_array().expect("wire input is array");
+        assert_eq!(arr.len(), 1);
+        let out = &arr[0];
+        assert_eq!(out.get("type").and_then(Value::as_str), Some("reasoning"));
+        assert_eq!(
+            out.get("encrypted_content").and_then(Value::as_str),
+            Some("OPAQUE_BLOB_XYZ")
+        );
+        let summary_arr = out.get("summary").and_then(Value::as_array).unwrap();
+        assert_eq!(summary_arr.len(), 2);
+        assert_eq!(
+            summary_arr[0].get("type").and_then(Value::as_str),
+            Some("summary_text")
+        );
+        assert_eq!(
+            summary_arr[0].get("text").and_then(Value::as_str),
+            Some("Analyzing the task...")
+        );
+    }
+
+    /// Non-reasoning items return None from the extractor.
+    #[test]
+    fn reasoning_item_from_value_ignores_non_reasoning_items() {
+        assert!(reasoning_item_from_value(&json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}]
+        }))
+        .is_none());
+        assert!(reasoning_item_from_value(&json!({
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "Read",
+            "arguments": "{}"
+        }))
+        .is_none());
+    }
+
+    /// Reasoning items with empty summary AND missing encrypted_content are
+    /// filtered out — avoids wasting tokens replaying useless payloads.
+    #[test]
+    fn reasoning_item_from_value_rejects_empty_payloads() {
+        assert!(reasoning_item_from_value(&json!({
+            "type": "reasoning",
+            "summary": []
+        }))
+        .is_none());
+        assert!(reasoning_item_from_value(&json!({
+            "type": "reasoning"
+        }))
+        .is_none());
+    }
+
+    /// `append_reasoning_items` preserves the order of reasoning items
+    /// relative to each other. Order matters because a later reasoning item
+    /// may depend on an earlier function_call_output.
+    #[test]
+    fn append_reasoning_items_preserves_order() {
+        let mut items: Vec<ConversationItem> = vec![ConversationItem::user_message("task")];
+        let raw = vec![
+            json!({
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "first"}],
+            }),
+            json!({
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "second"}],
+            }),
+        ];
+        append_reasoning_items(&mut items, &raw);
+
+        assert_eq!(items.len(), 3);
+        let ConversationItem::Reasoning { summary: s1, .. } = &items[1] else {
+            panic!("item[1] should be Reasoning");
+        };
+        let ConversationItem::Reasoning { summary: s2, .. } = &items[2] else {
+            panic!("item[2] should be Reasoning");
+        };
+        assert!(matches!(&s1[0], ReasoningSummary::SummaryText { text } if text == "first"));
+        assert!(matches!(&s2[0], ReasoningSummary::SummaryText { text } if text == "second"));
+    }
+
+    /// End-to-end check on a realistic multi-turn history: once reasoning is
+    /// in the items vector, the next turn's Responses wire body must include
+    /// both `reasoning` items AND function_call / function_call_output items
+    /// in the correct order — mirroring what Codex sends.
+    #[test]
+    fn multi_turn_history_wire_format_includes_reasoning() {
+        let items = vec![
+            ConversationItem::user_message("do the thing"),
+            ConversationItem::Reasoning {
+                summary: vec![ReasoningSummary::SummaryText {
+                    text: "thinking step 1".to_string(),
+                }],
+                encrypted_content: Some("BLOB1".to_string()),
+                redacted: false,
+            },
+            ConversationItem::FunctionCall {
+                call_id: "c1".to_string(),
+                name: "Read".to_string(),
+                arguments: "{\"file_path\":\"/x\"}".to_string(),
+            },
+            ConversationItem::FunctionCallOutput {
+                call_id: "c1".to_string(),
+                output: ToolOutputPayload::success("file body".to_string()),
+            },
+            ConversationItem::Reasoning {
+                summary: vec![ReasoningSummary::SummaryText {
+                    text: "thinking step 2".to_string(),
+                }],
+                encrypted_content: Some("BLOB2".to_string()),
+                redacted: false,
+            },
+        ];
+        let wire = items_to_responses_input(&items);
+        let arr = wire.as_array().unwrap();
+        let types: Vec<&str> = arr
+            .iter()
+            .filter_map(|v| v.get("type").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "message",
+                "reasoning",
+                "function_call",
+                "function_call_output",
+                "reasoning",
+            ]
+        );
+        // Encrypted blobs are preserved verbatim — that's the whole point.
+        assert_eq!(
+            arr[1].get("encrypted_content").and_then(Value::as_str),
+            Some("BLOB1")
+        );
+        assert_eq!(
+            arr[4].get("encrypted_content").and_then(Value::as_str),
+            Some("BLOB2")
+        );
     }
 }

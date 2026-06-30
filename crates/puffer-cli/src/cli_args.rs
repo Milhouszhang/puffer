@@ -1,3 +1,7 @@
+use crate::browser_args::BrowserArgs;
+use crate::media_internal_tools::{ImageGenerationArgs, MediaCapabilitiesArgs, VideoGenerationArgs};
+use crate::non_interactive::NonInteractiveArgs;
+use crate::subscriber_tool_args::{EmailArgs, SlackArgs, TelegramArgs};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -67,6 +71,25 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: Option<PluginCommand>,
     },
+    /// Register and inspect native Puffer workflows.
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
+    /// Control the managed Chrome browser for this workspace.
+    Browser(#[command(flatten)] BrowserArgs),
+    /// Authenticate a connector (Telegram, Email) without a running puffer
+    /// REPL. Targets GUI hosts that drive the auth flow over stdin/stdout.
+    Connect {
+        #[command(subcommand)]
+        command: ConnectCommand,
+    },
+    /// Execute an internal third-party tool through a CLI surface.
+    #[command(hide = true, name = "internal-tool")]
+    InternalTool {
+        #[command(subcommand)]
+        command: InternalToolCommand,
+    },
     /// Store a long-lived API token for a provider.
     SetupToken {
         /// Provider id. Defaults to the configured provider or `anthropic`.
@@ -104,6 +127,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ToolCommand,
     },
+    /// Internal: self-elevating Windows Chrome v20 import stages. Hidden.
+    #[command(hide = true, name = "__win-chrome-import")]
+    WinChromeImport {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Resume a stored session in the TUI.
     #[command(hide = true)]
     Resume {
@@ -135,6 +164,70 @@ pub(crate) enum Command {
     DesktopApi {
         #[command(subcommand)]
         command: DesktopApiCommand,
+    },
+    /// Run Puffer in connector-only mode (Telegram, Slack, …).
+    ///
+    /// Reads `.puffer/connectors.toml` (workspace) or
+    /// `~/.puffer/connectors.toml` (user) and starts every enabled,
+    /// compiled-in platform connector. Blocks until SIGINT/SIGTERM.
+    Serve {
+        /// Override the connectors config path.
+        #[arg(long = "config")]
+        config: Option<String>,
+    },
+    /// Run the Puffer daemon — a WebSocket/NDJSON server that exposes the
+    /// runtime (conversations, turns, permissions) to desktop / web / remote
+    /// clients. One daemon per host/user config; auth is a pre-shared token.
+    Daemon {
+        /// Bind address. Defaults to `127.0.0.1:0` (ephemeral localhost).
+        #[arg(long = "bind", default_value = "127.0.0.1:0")]
+        bind: String,
+        /// Path to write the auth token + bound port as NDJSON so callers
+        /// can pick them up. Defaults to `<user-config>/daemon.handshake`.
+        #[arg(long = "handshake-file")]
+        handshake_file: Option<String>,
+        /// Preset token (otherwise one is generated). Handy for tests.
+        #[arg(long = "token")]
+        token: Option<String>,
+        /// Print a single NDJSON line to stdout once bound, then continue
+        /// serving. Used by parent processes (Tauri) to pick up the port
+        /// + token without racing against the file write.
+        #[arg(long = "print-handshake", default_value_t = false)]
+        print_handshake: bool,
+        /// Disable Puffer's built-in Chrome browser RPCs for daemon runtimes.
+        #[arg(long = "no-browser", default_value_t = false)]
+        no_browser: bool,
+        /// Additional daemon system prompt inserted after Puffer's base system prompt.
+        #[arg(long = "system-prompt-1")]
+        system_prompt_1: Option<String>,
+        /// Disable automatic first-message title generation for daemon runtimes.
+        #[arg(long = "disable-auto-title", default_value_t = false)]
+        disable_auto_title: bool,
+        /// Bypass permission prompts for daemon runtimes.
+        #[arg(
+            long = "yolo",
+            alias = "dangerously-bypass-approvals-and-sandbox",
+            default_value_t = false
+        )]
+        yolo: bool,
+    },
+    /// Internal: run a baked-in subscriber skill driver. Invoked by the
+    /// subscriber supervisor; not intended for direct use.
+    #[command(hide = true, name = "__subscriber")]
+    Subscriber {
+        /// Subscriber id, matches `manifest.id` (e.g. `telegram-user`).
+        id: String,
+    },
+    /// Internal: command-backed connector protocol bridge. Invoked by the
+    /// subscription manager via the connector template `command` argv (e.g.
+    /// `puffer __connector lark-bot auth-ok <conn>`); not intended for direct use.
+    #[command(hide = true, name = "__connector")]
+    Connector {
+        /// Connector id selecting the bridge implementation (e.g. `lark-bot`).
+        id: String,
+        /// Protocol operation (`auth-ok`, `act`, or `subscribe`) and its args.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Run one unattended benchmark turn and emit result artifacts.
     #[command(hide = true)]
@@ -170,6 +263,33 @@ pub(crate) enum Command {
         #[arg(long = "deny-tool")]
         deny_tools: Vec<String>,
     },
+    /// Run one non-interactive agent turn.
+    #[command(name = "non-interactive")]
+    NonInteractive(NonInteractiveArgs),
+}
+
+/// Internal third-party tool command surface.
+#[derive(Debug, Subcommand)]
+pub(crate) enum InternalToolCommand {
+    /// Print shell aliases for internal tools.
+    Aliases,
+    /// Control the managed Chrome browser for this workspace.
+    Browser(#[command(flatten)] BrowserArgs),
+    /// Configure the email subscriber through the parent runtime.
+    Email(#[command(flatten)] EmailArgs),
+    /// Generate images through the parent media runtime.
+    #[command(name = "image-generation", alias = "imagegen")]
+    ImageGeneration(#[command(flatten)] ImageGenerationArgs),
+    /// List connected image/video generation providers and models.
+    #[command(name = "media-capabilities", alias = "mediacaps")]
+    MediaCapabilities(#[command(flatten)] MediaCapabilitiesArgs),
+    /// Log in to Slack or look up Slack conversations through the parent runtime.
+    Slack(#[command(flatten)] SlackArgs),
+    /// Log in to Telegram or look up Telegram peers through the parent runtime.
+    Telegram(#[command(flatten)] TelegramArgs),
+    /// Generate a text-to-video clip through the parent media runtime.
+    #[command(name = "video-generation", alias = "videogen")]
+    VideoGeneration(#[command(flatten)] VideoGenerationArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -209,6 +329,86 @@ pub(crate) enum DesktopApiCommand {
         provider: String,
     },
     SettingsSnapshot,
+    WorkflowList,
+    WorkflowRunsList {
+        workflow_slug: String,
+    },
+    WorkflowRunsShow {
+        idx: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum WorkflowCommand {
+    /// Register a workflow envelope or raw AgentFlow pipeline JSON file.
+    Register {
+        /// JSON file path.
+        json_path: String,
+        /// Optional workflow slug override.
+        #[arg(long = "slug")]
+        slug: Option<String>,
+        /// Cron trigger for raw AgentFlow pipeline imports.
+        #[arg(long = "cron", conflicts_with = "subscription_topic")]
+        cron: Option<String>,
+        /// Connection slug for raw AgentFlow pipeline imports.
+        #[arg(
+            long = "connection-slug",
+            alias = "subscription-topic",
+            conflicts_with = "cron"
+        )]
+        connection_slug: Option<String>,
+        /// Optional connection regex filter.
+        #[arg(long = "connection-pattern", alias = "subscription-pattern")]
+        connection_pattern: Option<String>,
+        /// Optional subscription classifier prompt.
+        #[arg(long = "classify-prompt")]
+        classify_prompt: Option<String>,
+    },
+    /// List registered workflows.
+    Ls {
+        /// Output JSON.
+        #[arg(long = "json", default_value_t = false)]
+        json: bool,
+    },
+    /// Inspect workflow run records.
+    Runs {
+        #[command(subcommand)]
+        command: WorkflowRunsCommand,
+    },
+    /// Run one workflow once. Use --dry-run for deterministic local execution.
+    Run {
+        /// Workflow slug.
+        workflow_slug: String,
+        /// Trigger JSON payload used for prompt interpolation.
+        #[arg(long = "trigger-json")]
+        trigger_json: Option<String>,
+        /// Use a deterministic local executor instead of calling an LLM provider.
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+        /// Output JSON.
+        #[arg(long = "json", default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum WorkflowRunsCommand {
+    /// List runs for a workflow slug.
+    Ls {
+        /// Workflow slug.
+        workflow_slug: String,
+        /// Output JSON.
+        #[arg(long = "json", default_value_t = false)]
+        json: bool,
+    },
+    /// Show one run by global index.
+    Show {
+        /// Global run index.
+        idx: u64,
+        /// Output JSON.
+        #[arg(long = "json", default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -458,6 +658,37 @@ pub(crate) enum McpCommand {
     ResetProjectChoices,
     /// Start the Puffer MCP server bridge.
     Serve,
+    /// Drive the OAuth interactive login for an HTTP MCP server.
+    ///
+    /// Runs RFC 8414 metadata discovery, RFC 7591 dynamic client
+    /// registration, the authorization-code-with-PKCE flow against the
+    /// server's authorization endpoint, captures the callback on a
+    /// localhost loopback port, and persists the resulting tokens under
+    /// `<config>/puffer/mcp-tokens/`. Tokens auto-refresh on expiry from
+    /// the runner the next time the server is contacted.
+    Login {
+        /// Stable MCP server id (must match a configured server with
+        /// `transport: http` and `oauth: true`).
+        name: String,
+        /// Skip the `webbrowser::open` attempt and just print the URL.
+        /// Useful for headless environments (SSH, container, CI). The
+        /// callback receiver still binds locally — pair this with a
+        /// reverse-tunnel or a manual paste-back of the redirect URL.
+        #[arg(long = "no-browser")]
+        no_browser: bool,
+    },
+    /// Print whether OAuth tokens exist on disk for an MCP server, and
+    /// where they live.
+    LoginStatus {
+        /// Stable MCP server id.
+        name: String,
+    },
+    /// Forget any persisted OAuth tokens for an MCP server. The next
+    /// connect will require a fresh `puffer mcp login`.
+    Logout {
+        /// Stable MCP server id.
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -585,4 +816,64 @@ mod tests {
         };
         assert_eq!(scope, ResourceScope::User);
     }
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConnectCommand {
+    /// Drive a Telegram personal-account login via a JSON-stdio REPL.
+    ///
+    /// Stdin accepts newline-delimited JSON objects, one per line.
+    /// Recognised actions: `login_start { phone, [api_id], [api_hash] }`,
+    /// `submit_code { code }`, `submit_password { password }`, `exit`.
+    /// Stdout emits the subscriber's control events (`login_awaiting_code`,
+    /// `login_awaiting_password`, `login_complete`, `login_error`).
+    Telegram {
+        /// Telegram connection slug. Distinct slugs scope independent
+        /// account sessions. Defaults to `telegram-user`.
+        #[arg(long = "connection", default_value = "telegram-user")]
+        connection_slug: String,
+    },
+    /// Persist Email (IMAP/SMTP) credentials for the email subscriber.
+    Email {
+        #[command(subcommand)]
+        command: ConnectEmailCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConnectEmailCommand {
+    /// Writes IMAP/SMTP credentials to the email subscriber's config file.
+    Configure {
+        /// IMAP server host, e.g. `imap.gmail.com`.
+        #[arg(long = "imap-host")]
+        imap_host: String,
+        /// IMAP server port. `0` lets the subscriber default it (993).
+        #[arg(long = "imap-port", default_value_t = 0)]
+        imap_port: u16,
+        /// SMTP server host, e.g. `smtp.gmail.com`.
+        #[arg(long = "smtp-host")]
+        smtp_host: String,
+        /// SMTP server port. `0` lets the subscriber default it (587).
+        #[arg(long = "smtp-port", default_value_t = 0)]
+        smtp_port: u16,
+        /// IMAP/SMTP login (usually the full email address).
+        #[arg(long)]
+        username: String,
+        /// IMAP/SMTP password or app-specific password.
+        #[arg(
+            long,
+            required_unless_present = "password_stdin",
+            conflicts_with = "password_stdin"
+        )]
+        password: Option<String>,
+        /// Read the password from stdin (newline-terminated).
+        #[arg(long = "password-stdin", default_value_t = false)]
+        password_stdin: bool,
+        /// From address used on outbound mail.
+        #[arg(long = "from-address")]
+        from_address: String,
+        /// Optional allow-listed sender; repeat for multiple entries.
+        #[arg(long = "allowed-sender")]
+        allowed_senders: Vec<String>,
+    },
 }

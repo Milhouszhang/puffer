@@ -1,0 +1,1832 @@
+.pf-tasks {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--background);
+}
+
+.pf-tasks-top {
+  flex-shrink: 0;
+  height: 48px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: color-mix(in oklab, var(--background) 96%, var(--muted));
+}
+
+.pf-tasks-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.pf-tasks-title h1 {
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.pf-tasks-title span {
+  min-width: 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pf-tasks-top-right {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pf-tasks-search {
+  width: min(320px, 32vw);
+  height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--background);
+  color: var(--muted-foreground);
+}
+
+.pf-tasks-search input {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--foreground);
+  font-size: 13px;
+}
+
+.pf-tasks-search input::placeholder {
+  color: var(--muted-foreground);
+}
+
+.pf-tasks-summary {
+  flex-shrink: 0;
+  min-height: 44px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  background: var(--background);
+}
+
+.pf-tasks-summary button,
+.pf-tasks-summary > div,
+.pf-tasks-summary label {
+  min-height: 30px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+}
+
+.pf-tasks-summary button {
+  cursor: pointer;
+}
+
+.pf-tasks-summary button:hover {
+  background: var(--accent);
+}
+
+.pf-tasks-summary button[data-active="true"] {
+  background: var(--pf-selected-bg);
+  color: var(--foreground);
+}
+
+.pf-tasks-summary strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.pf-tasks-summary span {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.pf-tasks-summary select {
+  height: 26px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--foreground);
+  padding: 0 7px;
+  font-size: 12px;
+}
+
+.pf-monitor-create {
+  flex-shrink: 0;
+  min-height: 42px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: color-mix(in oklab, var(--muted) 18%, var(--background));
+}
+
+.pf-monitor-create label {
+  min-width: min(360px, 48vw);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pf-monitor-create label > span,
+.pf-monitor-create-empty {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+.pf-monitor-create select {
+  min-width: 0;
+  width: 100%;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--foreground);
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.pf-monitor-create button {
+  margin-left: auto;
+}
+
+.pf-tasks-warning {
+  flex-shrink: 0;
+  min-height: 38px;
+  padding: 6px 14px;
+  border-bottom: 1px solid color-mix(in oklab, var(--puffer-accent) 24%, var(--border));
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: color-mix(in oklab, var(--puffer-accent) 8%, var(--background));
+  color: var(--foreground);
+  font-size: 12px;
+}
+
+.pf-tasks-warning span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pf-tasks-warning strong {
+  font-weight: 650;
+}
+
+.pf-tasks-warning button {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.pf-tasks-error {
+  flex-shrink: 0;
+  padding: 8px 14px;
+  border-bottom: 1px solid color-mix(in oklab, var(--destructive) 25%, var(--border));
+  background: color-mix(in oklab, var(--destructive) 8%, var(--background));
+  color: var(--destructive);
+  font-size: 12px;
+}
+
+.pf-tasks-workspace {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  background: var(--background);
+}
+
+.pf-tasks-workspace[data-inspector="true"] {
+  grid-template-columns: minmax(360px, 1fr) minmax(320px, 0.58fr);
+}
+
+.pf-tasks-list-panel {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.pf-tasks-workspace[data-inspector="true"] .pf-tasks-list-panel {
+  border-right: 1px solid var(--border);
+}
+
+.pf-tasks-list-head {
+  flex-shrink: 0;
+  height: 36px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.pf-tasks-list-head strong {
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.pf-tasks-list-head span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.pf-tasks-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.pf-task-row {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 76px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--background);
+}
+
+.pf-task-row:hover,
+.pf-task-row[data-selected="true"] {
+  background: var(--pf-selected-bg);
+}
+
+.pf-task-row[data-terminal="true"] {
+  color: color-mix(in oklab, var(--foreground) 72%, var(--muted-foreground));
+}
+
+.pf-task-row-main {
+  all: unset;
+  box-sizing: border-box;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  cursor: pointer;
+}
+
+.pf-task-row-main:focus-visible {
+  border-radius: 5px;
+  outline: 2px solid color-mix(in oklab, var(--puffer-accent) 55%, transparent);
+  outline-offset: 2px;
+}
+
+.pf-task-row-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.pf-task-row-title strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.pf-task-source,
+.pf-task-status {
+  flex-shrink: 0;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 12px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.pf-task-source {
+  background: color-mix(in oklab, var(--muted) 70%, transparent);
+  color: var(--muted-foreground);
+}
+
+.pf-task-row[data-source="monitor"] .pf-task-source,
+.pf-task-detail .pf-task-source {
+  background: color-mix(in oklab, var(--puffer-accent) 12%, var(--background));
+  color: var(--puffer-accent);
+}
+
+.pf-task-status {
+  background: var(--muted);
+  color: var(--muted-foreground);
+}
+
+.pf-task-status[data-status="completed"] {
+  background: color-mix(in oklab, oklch(0.62 0.15 145) 14%, var(--background));
+  color: oklch(0.52 0.14 145);
+}
+
+.pf-task-status[data-status="failed"],
+.pf-task-status[data-status="stopped"] {
+  background: color-mix(in oklab, var(--destructive) 12%, var(--background));
+  color: var(--destructive);
+}
+
+.pf-task-status[data-status="ignored"] {
+  background: color-mix(in oklab, var(--muted) 78%, var(--background));
+  color: var(--muted-foreground);
+}
+
+.pf-task-row-summary {
+  min-width: 0;
+  color: var(--muted-foreground);
+  font-size: 12.5px;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pf-task-meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  overflow: hidden;
+}
+
+.pf-task-meta > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pf-task-meta code {
+  max-width: 180px;
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.pf-task-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.pf-task-lazy-sentinel {
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--background);
+}
+
+.pf-task-ignore {
+  color: var(--muted-foreground);
+}
+
+.pf-task-ignore:hover {
+  color: var(--destructive);
+}
+
+.pf-task-ignore-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.pf-task-ignore-options {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  min-width: 180px;
+  max-width: 260px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--popover);
+  box-shadow: var(--shadow-md);
+}
+
+.pf-task-ignore-options button {
+  width: 100%;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--foreground);
+  padding: 7px 8px;
+  text-align: left;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.25;
+  cursor: pointer;
+}
+
+.pf-task-ignore-options button:hover {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+.pf-tasks-empty {
+  padding: 24px 14px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+.pf-task-detail {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  background: color-mix(in oklab, var(--background) 98%, var(--muted));
+}
+
+.pf-task-detail-head {
+  flex-shrink: 0;
+  padding: 16px 16px 14px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pf-task-detail-titlebar,
+.pf-task-detail-kicker {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.pf-task-detail-titlebar {
+  justify-content: space-between;
+}
+
+.pf-task-detail-kicker {
+  flex-wrap: wrap;
+}
+
+.pf-task-detail-head h2 {
+  margin: 0;
+  color: var(--foreground);
+  font-size: 16px;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.pf-task-detail-head p,
+.pf-task-detail-copy {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.pf-task-detail-section {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pf-task-detail-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.pf-task-detail-section-head strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.pf-task-detail-section-head span,
+.pf-task-detail-usage {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.pf-task-detail-meta {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+
+.pf-task-detail-meta div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.pf-task-detail-meta dt {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.pf-task-detail-meta dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--foreground);
+  font-size: 12px;
+}
+
+.pf-task-detail-meta code {
+  color: inherit;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.pf-task-config-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  padding: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in oklab, var(--background) 72%, transparent);
+  backdrop-filter: blur(4px);
+}
+
+.pf-task-config {
+  width: min(760px, calc(100vw - 32px));
+  height: min(760px, calc(100vh - 32px));
+  max-height: min(760px, calc(100vh - 32px));
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--background);
+  box-shadow: var(--shadow-md);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.pf-task-history {
+  width: min(1040px, calc(100vw - 32px));
+  height: min(760px, calc(100vh - 32px));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--background);
+  box-shadow: var(--shadow-md);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.pf-task-config-head {
+  flex: 0 0 auto;
+  min-height: 54px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pf-task-config-head h2 {
+  margin: 0;
+  color: var(--foreground);
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.pf-task-history-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pf-task-history-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(240px, 0.38fr) minmax(0, 1fr);
+}
+
+.pf-task-history-sidebar {
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  overflow: auto;
+  background: color-mix(in oklab, var(--background) 97%, var(--muted));
+}
+
+.pf-task-history-message {
+  all: unset;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.pf-task-history-message:hover,
+.pf-task-history-message[data-selected="true"] {
+  background: var(--pf-selected-bg);
+}
+
+.pf-task-history-message-top {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pf-task-history-message strong,
+.pf-task-history-message span,
+.pf-task-history-message small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pf-task-history-message strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.pf-task-history-message span {
+  color: var(--foreground);
+  font-size: 12px;
+}
+
+.pf-task-history-message small {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.pf-task-history-detail {
+  min-width: 0;
+  min-height: 0;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: auto;
+}
+
+.pf-task-history-selected {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+}
+
+.pf-task-history-selected div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.pf-task-history-selected span,
+.pf-task-history-selected code,
+.pf-task-history-agent-result span,
+.pf-task-history-agent-result small {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.pf-task-history-selected strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.pf-task-history-selected code {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+.pf-task-history-digest-note {
+  min-width: 0;
+  border: 1px solid color-mix(in oklab, var(--border) 70%, var(--accent));
+  border-radius: 7px;
+  padding: 8px 10px;
+  color: var(--muted-foreground);
+  background: color-mix(in oklab, var(--accent) 8%, var(--background));
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.pf-task-history-agent-card {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pf-task-history-agent-card p {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.pf-task-history-agent-card pre {
+  max-height: 180px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.pf-task-history-agent-result {
+  min-width: 0;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pf-task-history-agent-result:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.pf-task-history-agent-result div {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pf-task-history-agent-result strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.pf-task-config-head span,
+.pf-task-config-section-head span {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.pf-task-settings-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 168px minmax(0, 1fr);
+  background: var(--background);
+}
+
+.pf-task-settings-nav {
+  min-height: 0;
+  padding: 10px 8px;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: color-mix(in oklab, var(--background) 98%, var(--muted));
+}
+
+.pf-task-settings-nav-item {
+  all: unset;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  padding: 0 9px;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  color: var(--foreground);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 16px;
+  cursor: pointer;
+}
+
+.pf-task-settings-nav-item:hover,
+.pf-task-settings-nav-item[data-active="true"] {
+  background: var(--pf-selected-bg);
+}
+
+.pf-task-settings-nav-item[data-active="true"] {
+  font-weight: 650;
+}
+
+.pf-task-settings-pane {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+.pf-task-settings-section {
+  min-height: 100%;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.pf-task-settings-section-head {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pf-task-settings-section-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pf-task-settings-section-head strong,
+.pf-task-config-section-head strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.pf-task-settings-section-head span,
+.pf-task-settings-field-label {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.pf-task-settings-monitor-form,
+.pf-task-settings-monitor-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.pf-task-settings-monitor-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.pf-task-settings-monitor-row[data-enabled="false"] {
+  color: var(--muted-foreground);
+}
+
+.pf-task-settings-monitor-form label,
+.pf-task-settings-monitor-row label,
+.pf-task-config-memory-select {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.pf-task-settings-monitor-form label > span,
+.pf-task-settings-monitor-row label > span,
+.pf-task-config-memory-select > span,
+.pf-task-settings-field-label {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 14px;
+}
+
+.pf-task-settings-primary-button.sc-btn {
+  height: 30px;
+  border: 0;
+  border-radius: 6px;
+  justify-content: center;
+  background: #111111;
+  color: #ffffff;
+}
+
+.pf-task-settings-primary-button.sc-btn:hover:not(:disabled) {
+  background: #111111;
+  color: #ffffff;
+}
+
+.pf-task-settings-primary-button.sc-btn:disabled {
+  opacity: 1;
+  background: #111111;
+  color: #ffffff;
+}
+
+.pf-task-settings-compact-button.sc-btn {
+  width: 48px;
+  min-width: 48px;
+  padding: 0;
+}
+
+.pf-task-settings-save-button.sc-btn {
+  width: 104px;
+  min-width: 104px;
+  padding: 0;
+}
+
+.pf-task-settings-icon-button {
+  width: 48px;
+  justify-content: center;
+}
+
+.pf-task-contact-table {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--background);
+}
+
+.pf-task-contact-table-head,
+.pf-task-contact-table-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 22px minmax(148px, 0.42fr) minmax(0, 1fr) 72px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+}
+
+.pf-task-contact-table-head {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.pf-task-contact-table-head strong:last-child {
+  text-align: right;
+}
+
+.pf-task-contact-table-row {
+  border-top: 1px solid var(--border);
+  padding-block: 14px;
+  color: var(--foreground);
+  font-size: 12px;
+}
+
+.pf-task-contact-table-row[data-saved="true"],
+.pf-task-contact-table-row:hover {
+  background: color-mix(in oklab, var(--muted) 18%, var(--background));
+}
+
+.pf-task-contact-table-row .pf-task-contact-check > input[type="checkbox"] {
+  appearance: none;
+  box-sizing: border-box;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  padding: 0;
+  border: 1.5px solid color-mix(in oklab, var(--border) 80%, var(--foreground));
+  border-radius: 4px;
+  background: var(--background);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 16px;
+}
+
+.pf-task-contact-table-row .pf-task-contact-check > input[type="checkbox"]:checked {
+  border-color: #161616;
+  background: #161616;
+}
+
+.pf-task-contact-table-row .pf-task-contact-check > input[type="checkbox"]:checked::after {
+  content: "";
+  width: 8px;
+  height: 5px;
+  border-left: 1.7px solid #ffffff;
+  border-bottom: 1.7px solid #ffffff;
+  transform: rotate(-45deg) translate(1px, -1px);
+}
+
+.pf-task-contact-table-row .pf-task-contact-check > input[type="checkbox"]:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--foreground) 32%, transparent);
+  outline-offset: 2px;
+}
+
+.pf-task-contact-check {
+  display: flex;
+  justify-content: center;
+}
+
+.pf-task-contact-person {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.pf-task-contact-avatar {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--muted);
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.pf-task-contact-person > span:last-child {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pf-task-contact-person strong,
+.pf-task-contact-person small,
+.pf-task-contact-description {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pf-task-contact-person strong {
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.pf-task-contact-person small,
+.pf-task-contact-description {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.pf-task-contact-description {
+  white-space: normal;
+}
+
+.pf-task-contact-action {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.pf-task-contact-edit-button {
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 30px;
+  background: #f4f4f4;
+  color: #1f1f1f;
+}
+
+.pf-task-contact-edit-button:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.pf-task-contact-table-empty {
+  padding: 18px 16px;
+  border-top: 1px solid var(--border);
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.pf-task-settings-empty {
+  padding: 8px 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.pf-task-settings-rules-block,
+.pf-task-settings-memory-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pf-task-keyword-box {
+  min-width: 0;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 3px 5px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+}
+
+.pf-task-keyword-box:focus-within {
+  border-color: color-mix(in oklab, var(--puffer-accent) 60%, var(--border));
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--puffer-accent) 16%, transparent);
+}
+
+.pf-task-keyword-box input {
+  width: 80px;
+  min-width: 72px;
+  flex: 1 0 72px;
+  height: 22px;
+  padding: 0 2px;
+  border: 0;
+  box-shadow: none;
+}
+
+.pf-task-keyword-box input:focus {
+  border: 0;
+  box-shadow: none;
+}
+
+.pf-task-keyword-chip {
+  max-width: 100%;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 4px 0 7px;
+  border: 1px solid color-mix(in oklab, var(--puffer-accent) 28%, var(--border));
+  border-radius: 5px;
+  background: color-mix(in oklab, var(--puffer-accent) 10%, var(--background));
+  color: var(--foreground);
+  font-size: 12px;
+  line-height: 20px;
+}
+
+.pf-task-keyword-chip[data-mode="include"] {
+  border-color: color-mix(in oklab, var(--puffer-accent) 32%, var(--border));
+  background: color-mix(in oklab, var(--puffer-accent) 10%, var(--background));
+}
+
+.pf-task-keyword-chip[data-mode="exclude"] {
+  border-color: color-mix(in oklab, var(--pf-run-failed) 26%, var(--border));
+  background: color-mix(in oklab, var(--pf-run-failed) 6%, var(--background));
+}
+
+.pf-task-keyword-chip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pf-task-keyword-chip button {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted-foreground);
+}
+
+.pf-task-keyword-chip button:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--puffer-accent) 14%, transparent);
+  color: var(--foreground);
+}
+
+.pf-task-keyword-rule-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pf-task-keyword-rule-row {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+
+.pf-task-keyword-rule-label {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pf-task-keyword-rule-box {
+  min-height: 32px;
+}
+
+.pf-task-keyword-rule-box[data-mode="include"]:focus-within {
+  border-color: color-mix(in oklab, var(--puffer-accent) 62%, var(--border));
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--puffer-accent) 16%, transparent);
+}
+
+.pf-task-keyword-rule-box[data-mode="exclude"]:focus-within {
+  border-color: color-mix(in oklab, var(--pf-run-failed) 38%, var(--border));
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--pf-run-failed) 10%, transparent);
+}
+
+.pf-monitor-rule-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pf-monitor-rule-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--background) 92%, var(--muted) 8%);
+}
+
+.pf-monitor-rule-group.is-empty {
+  color: var(--muted-foreground);
+}
+
+.pf-monitor-rule-group-head {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.pf-monitor-rule-group-head > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pf-monitor-rule-group-head strong {
+  color: var(--foreground);
+  font-size: 13px;
+  line-height: 16px;
+}
+
+.pf-monitor-rule-group-head span {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  line-height: 14px;
+}
+
+.pf-monitor-rule-add-button {
+  min-width: 0;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pf-monitor-rule-add-button:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--puffer-accent) 35%, var(--border));
+  background: color-mix(in oklab, var(--puffer-accent) 8%, var(--background));
+}
+
+.pf-monitor-rule-chip-list {
+  max-height: 172px;
+  min-height: 0;
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 6px;
+  overflow-y: auto;
+  padding-right: 2px;
+  scrollbar-gutter: stable;
+}
+
+.pf-monitor-rule-chip {
+  width: fit-content;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 5px 4px 10px;
+  border: 1px solid color-mix(in oklab, var(--puffer-accent) 24%, var(--border));
+  border-radius: 6px;
+  background: color-mix(in oklab, var(--puffer-accent) 7%, var(--background));
+  color: var(--foreground);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.pf-monitor-rule-chip[data-mode="exclude"] {
+  border-color: color-mix(in oklab, var(--pf-run-failed) 24%, var(--border));
+  background: color-mix(in oklab, var(--pf-run-failed) 5%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="text"] {
+  border-color: color-mix(in oklab, #8b5cf6 38%, var(--border));
+  background: color-mix(in oklab, #8b5cf6 10%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="blue"] {
+  border-color: color-mix(in oklab, #2563eb 34%, var(--border));
+  background: color-mix(in oklab, #2563eb 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="green"] {
+  border-color: color-mix(in oklab, #16a34a 34%, var(--border));
+  background: color-mix(in oklab, #16a34a 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="amber"] {
+  border-color: color-mix(in oklab, #d97706 34%, var(--border));
+  background: color-mix(in oklab, #d97706 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="rose"] {
+  border-color: color-mix(in oklab, #e11d48 32%, var(--border));
+  background: color-mix(in oklab, #e11d48 7%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="teal"] {
+  border-color: color-mix(in oklab, #0d9488 34%, var(--border));
+  background: color-mix(in oklab, #0d9488 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="violet"] {
+  border-color: color-mix(in oklab, #7c3aed 34%, var(--border));
+  background: color-mix(in oklab, #7c3aed 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="cyan"] {
+  border-color: color-mix(in oklab, #0891b2 34%, var(--border));
+  background: color-mix(in oklab, #0891b2 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="lime"] {
+  border-color: color-mix(in oklab, #65a30d 34%, var(--border));
+  background: color-mix(in oklab, #65a30d 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="orange"] {
+  border-color: color-mix(in oklab, #ea580c 34%, var(--border));
+  background: color-mix(in oklab, #ea580c 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="pink"] {
+  border-color: color-mix(in oklab, #db2777 32%, var(--border));
+  background: color-mix(in oklab, #db2777 7%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="indigo"] {
+  border-color: color-mix(in oklab, #4f46e5 34%, var(--border));
+  background: color-mix(in oklab, #4f46e5 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="emerald"] {
+  border-color: color-mix(in oklab, #059669 34%, var(--border));
+  background: color-mix(in oklab, #059669 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="yellow"] {
+  border-color: color-mix(in oklab, #ca8a04 34%, var(--border));
+  background: color-mix(in oklab, #ca8a04 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="red"] {
+  border-color: color-mix(in oklab, #dc2626 32%, var(--border));
+  background: color-mix(in oklab, #dc2626 7%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="sky"] {
+  border-color: color-mix(in oklab, #0284c7 34%, var(--border));
+  background: color-mix(in oklab, #0284c7 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="fuchsia"] {
+  border-color: color-mix(in oklab, #c026d3 32%, var(--border));
+  background: color-mix(in oklab, #c026d3 7%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="slate"] {
+  border-color: color-mix(in oklab, #475569 32%, var(--border));
+  background: color-mix(in oklab, #475569 7%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="mint"] {
+  border-color: color-mix(in oklab, #10b981 34%, var(--border));
+  background: color-mix(in oklab, #10b981 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="coral"] {
+  border-color: color-mix(in oklab, #f97316 34%, var(--border));
+  background: color-mix(in oklab, #f97316 8%, var(--background));
+}
+
+.pf-monitor-rule-chip[data-tone="plum"] {
+  border-color: color-mix(in oklab, #9333ea 34%, var(--border));
+  background: color-mix(in oklab, #9333ea 8%, var(--background));
+}
+
+.pf-monitor-rule-chip-text {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pf-monitor-rule-chip-text strong {
+  font-weight: 700;
+}
+
+.pf-monitor-rule-chip button {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted-foreground);
+}
+
+.pf-monitor-rule-chip button:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--foreground) 8%, transparent);
+  color: var(--foreground);
+}
+
+.pf-monitor-rule-builder {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: end;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid color-mix(in oklab, var(--puffer-accent) 24%, var(--border));
+  border-radius: 8px;
+  background: var(--background);
+}
+
+.pf-monitor-rule-builder label {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.pf-monitor-rule-builder label > span {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  line-height: 13px;
+}
+
+.pf-monitor-rule-builder-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pf-monitor-rule-builder-actions button {
+  min-width: 104px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pf-monitor-rule-builder-actions .pf-secondary-button {
+  border: 1px solid var(--border);
+  background: var(--background);
+  color: var(--foreground);
+}
+
+.pf-monitor-rule-builder-actions .pf-primary-button {
+  border: 1px solid #111111;
+  background: #111111;
+  color: #ffffff;
+}
+
+.pf-monitor-rule-builder-actions button:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+
+.pf-task-config input,
+.pf-task-config select,
+.pf-task-config textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--foreground);
+}
+
+.pf-task-config input,
+.pf-task-config select {
+  height: 30px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.pf-task-config input::placeholder {
+  color: var(--muted-foreground);
+}
+
+.pf-task-config textarea {
+  min-height: 320px;
+  resize: vertical;
+  padding: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.pf-task-config input:focus,
+.pf-task-config select:focus,
+.pf-task-config textarea:focus {
+  outline: none;
+  border-color: color-mix(in oklab, var(--puffer-accent) 60%, var(--border));
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--puffer-accent) 16%, transparent);
+}
+
+.pf-task-config .pf-task-keyword-box input {
+  width: 80px;
+  min-width: 72px;
+  flex: 1 0 72px;
+  height: 22px;
+  padding: 0 2px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  line-height: 22px;
+}
+
+.pf-task-keyword-box input:focus {
+  border: 0;
+  box-shadow: none;
+}
+
+.pf-task-config p {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.pf-task-config-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+@media (max-width: 860px) {
+  .pf-tasks-top {
+    height: auto;
+    min-height: 48px;
+    align-items: stretch;
+    flex-direction: column;
+    padding: 8px 10px;
+  }
+
+  .pf-tasks-top-right {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .pf-tasks-search {
+    width: 100%;
+  }
+
+  .pf-tasks-summary {
+    padding: 6px 10px;
+  }
+
+  .pf-monitor-create {
+    padding: 8px 10px;
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pf-monitor-create label {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .pf-monitor-create button {
+    margin-left: 0;
+    align-self: flex-start;
+  }
+
+  .pf-tasks-warning {
+    padding: 8px 10px;
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .pf-tasks-warning span {
+    white-space: normal;
+  }
+
+  .pf-tasks-warning button {
+    margin-left: 0;
+  }
+
+  .pf-tasks-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pf-tasks-workspace[data-inspector="true"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pf-tasks-list-panel {
+    min-height: 42vh;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .pf-task-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .pf-task-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .pf-task-detail {
+    min-height: 38vh;
+  }
+
+  .pf-task-detail-meta {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pf-task-config-backdrop {
+    padding: 10px;
+    align-items: stretch;
+  }
+
+  .pf-task-config {
+    width: 100%;
+    height: calc(100vh - 20px);
+    max-height: calc(100vh - 20px);
+  }
+
+  .pf-task-history {
+    width: 100%;
+    height: calc(100vh - 20px);
+  }
+
+  .pf-task-history-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pf-task-history-sidebar {
+    max-height: 34vh;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .pf-task-settings-body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .pf-task-settings-nav {
+    min-height: 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    flex-direction: row;
+    overflow-x: auto;
+  }
+
+  .pf-task-settings-nav-item {
+    width: auto;
+    flex: 0 0 auto;
+  }
+
+  .pf-task-settings-monitor-form,
+  .pf-task-settings-monitor-row,
+  .pf-task-keyword-rule-row,
+  .pf-monitor-rule-builder {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .pf-monitor-rule-group-head,
+  .pf-monitor-rule-builder-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pf-task-contact-table-head {
+    display: none;
+  }
+
+  .pf-task-contact-table-row {
+    grid-template-columns: 22px minmax(0, 1fr) auto;
+  }
+
+  .pf-task-contact-description {
+    grid-column: 2 / -1;
+  }
+
+  .pf-task-config-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}

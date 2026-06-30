@@ -1,23 +1,79 @@
+mod attachment_bridge;
 mod auth_credentials;
 mod auth_provider;
 mod authflow;
+mod basic_commands;
+mod benchmark_reflection;
 mod benchmark_run;
+mod browser;
+mod browser_args;
+mod browser_output;
+mod browser_profiles;
 mod cli_args;
 mod command_surface;
 mod command_surface_desktop;
+mod connect;
+mod connectors;
+mod daemon;
+mod daemon_browser;
+mod daemon_browser_settings;
+mod daemon_contacts;
+mod daemon_files;
+mod daemon_fs_watch;
+mod daemon_gcal_browser_setup;
+mod daemon_gmail_browser_setup;
+#[path = "daemon_lark_browser_setup.rs"]
+mod daemon_lark_browser_setup;
+mod daemon_lambda_skills;
+mod daemon_local_model;
+mod daemon_lsp;
+mod daemon_pty;
+mod daemon_secrets;
+mod daemon_singleton;
+mod daemon_telegram_ranking;
+mod daemon_title;
+mod daemon_turn_recovery;
+mod daemon_turn_routing;
+mod daemon_ui_state;
+#[cfg(unix)]
+mod daemon_wechat_browser_setup;
+mod daemon_workflows;
+mod desktop_activity;
 mod desktop_api;
 mod desktop_api_types;
+mod gcal_browser;
+mod gmail_browser;
+mod gmail_browser_log;
+mod heartbeat;
+mod internal_tools;
+mod lark_connector;
+#[path = "lark_browser.rs"]
+mod lark_browser;
+#[path = "lark_browser_script.rs"]
+mod lark_browser_script;
+mod media_internal_tools;
+mod non_interactive;
+mod project_metadata;
 mod resource_fs;
+mod runner_selection;
+mod subscriber_tool_args;
+mod subscriber_tools;
+mod subscriptions;
+#[cfg(unix)]
+mod wechat_connector;
+mod workflow_runtime;
+mod workflows;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use basic_commands::{
+    provider_supports_auth_mode, run_agents_command, run_auto_mode_command, run_doctor_command,
+    run_install_command, run_setup_token_command, run_update_command,
+};
 use benchmark_run::run_benchmark_command;
 use clap::Parser;
 use cli_args::{AuthCommand, Cli, Command, SessionCommand, ToolCommand};
-use command_surface::{
-    provider_supports_auth_mode, run_agents_command, run_auto_mode_command, run_doctor_command,
-    run_install_command, run_mcp_command, run_plugin_command, run_setup_token_command,
-    run_update_command,
-};
+use command_surface::{run_mcp_command, run_plugin_command};
+use non_interactive::run_non_interactive_command;
 use puffer_config::{ensure_workspace_dirs, load_config, ConfigPaths};
 use puffer_core::{resolve_resume_launch, supported_commands, AppState, ResumeLaunchResolution};
 use puffer_provider_openai::{
@@ -25,9 +81,11 @@ use puffer_provider_openai::{
     parse_authorization_input as parse_openai_authorization_input,
     refresh_oauth_token as refresh_openai_oauth_token,
 };
-use puffer_provider_registry::{AuthMode, AuthStore, ProviderRegistry, StoredCredential};
+use puffer_provider_registry::{
+    canonical_provider_id, AuthMode, AuthStore, ProviderRegistry, StoredCredential,
+};
 use puffer_resources::load_resources;
-use puffer_session_store::SessionStore;
+use puffer_session_store::{SessionMetadata, SessionStore};
 use puffer_tools::ToolRegistry;
 use puffer_transport_anthropic::{
     build_messages_request, exchange_authorization_code as exchange_anthropic_code,
@@ -39,7 +97,7 @@ use puffer_transport_anthropic::{
 use puffer_tui::StartupAction;
 use std::io::Read as _;
 use std::io::Write as _;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::auth_credentials::{
@@ -52,15 +110,67 @@ use crate::auth_provider::{
     OauthFamily,
 };
 
+const CLI_MAIN_STACK_SIZE_BYTES: usize = 32 * 1024 * 1024;
+
 fn main() -> Result<()> {
+    let handle = std::thread::Builder::new()
+        .name("puffer-main".to_string())
+        .stack_size(CLI_MAIN_STACK_SIZE_BYTES)
+        .spawn(run_main)
+        .context("spawn puffer main thread")?;
+    match handle.join() {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn run_main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Hidden subscriber subcommand dispatches to a baked-in skill driver
+    // before any other Puffer state is loaded. The supervisor invokes
+    // `puffer __subscriber <id>`; that process is dedicated to the
+    // subscriber loop and has no business loading resources, providers,
+    // or the subscription manager itself.
+    if let Some(Command::Subscriber { id }) = &cli.subcommand {
+        return run_subscriber(id);
+    }
+
+    // Hidden connector-protocol bridge. The subscription manager invokes
+    // `puffer __connector <id> <op> ...` (per the connector template `command`
+    // argv) to run `auth-ok`, `act`, or `subscribe` against an external tool.
+    // Like `__subscriber`, this process is dedicated to the bridge and must not
+    // load resources, providers, or the subscription manager.
+    if let Some(Command::Connector { id, args }) = &cli.subcommand {
+        return run_connector_bridge(id, args);
+    }
+
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(&cwd);
     ensure_workspace_dirs(&paths)?;
     let config = load_config(&paths)?;
     let auth_path = paths.user_config_dir.join("auth.json");
     let mut auth_store = AuthStore::load(&auth_path)?;
-    let mut resources = load_resources(&paths)?;
+    let mut resources = load_resources(&paths, &puffer_runner_local::LocalToolRunner::new())?;
+
+    // Durable default logging: tracing events (connect/RPC/browser/errors)
+    // roll into ~/.puffer/logs/puffer.log so failures are debuggable after the
+    // fact. The telegram-user subscriber path returned earlier and keeps its
+    // own per-account log. The guard must live for the whole process.
+    let _log_guard = puffer_logging::init("puffer");
+
+    // Observability: opt-in via OTEL_EXPORTER_OTLP_ENDPOINT (+ optional
+    // LANGFUSE_PUBLIC_KEY/SECRET_KEY for Basic auth). When unset,
+    // [`puffer_observability::ObservabilityHandle::try_init_from_env`]
+    // returns `None` and the agent loop's span helpers short-circuit
+    // to no-ops. See `docs/observability/langfuse-design.md`.
+    match puffer_observability::ObservabilityHandle::try_init_from_env() {
+        Ok(Some(handle)) => puffer_core::install_observability(handle),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("warning: observability disabled — {error:?}");
+        }
+    }
 
     let mut providers = ProviderRegistry::new();
     for provider in &resources.providers {
@@ -70,6 +180,9 @@ fn main() -> Result<()> {
         );
     }
     providers.apply_openai_base_url_override(config.openai_base_url.as_deref());
+    if let Some(display_name) = config.openai_display_name.as_deref() {
+        providers.set_openai_display_name(display_name);
+    }
     if !config.openai_headers.is_empty() {
         providers.set_openai_headers(
             config
@@ -88,14 +201,86 @@ fn main() -> Result<()> {
                 .collect::<indexmap::IndexMap<_, _>>(),
         );
     }
-    let _ = providers.discover_and_merge_all(&auth_store);
+    // Discovery: synchronously apply whatever the cache already knows, then
+    // probe stale providers on a detached thread so an unreachable endpoint
+    // (e.g. a slow custom `openai_base_url`) cannot delay startup. Newly
+    // discovered models become available on the next launch.
+    let stale_provider_ids = providers.apply_discovery_cache();
+    let _discovery_handle = if let Ok(client) = proxy_discovery_client(&config) {
+        providers.start_background_discovery_with_discovery_client(
+            stale_provider_ids,
+            &auth_store,
+            client,
+        )
+    } else {
+        providers.start_background_discovery(stale_provider_ids, &auth_store)
+    };
 
-    match cli.subcommand {
+    // Boot background automation only for long-lived processes. Short CLI
+    // commands like `workflow register` and `workflow ls` must not fire cron
+    // triggers as a side effect of inspecting state.
+    let anthropic_base = providers.provider("anthropic").map(|p| p.base_url.clone());
+    let start_background_runtimes = should_start_background_runtimes(&cli.subcommand);
+    // Non-interactive turns still need the subscription manager so agent
+    // tools (Telegram, Email, …) can dispatch through it, but they MUST
+    // NOT spin up the cron / heartbeat threads — those are intended for
+    // long-lived processes only.
+    let install_subscription_manager =
+        start_background_runtimes || matches!(cli.subcommand, Some(Command::NonInteractive(_)));
+    let mut daemon_host_guard = if matches!(cli.subcommand, Some(Command::Daemon { .. })) {
+        Some(daemon_singleton::acquire(&paths)?)
+    } else {
+        None
+    };
+    let _heartbeat = if start_background_runtimes {
+        match heartbeat::start_from_env() {
+            Ok(handle) => handle,
+            Err(error) => {
+                eprintln!("heartbeat disabled: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let _workflow_runtime = if start_background_runtimes {
+        match workflow_runtime::install(&paths, &config, &resources, &providers, &auth_store) {
+            Ok(rt) => Some(rt),
+            Err(error) => {
+                eprintln!("workflow runtime failed to start: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let _subscription_runtime = if install_subscription_manager {
+        match subscriptions::install(&paths, &auth_store, anthropic_base.as_deref()) {
+            Ok(rt) => Some(rt),
+            Err(error) => {
+                eprintln!("subscription manager failed to start: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let result = match cli.subcommand {
+        Some(Command::Subscriber { .. }) => {
+            // Already handled above; here only to satisfy exhaustiveness.
+            unreachable!("__subscriber dispatched before main match")
+        }
+        Some(Command::Connector { .. }) => {
+            // Already handled above; here only to satisfy exhaustiveness.
+            unreachable!("__connector dispatched before main match")
+        }
         Some(Command::Agents { setting_sources }) => {
             run_agents_command(&paths, &config, setting_sources.as_deref())
         }
         Some(Command::Auth { command }) => run_auth_command(
             command,
+            &config,
             config.default_provider.as_deref(),
             &mut auth_store,
             &auth_path,
@@ -108,14 +293,18 @@ fn main() -> Result<()> {
         Some(Command::Install { target, force }) => {
             run_install_command(target.as_deref(), force, &cwd)
         }
-        Some(Command::Mcp { command }) => run_mcp_command(command, &paths, &resources),
+        Some(Command::Mcp { command }) => {
+            run_mcp_command(command, &paths, &config, &resources, &cwd)
+        }
         Some(Command::Plugin { command }) => run_plugin_command(command, &paths, &resources),
+        Some(Command::Workflow { command }) => workflows::run_workflow_command(command, &paths),
         Some(Command::SetupToken {
             provider,
             token,
             stdin,
         }) => {
-            let provider = resolve_provider_arg(provider, config.default_provider.as_deref());
+            let provider =
+                resolve_provider_arg(&providers, provider, config.default_provider.as_deref());
             let token = if stdin {
                 read_secret_from_stdin()?
             } else if let Some(token) = token {
@@ -168,6 +357,7 @@ fn main() -> Result<()> {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "prompts": resources.prompts,
                     "tools": resources.tools,
+                    "internal_tools": resources.internal_tools,
                     "skills": resources.skills,
                     "plugins": resources.plugins,
                     "mcp_servers": resources.mcp_servers,
@@ -185,6 +375,33 @@ fn main() -> Result<()> {
             &providers,
             &mut auth_store,
         ),
+        Some(Command::Daemon {
+            bind,
+            handshake_file,
+            token,
+            print_handshake,
+            no_browser,
+            system_prompt_1,
+            disable_auto_title,
+            yolo,
+        }) => daemon::run(daemon::DaemonOptions {
+            host_guard: daemon_host_guard
+                .take()
+                .expect("daemon host guard acquired before daemon startup"),
+            bind,
+            handshake_file,
+            token,
+            print_handshake,
+            no_browser,
+            system_prompt_1,
+            disable_auto_title,
+            yolo,
+        }),
+        Some(Command::Browser(args)) => browser::run_browser_command(&cwd, &paths, args),
+        Some(Command::Connect { command }) => connect::run_connect_command(&paths, command),
+        Some(Command::InternalTool { command }) => {
+            internal_tools::run_internal_tool_command(&cwd, &paths, command)
+        }
         Some(Command::BenchmarkRun {
             prompt,
             prompt_file,
@@ -214,6 +431,15 @@ fn main() -> Result<()> {
                 trajectory_json,
                 deny_tools,
             },
+        ),
+        Some(Command::NonInteractive(args)) => run_non_interactive_command(
+            &cwd,
+            &config,
+            &resources,
+            &mut providers,
+            &mut auth_store,
+            &paths,
+            args,
         ),
         Some(Command::AnthropicRequestFixture) => {
             let request = build_messages_request(
@@ -261,7 +487,30 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Some(Command::Serve {
+            config: config_override,
+        }) => run_serve_command(
+            config_override.as_deref(),
+            &cwd,
+            config,
+            resources,
+            providers,
+            auth_store,
+            auth_path,
+            &paths,
+        ),
         Some(Command::Tool { command }) => run_tool_command(command, &resources, &cwd),
+        Some(Command::WinChromeImport { args }) => {
+            #[cfg(target_os = "windows")]
+            {
+                puffer_secrets::win_chrome_import::dispatch(&args)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = args;
+                anyhow::bail!("__win-chrome-import is Windows-only")
+            }
+        }
         Some(Command::Remote {
             target,
             cwd,
@@ -319,8 +568,17 @@ fn main() -> Result<()> {
                     cli.no_alt_screen || config.ui.no_alt_screen,
                 ),
                 ResumeLaunchResolution::Picker { query, .. } if cli.resume.is_some() => {
-                    let session = session_store.create_session(cwd.clone())?;
-                    let mut state = AppState::new(config.clone(), cwd, session);
+                    let runner = crate::runner_selection::select_tool_runner(
+                        &config,
+                        &resources,
+                        cwd.clone(),
+                    );
+                    let mut state = AppState::new(
+                        config.clone(),
+                        cwd.clone(),
+                        transient_resume_picker_session(cwd),
+                    )
+                    .with_tool_runner(runner);
                     if let Some(prompt) = cli.prompt {
                         state.queue_pending_query_prompt(prompt);
                     }
@@ -346,7 +604,13 @@ fn main() -> Result<()> {
                 }
                 _ => {
                     let session = session_store.create_session(cwd.clone())?;
-                    let mut state = AppState::new(config.clone(), cwd, session);
+                    let runner = crate::runner_selection::select_tool_runner(
+                        &config,
+                        &resources,
+                        cwd.clone(),
+                    );
+                    let mut state =
+                        AppState::new(config.clone(), cwd, session).with_tool_runner(runner);
                     puffer_tui::run_app(
                         &mut state,
                         &mut resources,
@@ -361,7 +625,24 @@ fn main() -> Result<()> {
                 }
             }
         }
-    }
+    };
+
+    // Force-flush observability spans (and other runtime services) before
+    // process exit. Without this, short-running commands like
+    // `benchmark-run` can race the OTLP exporter and lose the last few
+    // spans in transit.
+    let _ = puffer_core::shutdown_runtime_services();
+    result
+}
+
+fn should_start_background_runtimes(subcommand: &Option<Command>) -> bool {
+    matches!(
+        subcommand,
+        None | Some(Command::Resume { .. })
+            | Some(Command::Fork { .. })
+            | Some(Command::Daemon { .. })
+            | Some(Command::Serve { .. })
+    )
 }
 
 fn run_existing_session_tui(
@@ -383,6 +664,8 @@ fn run_existing_session_tui(
         state.cwd = cwd.to_path_buf();
         state.session.cwd = cwd.to_path_buf();
     }
+    let runner = crate::runner_selection::select_tool_runner(config, resources, state.cwd.clone());
+    state = state.with_tool_runner(runner);
     puffer_tui::run_app(
         &mut state,
         resources,
@@ -394,6 +677,25 @@ fn run_existing_session_tui(
         initial_prompt,
         no_alt_screen,
     )
+}
+
+fn transient_resume_picker_session(cwd: std::path::PathBuf) -> SessionMetadata {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    SessionMetadata {
+        id: Uuid::nil(),
+        display_name: Some("Resume picker".to_string()),
+        generated_title: None,
+        cwd,
+        created_at_ms: now,
+        updated_at_ms: now,
+        parent_session_id: None,
+        slug: None,
+        tags: Vec::new(),
+        note: None,
+    }
 }
 
 fn run_tool_command(
@@ -465,7 +767,6 @@ fn run_tool_command(
                     command,
                     timeout: None,
                     run_in_background: false,
-                    dangerously_disable_sandbox: false,
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -605,6 +906,7 @@ fn run_session_command(command: Option<SessionCommand>, paths: &ConfigPaths) -> 
 
 fn run_auth_command(
     command: AuthCommand,
+    config: &puffer_config::PufferConfig,
     default_provider: Option<&str>,
     auth_store: &mut AuthStore,
     auth_path: &std::path::Path,
@@ -651,16 +953,18 @@ fn run_auth_command(
             value,
             stdin,
         } => {
-            let provider = resolve_provider_arg(provider, default_provider);
+            let provider = resolve_provider_arg(providers, provider, default_provider);
             if !provider_supports_auth_mode(&provider, providers, &AuthMode::OAuth) {
                 anyhow::bail!(
                     "provider `{provider}` does not support OAuth; use `puffer setup-token {provider}` or `puffer auth set-api-key {provider}`"
                 );
             }
-            run_login_flow(&provider, value, stdin, auth_store, auth_path, providers)?;
+            run_login_flow(
+                &provider, value, stdin, auth_store, auth_path, providers, config,
+            )?;
         }
         AuthCommand::Logout { provider } => {
-            let provider = resolve_provider_arg(provider, default_provider);
+            let provider = resolve_provider_arg(providers, provider, default_provider);
             let removed = auth_store.remove(&provider);
             auth_store.save(auth_path)?;
             if removed.is_some() {
@@ -674,6 +978,7 @@ fn run_auth_command(
             api_key,
             stdin,
         } => {
+            let provider = resolve_provider_id(providers, &provider);
             let key = if stdin {
                 read_secret_from_stdin()?
             } else {
@@ -686,6 +991,7 @@ fn run_auth_command(
             println!("stored api key for {provider}");
         }
         AuthCommand::Clear { provider } => {
+            let provider = resolve_provider_id(providers, &provider);
             let removed = auth_store.remove(&provider);
             auth_store.save(auth_path)?;
             if removed.is_some() {
@@ -695,10 +1001,12 @@ fn run_auth_command(
             }
         }
         AuthCommand::OauthUrl { provider } => {
+            let provider = resolve_provider_id(providers, &provider);
             let bundle = oauth_start_bundle_for_provider(providers, &provider)?;
             println!("{}", bundle.authorization_url);
         }
         AuthCommand::OauthStart { provider } => {
+            let provider = resolve_provider_id(providers, &provider);
             let bundle = oauth_start_bundle_for_provider(providers, &provider)?;
             println!(
                 "{}",
@@ -720,6 +1028,7 @@ fn run_auth_command(
             state,
             stdin,
         } => {
+            let provider = resolve_provider_id(providers, &provider);
             let input = if stdin {
                 read_secret_from_stdin()?
             } else {
@@ -740,7 +1049,17 @@ fn run_auth_command(
                             anyhow::bail!("oauth state mismatch for openai");
                         }
                     }
-                    let credential = exchange_openai_code(&code, &verifier, None)?;
+                    let credential = match proxy_oauth_client(
+                        config,
+                        puffer_provider_openai::OPENAI_TOKEN_URL,
+                    ) {
+                        Ok(client) => {
+                            puffer_provider_openai::exchange_authorization_code_with_client(
+                                &client, &code, &verifier, None,
+                            )?
+                        }
+                        Err(_) => exchange_openai_code(&code, &verifier, None)?,
+                    };
                     auth_store.set_oauth(
                         provider.clone(),
                         to_registry_oauth_credential_openai(credential),
@@ -759,13 +1078,25 @@ fn run_auth_command(
                     }
                     let redirect_uri = inferred_anthropic_redirect_uri(&input)
                         .unwrap_or_else(|| ANTHROPIC_MANUAL_REDIRECT_URL.to_string());
-                    let credential = exchange_anthropic_code(
-                        &code,
-                        &verifier,
-                        &expected_state,
-                        Some(&redirect_uri),
-                        Some(ANTHROPIC_API_BASE_URL),
-                    )?;
+                    let credential = match proxy_oauth_client(config, ANTHROPIC_API_BASE_URL) {
+                        Ok(client) => {
+                            puffer_transport_anthropic::exchange_authorization_code_with_client(
+                                &client,
+                                &code,
+                                &verifier,
+                                &expected_state,
+                                Some(&redirect_uri),
+                                Some(ANTHROPIC_API_BASE_URL),
+                            )?
+                        }
+                        Err(_) => exchange_anthropic_code(
+                            &code,
+                            &verifier,
+                            &expected_state,
+                            Some(&redirect_uri),
+                            Some(ANTHROPIC_API_BASE_URL),
+                        )?,
+                    };
                     store_anthropic_credential(auth_store, &provider, credential)?;
                 }
                 None => anyhow::bail!("oauth exchange is not implemented for {provider}"),
@@ -774,6 +1105,7 @@ fn run_auth_command(
             println!("stored oauth credentials for {provider}");
         }
         AuthCommand::OauthRefresh { provider } => {
+            let provider = resolve_provider_id(providers, &provider);
             let credential = auth_store
                 .get(&provider)
                 .ok_or_else(|| anyhow::anyhow!("no credentials stored for {provider}"))?;
@@ -782,17 +1114,34 @@ fn run_auth_command(
             };
             let refreshed = match oauth_family_for_provider(providers, &provider) {
                 Some(OauthFamily::OpenAi) => {
-                    StoredCredential::OAuth(to_registry_oauth_credential_openai(
-                        refresh_openai_oauth_token(&existing.refresh_token)?,
-                    ))
+                    let credential = match proxy_oauth_client(
+                        config,
+                        puffer_provider_openai::OPENAI_TOKEN_URL,
+                    ) {
+                        Ok(client) => puffer_provider_openai::refresh_oauth_token_with_client(
+                            &client,
+                            &existing.refresh_token,
+                        )?,
+                        Err(_) => refresh_openai_oauth_token(&existing.refresh_token)?,
+                    };
+                    StoredCredential::OAuth(to_registry_oauth_credential_openai(credential))
                 }
                 Some(OauthFamily::Anthropic) => {
-                    store_ready_credential_from_anthropic(refresh_anthropic_oauth_token(
-                        &existing.refresh_token,
-                        anthropic_refresh_scopes(existing).as_deref(),
-                        Some(ANTHROPIC_API_BASE_URL),
-                        Some(&registry_to_anthropic_oauth_credential(existing)),
-                    )?)?
+                    let credential = match proxy_oauth_client(config, ANTHROPIC_API_BASE_URL) {
+                        Ok(client) => puffer_transport_anthropic::refresh_oauth_token_with_client(
+                            &client,
+                            &existing.refresh_token,
+                            anthropic_refresh_scopes(existing).as_deref(),
+                            Some(&registry_to_anthropic_oauth_credential(existing)),
+                        )?,
+                        Err(_) => refresh_anthropic_oauth_token(
+                            &existing.refresh_token,
+                            anthropic_refresh_scopes(existing).as_deref(),
+                            Some(ANTHROPIC_API_BASE_URL),
+                            Some(&registry_to_anthropic_oauth_credential(existing)),
+                        )?,
+                    };
+                    store_ready_credential_from_anthropic(credential)?
                 }
                 None => anyhow::bail!("oauth refresh is not implemented for {provider}"),
             };
@@ -804,10 +1153,48 @@ fn run_auth_command(
     Ok(())
 }
 
-fn resolve_provider_arg(provider: Option<String>, default_provider: Option<&str>) -> String {
-    provider
+fn resolve_provider_arg(
+    providers: &ProviderRegistry,
+    provider: Option<String>,
+    default_provider: Option<&str>,
+) -> String {
+    let provider = provider
         .or_else(|| default_provider.map(ToOwned::to_owned))
-        .unwrap_or_else(|| "anthropic".to_string())
+        .unwrap_or_else(|| "anthropic".to_string());
+    resolve_provider_id(providers, &provider)
+}
+
+fn resolve_provider_id(providers: &ProviderRegistry, provider: &str) -> String {
+    providers
+        .provider(provider)
+        .map(|descriptor| descriptor.id.clone())
+        .unwrap_or_else(|| canonical_provider_id(provider))
+}
+
+fn proxy_discovery_client(
+    config: &puffer_config::PufferConfig,
+) -> Result<puffer_provider_registry::ModelDiscoveryClient> {
+    let client = puffer_core::blocking_client_for_url(
+        &config.network.proxy,
+        puffer_core::HttpPurpose::Discovery,
+        "https://api.openai.com/v1/models",
+        Duration::from_secs(8),
+    )?;
+    Ok(puffer_provider_registry::ModelDiscoveryClient::with_client(
+        client,
+    ))
+}
+
+fn proxy_oauth_client(
+    config: &puffer_config::PufferConfig,
+    url: &str,
+) -> Result<reqwest::blocking::Client> {
+    puffer_core::blocking_client_for_url(
+        &config.network.proxy,
+        puffer_core::HttpPurpose::OAuth,
+        url,
+        Duration::from_secs(60),
+    )
 }
 
 fn run_login_flow(
@@ -817,6 +1204,7 @@ fn run_login_flow(
     auth_store: &mut AuthStore,
     auth_path: &std::path::Path,
     providers: &ProviderRegistry,
+    config: &puffer_config::PufferConfig,
 ) -> Result<()> {
     let callback_listener = if stdin || value.is_some() {
         None
@@ -863,7 +1251,16 @@ fn run_login_flow(
                     anyhow::bail!("oauth state mismatch for openai");
                 }
             }
-            let credential = exchange_openai_code(&code, &bundle.verifier, None)?;
+            let credential =
+                match proxy_oauth_client(config, puffer_provider_openai::OPENAI_TOKEN_URL) {
+                    Ok(client) => puffer_provider_openai::exchange_authorization_code_with_client(
+                        &client,
+                        &code,
+                        &bundle.verifier,
+                        None,
+                    )?,
+                    Err(_) => exchange_openai_code(&code, &bundle.verifier, None)?,
+                };
             auth_store.set_oauth(
                 provider.to_string(),
                 to_registry_oauth_credential_openai(credential),
@@ -881,13 +1278,23 @@ fn run_login_flow(
             let redirect_uri = inferred_anthropic_redirect_uri(&input)
                 .or_else(|| bundle.manual_redirect_uri.clone())
                 .unwrap_or_else(|| ANTHROPIC_MANUAL_REDIRECT_URL.to_string());
-            let credential = exchange_anthropic_code(
-                &code,
-                &bundle.verifier,
-                &bundle.state,
-                Some(&redirect_uri),
-                Some(ANTHROPIC_API_BASE_URL),
-            )?;
+            let credential = match proxy_oauth_client(config, ANTHROPIC_API_BASE_URL) {
+                Ok(client) => puffer_transport_anthropic::exchange_authorization_code_with_client(
+                    &client,
+                    &code,
+                    &bundle.verifier,
+                    &bundle.state,
+                    Some(&redirect_uri),
+                    Some(ANTHROPIC_API_BASE_URL),
+                )?,
+                Err(_) => exchange_anthropic_code(
+                    &code,
+                    &bundle.verifier,
+                    &bundle.state,
+                    Some(&redirect_uri),
+                    Some(ANTHROPIC_API_BASE_URL),
+                )?,
+            };
             store_anthropic_credential(auth_store, provider, credential)?;
         }
         None => anyhow::bail!("oauth login is not implemented for {provider}"),
@@ -982,6 +1389,52 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 
+/// Dispatcher for the hidden `__subscriber <id>` subcommand. Each
+/// supported subscriber id maps to one baked-in driver crate. Unknown
+/// ids exit with a clear error so the supervisor's restart loop does not
+/// silently spin forever.
+fn run_subscriber(id: &str) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name(format!("puffer-subscriber-{id}"))
+        .build()
+        .context("failed to build subscriber tokio runtime")?;
+    runtime.block_on(async move {
+        match id {
+            "telegram-user" => puffer_subscriber_telegram_user::run().await,
+            "email" => puffer_subscriber_email::run().await,
+            "gcal-browser" => crate::gcal_browser::run_subscriber().await,
+            "gmail-browser" => crate::gmail_browser::run_subscriber().await,
+            "lark-browser" => crate::lark_browser::run_subscriber().await,
+            other => Err(anyhow::anyhow!(
+                "unknown subscriber id `{other}`; this puffer build does not bundle a driver for it"
+            )),
+        }
+    })
+}
+
+/// Dispatcher for the hidden `__connector <id> <op> ...` bridge subcommand.
+/// Each supported connector id maps to one baked-in protocol bridge. Unknown
+/// ids exit with a clear error.
+fn run_connector_bridge(id: &str, args: &[String]) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name(format!("puffer-connector-{id}"))
+        .build()
+        .context("failed to build connector bridge tokio runtime")?;
+    runtime.block_on(async move {
+        match id {
+            "lark-user" => lark_connector::run("user", args).await,
+            "lark-bot" => lark_connector::run("bot", args).await,
+            #[cfg(unix)]
+            "wechat-user" => wechat_connector::run("user", args).await,
+            other => Err(anyhow::anyhow!(
+                "unknown connector id `{other}`; this puffer build does not bundle a bridge for it"
+            )),
+        }
+    })
+}
+
 fn resolve_session_query(session_store: &SessionStore, query: &str) -> Result<Uuid> {
     if let Ok(session_id) = query.parse() {
         return Ok(session_id);
@@ -990,4 +1443,94 @@ fn resolve_session_query(session_store: &SessionStore, query: &str) -> Result<Uu
         .find_session(query)?
         .ok_or_else(|| anyhow::anyhow!("no session matched `{query}`"))?;
     Ok(session.id)
+}
+
+/// Runs `puffer serve` — headless connector-only mode. Blocks on
+/// SIGINT/SIGTERM, then drives a graceful shutdown for every connector.
+fn run_serve_command(
+    config_override: Option<&str>,
+    cwd: &std::path::Path,
+    config: puffer_config::PufferConfig,
+    resources: puffer_resources::LoadedResources,
+    providers: ProviderRegistry,
+    auth_store: AuthStore,
+    auth_path: std::path::PathBuf,
+    paths: &ConfigPaths,
+) -> Result<()> {
+    let connectors_config = match config_override {
+        Some(path) => puffer_connector_core::ConnectorsConfig::load(std::path::Path::new(path))?,
+        None => connectors::load_connectors_config(paths)?,
+    };
+
+    if !connectors_config.enabled {
+        eprintln!("connectors are disabled (enabled = false); nothing to run");
+        return Ok(());
+    }
+
+    let session_store = SessionStore::from_paths(paths)?;
+    let map_path = connectors::session_map_path(paths);
+    let runtime = connectors::build_runtime(
+        config,
+        resources,
+        providers,
+        auth_store,
+        auth_path,
+        session_store,
+        cwd.to_path_buf(),
+        &map_path,
+    )?;
+
+    let running = connectors::start_configured_connectors(runtime, &connectors_config)?;
+    if running.is_empty() {
+        eprintln!("no connectors started; add entries to connectors.toml or enable more features");
+        return Ok(());
+    }
+
+    let ids = running.ids();
+    eprintln!(
+        "puffer serve: running {} connector(s): {}",
+        ids.len(),
+        ids.join(", ")
+    );
+    eprintln!("press Ctrl+C to stop");
+
+    // Block on SIGINT. `ctrlc` installs the handler and signals via the
+    // shared channel; we block on receive once it fires.
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = signal_tx.send(());
+    })
+    .map_err(|error| anyhow::anyhow!("failed to install Ctrl+C handler: {error}"))?;
+    let _ = signal_rx.recv();
+
+    eprintln!("shutting down connectors…");
+    let errors = running.shutdown();
+    for (id, error) in errors {
+        eprintln!("  connector `{id}` shutdown error: {error:#}");
+    }
+    puffer_core::shutdown_runtime_services().ok();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cli_proxy_clients_accept_configured_proxy() {
+        let config = puffer_config::PufferConfig {
+            network: puffer_config::NetworkConfig {
+                proxy: puffer_config::ProxyConfig {
+                    enabled: false,
+                    selected: None,
+                    bypass: vec![],
+                    proxies: vec![],
+                },
+            },
+            ..puffer_config::PufferConfig::default()
+        };
+
+        let discovery = super::proxy_discovery_client(&config).expect("discovery client");
+        let oauth = super::proxy_oauth_client(&config, puffer_provider_openai::OPENAI_TOKEN_URL)
+            .expect("oauth client");
+        let _ = (discovery, oauth);
+    }
 }

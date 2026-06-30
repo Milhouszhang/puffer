@@ -60,6 +60,7 @@ mod subscriber_tools;
 mod subscriptions;
 #[cfg(unix)]
 mod wechat_connector;
+mod workflow_run_events;
 mod workflow_runtime;
 mod workflows;
 

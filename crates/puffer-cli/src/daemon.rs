@@ -248,6 +248,7 @@ async fn run_async(options: DaemonOptions) -> Result<()> {
         std::env::remove_var("PUFFER_NO_BROWSER");
     }
     let state = Arc::new(state);
+    crate::workflow_run_events::set_workflow_run_event_sink(state.event_sender());
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
@@ -6694,6 +6695,11 @@ fn apply_daemon_yolo_mode(app_state: &mut AppState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workflow_run_finished_channel_is_not_replayed() {
+        assert!(!super::is_replay_channel("workflow-run:finished"));
+    }
+
     use super::{
         append_ordered_turn_progress, apply_daemon_yolo_mode, apply_turn_model_override,
         apply_turn_request_options, browser_launch_settings_or_default,

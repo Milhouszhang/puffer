@@ -71,8 +71,8 @@ pub use event_schema::{
     EventFieldRule, EventFieldType, EventFieldValue, EventOperator, EventSchema, EventTextField,
 };
 pub use history::{
-    now_ms, WorkflowActionLog, WorkflowBindingRun, WorkflowBindingRunStatus, WorkflowHistoryStore,
-    WorkflowHistoryStoreError,
+    now_ms, RunFinishedObserver, WorkflowActionLog, WorkflowBindingRun, WorkflowBindingRunStatus,
+    WorkflowHistoryStore, WorkflowHistoryStoreError,
 };
 pub use manager::{
     ConnectionAuthChecker, ConnectionAuthStatus, SubscriptionManager, SubscriptionManagerBuilder,

@@ -1,9 +1,37 @@
 use crate::AppState;
-use anyhow::Result;
-use serde_json::Value;
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
 use std::path::Path;
+
+use super::store::{load_store, save_store, todos_path, StoredTodo, TodoStore, TodoWriteInput};
+use super::task_runtime::{
+    is_subagent_context, should_emit_verification_nudge_for_todos, validate_todos,
+    VERIFICATION_NUDGE,
+};
 
 /// Executes the Claude-compatible `TodoWrite` tool scaffold.
 pub fn execute_todo_write(state: &mut AppState, cwd: &Path, input: Value) -> Result<String> {
-    super::support::execute_todo_write(state, cwd, input)
+    let parsed: TodoWriteInput =
+        serde_json::from_value(input).context("invalid TodoWrite input")?;
+    validate_todos(&parsed.todos)?;
+    let mut store = load_store::<TodoStore>(&todos_path(cwd))?;
+    let old = store.todos.clone();
+    store.todos = parsed
+        .todos
+        .into_iter()
+        .map(|todo| StoredTodo {
+            content: todo.content,
+            status: todo.status,
+            active_form: todo.active_form,
+        })
+        .collect();
+    let verification_nudge_needed =
+        !is_subagent_context(state) && should_emit_verification_nudge_for_todos(&store.todos);
+    save_store(&todos_path(cwd), &store)?;
+    Ok(serde_json::to_string_pretty(&json!({
+        "oldTodos": old,
+        "newTodos": store.todos,
+        "verificationNudgeNeeded": verification_nudge_needed,
+        "note": verification_nudge_needed.then_some(VERIFICATION_NUDGE),
+    }))?)
 }

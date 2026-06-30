@@ -9,9 +9,10 @@ use super::store::{
     TaskOutputInput, TaskStopInput, TaskStore, TaskUpdateInput,
 };
 use super::task_runtime::{
-    read_runtime_agent_output, read_task_output, refresh_stored_task, runtime_agent_output_path,
-    runtime_agent_terminal_status, terminal_task_status, wait_for_runtime_agent_output,
-    wait_for_stored_task,
+    is_subagent_context, read_runtime_agent_output, read_task_output, refresh_stored_task,
+    runtime_agent_output_path, runtime_agent_terminal_status,
+    should_emit_verification_nudge_for_tasks, terminal_task_status, wait_for_runtime_agent_output,
+    wait_for_stored_task, VERIFICATION_NUDGE,
 };
 use crate::{AppState, MonitorSourceStampContext, MonitorTaskCreateGateContext};
 use anyhow::{anyhow, bail, Context, Result};
@@ -421,12 +422,21 @@ pub(super) fn execute_task_update(
         }
     }
     task.updated_at_ms = Some(now_ms());
+    let verification_nudge_needed = !is_subagent_context(state)
+        && status_change
+            .as_ref()
+            .and_then(|change| change.get("to"))
+            .and_then(Value::as_str)
+            == Some("completed")
+        && should_emit_verification_nudge_for_tasks(&store.tasks);
     save_store(&tp, &store)?;
     Ok(serde_json::to_string_pretty(&json!({
         "success": true,
         "taskId": task_id,
         "updatedFields": updated_fields,
         "statusChange": status_change,
+        "verificationNudgeNeeded": verification_nudge_needed,
+        "note": verification_nudge_needed.then_some(VERIFICATION_NUDGE),
     }))?)
 }
 

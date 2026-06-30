@@ -40,7 +40,7 @@ use puffer_config::{
 use puffer_core::{
     command_surface, default_effort_level, dispatch_command, enter_plan_mode, execute_connect_flow,
     execute_user_turn_streaming_with_prompt_tools_and_cancel, provider_preference_family,
-    supported_effort_levels, with_user_question_prompt_handler, AppState,
+    subscription_manager, supported_effort_levels, with_user_question_prompt_handler, AppState,
     BrowserPermissionPromptActionSet, BrowserPermissionPromptSource,
     BrowserPermissionPromptTargetClass, CancelToken, MessageRole, ModelPreferenceFamily,
     PermissionPromptAction, PermissionPromptRequest, ToolCallRequest, ToolInvocation,
@@ -236,6 +236,12 @@ async fn run_async(options: DaemonOptions) -> Result<()> {
         yolo,
     )?;
     apply_proxy_env_at_startup(&state.config.lock().unwrap().network.proxy);
+    // Push the startup proxy config into the manager so any subscriber
+    // that is later respawned (e.g. after an auth failure) inherits the
+    // correct proxy configuration even if no save-settings call has occurred.
+    if let Ok(manager) = subscription_manager() {
+        manager.set_proxy_config(state.config.lock().unwrap().network.proxy.clone());
+    }
     if let Some(prompt) = system_prompt_1
         .as_deref()
         .map(str::trim)
@@ -2349,6 +2355,25 @@ fn handle_save_proxy_settings(state: &DaemonState, params: &Value) -> Result<Val
     config.network.proxy.validate()?;
     save_user_config(&state.paths, &config).context("save user config")?;
     reload_daemon_config(state)?;
+    // Push the new proxy config into the manager and respawn proxy-sensitive
+    // subscribers (Telegram) so the change takes effect without an app restart.
+    // Failures here are logged but must not prevent the settings save from
+    // succeeding.
+    {
+        let proxy = state.config.lock().unwrap().network.proxy.clone();
+        match subscription_manager() {
+            Ok(manager) => {
+                manager.set_proxy_config(proxy);
+                if let Err(error) = manager.respawn_proxy_sensitive_subscribers() {
+                    tracing::warn!(%error, "failed to respawn subscribers after proxy change");
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "subscription manager unavailable; proxy change not pushed to subscribers"
+            ),
+        }
+    }
     let fresh = state.build_runtime_inputs()?;
     let config = state.config.lock().unwrap().clone();
     let snapshot: SettingsSnapshotDto = desktop_api::load_settings_snapshot(

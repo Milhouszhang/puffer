@@ -80,6 +80,27 @@ impl ProxyScheme {
 }
 
 impl ProxyEndpoint {
+    /// Renders this endpoint as a `scheme://[user:pass@]host:port` URI,
+    /// URL-encoding any credentials.
+    pub fn to_uri(&self) -> anyhow::Result<String> {
+        if self.host.trim().is_empty() {
+            anyhow::bail!("proxy host must not be empty");
+        }
+        let scheme = self.scheme.as_uri_scheme();
+        let host = self.host.trim();
+        let auth = match (
+            self.username.as_deref().filter(|v| !v.is_empty()),
+            self.password.as_deref().filter(|v| !v.is_empty()),
+        ) {
+            (Some(u), Some(p)) => {
+                format!("{}:{}@", urlencoding::encode(u), urlencoding::encode(p))
+            }
+            (Some(u), None) => format!("{}@", urlencoding::encode(u)),
+            _ => String::new(),
+        };
+        Ok(format!("{scheme}://{auth}{host}:{}", self.port))
+    }
+
     /// Returns a credential-free endpoint snapshot suitable for UI payloads.
     pub fn sanitized(&self) -> SanitizedProxyEndpoint {
         SanitizedProxyEndpoint {
@@ -161,6 +182,76 @@ impl ProxyConfig {
     }
 }
 
+/// Env vars Puffer manages for proxy routing. Listed for the "clear" path so a
+/// disabled config removes any ambient (shell-inherited) proxy.
+const PROXY_ENV_KEYS: &[&str] = &[
+    "ALL_PROXY", "all_proxy",
+    "HTTP_PROXY", "http_proxy",
+    "HTTPS_PROXY", "https_proxy",
+    "NO_PROXY", "no_proxy",
+    "PUFFER_TELEGRAM_PROXY",
+];
+
+/// Hosts that must never be routed through an external proxy.
+const ALWAYS_DIRECT: &[&str] = &["localhost", "127.0.0.1", "::1"];
+
+/// The env vars to set / unset to make the process (and its children) route
+/// through `proxy`. A plain data struct so it is trivially testable without
+/// touching real process env.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyEnvBlock {
+    pub set: Vec<(String, String)>,
+    pub unset: Vec<String>,
+}
+
+fn clear_block() -> ProxyEnvBlock {
+    ProxyEnvBlock {
+        set: Vec::new(),
+        unset: PROXY_ENV_KEYS.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// Derives the proxy env block from config. One uniform block fits every child;
+/// the Telegram subscriber's existing `socks5://`-only filter self-excludes an
+/// http endpoint.
+pub fn proxy_env_block(proxy: &ProxyConfig) -> ProxyEnvBlock {
+    let endpoint = if proxy.enabled {
+        proxy
+            .selected
+            .as_deref()
+            .and_then(|sel| proxy.proxies.iter().find(|e| e.id == sel))
+    } else {
+        None
+    };
+    let Some(endpoint) = endpoint else {
+        return clear_block();
+    };
+    let Ok(uri) = endpoint.to_uri() else {
+        return clear_block();
+    };
+    let no_proxy = ALWAYS_DIRECT
+        .iter()
+        .map(|s| s.to_string())
+        .chain(
+            proxy
+                .bypass
+                .iter()
+                .map(|b| b.trim().to_string())
+                .filter(|b| !b.is_empty()),
+        )
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut set = Vec::new();
+    for key in ["ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+        set.push((key.to_string(), uri.clone()));
+    }
+    set.push(("NO_PROXY".to_string(), no_proxy.clone()));
+    set.push(("no_proxy".to_string(), no_proxy));
+    // PUFFER_TELEGRAM_PROXY intentionally left unset: telegram falls back to
+    // ALL_PROXY, so one var covers it. It is in the clear list for "disabled".
+    ProxyEnvBlock { set, unset: Vec::new() }
+}
+
 fn default_proxy_bypass() -> Vec<String> {
     vec![
         "localhost".to_string(),
@@ -191,7 +282,8 @@ fn validate_bypass_entry(entry: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ProxyEndpoint, ProxyScheme, PufferConfig};
+    use crate::{ProxyConfig, ProxyEndpoint, ProxyScheme, PufferConfig};
+    use super::proxy_env_block;
 
     #[test]
     fn proxy_config_defaults_to_disabled_with_bypass_entries() {
@@ -332,5 +424,61 @@ password = "secret"
         assert_eq!(sanitized.username.as_deref(), Some("alice"));
         assert!(sanitized.has_password);
         assert_eq!(sanitized.uri, "http://proxy.example:8080");
+    }
+
+    #[test]
+    fn to_uri_encodes_credentials() {
+        let ep = ProxyEndpoint {
+            id: "p".into(),
+            scheme: ProxyScheme::Socks5,
+            host: "127.0.0.1".into(),
+            port: 7890,
+            username: Some("u ser".into()),
+            password: Some("p@ss".into()),
+        };
+        assert_eq!(ep.to_uri().unwrap(), "socks5://u%20ser:p%40ss@127.0.0.1:7890");
+    }
+
+    fn cfg(enabled: bool, scheme: ProxyScheme) -> ProxyConfig {
+        ProxyConfig {
+            enabled,
+            selected: Some("p".into()),
+            bypass: vec!["example.com".into()],
+            proxies: vec![ProxyEndpoint {
+                id: "p".into(),
+                scheme,
+                host: "127.0.0.1".into(),
+                port: 7890,
+                username: None,
+                password: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn enabled_socks5_sets_all_proxy_and_no_proxy_floor() {
+        let block = proxy_env_block(&cfg(true, ProxyScheme::Socks5));
+        let set: std::collections::HashMap<_, _> = block.set.iter().cloned().collect();
+        assert_eq!(set.get("ALL_PROXY").unwrap(), "socks5://127.0.0.1:7890");
+        assert_eq!(set.get("all_proxy").unwrap(), "socks5://127.0.0.1:7890");
+        assert_eq!(set.get("NO_PROXY").unwrap(), "localhost,127.0.0.1,::1,example.com");
+        assert!(block.unset.is_empty());
+    }
+
+    #[test]
+    fn enabled_http_still_sets_all_proxy_telegram_self_excludes() {
+        // One uniform block: telegram's own socks5-only filter rejects http at runtime.
+        let block = proxy_env_block(&cfg(true, ProxyScheme::Http));
+        let set: std::collections::HashMap<_, _> = block.set.iter().cloned().collect();
+        assert_eq!(set.get("ALL_PROXY").unwrap(), "http://127.0.0.1:7890");
+    }
+
+    #[test]
+    fn disabled_unsets_every_proxy_var() {
+        let block = proxy_env_block(&cfg(false, ProxyScheme::Socks5));
+        assert!(block.set.is_empty());
+        for key in ["ALL_PROXY", "all_proxy", "HTTP_PROXY", "NO_PROXY", "PUFFER_TELEGRAM_PROXY"] {
+            assert!(block.unset.iter().any(|k| k == key), "missing {key}");
+        }
     }
 }

@@ -94,30 +94,7 @@ pub fn bypass_matches(proxy: &ProxyConfig, url: &str) -> bool {
 
 /// Builds the proxy URI accepted by reqwest.
 pub fn proxy_uri(endpoint: &ProxyEndpoint) -> Result<String> {
-    if endpoint.host.trim().is_empty() {
-        anyhow::bail!("proxy host must not be empty");
-    }
-    let scheme = endpoint.scheme.as_uri_scheme();
-    let host = endpoint.host.trim();
-    let auth = match (
-        endpoint
-            .username
-            .as_deref()
-            .filter(|value| !value.is_empty()),
-        endpoint
-            .password
-            .as_deref()
-            .filter(|value| !value.is_empty()),
-    ) {
-        (Some(username), Some(password)) => format!(
-            "{}:{}@",
-            urlencoding::encode(username),
-            urlencoding::encode(password)
-        ),
-        (Some(username), None) => format!("{}@", urlencoding::encode(username)),
-        _ => String::new(),
-    };
-    Ok(format!("{scheme}://{auth}{host}:{}", endpoint.port))
+    endpoint.to_uri()
 }
 
 fn selected_endpoint(proxy: &ProxyConfig) -> Result<Option<&ProxyEndpoint>> {

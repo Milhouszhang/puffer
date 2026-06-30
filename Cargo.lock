@@ -4496,6 +4496,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+ "urlencoding",
 ]
 
 [[package]]

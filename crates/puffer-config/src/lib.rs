@@ -27,7 +27,10 @@ pub use project_memory::{
     ensure_project_memory, load_project_registry, resolve_project_memory, ProjectEntry,
     ProjectRegistry, ResolvedProjectMemory,
 };
-pub use proxy::{NetworkConfig, ProxyConfig, ProxyEndpoint, ProxyScheme, SanitizedProxyEndpoint};
+pub use proxy::{
+    proxy_env_block, NetworkConfig, ProxyConfig, ProxyEnvBlock, ProxyEndpoint, ProxyScheme,
+    SanitizedProxyEndpoint,
+};
 pub use settings_catalog::{
     config_setting_persists_to_workspace_file, config_setting_scope, config_setting_spec,
     normalize_config_setting_key, parse_config_cli_value, supported_config_settings,

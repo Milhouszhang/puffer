@@ -63,7 +63,7 @@ time.workspace = true
 toml.workspace = true
 tungstenite.workspace = true
 url.workspace = true
-urlencoding = "2.1.3"
+urlencoding.workspace = true
 uuid.workspace = true
 puffer-config = { path = "../puffer-config" }
 puffer-mcp-oauth = { path = "../puffer-mcp-oauth" }

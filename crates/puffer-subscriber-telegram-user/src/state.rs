@@ -261,7 +261,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_telegram_proxy_accepts_only_socks5() {
+    fn normalize_telegram_proxy_accepts_socks5_and_normalizes_socks5h() {
         assert_eq!(
             normalize_telegram_proxy("socks5://127.0.0.1:7890"),
             Some("socks5://127.0.0.1:7890".to_string())

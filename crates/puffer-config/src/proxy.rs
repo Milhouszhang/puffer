@@ -96,6 +96,7 @@ impl ProxyEndpoint {
                 format!("{}:{}@", urlencoding::encode(u), urlencoding::encode(p))
             }
             (Some(u), None) => format!("{}@", urlencoding::encode(u)),
+            // a password without a username is not representable in a proxy URI; dropped.
             _ => String::new(),
         };
         Ok(format!("{scheme}://{auth}{host}:{}", self.port))
@@ -127,6 +128,14 @@ impl ProxyEndpoint {
 }
 
 impl ProxyConfig {
+    /// The currently selected endpoint, or None when unselected/unresolved.
+    /// Does not consider `enabled`.
+    pub fn selected_endpoint(&self) -> Option<&ProxyEndpoint> {
+        self.selected
+            .as_deref()
+            .and_then(|sel| self.proxies.iter().find(|e| e.id == sel))
+    }
+
     /// Normalizes enabled and selected state against the configured proxy list.
     pub fn normalize_selection(&mut self) {
         self.selected = self.selected.as_ref().and_then(|value| {
@@ -216,10 +225,7 @@ fn clear_block() -> ProxyEnvBlock {
 /// http endpoint.
 pub fn proxy_env_block(proxy: &ProxyConfig) -> ProxyEnvBlock {
     let endpoint = if proxy.enabled {
-        proxy
-            .selected
-            .as_deref()
-            .and_then(|sel| proxy.proxies.iter().find(|e| e.id == sel))
+        proxy.selected_endpoint()
     } else {
         None
     };

@@ -138,11 +138,7 @@ fn chrome_proxy_args(proxy: &ProxyConfig) -> Vec<String> {
     if !proxy.enabled {
         return Vec::new();
     }
-    let Some(endpoint) = proxy
-        .selected
-        .as_deref()
-        .and_then(|sel| proxy.proxies.iter().find(|e| e.id == sel))
-    else {
+    let Some(endpoint) = proxy.selected_endpoint() else {
         return Vec::new();
     };
     // Chrome's `--proxy-server` rejects the `socks5h` scheme; its `socks5://`

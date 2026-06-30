@@ -96,6 +96,7 @@ pub struct SubscriptionManagerBuilder {
     self_gate: Arc<dyn SelfMessageGate>,
     auth_checker: Option<Arc<dyn ConnectionAuthChecker>>,
     monitor_digest_interval: Duration,
+    run_finished_observer: Option<crate::history::RunFinishedObserver>,
 }
 
 impl SubscriptionManagerBuilder {
@@ -139,6 +140,7 @@ impl SubscriptionManagerBuilder {
             self_gate: Arc::new(DropAllSelfGate),
             auth_checker: None,
             monitor_digest_interval: monitor_digest_interval_from_env(),
+            run_finished_observer: None,
         }
     }
 
@@ -208,12 +210,28 @@ impl SubscriptionManagerBuilder {
         self
     }
 
+    /// Observer fired when a workflow run reaches a terminal status. Forwarded
+    /// to the history store built in `build`.
+    pub fn with_run_finished_observer(
+        mut self,
+        observer: crate::history::RunFinishedObserver,
+    ) -> Self {
+        self.run_finished_observer = Some(observer);
+        self
+    }
+
     /// Loads the store and spawns the router on the supplied Tokio runtime.
     pub fn build(self, handle: Handle) -> Result<SubscriptionManager> {
         let store = Arc::new(SubscriptionStore::load(&self.store_path)?);
         let connector_store = Arc::new(ConnectorCatalogStore::load(&self.connector_store_path)?);
         let connection_store = Arc::new(ConnectionStore::load(&self.connection_store_path)?);
-        let history_store = Arc::new(WorkflowHistoryStore::load(&self.history_store_path)?);
+        let history_store = Arc::new({
+            let store = WorkflowHistoryStore::load(&self.history_store_path)?;
+            match self.run_finished_observer.clone() {
+                Some(observer) => store.with_run_finished_observer(observer),
+                None => store,
+            }
+        });
         let monitor_trace_store =
             Arc::new(MonitorTraceStore::load(&self.monitor_trace_store_path)?);
         // Root cause D: reclaim runs left `Running` by a previous process (crash/kill

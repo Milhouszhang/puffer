@@ -1061,3 +1061,76 @@ fn read_subscribe_commands(path: &Path) -> Vec<Value> {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect()
 }
+
+fn run_finished_test_binding() -> WorkflowBindingSpec {
+    WorkflowBindingSpec {
+        slug: "demo".into(),
+        description: "demo".into(),
+        connection_slug: "telegram-user".into(),
+        connector_slug: Some("telegram-login".into()),
+        status: WorkflowBindingStatus::Enabled,
+        filter: None,
+        ignore_filters: Vec::new(),
+        contact_ids: Vec::new(),
+        classify_prompt: None,
+        classify_model: None,
+        action: ActionSpec::RunWorkflow {
+            slug: "native".into(),
+        },
+        created_at_ms: 0,
+    }
+}
+
+fn run_finished_test_envelope() -> EventEnvelope {
+    EventEnvelope {
+        envelope_id: "env".into(),
+        subscriber_id: "telegram-user".into(),
+        received_at_ms: 1,
+        event: Event {
+            topic: "telegram-user".into(),
+            kind: "message".into(),
+            control: false,
+            dedup_key: Some("d".into()),
+            text: "gm".into(),
+            payload: json!({"from":"Tony"}),
+        },
+    }
+}
+
+fn run_finished_test_action_result(success: bool) -> ActionResult {
+    ActionResult {
+        success,
+        summary: "s".into(),
+        usage: None,
+        turn_started_at_ms: None,
+        turn_ended_at_ms: None,
+        triage_decisions: Vec::new(),
+    }
+}
+
+#[test]
+fn builder_attaches_run_finished_observer_to_history_store() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let count = std::sync::Arc::new(AtomicUsize::new(0));
+    let c2 = count.clone();
+
+    let manager = crate::SubscriptionManagerBuilder::new(temp.path().join("subscriptions.json"))
+        .with_run_finished_observer(std::sync::Arc::new(move |_run| {
+            c2.fetch_add(1, Ordering::SeqCst);
+        }))
+        .build(runtime.handle().clone())
+        .unwrap();
+
+    manager
+        .history_store()
+        .append_action_result(
+            &run_finished_test_binding(), &run_finished_test_envelope(),
+            &crate::spec::ActionSpec::RunWorkflow { slug: "native".into() },
+            &run_finished_test_action_result(true), 1, 2,
+        )
+        .unwrap();
+
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}

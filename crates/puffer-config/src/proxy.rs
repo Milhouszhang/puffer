@@ -283,7 +283,7 @@ fn validate_bypass_entry(entry: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::{ProxyConfig, ProxyEndpoint, ProxyScheme, PufferConfig};
-    use super::proxy_env_block;
+    use super::{proxy_env_block, PROXY_ENV_KEYS};
 
     #[test]
     fn proxy_config_defaults_to_disabled_with_bypass_entries() {
@@ -477,7 +477,7 @@ password = "secret"
     fn disabled_unsets_every_proxy_var() {
         let block = proxy_env_block(&cfg(false, ProxyScheme::Socks5));
         assert!(block.set.is_empty());
-        for key in ["ALL_PROXY", "all_proxy", "HTTP_PROXY", "NO_PROXY", "PUFFER_TELEGRAM_PROXY"] {
+        for key in PROXY_ENV_KEYS {
             assert!(block.unset.iter().any(|k| k == key), "missing {key}");
         }
     }

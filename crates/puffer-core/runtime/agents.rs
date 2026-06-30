@@ -349,7 +349,7 @@ fn prepare_agent_execution(
     nested_state.transcript.clear();
     nested_state.push_message(
         MessageRole::System,
-        build_agent_system_prompt(agent_source, &agent.value)?,
+        build_agent_system_prompt(&nested_cwd, agent_source, &agent.value)?,
     );
     let effective_mode = input
         .mode

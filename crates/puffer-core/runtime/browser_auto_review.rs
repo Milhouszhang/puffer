@@ -616,7 +616,12 @@ fn run_browser_auto_review_with_timeout(
     let side_resources = build_browser_auto_review_resources(resources, &reviewer.value);
     let structured_output = build_browser_auto_review_structured_output();
     let mut side_state = build_browser_auto_review_side_state(state);
-    let prompt = match build_browser_auto_review_prompt(resources, &reviewer.value, &review_input) {
+    let prompt = match build_browser_auto_review_prompt(
+        &state.cwd,
+        resources,
+        &reviewer.value,
+        &review_input,
+    ) {
         Ok(prompt) => prompt,
         Err(_) => return BrowserAutoReviewRuntimeResult::Unavailable,
     };
@@ -666,11 +671,12 @@ fn approval_reviewer_agent(
 }
 
 fn build_browser_auto_review_prompt(
+    cwd: &std::path::Path,
     resources: &LoadedResources,
     agent: &puffer_resources::AgentSpec,
     review_input: &str,
 ) -> Result<String> {
-    let system_prompt = build_agent_system_prompt(resources, agent)?;
+    let system_prompt = build_agent_system_prompt(cwd, resources, agent)?;
     Ok(combine_agent_prompt(Some(&system_prompt), review_input))
 }
 

@@ -219,15 +219,23 @@ fn provider_message_payload(message: &RenderedMessage, api: &str, index: usize) 
                 "status": "completed",
                 "id": format!("msg_{index}"),
             }),
-            MessageRole::System
-            | MessageRole::ToolCall
-            | MessageRole::ToolResult => json!({
+            MessageRole::System | MessageRole::ToolCall | MessageRole::ToolResult => json!({
                 "role": "system",
                 "content": message.text,
             }),
         })
         .unwrap_or_default(),
     }
+}
+
+/// Returns the set of enabled tool names for the active API.
+pub(crate) fn enabled_tool_names(
+    api: &str,
+    registry: &ToolRegistry,
+    permission_context: &crate::permissions::RuntimePermissionContext,
+) -> Result<BTreeSet<String>> {
+    let (rows, _) = tool_rows_for_summary(api, registry, permission_context)?;
+    Ok(rows.into_iter().map(|r| r.label).collect())
 }
 
 fn tool_rows_for_summary(
@@ -237,7 +245,7 @@ fn tool_rows_for_summary(
 ) -> Result<(Vec<UsageRow>, BTreeSet<String>)> {
     if api == "anthropic-messages" {
         let definitions =
-            anthropic_tool_definitions_for_request(registry, None, Some(permission_context), None)?;
+            anthropic_tool_definitions_for_request(registry, None, Some(permission_context))?;
         let rows = definitions
             .into_iter()
             .filter_map(|definition| {
@@ -257,13 +265,8 @@ fn tool_rows_for_summary(
     }
 
     let use_native = false;
-    let definitions = openai_tool_definitions_for_request(
-        registry,
-        None,
-        use_native,
-        Some(permission_context),
-        None,
-    )?;
+    let definitions =
+        openai_tool_definitions_for_request(registry, None, use_native, Some(permission_context))?;
     let rows = definitions
         .into_iter()
         .map(|definition| UsageRow {

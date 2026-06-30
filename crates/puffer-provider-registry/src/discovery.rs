@@ -1,6 +1,8 @@
 use crate::auth::{AuthStore, StoredCredential};
+use crate::input_capability::infer_input_modalities;
 use crate::model::{
-    ModelDescriptor, ModelDiscoveryConfig, ModelDiscoveryFormat, ProviderDescriptor,
+    ModelCompat, ModelDescriptor, ModelDiscoveryConfig, ModelDiscoveryFormat,
+    OpenAiCompletionsCompat, ProviderDescriptor, ThinkingFormat,
 };
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client;
@@ -9,19 +11,34 @@ use serde_json::Value;
 
 const OPENAI_CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const OPENAI_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const OPENAI_CODEX_COMPAT_VERSION: &str = "0.125.0";
 
 /// Performs runtime provider model-discovery requests.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ModelDiscoveryClient {
     client: Client,
 }
 
+impl Default for ModelDiscoveryClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ModelDiscoveryClient {
-    /// Creates a discovery client backed by the default blocking HTTP client.
+    /// Creates a discovery client with sensible timeouts for startup discovery.
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-        }
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .unwrap_or_default();
+        Self { client }
+    }
+
+    /// Creates a discovery client from an externally configured blocking client.
+    pub fn with_client(client: Client) -> Self {
+        Self { client }
     }
 
     /// Fetches and parses discovery results for a provider descriptor.
@@ -60,16 +77,26 @@ impl ModelDiscoveryClient {
     }
 }
 
-/// Merges discovered models into an existing model list without replacing existing ids.
+/// Reconciles an existing model list with provider-discovered availability.
+///
+/// Discovery responses are authoritative for availability: models omitted by
+/// the provider are removed so stale bundled entries do not stay selectable.
+/// Matching bundled entries keep their curated metadata while newly discovered
+/// ids are appended with discovery-provided defaults.
 pub fn merge_discovered_models(
     existing: &mut Vec<ModelDescriptor>,
     discovered: Vec<ModelDescriptor>,
 ) {
+    if discovered.is_empty() {
+        return;
+    }
+    let previous = std::mem::take(existing);
     for model in discovered {
-        if existing.iter().any(|current| current.id == model.id) {
-            continue;
+        if let Some(current) = previous.iter().find(|current| current.id == model.id) {
+            existing.push(current.clone());
+        } else {
+            existing.push(model);
         }
-        existing.push(model);
     }
 }
 
@@ -116,7 +143,7 @@ fn discovery_url(
                 for (key, value) in &provider.query_params {
                     pairs.append_pair(key, value);
                 }
-                pairs.append_pair("client_version", env!("CARGO_PKG_VERSION"));
+                pairs.append_pair("client_version", OPENAI_CODEX_COMPAT_VERSION);
             }
             parsed.to_string()
         }
@@ -147,9 +174,9 @@ fn apply_discovery_headers(
         request = request.header("originator", OPENAI_CODEX_ORIGINATOR);
         request = request.header(
             reqwest::header::USER_AGENT,
-            format!("{OPENAI_CODEX_ORIGINATOR}/{}", env!("CARGO_PKG_VERSION")),
+            format!("{OPENAI_CODEX_ORIGINATOR}/{OPENAI_CODEX_COMPAT_VERSION}"),
         );
-        request = request.header("version", env!("CARGO_PKG_VERSION"));
+        request = request.header("version", OPENAI_CODEX_COMPAT_VERSION);
     }
     request
 }
@@ -250,6 +277,9 @@ fn parse_discovered_models(
             .and_then(Value::as_str)
             .or_else(|| default_display_name(item, &discovery.response))
             .unwrap_or(id);
+        if discovery_item_lacks_tool_support(item) {
+            continue;
+        }
         models.push(ModelDescriptor {
             id: id.to_string(),
             display_name: display_name.to_string(),
@@ -258,9 +288,40 @@ fn parse_discovered_models(
             context_window: discovery.context_window,
             max_output_tokens: discovery.max_output_tokens,
             supports_reasoning: discovery.supports_reasoning,
+            compat: discovery_model_compat(provider, discovery),
+            input: infer_input_modalities(item, id),
+            cost: None,
         });
     }
     Ok(models)
+}
+
+fn discovery_item_lacks_tool_support(item: &Value) -> bool {
+    let Some(parameters) = item.get("supported_parameters").and_then(Value::as_array) else {
+        return false;
+    };
+    !parameters.iter().any(|parameter| {
+        parameter
+            .as_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case("tools"))
+    })
+}
+
+fn discovery_model_compat(
+    provider: &ProviderDescriptor,
+    discovery: &ModelDiscoveryConfig,
+) -> Option<ModelCompat> {
+    let provider_id = provider.id.trim().to_ascii_lowercase();
+    let base_url = provider.base_url.to_ascii_lowercase();
+    if discovery.api == "openai-completions"
+        && (provider_id == "openrouter" || base_url.contains("openrouter.ai"))
+    {
+        return Some(ModelCompat::OpenAiCompletions(OpenAiCompletionsCompat {
+            thinking_format: Some(ThinkingFormat::Openrouter),
+            ..OpenAiCompletionsCompat::default()
+        }));
+    }
+    None
 }
 
 fn default_display_name<'a>(item: &'a Value, format: &ModelDiscoveryFormat) -> Option<&'a str> {
@@ -332,6 +393,9 @@ fn parse_codex_discovered_models(
             context_window,
             max_output_tokens: discovery.max_output_tokens,
             supports_reasoning,
+            compat: None,
+            input: infer_input_modalities(item, id),
+            cost: None,
         });
     }
     Ok(models)
@@ -365,21 +429,40 @@ mod tests {
             headers: IndexMap::new(),
             query_params: IndexMap::new(),
             discovery: Some(discovery),
+            media: None,
             models: Vec::new(),
+            chat_completions_path: None,
         }
     }
 
     #[test]
-    fn merge_discovered_models_only_adds_missing_ids() {
-        let mut models = vec![ModelDescriptor {
-            id: "claude-sonnet-4-5".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            provider: "anthropic".to_string(),
-            api: "anthropic-messages".to_string(),
-            context_window: 200_000,
-            max_output_tokens: 8_192,
-            supports_reasoning: true,
-        }];
+    fn merge_discovered_models_reconciles_available_ids() {
+        let mut models = vec![
+            ModelDescriptor {
+                id: "claude-sonnet-4-5".to_string(),
+                display_name: "Claude Sonnet 4.5".to_string(),
+                provider: "anthropic".to_string(),
+                api: "anthropic-messages".to_string(),
+                context_window: 200_000,
+                max_output_tokens: 8_192,
+                supports_reasoning: true,
+                compat: None,
+                input: vec![crate::Modality::Text],
+                cost: None,
+            },
+            ModelDescriptor {
+                id: "claude-stale".to_string(),
+                display_name: "Claude Stale".to_string(),
+                provider: "anthropic".to_string(),
+                api: "anthropic-messages".to_string(),
+                context_window: 200_000,
+                max_output_tokens: 8_192,
+                supports_reasoning: true,
+                compat: None,
+                input: vec![crate::Modality::Text],
+                cost: None,
+            },
+        ];
 
         merge_discovered_models(
             &mut models,
@@ -392,6 +475,9 @@ mod tests {
                     context_window: 200_000,
                     max_output_tokens: 8_192,
                     supports_reasoning: true,
+                    compat: None,
+                    input: vec![crate::Modality::Text],
+                    cost: None,
                 },
                 ModelDescriptor {
                     id: "claude-opus-4-1".to_string(),
@@ -401,12 +487,27 @@ mod tests {
                     context_window: 200_000,
                     max_output_tokens: 8_192,
                     supports_reasoning: true,
+                    compat: None,
+                    input: vec![crate::Modality::Text],
+                    cost: None,
                 },
             ],
         );
 
         assert_eq!(models.len(), 2);
+        assert!(models.iter().any(|model| model.id == "claude-sonnet-4-5"));
         assert!(models.iter().any(|model| model.id == "claude-opus-4-1"));
+        assert!(!models.iter().any(|model| model.id == "claude-stale"));
+    }
+
+    #[test]
+    fn discovery_client_accepts_injected_reqwest_client() {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .expect("client");
+        let discovery = ModelDiscoveryClient::with_client(client);
+        let _ = discovery;
     }
 
     #[test]
@@ -437,6 +538,118 @@ mod tests {
     }
 
     #[test]
+    fn discovery_infers_image_input_for_worldrouter_claude_family() {
+        let discovery = ModelDiscoveryConfig {
+            path: "/models".to_string(),
+            response: ModelDiscoveryFormat::OpenAiModels,
+            api: "openai-completions".to_string(),
+            context_window: 200_000,
+            max_output_tokens: 16_384,
+            supports_reasoning: true,
+            items_field: "data".to_string(),
+            id_field: "id".to_string(),
+            display_name_field: Some("name".to_string()),
+            headers: IndexMap::new(),
+        };
+        let payload = serde_json::json!({
+            "data": [
+                { "id": "anthropic/claude-opus-4-8", "name": "Claude Opus 4.8" }
+            ]
+        });
+        let mut provider = provider(discovery);
+        provider.id = "worldrouter".to_string();
+        provider.base_url = "https://inference-api.worldrouter.ai/v1".to_string();
+
+        let models =
+            parse_discovered_models(&provider, provider.discovery.as_ref().unwrap(), &payload)
+                .expect("models");
+
+        assert_eq!(
+            models[0].input,
+            vec![crate::Modality::Text, crate::Modality::Image]
+        );
+    }
+
+    #[test]
+    fn merge_discovered_models_preserves_curated_input_metadata() {
+        let mut models = vec![ModelDescriptor {
+            id: "gpt-5.5".to_string(),
+            display_name: "GPT-5.5".to_string(),
+            provider: "worldrouter".to_string(),
+            api: "openai-completions".to_string(),
+            context_window: 200_000,
+            max_output_tokens: 16_384,
+            supports_reasoning: true,
+            compat: None,
+            input: vec![crate::Modality::Text, crate::Modality::Image],
+            cost: None,
+        }];
+
+        merge_discovered_models(
+            &mut models,
+            vec![ModelDescriptor {
+                id: "gpt-5.5".to_string(),
+                display_name: "gpt-5.5".to_string(),
+                provider: "worldrouter".to_string(),
+                api: "openai-completions".to_string(),
+                context_window: 200_000,
+                max_output_tokens: 16_384,
+                supports_reasoning: true,
+                compat: None,
+                input: vec![crate::Modality::Text],
+                cost: None,
+            }],
+        );
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].input,
+            vec![crate::Modality::Text, crate::Modality::Image]
+        );
+    }
+
+    #[test]
+    fn discovery_filters_models_without_tool_support_parameter() {
+        let discovery = ModelDiscoveryConfig {
+            path: "/models".to_string(),
+            response: ModelDiscoveryFormat::OpenAiModels,
+            api: "openai-completions".to_string(),
+            context_window: 32_000,
+            max_output_tokens: 4_096,
+            supports_reasoning: false,
+            items_field: "data".to_string(),
+            id_field: "id".to_string(),
+            display_name_field: Some("name".to_string()),
+            headers: IndexMap::new(),
+        };
+        let payload = serde_json::json!({
+            "data": [
+                {
+                    "id": "plain-chat",
+                    "name": "Plain Chat",
+                    "supported_parameters": ["temperature", "top_p"]
+                },
+                {
+                    "id": "agent-chat",
+                    "name": "Agent Chat",
+                    "supported_parameters": ["temperature", "tools", "tool_choice"]
+                },
+                {
+                    "id": "legacy-chat",
+                    "name": "Legacy Chat"
+                }
+            ]
+        });
+        let provider = provider(discovery.clone());
+        let models =
+            parse_discovered_models(&provider, provider.discovery.as_ref().unwrap(), &payload)
+                .expect("models");
+
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, vec!["agent-chat", "legacy-chat"]);
+    }
+
+    #[test]
     fn discovery_parses_ollama_model_lists() {
         let discovery = ModelDiscoveryConfig {
             path: "/api/tags".to_string(),
@@ -462,6 +675,40 @@ mod tests {
         assert_eq!(models[0].id, "qwen3:14b");
         assert_eq!(models[0].display_name, "qwen3:14b");
         assert_eq!(models[0].api, "openai-completions");
+    }
+
+    #[test]
+    fn openrouter_discovery_marks_completions_reasoning_shape() {
+        let discovery = ModelDiscoveryConfig {
+            path: "/models".to_string(),
+            response: ModelDiscoveryFormat::OpenAiModels,
+            api: "openai-completions".to_string(),
+            context_window: 200_000,
+            max_output_tokens: 16_384,
+            supports_reasoning: true,
+            items_field: "data".to_string(),
+            id_field: "id".to_string(),
+            display_name_field: None,
+            headers: IndexMap::new(),
+        };
+        let payload = serde_json::json!({
+            "data": [
+                { "id": "google/gemini-3.5-flash", "name": "Google: Gemini 3.5 Flash" }
+            ]
+        });
+        let mut provider = provider(discovery);
+        provider.id = "openrouter".to_string();
+        provider.base_url = "https://openrouter.ai/api/v1".to_string();
+        let models =
+            parse_discovered_models(&provider, provider.discovery.as_ref().unwrap(), &payload)
+                .expect("models");
+
+        let compat = models[0]
+            .compat
+            .as_ref()
+            .and_then(ModelCompat::as_openai_completions)
+            .expect("openrouter completions compat");
+        assert_eq!(compat.thinking_format, Some(ThinkingFormat::Openrouter));
     }
 
     #[test]
@@ -507,7 +754,9 @@ mod tests {
                 display_name_field: None,
                 headers: IndexMap::new(),
             }),
+            media: None,
             models: Vec::new(),
+            chat_completions_path: None,
         };
         let mut auth = AuthStore::default();
         auth.set_api_key("custom-anthropic", "sk-ant-custom");
@@ -595,10 +844,12 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-5.3-codex");
         let request = server.join().expect("request");
-        assert!(request.contains("GET /api/codex/models?client_version="));
+        assert!(request.contains("GET /api/codex/models?client_version=0.125.0"));
         assert!(request.contains("authorization: Bearer token-123"));
         assert!(request.contains("chatgpt-account-id: acct-123"));
         assert!(request.contains("originator: codex_cli_rs"));
+        assert!(request.contains("user-agent: codex_cli_rs/0.125.0"));
+        assert!(request.contains("version: 0.125.0"));
     }
 
     #[test]
@@ -612,7 +863,9 @@ mod tests {
             headers: IndexMap::new(),
             query_params: IndexMap::new(),
             discovery: None,
+            media: None,
             models: Vec::new(),
+            chat_completions_path: None,
         };
 
         assert_eq!(
@@ -667,7 +920,9 @@ mod tests {
                 display_name_field: None,
                 headers: IndexMap::new(),
             }),
+            media: None,
             models: Vec::new(),
+            chat_completions_path: None,
         };
         let mut auth = AuthStore::default();
         auth.set_api_key("openai", "sk-test");

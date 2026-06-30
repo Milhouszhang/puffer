@@ -1,0 +1,103 @@
+id: Canvas
+name: Canvas
+description: |-
+  Render a structured result as an interactive Canvas page and open it.
+
+  Canvas is a small DESIGN SYSTEM, not a fixed template: you COMPOSE a tree of
+  components into a page for the task at hand (a code review, a research
+  dashboard, a test report, an audit). You provide only the component tree; a
+  shared design system (tokens, layout, dark + light) renders it consistently.
+  Do NOT write HTML/CSS yourself.
+
+  Spec: { title, meta?: string[], summary?, body: Node[] }
+  Node: { type, ...props, children?: Node[] }
+
+  Components you can compose:
+  - Layout:  section{title} · grid{min} · columns · card{title} · divider
+  - Text:    heading{level,text} · text{value} · badge{text,tone}
+  - Data:    metrics{items:[{value,label,tone?}]}  (inline summary strip)
+             kv{rows:[[k,v]]} · table{columns,rows}
+  - Viz:     bar{items:[{label,value,max?,tone?}]}
+             heatmap{columns,rows:[{label,cells:[0-4]}]}
+  - Input:   toggle{id,label,value?}
+             singleSelect{id,label,options:[{id,label}],value?}
+             multiSelect{id,label,options:[{id,label}],value?:string[]}
+             barSelect{id,label,options:[{id,label}],value?}
+             slider{id,label,min?,max?,step?,value?}
+             textInput{id,label,placeholder?,value?}
+  - Rich:    finding{severity,title,status?,locations?,body?,evidence?,
+                     actions?:[{id,label,intent?}]}
+             diff{text} · code{text} · callout{tone,title,body}
+  tone: "crit" | "high" | "ok" | "info"  ·  severity: critical|high|medium|low|info
+  intent (on actions): "fix" | "test" | "explain"
+
+  Compose what fits the task — do not force every result into the same shape.
+  Prefer information density over decoration.
+
+  IMPORTANT — make it actionable, not a static report: every `finding` SHOULD
+  carry `locations` and `evidence` (the actual diff/code, not a paraphrase), and
+  SHOULD expose `actions` (e.g. {id,label:"Suggest change",intent:"fix"} /
+  {label:"Add test",intent:"test"} / {label:"Explain",intent:"explain"}) whenever
+  the user could act. Action buttons continue the conversation with the agent
+  (carrying the finding's context) without the user typing — so a finding with no
+  action is a missed entry point. Do not emit decorative nodes with no evidence.
+
+  In Puffer Desktop, Canvas renders inline inside the chat. The HTML fallback is
+  still written under .puffer/canvas/ for non-inline hosts. Interactive nodes
+  write typed values into .puffer/canvas/<canvasId>.state.json.
+  Use CanvasState after the user interacts with a Canvas to read selected
+  toggles, choices, sliders, and text values. Every interactive node MUST have a
+  stable `id`; that id becomes the key in CanvasState.values.
+
+  PROACTIVELY OFFERING CANVAS — when a final answer is long and structured
+  (multiple findings/sections, a review/dashboard/report, lots of code/diff),
+  don't dump it all as text: first OFFER Canvas via AskUserQuestion, then render
+  on a yes. The frontend reskins this specific question into a one-click Canvas
+  button, so it MUST follow this exact contract:
+    AskUserQuestion({
+      metadata: { kind: "canvas-offer" },
+      questions: [{
+        question: "用 Canvas 呈现这个结果?",   // your reason, one line
+        header: "Canvas",
+        options: [
+          { label: "用 Canvas 打开", description: "..." },  // [0] = affirmative
+          { label: "普通文字显示",   description: "..." }   // [1] = decline
+        ]
+      }]
+    })
+  metadata.kind MUST be "canvas-offer"; options[0] = use Canvas, options[1] =
+  decline. If the user picks options[0], call the Canvas tool with the composed
+  tree; if options[1], just give the plain text answer. Offer once, only for
+  answers that genuinely benefit — never for short replies.
+handler: runtime:workflow:canvas
+approval_policy: auto
+sandbox_policy: workspace-write
+input_schema:
+  type: object
+  description: The canvas component tree.
+  required:
+    - title
+    - body
+  properties:
+    title:
+      type: string
+      description: Page title.
+    meta:
+      type: array
+      items: { type: string }
+      description: Dense header tags, e.g. ["PR #210", "3 files"].
+    summary:
+      type: string
+      description: Optional one-paragraph summary under the title.
+    body:
+      type: array
+      description: The component tree. Each item is a node { type, ...props, children? }.
+      items:
+        type: object
+        properties:
+          type:
+            type: string
+            description: Component type (section, grid, card, metrics, table, bar, heatmap, toggle, singleSelect, multiSelect, barSelect, slider, textInput, finding, diff, code, callout, text, heading, badge, kv, columns, divider).
+        required: [type]
+        additionalProperties: true
+  additionalProperties: true

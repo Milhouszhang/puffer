@@ -1,6 +1,7 @@
 use super::{
-    handle_plan_command, plan_mode_context_message, prepare_btw_prompt_command,
-    prepare_commit_prompt_command, prepare_compact_prompt_command, prepare_plan_prompt_command,
+    build_night_directive, execute_compact_prompt_command, handle_plan_command,
+    plan_mode_context_message, prepare_btw_prompt_command, prepare_commit_prompt_command,
+    prepare_compact_prompt_command, prepare_plan_prompt_command,
     prepare_pr_comments_prompt_command, prepare_prompt_command_specialization,
     prepare_security_review_prompt_command, prepare_statusline_prompt_command,
     PromptCommandPreparation,
@@ -8,11 +9,17 @@ use super::{
 use crate::plans::{ensure_plan_file, persist_plan_output, plan_file_path};
 use crate::{AppState, MessageRole};
 use puffer_config::{ensure_workspace_dirs, ConfigPaths, PufferConfig};
-use puffer_provider_registry::{AuthStore, ProviderRegistry};
-use puffer_resources::{LoadedItem, LoadedResources, PromptTemplate, SourceInfo, SourceKind};
+use puffer_provider_registry::{AuthStore, ModelDescriptor, ProviderDescriptor, ProviderRegistry};
+use puffer_resources::{
+    LoadedItem, LoadedResources, PromptTemplate, SourceInfo, SourceKind, ToolSpec,
+};
 use puffer_session_store::SessionStore;
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
 use tempfile::tempdir;
 use tempfile::TempDir;
 
@@ -29,8 +36,8 @@ fn compact_specialization_returns_prompt_override() {
 
     match outcome {
         PromptCommandPreparation::PromptOverride(prompt) => {
-            assert!(prompt.contains("Summarize the current conversation"));
-            assert!(prompt.contains("custom_instruction: focus on tests"));
+            assert!(prompt.contains("Summarize the conversation into a compact context block"));
+            assert!(prompt.contains("Additional instruction: focus on tests"));
         }
         PromptCommandPreparation::DirectPrompt(_)
         | PromptCommandPreparation::HandledLocally
@@ -39,6 +46,83 @@ fn compact_specialization_returns_prompt_override() {
             panic!("expected compact prompt override")
         }
     }
+}
+
+#[test]
+fn execute_compact_command_flushes_project_memory_before_rewriting_transcript() {
+    let fixture = sample_state();
+    let mut state = fixture.state;
+    let memory_file = fixture.tempdir.path().join("MEMORY.md");
+    state.project_memory = Some(
+        crate::memory::ProjectMemoryContext::from_parts(
+            "demo".to_string(),
+            fixture.tempdir.path().to_path_buf(),
+            memory_file.clone(),
+            6_000,
+        )
+        .unwrap(),
+    );
+    state.current_provider = Some("local-anthropic".to_string());
+    state.current_model = Some("local-anthropic/claude-sonnet-4-5".to_string());
+    state.push_message(MessageRole::User, "original context");
+    state.push_message(MessageRole::Assistant, "working on it");
+    let resources = LoadedResources {
+        tools: vec![memory_tool_resource()],
+        ..LoadedResources::default()
+    };
+    let mut providers = ProviderRegistry::new();
+    providers.register(local_provider(spawn_json_server(vec![
+        json!({
+            "id": "msg_flush_tool",
+            "model": "claude-sonnet-4-5",
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_flush_1",
+                "name": "Memory",
+                "input": {"action": "add", "content": "durable fact from compact flush"}
+            }],
+            "stop_reason": "tool_use"
+        }),
+        json!({
+            "id": "msg_flush_done",
+            "model": "claude-sonnet-4-5",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "flush complete"}],
+            "stop_reason": "end_turn"
+        }),
+        json!({
+            "id": "msg_compact_done",
+            "model": "claude-sonnet-4-5",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "summary body"}],
+            "stop_reason": "end_turn"
+        }),
+    ])));
+    let mut auth_store = AuthStore::default();
+
+    execute_compact_prompt_command(
+        &mut state,
+        &resources,
+        &providers,
+        &mut auth_store,
+        &fixture.session_store,
+        "Summarize now",
+        None,
+    )
+    .unwrap();
+
+    let memory_contents = std::fs::read_to_string(&memory_file).unwrap();
+    assert!(memory_contents.contains("durable fact from compact flush"));
+    assert!(
+        matches!(state.transcript.first(), Some(message) if message.role == MessageRole::User && message.text.contains("[Conversation compacted"))
+    );
+    assert!(state.transcript.iter().any(|message| {
+        message.role == MessageRole::System
+            && message
+                .text
+                .contains("Conversation compacted. Summary preserved in context.")
+    }));
 }
 
 #[test]
@@ -446,6 +530,22 @@ fn dispatcher_helper_routes_known_prompt_specializations() {
         _ => panic!("expected commit prompt variable overrides"),
     }
 
+    state.project_memory = None;
+    let init =
+        prepare_prompt_command_specialization(&mut state, &session_store, "init", "").unwrap();
+    match init {
+        Some(PromptCommandPreparation::VariableOverrides(variables)) => {
+            assert!(variables.is_empty());
+            let context = state
+                .project_memory
+                .as_ref()
+                .expect("/init should initialize project memory");
+            assert!(context.memory_file.ends_with("MEMORY.md"));
+            assert!(context.memory_file.exists());
+        }
+        _ => panic!("expected /init prompt variable overrides"),
+    }
+
     let plan =
         prepare_prompt_command_specialization(&mut state, &session_store, "plan", "").unwrap();
     assert!(plan.is_none());
@@ -468,7 +568,7 @@ fn dispatcher_helper_routes_known_prompt_specializations() {
         prepare_prompt_command_specialization(&mut state, &session_store, "compact", "").unwrap();
     match compact {
         Some(PromptCommandPreparation::PromptOverride(prompt)) => {
-            assert!(prompt.contains("Summarize the current conversation"));
+            assert!(prompt.contains("Summarize the conversation into a compact context block"));
         }
         _ => panic!("expected /compact prompt override specialization"),
     }
@@ -530,8 +630,26 @@ struct TestFixture {
     session_store: SessionStore,
 }
 
+struct ScopedPufferHome {
+    _override: puffer_config::PufferHomeOverride,
+}
+
+impl ScopedPufferHome {
+    fn set(path: &std::path::Path) -> Self {
+        Self {
+            _override: puffer_config::set_puffer_home_override(path),
+        }
+    }
+}
+
 fn sample_state() -> TestFixture {
     let tempdir = tempdir().unwrap();
+    let _lock = crate::test_locks::env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let home = tempdir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let _home = ScopedPufferHome::set(&home);
     let paths = ConfigPaths::discover(tempdir.path());
     ensure_workspace_dirs(&paths).unwrap();
     let session_store = SessionStore::from_paths(&paths).unwrap();
@@ -548,4 +666,114 @@ fn sample_state() -> TestFixture {
         state,
         session_store,
     }
+}
+
+fn memory_tool_resource() -> LoadedItem<ToolSpec> {
+    LoadedItem {
+        value: ToolSpec {
+            id: "Memory".to_string(),
+            name: "Memory".to_string(),
+            description: "Project memory tool".to_string(),
+            handler: "runtime:project_memory".to_string(),
+            approval_policy: Some("auto".to_string()),
+            sandbox_policy: Some("workspace-write".to_string()),
+            input_schema: Some(json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "content": {"type": "string"},
+                    "old_text": {"type": "string"}
+                },
+                "required": ["action"]
+            })),
+            ..ToolSpec::default()
+        },
+        source_info: SourceInfo {
+            path: PathBuf::from("memory.yaml"),
+            kind: SourceKind::Builtin,
+        },
+    }
+}
+
+fn local_provider(base_url: String) -> ProviderDescriptor {
+    ProviderDescriptor {
+        id: "local-anthropic".to_string(),
+        display_name: "Local Anthropic".to_string(),
+        base_url,
+        default_api: "anthropic-messages".to_string(),
+        auth_modes: Vec::new(),
+        headers: Default::default(),
+        query_params: Default::default(),
+        discovery: None,
+        media: None,
+        models: vec![ModelDescriptor {
+            id: "claude-sonnet-4-5".to_string(),
+            display_name: "Claude Sonnet 4.5".to_string(),
+            provider: "local-anthropic".to_string(),
+            api: "anthropic-messages".to_string(),
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+            supports_reasoning: true,
+            input: Vec::new(),
+            cost: None,
+            compat: None,
+        }],
+        chat_completions_path: None,
+    }
+}
+
+fn spawn_json_server(responses: Vec<Value>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for response_body in responses {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0_u8; 8192];
+            let _ = stream.read(&mut buffer);
+            let body = response_body.to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+    });
+    format!("http://{address}")
+}
+
+#[test]
+fn night_directive_carries_guardrails_budget_and_gates_pr() {
+    // Fork-PR off (experimental default): all guardrails + budget + fenced leads.
+    let off = build_night_directive("lead: extend the recall index", false, 1_000_000);
+    assert!(
+        off.contains(".worktree/"),
+        "must mandate worktree isolation"
+    );
+    assert!(off.contains("NON-DESTRUCTIVE"));
+    assert!(off.contains("NO DRIFT"));
+    assert!(off.contains("SUBAGENTS"));
+    assert!(off.contains("end-to-end") && off.contains("SCREENSHOTS"));
+    // Leads are embedded but FENCED as untrusted (not framed as commands).
+    assert!(
+        off.contains("<untrusted-leads>"),
+        "leads must be fenced as untrusted"
+    );
+    assert!(off.contains("UNTRUSTED"));
+    assert!(
+        off.contains("lead: extend the recall index"),
+        "autodream leads embedded"
+    );
+    // Budget/goal section present.
+    assert!(off.contains("budget") && off.contains("1000000"));
+    assert!(off.contains("Fork-PR is DISABLED"));
+    assert!(!off.contains("Fork-PR is ENABLED"));
+
+    // Fork-PR on + empty leads -> "(none)" inside the fence + enabled clause.
+    let on = build_night_directive("   ", true, 500_000);
+    assert!(on.contains("Fork-PR is ENABLED"));
+    assert!(on.contains("USER'S FORK"));
+    assert!(on.contains("<untrusted-leads>\n(none)\n</untrusted-leads>"));
+    assert!(on.contains("500000"));
 }

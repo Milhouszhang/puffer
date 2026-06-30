@@ -49,6 +49,13 @@ description: |-
 
   Make sure to read a task's latest state using `TaskGet` before updating it.
 
+  ## Monitor Tasks
+
+  Do not mark a human-gated or typed executable monitor task completed with
+  TaskUpdate. For typed Telegram and Gmail replies, save a pending draft action
+  with MonitorActionDraft. For legacy Telegram reply tasks, save a draft with
+  MonitorReplyDraft. Let Bobo ask the user to approve the final external action.
+
   ## Examples
 
   Mark task as in progress when starting work:

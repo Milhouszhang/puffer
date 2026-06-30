@@ -1,0 +1,51 @@
+id: ConnectorAct
+name: ConnectorAct
+description: |-
+  Invoke a connector action through Telegram, Slack, email, gmail-browser,
+  gcal-browser, lark-browser, or feishu-browser.
+
+  Use this tool for configured email, gmail-browser, gcal-browser, lark-browser, and feishu-browser accounts
+  instead of opening a separate browser session. Email actions include
+  list_emails, list_inbox, list_category, search_emails, mark_read,
+  draft_reply, draft_forward, send_email, and delete. Google Calendar Browser
+  actions include list_events, search_events, get_detail, accept, and deny.
+  Use list_events or search_events before get_detail when you do not already
+  have an event_id, title, or url. The browser-backed connectors also support
+  requestuserbrowseraction when they need the user to complete a sign-in or
+  approval step in the global Puffer browser profile. The email connector
+  executes through IMAP/SMTP; gmail-browser, gcal-browser, lark-browser, and feishu-browser execute through
+  the daemon-managed global Chrome profile that owns browser-backed
+  connections. Do not use Slack/Lark read_messages for email or gmail-browser;
+  use list_emails or search_emails instead.
+
+  Connector actions are external side effects. The connector's action metadata
+  defines the permission category and input shape.
+
+  Do not use this tool for external message sends, replies, forwards, posts, or
+  emails. Use ConnectorActionDraft for those actions so the human can review the
+  exact outbound content before it is sent.
+handler: runtime:workflow:connector_act
+approval_policy: ask
+sandbox_policy: workspace-write
+input_schema:
+  type: object
+  properties:
+    connector_slug:
+      type: string
+    connection_slug:
+      type: string
+      description: Authorized connection slug. Defaults to input.connection or connector_slug.
+    account_slug:
+      type: string
+      description: Alias for connection_slug when the connector connection represents an account.
+    account:
+      type: string
+      description: Alias for connection_slug when the connector connection represents an account.
+    action:
+      type: string
+      description: Connector action slug, such as "send_message".
+    input:
+      type: object
+      description: Action JSON payload.
+  required: [connector_slug, action, input]
+  additionalProperties: false

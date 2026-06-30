@@ -9,28 +9,155 @@ discovery:
   path: /v1/models
   response: open_ai_models
   api: openai-responses
-  context_window: 272000
-  max_output_tokens: 16384
+  context_window: 1047576
+  max_output_tokens: 128000
   supports_reasoning: true
+media:
+  image:
+    discovery:
+      adapter: static
+    execution:
+      adapter: images_json
+      path: /v1/images/generations
+      batch:
+        mode: per_image
+    models:
+      - id: gpt-image-2
+        display_name: GPT Image 2
+        operations:
+          - generate
+        max_outputs: 9
+        axes:
+          - { id: mode, label: Mode, role: param, control: !enum { values: ["1K SD", "2K HD"], default: "1K SD" } }
+          - { id: ratio, label: Ratio, role: param, control: !enum { values: ["Auto", "1:1"], default: "Auto" } }
+        media_map:
+          size:
+            field: size
+            values:
+              "1K SD":
+                Auto: auto
+                "1:1": "1024x1024"
+              "2K HD":
+                Auto: auto
+                "1:1": "2048x2048"
+        variants: { model_id: gpt-image-2, base_params: { quality: auto, output_format: png } }
+      - id: gpt-image-1.5
+        display_name: GPT Image 1.5
+        operations:
+          - generate
+        max_outputs: 9
+        axes:
+          - { id: mode, label: Mode, role: param, control: !enum { values: ["1K SD"], default: "1K SD" } }
+          - { id: ratio, label: Ratio, role: param, control: !enum { values: ["Auto", "1:1", "2:3", "3:2"], default: "Auto" } }
+        media_map:
+          size:
+            field: size
+            values:
+              "1K SD":
+                Auto: auto
+                "1:1": "1024x1024"
+                "2:3": "1024x1536"
+                "3:2": "1536x1024"
+        variants: { model_id: gpt-image-1.5, base_params: { quality: auto, output_format: png } }
+      - id: chatgpt-image-latest
+        display_name: ChatGPT Image Latest
+        operations:
+          - generate
+        max_outputs: 9
+        axes:
+          - { id: mode, label: Mode, role: param, control: !enum { values: ["1K SD"], default: "1K SD" } }
+          - { id: ratio, label: Ratio, role: param, control: !enum { values: ["Auto", "1:1", "2:3", "3:2"], default: "Auto" } }
+        media_map:
+          size:
+            field: size
+            values:
+              "1K SD":
+                Auto: auto
+                "1:1": "1024x1024"
+                "2:3": "1024x1536"
+                "3:2": "1536x1024"
+        variants: { model_id: chatgpt-image-latest, base_params: { quality: auto, output_format: png } }
+      - id: gpt-image-1
+        display_name: GPT Image 1
+        operations:
+          - generate
+        max_outputs: 9
+        axes:
+          - { id: mode, label: Mode, role: param, control: !enum { values: ["1K SD"], default: "1K SD" } }
+          - { id: ratio, label: Ratio, role: param, control: !enum { values: ["Auto", "1:1", "2:3", "3:2"], default: "Auto" } }
+        media_map:
+          size:
+            field: size
+            values:
+              "1K SD":
+                Auto: auto
+                "1:1": "1024x1024"
+                "2:3": "1024x1536"
+                "3:2": "1536x1024"
+        variants: { model_id: gpt-image-1, base_params: { quality: auto, output_format: png } }
+      - id: gpt-image-1-mini
+        display_name: GPT Image 1 Mini
+        operations:
+          - generate
+        max_outputs: 9
+        axes:
+          - { id: mode, label: Mode, role: param, control: !enum { values: ["1K SD"], default: "1K SD" } }
+          - { id: ratio, label: Ratio, role: param, control: !enum { values: ["Auto", "1:1", "2:3", "3:2"], default: "Auto" } }
+        media_map:
+          size:
+            field: size
+            values:
+              "1K SD":
+                Auto: auto
+                "1:1": "1024x1024"
+                "2:3": "1024x1536"
+                "3:2": "1536x1024"
+        variants: { model_id: gpt-image-1-mini, base_params: { quality: auto, output_format: png } }
 models:
-  - id: gpt-5
-    display_name: GPT-5
+  - id: gpt-5.5
+    display_name: GPT-5.5
     provider: openai
     api: openai-responses
-    context_window: 272000
-    max_output_tokens: 16384
+    context_window: 1041920
+    max_output_tokens: 128000
     supports_reasoning: true
+    input: [text, image]
   - id: gpt-5.4
     display_name: GPT-5.4
     provider: openai
     api: openai-responses
-    context_window: 272000
-    max_output_tokens: 16384
+    context_window: 1047576
+    max_output_tokens: 128000
     supports_reasoning: true
+    input: [text, image]
+  - id: gpt-5.4-mini
+    display_name: GPT-5.4 Mini
+    provider: openai
+    api: openai-responses
+    context_window: 400000
+    max_output_tokens: 128000
+    supports_reasoning: true
+    input: [text, image]
+  - id: gpt-5.4-nano
+    display_name: GPT-5.4 Nano
+    provider: openai
+    api: openai-responses
+    context_window: 400000
+    max_output_tokens: 128000
+    supports_reasoning: true
+  - id: gpt-5
+    display_name: GPT-5
+    provider: openai
+    api: openai-responses
+    context_window: 400000
+    max_output_tokens: 128000
+    supports_reasoning: true
+    input: [text, image]
   - id: gpt-5-mini
     display_name: GPT-5 Mini
     provider: openai
     api: openai-responses
-    context_window: 272000
-    max_output_tokens: 16384
+    context_window: 400000
+    max_output_tokens: 128000
     supports_reasoning: true
+    input: [text, image]

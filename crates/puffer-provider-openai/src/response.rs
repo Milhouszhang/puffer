@@ -36,6 +36,16 @@ pub struct OpenAIResponsesOutputItem {
     pub arguments: Option<Value>,
     #[serde(default)]
     pub content: Vec<OpenAIResponsesContentItem>,
+    /// Present when `kind == "reasoning"` — thinking-chain summary items.
+    /// Aligned with Codex `ResponseItem::Reasoning.summary`.
+    #[serde(default)]
+    pub summary: Vec<Value>,
+    /// Present when `kind == "reasoning"` — opaque encrypted thinking chain
+    /// returned by the Responses API when `include` contains the
+    /// `reasoning.encryptedcontent` selector. Aligned with Codex
+    /// `ResponseItem::Reasoning.encrypted_content`.
+    #[serde(default)]
+    pub encrypted_content: Option<String>,
 }
 
 /// A content fragment nested under an OpenAI assistant message output item.
@@ -75,8 +85,130 @@ pub struct OpenAIChatChoiceMessage {
     pub role: Option<String>,
     #[serde(default)]
     pub content: Option<Value>,
+    /// Reasoning chain emitted by reasoning-capable Chat-Completions
+    /// providers (Moonshot Kimi, Deepseek, OpenRouter, etc.). The
+    /// canonical key is `reasoning_content`; we accept `reasoning` as
+    /// an alias because some compatible relays use the shorter name.
+    /// Populated for non-streaming responses.
+    #[serde(default, alias = "reasoning")]
+    pub reasoning_content: Option<String>,
     #[serde(default, deserialize_with = "deserialize_tool_calls")]
     pub tool_calls: Vec<OpenAIChatToolCall>,
+}
+
+/// Convenience accessor: returns the reasoning chain text when the
+/// message includes one, or `None` for non-reasoning models.
+///
+/// Tries three sources, in order:
+/// 1. The dedicated `reasoning_content` field (canonical Moonshot Kimi
+///    / Deepseek shape; also accepted as `reasoning` via serde alias
+///    used by OpenRouter and others).
+/// 2. The `reasoning` JSON object (some providers nest summary text
+///    under `message.reasoning.summary` or `message.reasoning.content`).
+/// 3. A `<think>…</think>` block inside `message.content` (the
+///    open-source / DeepSeek-R1 distill convention).
+pub fn extract_chat_completions_reasoning(
+    response: &OpenAIChatCompletionsResponse,
+) -> Option<String> {
+    let message = response.choices.first().map(|choice| &choice.message)?;
+
+    // (1) explicit reasoning_content field.
+    if let Some(value) = message
+        .reasoning_content
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(value.to_string());
+    }
+
+    // (3) <think>…</think> inside content. Catches DeepSeek-R1-style
+    // distill outputs and several Moonshot / Kimi K2 modes that pack
+    // the chain-of-thought into the visible content stream.
+    if let Some(content) = message.content.as_ref() {
+        let raw = content_to_text(content);
+        if let Some(thinking) = extract_think_block(&raw) {
+            return Some(thinking);
+        }
+    }
+
+    None
+}
+
+/// Returns the visible-to-user portion of the assistant message,
+/// stripped of any `<think>…</think>` block. Used by the agent loop
+/// after `extract_chat_completions_reasoning` so the same content
+/// doesn't appear twice (once in the thinking card, once in the
+/// answer card). Falls back to the raw text when no think block is
+/// present.
+pub fn extract_chat_completions_visible_text(response: &OpenAIChatCompletionsResponse) -> String {
+    response
+        .choices
+        .first()
+        .and_then(|choice| choice.message.content.as_ref())
+        .map(content_to_text)
+        .map(|raw| strip_think_block(&raw).into_owned())
+        .unwrap_or_default()
+}
+
+/// Lightweight conversion that mirrors `extract_chat_content_text` but
+/// is reachable from the reasoning helpers. Kept separate to avoid
+/// re-exporting the private fn.
+fn content_to_text(content: &Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    if let Some(array) = content.as_array() {
+        return array
+            .iter()
+            .filter_map(|item| {
+                let kind = item.get("type").and_then(Value::as_str)?;
+                if kind == "text" || kind == "output_text" {
+                    item.get("text").and_then(Value::as_str).map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("");
+    }
+    String::new()
+}
+
+/// Returns the inner text of the FIRST `<think>...</think>` block, or
+/// `None` if no such block exists. Tolerant of leading whitespace and
+/// case (some providers emit `<Think>` or `<THINK>`).
+fn extract_think_block(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let start_tag = lower.find("<think>")?;
+    let after_open = start_tag + "<think>".len();
+    let close_offset = lower[after_open..].find("</think>")?;
+    let inner = &text[after_open..after_open + close_offset];
+    let trimmed = inner.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Returns `text` with the FIRST `<think>...</think>` block removed.
+/// Used to compute the "visible answer" when reasoning is embedded
+/// inline in the content stream.
+fn strip_think_block(text: &str) -> std::borrow::Cow<'_, str> {
+    let lower = text.to_ascii_lowercase();
+    let Some(start_tag) = lower.find("<think>") else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let after_open = start_tag + "<think>".len();
+    let Some(close_offset) = lower[after_open..].find("</think>") else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let close_end = after_open + close_offset + "</think>".len();
+    let mut out = String::with_capacity(text.len() - (close_end - start_tag));
+    out.push_str(&text[..start_tag]);
+    out.push_str(&text[close_end..]);
+    std::borrow::Cow::Owned(out.trim().to_string())
 }
 
 /// A tool-call item nested under a Chat Completions assistant message.
@@ -178,12 +310,7 @@ pub(crate) fn extract_chat_completions_tool_calls(
         .flat_map(|choice| choice.message.tool_calls.iter())
         .map(|tool_call| {
             let arguments = parse_tool_arguments(&tool_call.function.arguments, &tool_call.id)
-                .with_context(|| {
-                    format!(
-                        "failed to parse OpenAI Chat Completions tool arguments for call {}",
-                        tool_call.id
-                    )
-                })?;
+                .unwrap_or_else(|_| tool_call.function.arguments.clone());
             Ok(OpenAIResponseToolCall {
                 item_id: None,
                 status: None,
@@ -451,5 +578,39 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "search_text");
         assert_eq!(calls[0].arguments["query"], "tool schema");
+    }
+
+    #[test]
+    fn preserves_invalid_chat_completions_tool_arguments_for_retry() {
+        let response = parse_chat_completions_response(
+            r#"{
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_bad",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Bash",
+                                        "arguments": "{\"command\":\"python3 - <<'PY'\nprint('unterminated')"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let calls = extract_chat_completions_tool_calls(&response).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(
+            calls[0].arguments,
+            json!("{\"command\":\"python3 - <<'PY'\nprint('unterminated')")
+        );
     }
 }

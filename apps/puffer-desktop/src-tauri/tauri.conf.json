@@ -1,23 +1,27 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Puffer Desktop",
+  "productName": "Corbina",
   "version": "0.1.0",
-  "identifier": "com.berabuddies.puffer.desktop",
+  "identifier": "com.corbina.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run build:puffer-cli:dev && npm run dev",
+    "beforeBuildCommand": "npm run build:puffer-cli:release && npm run build",
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
-        "title": "Puffer Desktop",
-        "width": 1500,
-        "height": 960,
-        "minWidth": 1200,
-        "minHeight": 760,
-        "resizable": true
+        "title": "Corbina",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 720,
+        "minHeight": 480,
+        "resizable": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "acceptFirstMouse": true,
+        "dragDropEnabled": false
       }
     ],
     "security": {
@@ -25,6 +29,9 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": ["deb", "appimage"],
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "resources": ["../../../resources/browser_extensions"]
   }
 }

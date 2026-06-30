@@ -15,6 +15,10 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+/// Invoked (best-effort) when a run reaches a terminal status. Set by the
+/// daemon to bridge run completion to the dock badge; `None` everywhere else.
+pub type RunFinishedObserver = std::sync::Arc<dyn Fn(&WorkflowBindingRun) + Send + Sync>;
+
 /// Status for a recorded direct workflow run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +29,13 @@ pub enum WorkflowBindingRunStatus {
     Completed,
     /// The action failed.
     Failed,
+}
+
+impl WorkflowBindingRunStatus {
+    /// True once the run can no longer change (success or failure).
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
 }
 
 /// How many times a (binding, dedup_key) may fail before it is treated as a
@@ -120,6 +131,7 @@ fn default_next_idx() -> u64 {
 pub struct WorkflowHistoryStore {
     path: PathBuf,
     inner: Mutex<HistoryFile>,
+    run_finished_observer: Option<RunFinishedObserver>,
 }
 
 impl WorkflowHistoryStore {
@@ -139,7 +151,26 @@ impl WorkflowHistoryStore {
         Ok(Self {
             path,
             inner: Mutex::new(inner),
+            run_finished_observer: None,
         })
+    }
+
+    /// Attaches a best-effort observer fired when a run reaches a terminal
+    /// status. Consuming builder so the store stays immutable afterwards.
+    pub fn with_run_finished_observer(mut self, observer: RunFinishedObserver) -> Self {
+        self.run_finished_observer = Some(observer);
+        self
+    }
+
+    /// Fires the observer iff `run` is terminal. Call only after the inner
+    /// `Mutex` guard is dropped — the observer does a broadcast send and must
+    /// not run while the store lock is held.
+    fn notify_run_finished(&self, run: &WorkflowBindingRun) {
+        if run.status.is_terminal() {
+            if let Some(observer) = &self.run_finished_observer {
+                observer(run);
+            }
+        }
     }
 
     /// Appends a direct workflow run produced by a routed connector event.
@@ -248,6 +279,8 @@ impl WorkflowHistoryStore {
         run.ended_at_ms = ended_at_ms;
         let updated = run.clone();
         write_atomic(&self.path, &*guard)?;
+        drop(guard);
+        self.notify_run_finished(&updated);
         Ok(Some(updated))
     }
 
@@ -286,11 +319,14 @@ impl WorkflowHistoryStore {
         &self,
         mut run: WorkflowBindingRun,
     ) -> Result<WorkflowBindingRun, WorkflowHistoryStoreError> {
-        let mut guard = self.inner.lock().unwrap();
-        run.idx = guard.next_idx;
-        guard.next_idx += 1;
-        guard.runs.push(run.clone());
-        write_atomic(&self.path, &*guard)?;
+        {
+            let mut guard = self.inner.lock().unwrap();
+            run.idx = guard.next_idx;
+            guard.next_idx += 1;
+            guard.runs.push(run.clone());
+            write_atomic(&self.path, &*guard)?;
+        } // guard dropped here
+        self.notify_run_finished(&run);
         Ok(run)
     }
 
@@ -506,6 +542,84 @@ mod tests {
                 payload: json!({"from":"Tony"}),
             },
         }
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn run_result(success: bool) -> ActionResult {
+        ActionResult {
+            success,
+            summary: "s".into(),
+            usage: None,
+            turn_started_at_ms: None,
+            turn_ended_at_ms: None,
+            triage_decisions: Vec::new(),
+        }
+    }
+
+    fn counting_store(path: std::path::PathBuf) -> (WorkflowHistoryStore, std::sync::Arc<AtomicUsize>) {
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let c2 = count.clone();
+        let store = WorkflowHistoryStore::load(path)
+            .unwrap()
+            .with_run_finished_observer(std::sync::Arc::new(move |_run| {
+                c2.fetch_add(1, Ordering::SeqCst);
+            }));
+        (store, count)
+    }
+
+    #[test]
+    fn observer_fires_once_on_terminal_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, count) = counting_store(temp.path().join("h.json"));
+        store
+            .append_action_result(&binding(), &envelope(),
+                &ActionSpec::RunWorkflow { slug: "native".into() }, &run_result(true), 1, 2)
+            .unwrap();
+        store
+            .append_action_result(&binding(), &envelope(),
+                &ActionSpec::RunWorkflow { slug: "native".into() }, &run_result(false), 1, 2)
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2); // one Completed + one Failed
+    }
+
+    #[test]
+    fn observer_silent_on_running_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, count) = counting_store(temp.path().join("h.json"));
+        store
+            .append_action_started(&binding(), &envelope(),
+                &ActionSpec::RunWorkflow { slug: "native".into() }, 1)
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 0); // Running must not notify
+    }
+
+    #[test]
+    fn observer_fires_on_complete_action_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, count) = counting_store(temp.path().join("h.json"));
+        let started = store
+            .append_action_started(&binding(), &envelope(),
+                &ActionSpec::RunWorkflow { slug: "native".into() }, 1)
+            .unwrap();
+        store
+            .complete_action_result(started.idx,
+                &ActionSpec::RunWorkflow { slug: "native".into() }, &run_result(true), 1, 2)
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1); // the path a router-level hook would miss
+    }
+
+    #[test]
+    fn observer_silent_on_boot_reclaim() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, count) = counting_store(temp.path().join("h.json"));
+        store
+            .append_action_started(&binding(), &envelope(),
+                &ActionSpec::RunWorkflow { slug: "native".into() }, 1)
+            .unwrap();
+        let reclaimed = store.expire_orphaned_running(i128::MAX); // fence after the run
+        assert_eq!(reclaimed, 1);
+        assert_eq!(count.load(Ordering::SeqCst), 0); // stale-run cleanup must not badge
     }
 
     #[test]

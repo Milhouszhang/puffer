@@ -1256,28 +1256,69 @@ async fn import_and_connect(
             return Ok(None);
         }
     };
-    let Some(client) = verify_imported_session(env, &mut outcome).await? else {
-        emit_control(
-            &env.topic,
-            "login_error",
-            json!({
-                "error": "Telegram import wrote a session, but Telegram did not accept it",
-                "phase": "import_verify",
-                "import": import_payload(&outcome),
-            }),
-        )?;
-        return Ok(None);
+    let client = match verify_imported_session(env, &mut outcome).await? {
+        VerifyOutcome::Connected(client) => client,
+        VerifyOutcome::Failed(failure) => {
+            let (class, error) = verify_failure_login_error(&failure);
+            emit_control(
+                &env.topic,
+                "login_error",
+                json!({
+                    "error": error,
+                    "phase": "import_verify",
+                    "class": class,
+                    "import": import_payload(&outcome),
+                }),
+            )?;
+            return Ok(None);
+        }
     };
     emit_import_complete(env, &client, &mut outcome).await?;
     Ok(Some(client))
 }
 
+/// Why a post-import session verification did not connect.
+enum VerifyFailure {
+    /// Could not reach Telegram (network/proxy/DC unreachable) — retryable.
+    Unreachable(String),
+    /// Reached Telegram but the imported session was not accepted (re-login).
+    Rejected,
+}
+
+/// Result of verifying an imported session against Telegram.
+enum VerifyOutcome {
+    Connected(Client),
+    Failed(VerifyFailure),
+}
+
+/// Maps a verify failure to (`class`, user-facing message) for the
+/// `login_error` event the connector-setup UI shows.
+fn verify_failure_login_error(failure: &VerifyFailure) -> (&'static str, String) {
+    match failure {
+        VerifyFailure::Unreachable(_) => (
+            "network",
+            "Couldn't reach Telegram to verify the import (likely a network/proxy block). \
+             The local session was imported; check your network/proxy and retry."
+                .to_string(),
+        ),
+        VerifyFailure::Rejected => (
+            "auth",
+            "Telegram import wrote a session, but Telegram did not accept it; re-login may be required."
+                .to_string(),
+        ),
+    }
+}
+
 async fn verify_imported_session(
     env: &SkillEnv,
     outcome: &mut TdataImportOutcome,
-) -> anyhow::Result<Option<Client>> {
-    if let SessionResume::Resumed(client) = try_resume_session(env).await? {
-        return Ok(Some(client));
+) -> anyhow::Result<VerifyOutcome> {
+    let mut last_unreachable: Option<String> = None;
+
+    match try_resume_session(env).await? {
+        SessionResume::Resumed(client) => return Ok(VerifyOutcome::Connected(client)),
+        SessionResume::AuthRequired => return Ok(VerifyOutcome::Failed(VerifyFailure::Rejected)),
+        SessionResume::Transient(detail) => last_unreachable = Some(detail),
     }
 
     let mut tried = vec![outcome.dc_id];
@@ -1288,11 +1329,18 @@ async fn verify_imported_session(
         tried.push(dc_id);
         rewrite_imported_session_dc(env, dc_id)?;
         outcome.dc_id = dc_id;
-        if let SessionResume::Resumed(client) = try_resume_session(env).await? {
-            return Ok(Some(client));
+        match try_resume_session(env).await? {
+            SessionResume::Resumed(client) => return Ok(VerifyOutcome::Connected(client)),
+            SessionResume::AuthRequired => {
+                return Ok(VerifyOutcome::Failed(VerifyFailure::Rejected))
+            }
+            SessionResume::Transient(detail) => last_unreachable = Some(detail),
         }
     }
-    Ok(None)
+
+    Ok(VerifyOutcome::Failed(VerifyFailure::Unreachable(
+        last_unreachable.unwrap_or_else(|| "Telegram unreachable".to_string()),
+    )))
 }
 
 fn rewrite_imported_session_dc(env: &SkillEnv, dc_id: i32) -> anyhow::Result<()> {
@@ -1351,10 +1399,21 @@ fn import_payload(outcome: &TdataImportOutcome) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_offline_retry_delay, startup_monitoring_boundary, OFFLINE_RESUME_RETRY_INITIAL_DELAY,
-        OFFLINE_RESUME_RETRY_MAX_DELAY,
+        next_offline_retry_delay, startup_monitoring_boundary, verify_failure_login_error,
+        VerifyFailure, OFFLINE_RESUME_RETRY_INITIAL_DELAY, OFFLINE_RESUME_RETRY_MAX_DELAY,
     };
     use std::time::Duration;
+
+    #[test]
+    fn verify_failure_message_distinguishes_network_from_rejection() {
+        let (class, msg) = verify_failure_login_error(&VerifyFailure::Unreachable("io timeout".into()));
+        assert_eq!(class, "network");
+        assert!(msg.contains("network/proxy"), "network message: {msg}");
+
+        let (class, msg) = verify_failure_login_error(&VerifyFailure::Rejected);
+        assert_eq!(class, "auth");
+        assert!(msg.contains("did not accept"), "rejected message: {msg}");
+    }
 
     #[test]
     fn startup_monitoring_boundary_uses_offline_start_after_recovery() {

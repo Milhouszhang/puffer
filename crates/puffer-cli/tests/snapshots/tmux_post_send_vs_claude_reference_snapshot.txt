@@ -21,19 +21,20 @@ Review the current worktree and call out any risks.
 ❯
 
 Puffer captured pane:
-                 ██
-             ██████████    ██
-           ████████████████████
-       ████████████████████████    ╭ Puffer Code ────────────────────────────────────────────────╮
-       ██████████████████████      │Account   anthropic via API key                              │
-     ████████████████████████████  │Model     anthropic/claude-sonnet-4-5 · tools 0/0            │
- ██████████████████████████████    │Session   dockyard · <id>│
-   ████████████████████████████    │Mode      effort auto                                        │
-       ████████████████████████    │Context   dockyard · 2 msgs · 0 wds · sandbox workspace-write│
-     ████████████████████████      ╰─────────────────────────────────────────────────────────────╯
-         ████████████████████
-         ████████████████
-             ████████
+                ██                ╭ Puffer Code ───────────────────────────────────────────────────╮
+            ██████████    ██      │Account   anthropic via API key                                 │
+          ████████████████████    │Model     anthropic/claude-sonnet-4-5 · tools 83/91             │
+      ████████████████████████    │Session   dockyard · <id>│
+      ██████████████████████      │Mode      effort auto                                           │
+    ████████████████████████████  │Context   dockyard · 2 msgs · 0 wds · permissions ACL · 99% left│
+██████████████████████████████    ╰────────────────────────────────────────────────────────────────╯
+  ████████████████████████████
+      ████████████████████████
+    ████████████████████████
+        ████████████████████
+        ████████████████
+            ████████
+
 › Review the current worktree and call out any risks.
 The working tree is clean.
 
@@ -41,7 +42,7 @@ The working tree is clean.
   No pending changes are waiting for review.
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯ Review changes, ask a question, or type /
-anthropic/claude-sonnet-4-5 · 0% left · ~/dockyard · sandbox workspace-write
+anthropic/claude-sonnet-4-5 · 99% left · ~/dockyard · permissions ACL
 
 Feature comparison:
 top_panel: claude=false puffer=true

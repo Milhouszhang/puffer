@@ -1,0 +1,183 @@
+id: BrowserAction
+name: BrowserAction
+description: |-
+  Execute one managed Puffer browser action through the typed browser runtime.
+
+  Use this for verified Lambda Skill contracts that need browser session state,
+  DOM snapshots, element refs, screenshots, or browser input. Each call carries
+  one structured browser action and the exact arguments that the runtime will
+  execute. This tool does not expose a shell command surface.
+
+  For sign-in and login flows, search `RequestSecret` for the relevant site,
+  domain, account, or username before using this browser tool for credential
+  fields. Use non-secret `username` metadata from RequestSecret search/request
+  results for email, phone, username, or account fields. Use
+  `PUFFER_SECRET_...` placeholders only for password, token, API key, or other
+  secret-value fields. If no matching credential exists, use `RequestSecret` to
+  collect a reusable credential instead of asking the user to paste passwords,
+  tokens, or API keys into chat.
+
+  For editable controls, use `fill` when the desired final value is known.
+  `fill` replaces the control value and is the normal action for email,
+  username, password, search, and address fields. `type` and `insertText`
+  append text at the current cursor/selection and can duplicate existing field
+  contents when retried.
+
+  Hosted payment fields (card number, expiry, CVV inside cross-origin PCI
+  iframes such as Shopify or Stripe checkout) appear in snapshots as `iframe`
+  refs named like "Field container for: Card number". Use `fill` on that ref:
+  the runtime focuses the frame with a real click, clears it, and types the
+  value through trusted input. The frame's value cannot be read back, so
+  verify acceptance through the page's own validation messages in the next
+  snapshot. Do not use `evaluate` to reach into these frames; the top
+  document cannot access them.
+
+  For page readiness, use `open` or `navigate` followed by `snapshot`,
+  `screenshot`, `domInspect`, or a targeted browser action. Do not wait for
+  network idle after navigation. Modern sites often keep telemetry, beacon,
+  streaming, or long-polling requests open, so network quiet is not a reliable
+  readiness signal for interactive browser work.
+handler: runtime:browser
+approval_policy: auto
+sandbox_policy: workspace-write
+input_schema:
+  type: object
+  properties:
+    action:
+      type: string
+      enum:
+        - list
+        - open
+        - new
+        - focus
+        - close
+        - quit
+        - navigate
+        - reload
+        - back
+        - forward
+        - snapshot
+        - domInspect
+        - consoleLogs
+        - screenshot
+        - openConsoleLogs
+        - openScreenshot
+        - click
+        - dblclick
+        - hover
+        - focus_ref
+        - type
+        - insertText
+        - fill
+        - select
+        - upload
+        - check
+        - uncheck
+        - press
+        - keydown
+        - keyup
+        - scroll
+        - scrollIntoView
+        - evaluate
+      description: Browser action to perform. Use open for creating or reusing a tab at a URL; openScreenshot and openConsoleLogs wait for DOM readiness, not full network idle.
+    sessionId:
+      type: string
+      description: Puffer session id. Defaults to the current agent session.
+    tabId:
+      type: string
+      description: Stable browser tab id such as t1 or t2.
+    label:
+      type: string
+      description: Optional stable label for a newly opened tab.
+    url:
+      type: string
+      description: URL for open, navigate, openConsoleLogs, or openScreenshot actions.
+    page:
+      description: Browser page handle or tab id for actions that read an existing page.
+    query:
+      type: string
+      description: CSS selector for domInspect.
+    clear:
+      type: boolean
+      description: Whether consoleLogs should clear the buffered console entries after reading them.
+    ref:
+      type: string
+      description: Fresh element ref from the latest snapshot for ref-based actions, such as @e1.
+    value:
+      type: string
+      description: Exact option value or label text for select actions.
+    text:
+      type: string
+      description: Text for fill, type, or insertText. For form fields, prefer fill because it replaces the value; type and insertText append at the current cursor or selection.
+    question:
+      type: string
+      description: Optional caller question preserved for screenshot-style verified skill contracts.
+    key:
+      type: string
+      description: Keyboard key for press, keydown, or keyup. Supports modifier combos like Meta+A, Ctrl+Shift+Z. Select-all combos (Meta+A / Ctrl+A) are routed as real editing commands, so they work inside focused cross-origin frames.
+    script:
+      type: string
+      description: JavaScript expression for evaluate actions.
+    direction:
+      type: string
+      enum:
+        - up
+        - down
+        - left
+        - right
+      description: Scroll direction for scroll actions.
+    px:
+      type: integer
+      minimum: 0
+      description: Optional scroll distance in pixels for scroll actions. Defaults to 600.
+    width:
+      type: integer
+      minimum: 1
+      description: Optional viewport width for launching a tab.
+    height:
+      type: integer
+      minimum: 1
+      description: Optional viewport height for launching a tab.
+    activate:
+      type: boolean
+      description: Whether a newly opened tab should become active.
+    files:
+      type: array
+      items:
+        type: string
+      description: Files to upload into a native file input ref.
+    annotate:
+      type: boolean
+      description: Whether screenshot should overlay fresh element refs.
+    screenshotFormat:
+      type: string
+      enum:
+        - png
+        - jpeg
+      description: Screenshot image format.
+    screenshotQuality:
+      type: integer
+      minimum: 0
+      maximum: 100
+      description: JPEG screenshot quality. Requires screenshotFormat=jpeg.
+    idleMs:
+      type: integer
+      minimum: 1
+      maximum: 10000
+      description: Reserved for legacy internal waitNetworkIdle calls. Do not set for normal model-directed browser actions.
+    timeoutMs:
+      type: integer
+      minimum: 1
+      maximum: 120000
+      description: Reserved for legacy internal waitNetworkIdle calls. Do not set for normal model-directed browser actions.
+  required:
+    - action
+  additionalProperties: false
+metadata:
+  may_spawn_processes: true
+  may_read_files: false
+  may_write_files: false
+display:
+  group: browser
+  title: BrowserAction
+  show_in_status: true

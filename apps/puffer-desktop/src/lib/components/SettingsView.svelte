@@ -1,10 +1,12 @@
 <script lang="ts">
   import type {
+    BrowserRenderer,
     DesktopPreferences,
     InspectorTab,
     RemoteOperation,
     SettingsSnapshot
   } from "../types";
+  import { providerModelIntro } from "../providerModelIntro";
 
   export let snapshot: SettingsSnapshot | null = null;
   export let loading = false;
@@ -46,6 +48,12 @@
   function updateTab(value: string) {
     if (value === "latest-diff" || value === "history" || value === "tool-details") {
       onPreferenceChange("defaultInspectorTab", value satisfies InspectorTab);
+    }
+  }
+
+  function updateBrowserRenderer(value: string) {
+    if (value === "cef" || value === "screencast") {
+      onPreferenceChange("browserRenderer", value satisfies BrowserRenderer);
     }
   }
 </script>
@@ -138,6 +146,18 @@
           />
           <strong>{preferences.defaultInspectorWidth}%</strong>
         </div>
+      </label>
+
+      <label class="field">
+        <span>Browser renderer</span>
+        <select
+          value={preferences.browserRenderer}
+          on:change={(event) =>
+            updateBrowserRenderer((event.currentTarget as HTMLSelectElement).value)}
+        >
+          <option value="cef">CEF</option>
+          <option value="screencast">Screencast</option>
+        </select>
       </label>
 
       <button class="reset" on:click={onResetPreferences}>Reset desktop preferences</button>
@@ -329,8 +349,9 @@
         </div>
       {:else if remoteEnabled}
         <div class="empty-card">
-          Remote auth is empty for this SSH target. Use the login page to store an API key or OAuth
-          credential on the remote host, or use the remote TUI / `puffer auth ...` over SSH.
+          No providers connected on this SSH target yet. Connect one from the onboarding pane to
+          store an API key or OAuth credential on the remote host, or use the remote TUI /
+          `puffer auth ...` over SSH.
         </div>
       {:else if snapshot?.auth.length}
         <div class="stack">
@@ -367,7 +388,7 @@
                 <span>{provider.id} · {provider.defaultApi}</span>
               </div>
               <div>
-                <strong>{provider.modelCount} models</strong>
+                <strong>{providerModelIntro(provider)}</strong>
                 <span>{provider.authModes.join(", ")}</span>
               </div>
               <div class="path-cell">
@@ -647,7 +668,7 @@
     border-radius: 16px;
     background: rgba(247, 243, 235, 0.82);
     border: 1px solid rgba(111, 101, 89, 0.14);
-    font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+    font-family: var(--font-mono);
     font-size: 0.8rem;
     line-height: 1.55;
     white-space: pre-wrap;
@@ -655,7 +676,7 @@
   }
 
   code {
-    font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+    font-family: var(--font-mono);
     font-size: 0.82rem;
     padding: 0.08rem 0.28rem;
     border-radius: 8px;

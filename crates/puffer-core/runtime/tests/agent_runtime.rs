@@ -39,6 +39,7 @@ fn execute_agent_tool_background_returns_async_payload_and_output_file() {
     let session = SessionMetadata {
         id: Uuid::new_v4(),
         display_name: None,
+        generated_title: None,
         cwd: temp.path().to_path_buf(),
         created_at_ms: 0,
         updated_at_ms: 0,

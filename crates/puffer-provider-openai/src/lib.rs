@@ -6,6 +6,7 @@
 
 mod auth;
 mod codex;
+pub mod compat;
 mod request;
 mod response;
 mod usage;
@@ -19,6 +20,11 @@ pub use auth::OPENAI_CODEX_CLIENT_ID;
 pub use auth::OPENAI_REDIRECT_URI;
 pub use auth::OPENAI_SCOPE;
 pub use auth::OPENAI_TOKEN_URL;
+pub use codex::codex_user_agent;
+pub use compat::CacheControlFormat;
+pub use compat::MaxTokensField;
+pub use compat::OpenAICompat;
+pub use compat::ThinkingFormat;
 pub use request::BuiltOpenAIRequest;
 pub use request::OpenAIChatCompletionTool;
 pub use request::OpenAIChatCompletionToolFunction;
@@ -28,6 +34,7 @@ pub use request::OpenAIChatMessage;
 pub use request::OpenAIChatResponseFormat;
 pub use request::OpenAIChatResponseJsonSchema;
 pub use request::OpenAIChatToolCall;
+pub use request::OpenAIRealtimeClientSecretRequest;
 pub use request::OpenAIRequestConfig;
 pub use request::OpenAIResponsesFunctionCallOutput;
 pub use request::OpenAIResponsesNamedToolChoice;
@@ -73,9 +80,27 @@ pub fn exchange_authorization_code(
     auth::exchange_authorization_code(code, verifier, redirect_uri)
 }
 
+/// Exchanges an OAuth authorization code using an injected blocking HTTP client.
+pub fn exchange_authorization_code_with_client(
+    client: &reqwest::blocking::Client,
+    code: &str,
+    verifier: &str,
+    redirect_uri: Option<&str>,
+) -> anyhow::Result<OpenAIOAuthCredentials> {
+    auth::exchange_authorization_code_with_client(client, code, verifier, redirect_uri)
+}
+
 /// Refreshes OpenAI bearer credentials from a stored refresh token.
 pub fn refresh_oauth_token(refresh_token: &str) -> anyhow::Result<OpenAIOAuthCredentials> {
     auth::refresh_oauth_token(refresh_token)
+}
+
+/// Refreshes OpenAI bearer credentials using an injected blocking HTTP client.
+pub fn refresh_oauth_token_with_client(
+    client: &reqwest::blocking::Client,
+    refresh_token: &str,
+) -> anyhow::Result<OpenAIOAuthCredentials> {
+    auth::refresh_oauth_token_with_client(client, refresh_token)
 }
 
 /// Builds an ordered OpenAI Responses API request for execution or testing.
@@ -111,6 +136,14 @@ pub fn build_json_post_request(
     request::build_json_post_request(config, path, body)
 }
 
+/// Builds an ordered Realtime API client-secret request.
+pub fn build_realtime_client_secret_request(
+    config: &OpenAIRequestConfig,
+    request: &OpenAIRealtimeClientSecretRequest,
+) -> anyhow::Result<BuiltOpenAIRequest> {
+    request::build_realtime_client_secret_request(config, request)
+}
+
 /// Parses a serialized OpenAI Responses API payload into typed response data.
 pub fn parse_responses_response(payload: &str) -> anyhow::Result<OpenAIResponsesResponse> {
     response::parse_responses_response(payload)
@@ -131,6 +164,29 @@ pub fn extract_responses_text(response: &OpenAIResponsesResponse) -> String {
 /// Extracts assistant text from a parsed OpenAI-compatible Chat Completions payload.
 pub fn extract_chat_completions_text(response: &OpenAIChatCompletionsResponse) -> String {
     response::extract_chat_completions_text(response)
+}
+
+/// Extracts the reasoning / thinking chain from a parsed OpenAI-compatible
+/// Chat Completions payload. Non-reasoning models (or providers that omit
+/// the field) return `None`. Used by the agent loop to surface a
+/// `ThinkingDelta` event so the TUI's thinking block stays populated for
+/// reasoning-capable Chat Completions providers (Moonshot Kimi, Deepseek,
+/// OpenRouter relays). Tries the dedicated `reasoning_content` /
+/// `reasoning` field first, then falls back to a `<think>…</think>`
+/// block inside `content` (DeepSeek-R1 distill convention).
+pub fn extract_chat_completions_reasoning(
+    response: &OpenAIChatCompletionsResponse,
+) -> Option<String> {
+    response::extract_chat_completions_reasoning(response)
+}
+
+/// Returns the visible-to-user portion of the assistant message — same
+/// as `extract_chat_completions_text` but additionally strips a leading
+/// `<think>…</think>` block when one is embedded in `content`. Pair
+/// with `extract_chat_completions_reasoning` so the same prose doesn't
+/// land in both the thinking card and the answer card.
+pub fn extract_chat_completions_visible_text(response: &OpenAIChatCompletionsResponse) -> String {
+    response::extract_chat_completions_visible_text(response)
 }
 
 /// Extracts tool calls from a parsed OpenAI Responses API payload.
@@ -176,6 +232,8 @@ mod tests {
                 account_id: None,
                 custom_headers: Vec::new(),
                 query_params: Vec::new(),
+                chat_completions_path: None,
+                responses_path: None,
             },
             &OpenAIResponsesRequest {
                 model: "gpt-5".to_string(),
@@ -186,6 +244,37 @@ mod tests {
         .expect("request should build");
         assert_eq!(request.method, "POST");
         assert_eq!(request.url, "https://api.openai.com/v1/responses");
+    }
+
+    #[test]
+    fn crate_root_builds_realtime_client_secret_request() {
+        let request = build_realtime_client_secret_request(
+            &OpenAIRequestConfig {
+                base_url: "https://api.openai.com".to_string(),
+                version: "0.1.0".to_string(),
+                auth: OpenAIAuth::ApiKey("test-api-key".to_string()),
+                originator: "codex_cli_rs".to_string(),
+                session_id: None,
+                account_id: None,
+                custom_headers: Vec::new(),
+                query_params: Vec::new(),
+                chat_completions_path: None,
+                responses_path: None,
+            },
+            &OpenAIRealtimeClientSecretRequest {
+                session: json!({
+                    "type": "realtime",
+                    "model": "gpt-realtime-2"
+                }),
+            },
+        )
+        .expect("realtime client secret request should build");
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.url,
+            "https://api.openai.com/v1/realtime/client_secrets"
+        );
     }
 
     #[test]
@@ -200,6 +289,8 @@ mod tests {
                 account_id: None,
                 custom_headers: Vec::new(),
                 query_params: Vec::new(),
+                chat_completions_path: None,
+                responses_path: None,
             },
             &OpenAIResponsesToolRequest {
                 model: "gpt-5".to_string(),
@@ -246,6 +337,8 @@ mod tests {
                 account_id: None,
                 custom_headers: Vec::new(),
                 query_params: Vec::new(),
+                chat_completions_path: None,
+                responses_path: None,
             },
             &OpenAIChatCompletionsRequest {
                 model: "auto".to_string(),
@@ -254,10 +347,16 @@ mod tests {
                     content: Some(json!("hello")),
                     tool_call_id: None,
                     tool_calls: Vec::new(),
+                    reasoning_content: None,
                 }],
                 tools: Vec::new(),
                 tool_choice: None,
                 response_format: None,
+                reasoning_effort: None,
+                reasoning: None,
+                thinking: None,
+                enable_thinking: None,
+                chat_template_kwargs: None,
             },
         )
         .expect("request should build");

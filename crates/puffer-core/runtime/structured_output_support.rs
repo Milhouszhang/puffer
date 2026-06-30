@@ -1,5 +1,4 @@
 use crate::permissions::RuntimePermissionContext;
-use crate::runtime::RequestToolFilter;
 use anyhow::{anyhow, bail, Context, Result};
 use puffer_provider_openai::{
     OpenAIChatCompletionTool, OpenAIChatCompletionToolFunction, OpenAIChatResponseFormat,
@@ -86,22 +85,19 @@ pub(super) fn anthropic_tool_definitions(
     registry: &ToolRegistry,
     structured_output: Option<&StructuredOutputConfig>,
 ) -> Result<Vec<Value>> {
-    anthropic_tool_definitions_for_request(registry, structured_output, None, None)
+    anthropic_tool_definitions_for_request(registry, structured_output, None)
 }
 
 pub(super) fn anthropic_tool_definitions_for_request(
     registry: &ToolRegistry,
     structured_output: Option<&StructuredOutputConfig>,
     permission_context: Option<&RuntimePermissionContext>,
-    request_tool_filter: Option<&RequestToolFilter>,
 ) -> Result<Vec<Value>> {
     let definitions =
         anthropic_tool_definitions_with_structured_output(registry, structured_output)?;
     Ok(definitions
         .into_iter()
-        .filter(|definition| {
-            tool_visible_to_model(permission_context, request_tool_filter, definition)
-        })
+        .filter(|definition| tool_visible_to_model(permission_context, definition))
         .map(|definition| {
             json!({
                 "name": definition.id,
@@ -117,7 +113,7 @@ pub(super) fn openai_tool_definitions(
     structured_output: Option<&StructuredOutputConfig>,
     use_native: bool,
 ) -> Result<Vec<OpenAIResponsesTool>> {
-    openai_tool_definitions_for_request(registry, structured_output, use_native, None, None)
+    openai_tool_definitions_for_request(registry, structured_output, use_native, None)
 }
 
 pub(super) fn openai_tool_definitions_for_request(
@@ -125,26 +121,76 @@ pub(super) fn openai_tool_definitions_for_request(
     structured_output: Option<&StructuredOutputConfig>,
     use_native: bool,
     permission_context: Option<&RuntimePermissionContext>,
-    request_tool_filter: Option<&RequestToolFilter>,
 ) -> Result<Vec<OpenAIResponsesTool>> {
     let definitions =
         openai_tool_definitions_with_structured_output(registry, structured_output, use_native)?;
     Ok(definitions
         .into_iter()
-        .filter(|definition| {
-            tool_visible_to_model(permission_context, request_tool_filter, definition)
-        })
-        .map(|definition| OpenAIResponsesTool {
-            kind: "function".to_string(),
-            name: definition.id.clone(),
-            description: rendered_openai_tool_description(&definition),
-            strict: false,
-            parameters: openai_compatible_schema(definition.input_schema.as_json_schema()),
-            filters: None,
-            user_location: None,
-            external_web_access: None,
+        .filter(|definition| tool_visible_to_model(permission_context, definition))
+        .map(|definition| {
+            if is_native_openai_web_search(&definition) {
+                native_openai_web_search_tool()
+            } else {
+                OpenAIResponsesTool {
+                    kind: "function".to_string(),
+                    name: definition.id.clone(),
+                    description: rendered_openai_tool_description(&definition),
+                    strict: false,
+                    parameters: openai_tool_parameters_schema(
+                        definition.input_schema.as_json_schema(),
+                    ),
+                    filters: None,
+                    user_location: None,
+                    external_web_access: None,
+                }
+            }
         })
         .collect())
+}
+
+fn is_native_openai_web_search(definition: &ToolDefinition) -> bool {
+    if definition.id != WEB_SEARCH_TOOL_ID {
+        return false;
+    }
+    if std::env::var("PUFFER_OPENAI_NATIVE_WEB_SEARCH")
+        .ok()
+        .is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
+    {
+        return false;
+    }
+    definition.handler == "provider:web_search"
+}
+
+/// Builds the native OpenAI Responses `web_search` tool entry.
+///
+/// Mirrors codex's `create_web_search_tool` shape: `external_web_access`
+/// must be set to a boolean (`true` for live, `false` for cached). The
+/// bare `{"type": "web_search"}` form documented by OpenAI is not actually
+/// accepted by the Responses API — codex carries a long-standing TODO
+/// about this in `tools/src/tool_spec.rs`. Default to live access so
+/// gpt-5/4-mini and friends actually invoke the tool; flip to cached via
+/// `PUFFER_OPENAI_WEB_SEARCH_MODE=cached`.
+fn native_openai_web_search_tool() -> OpenAIResponsesTool {
+    let external_web_access = match std::env::var("PUFFER_OPENAI_WEB_SEARCH_MODE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("cached") => Some(false),
+        _ => Some(true),
+    };
+    OpenAIResponsesTool {
+        kind: "web_search".to_string(),
+        name: String::new(),
+        description: String::new(),
+        strict: false,
+        parameters: Value::Null,
+        filters: None,
+        user_location: None,
+        external_web_access,
+    }
 }
 
 pub(super) fn openai_chat_completion_tools(
@@ -152,7 +198,7 @@ pub(super) fn openai_chat_completion_tools(
     structured_output: Option<&StructuredOutputConfig>,
     use_native: bool,
 ) -> Result<Vec<OpenAIChatCompletionTool>> {
-    openai_chat_completion_tools_for_request(registry, structured_output, use_native, None, None)
+    openai_chat_completion_tools_for_request(registry, structured_output, use_native, None)
 }
 
 pub(super) fn openai_chat_completion_tools_for_request(
@@ -160,21 +206,18 @@ pub(super) fn openai_chat_completion_tools_for_request(
     structured_output: Option<&StructuredOutputConfig>,
     use_native: bool,
     permission_context: Option<&RuntimePermissionContext>,
-    request_tool_filter: Option<&RequestToolFilter>,
 ) -> Result<Vec<OpenAIChatCompletionTool>> {
     let definitions =
         openai_tool_definitions_with_structured_output(registry, structured_output, use_native)?;
     Ok(definitions
         .into_iter()
-        .filter(|definition| {
-            tool_visible_to_model(permission_context, request_tool_filter, definition)
-        })
+        .filter(|definition| tool_visible_to_model(permission_context, definition))
         .map(|definition| OpenAIChatCompletionTool {
             kind: "function".to_string(),
             function: OpenAIChatCompletionToolFunction {
                 name: definition.id.clone(),
                 description: rendered_openai_tool_description(&definition),
-                parameters: openai_compatible_schema(definition.input_schema.as_json_schema()),
+                parameters: openai_tool_parameters_schema(definition.input_schema.as_json_schema()),
                 strict: false,
             },
         })
@@ -190,13 +233,14 @@ pub(super) fn openai_responses_text_config(
     }
     let config = structured_output?;
     Some(OpenAIResponsesTextConfig {
-        format: OpenAIResponsesTextFormat {
+        format: Some(OpenAIResponsesTextFormat {
             kind: "json_schema".to_string(),
             name: config.name.clone(),
             description: config.description.clone(),
             schema: openai_compatible_schema(config.schema.clone()),
             strict: true,
-        },
+        }),
+        verbosity: None,
     })
 }
 
@@ -267,15 +311,11 @@ fn include_base_model_tool(registry: &ToolRegistry, definition: &ToolDefinition)
 
 fn tool_visible_to_model(
     permission_context: Option<&RuntimePermissionContext>,
-    request_tool_filter: Option<&RequestToolFilter>,
     definition: &ToolDefinition,
 ) -> bool {
     permission_context
         .map(|context| context.tool_visible_to_model(definition))
         .unwrap_or(true)
-        && request_tool_filter
-            .map(|filter| filter.allows_definition(definition))
-            .unwrap_or(true)
 }
 
 fn requested_structured_output_definition(
@@ -434,6 +474,28 @@ fn openai_compatible_schema(schema: Value) -> Value {
     }
 }
 
+fn openai_tool_parameters_schema(schema: Value) -> Value {
+    const DISALLOWED_ROOT_KEYS: [&str; 5] = ["oneOf", "anyOf", "allOf", "enum", "not"];
+
+    let normalized = openai_compatible_schema(schema);
+    let Value::Object(mut object) = normalized else {
+        return json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        });
+    };
+
+    object.insert("type".to_string(), json!("object"));
+    object
+        .entry("properties".to_string())
+        .or_insert_with(|| json!({}));
+    for key in DISALLOWED_ROOT_KEYS {
+        object.remove(key);
+    }
+    Value::Object(object)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,6 +609,61 @@ mod tests {
     }
 
     #[test]
+    fn openai_tool_parameters_strip_root_schema_combinators() {
+        let registry = ToolRegistry::from_definitions(vec![ToolDefinition {
+            id: "WorkflowCreate".to_string(),
+            name: "WorkflowCreate".to_string(),
+            description: "Create workflow".to_string(),
+            handler: "runtime:workflow:workflow_create".to_string(),
+            aliases: Vec::new(),
+            handler_args: Vec::new(),
+            kind: ToolKind::Custom,
+            input_schema: ToolInputSchema {
+                properties: BTreeMap::new(),
+                raw_json_schema: Some(
+                    serde_json::to_string(&json!({
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "object",
+                                "anyOf": [
+                                    { "required": ["prompt"] },
+                                    { "required": ["command"] }
+                                ]
+                            },
+                            "yaml_action": { "type": "string" }
+                        },
+                        "required": ["slug"],
+                        "anyOf": [
+                            { "required": ["action"] },
+                            { "required": ["yaml_action"] }
+                        ],
+                        "additionalProperties": false
+                    }))
+                    .unwrap(),
+                ),
+            },
+            metadata: ToolMetadata::default(),
+            policy: ToolPolicyHints::default(),
+            shared_lib: None,
+            enabled_if: None,
+            display: ToolDisplayHints::default(),
+        }]);
+
+        let responses_tools = openai_tool_definitions(&registry, None, false).unwrap();
+        let chat_tools = openai_chat_completion_tools(&registry, None, false).unwrap();
+        let parameters = &responses_tools[0].parameters;
+
+        assert_eq!(parameters["type"], "object");
+        assert!(parameters.get("anyOf").is_none());
+        assert_eq!(
+            parameters["properties"]["action"]["anyOf"][0]["required"],
+            json!(["prompt"])
+        );
+        assert_eq!(chat_tools[0].function.parameters, *parameters);
+    }
+
+    #[test]
     fn openai_native_path_skips_structured_output_tool() {
         let registry = structured_output_registry();
         let config = StructuredOutputConfig::new("shape", json!({ "type": "object" }));
@@ -554,13 +671,128 @@ mod tests {
         assert!(tools.is_empty());
     }
 
+    fn web_search_tool_definition(handler: &str) -> ToolDefinition {
+        ToolDefinition {
+            id: WEB_SEARCH_TOOL_ID.to_string(),
+            name: WEB_SEARCH_TOOL_ID.to_string(),
+            description: "Search the web.".to_string(),
+            handler: handler.to_string(),
+            aliases: Vec::new(),
+            handler_args: Vec::new(),
+            kind: ToolKind::Custom,
+            input_schema: ToolInputSchema::default(),
+            metadata: ToolMetadata::default(),
+            policy: ToolPolicyHints::default(),
+            shared_lib: None,
+            enabled_if: None,
+            display: ToolDisplayHints::default(),
+        }
+    }
+
+    #[test]
+    fn provider_web_search_handler_emits_native_responses_tool() {
+        let _guard = crate::test_locks::env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prev_native = std::env::var_os("PUFFER_OPENAI_NATIVE_WEB_SEARCH");
+        let prev_mode = std::env::var_os("PUFFER_OPENAI_WEB_SEARCH_MODE");
+        std::env::remove_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH");
+        std::env::remove_var("PUFFER_OPENAI_WEB_SEARCH_MODE");
+        let registry =
+            ToolRegistry::from_definitions(vec![web_search_tool_definition("provider:web_search")]);
+        let tools = openai_tool_definitions(&registry, None, false).unwrap();
+        if let Some(value) = prev_native {
+            std::env::set_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH", value);
+        }
+        if let Some(value) = prev_mode {
+            std::env::set_var("PUFFER_OPENAI_WEB_SEARCH_MODE", value);
+        }
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].kind, "web_search");
+        assert!(tools[0].name.is_empty());
+        assert!(tools[0].description.is_empty());
+        assert!(tools[0].parameters.is_null());
+        let serialized = serde_json::to_value(&tools[0]).unwrap();
+        assert_eq!(
+            serialized,
+            json!({ "type": "web_search", "external_web_access": true })
+        );
+    }
+
+    #[test]
+    fn web_search_mode_env_switches_external_access() {
+        let _guard = crate::test_locks::env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prev_native = std::env::var_os("PUFFER_OPENAI_NATIVE_WEB_SEARCH");
+        let prev_mode = std::env::var_os("PUFFER_OPENAI_WEB_SEARCH_MODE");
+        std::env::remove_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH");
+        std::env::set_var("PUFFER_OPENAI_WEB_SEARCH_MODE", "cached");
+        let registry =
+            ToolRegistry::from_definitions(vec![web_search_tool_definition("provider:web_search")]);
+        let tools = openai_tool_definitions(&registry, None, false).unwrap();
+        if let Some(value) = prev_native {
+            std::env::set_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH", value);
+        }
+        match prev_mode {
+            Some(value) => std::env::set_var("PUFFER_OPENAI_WEB_SEARCH_MODE", value),
+            None => std::env::remove_var("PUFFER_OPENAI_WEB_SEARCH_MODE"),
+        }
+        let serialized = serde_json::to_value(&tools[0]).unwrap();
+        assert_eq!(
+            serialized,
+            json!({ "type": "web_search", "external_web_access": false })
+        );
+    }
+
+    #[test]
+    fn non_provider_web_search_handler_stays_function_tool() {
+        let _guard = crate::test_locks::env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prev = std::env::var_os("PUFFER_OPENAI_NATIVE_WEB_SEARCH");
+        std::env::remove_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH");
+        let registry = ToolRegistry::from_definitions(vec![web_search_tool_definition(
+            "runtime:workflow:web_search",
+        )]);
+        let tools = openai_tool_definitions(&registry, None, false).unwrap();
+        if let Some(value) = prev {
+            std::env::set_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH", value);
+        }
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].kind, "function");
+        assert_eq!(tools[0].name, WEB_SEARCH_TOOL_ID);
+    }
+
+    #[test]
+    fn env_opt_out_disables_native_web_search() {
+        let _guard = crate::test_locks::env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let registry =
+            ToolRegistry::from_definitions(vec![web_search_tool_definition("provider:web_search")]);
+        let prev = std::env::var_os("PUFFER_OPENAI_NATIVE_WEB_SEARCH");
+        std::env::set_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH", "0");
+        let tools = openai_tool_definitions(&registry, None, false).unwrap();
+        match prev {
+            Some(value) => std::env::set_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH", value),
+            None => std::env::remove_var("PUFFER_OPENAI_NATIVE_WEB_SEARCH"),
+        }
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].kind, "function");
+        assert_eq!(tools[0].name, WEB_SEARCH_TOOL_ID);
+    }
+
     #[test]
     fn openai_native_responses_format_is_emitted_when_enabled() {
         let config = StructuredOutputConfig::new("shape", json!({ "type": "object" }));
         let text = openai_responses_text_config(Some(&config), true).unwrap();
-        assert_eq!(text.format.kind, "json_schema");
-        assert_eq!(text.format.name, "shape");
-        assert!(text.format.strict);
+        let format = text
+            .format
+            .expect("format must be emitted for structured output");
+        assert_eq!(format.kind, "json_schema");
+        assert_eq!(format.name, "shape");
+        assert!(format.strict);
     }
 
     #[test]

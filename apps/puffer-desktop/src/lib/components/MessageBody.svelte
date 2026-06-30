@@ -1,36 +1,264 @@
 <script lang="ts">
+  import { chatFileTarget, fileOpenIntent, type ChatOpenIntent } from "../chatOpenIntent";
+
   type InlineSegment = {
     kind: "text" | "code";
     text: string;
+    strong?: boolean;
+    emphasis?: boolean;
+    strike?: boolean;
+    href?: string;
+  };
+
+  type ListItem = {
+    text: string;
+    checked: boolean | null;
   };
 
   type MessageBlock =
     | { kind: "paragraph"; text: string }
-    | { kind: "list"; ordered: boolean; items: string[] }
+    | { kind: "heading"; level: 1 | 2 | 3 | 4 | 5 | 6; text: string }
+    | { kind: "list"; ordered: boolean; items: ListItem[] }
     | { kind: "quote"; text: string }
-    | { kind: "code"; language: string | null; text: string };
+    | { kind: "code"; language: string | null; text: string }
+    | { kind: "table"; headers: string[]; rows: string[][] }
+    | { kind: "rule" };
 
   export let body = "";
+  export let onOpenChatIntent: ((intent: ChatOpenIntent) => void) | undefined = undefined;
 
-  function inlineSegments(text: string): InlineSegment[] {
-    const parts: InlineSegment[] = [];
-    const pattern = /`([^`]+)`/g;
-    let lastIndex = 0;
-    let match: RegExpExecArray | null;
+  const urlPattern = /^(https?:\/\/[^\s<]+|file:\/\/[^\s<]+|\/[^\s<]+)$/;
+  const bareLocalPathPattern = /(file:\/\/[^\s<>()]+|\/[^\s<>()]+)/g;
 
-    while ((match = pattern.exec(text)) !== null) {
-      if (match.index > lastIndex) {
-        parts.push({ kind: "text", text: text.slice(lastIndex, match.index) });
+  function openFileLink(event: MouseEvent, href: string) {
+    const target = chatFileTarget(href);
+    if (!target) return;
+    event.preventDefault();
+    onOpenChatIntent?.(fileOpenIntent(target.path, target.line));
+  }
+
+  function appendText(
+    parts: InlineSegment[],
+    text: string,
+    flags: Omit<InlineSegment, "kind" | "text"> = {}
+  ) {
+    if (!text) return;
+    const prev = parts[parts.length - 1];
+    if (
+      prev?.kind === "text" &&
+      prev.strong === flags.strong &&
+      prev.emphasis === flags.emphasis &&
+      prev.strike === flags.strike &&
+      prev.href === flags.href
+    ) {
+      prev.text += text;
+      return;
+    }
+    parts.push({ kind: "text", text, ...flags });
+  }
+
+  function appendAutolinkedText(
+    parts: InlineSegment[],
+    text: string,
+    flags: Omit<InlineSegment, "kind" | "text"> = {}
+  ) {
+    if (!text) return;
+    let cursor = 0;
+    for (const match of text.matchAll(bareLocalPathPattern)) {
+      const raw = match[0];
+      const start = match.index ?? 0;
+      if (start > cursor) appendText(parts, text.slice(cursor, start), flags);
+      const { target, suffix } = splitTrailingPathPunctuation(raw);
+      if (target.startsWith("/") && text[start - 1] === ":") {
+        appendText(parts, target, flags);
+      } else if (chatFileTarget(target)) {
+        appendText(parts, target, { ...flags, href: target });
+      } else {
+        appendText(parts, target, flags);
       }
-      parts.push({ kind: "code", text: match[1] });
-      lastIndex = match.index + match[0].length;
+      if (suffix) appendText(parts, suffix, flags);
+      cursor = start + raw.length;
+    }
+    if (cursor < text.length) appendText(parts, text.slice(cursor), flags);
+  }
+
+  function splitTrailingPathPunctuation(value: string): { target: string; suffix: string } {
+    const match = value.match(/^(.*?)([.,;!?]+)$/);
+    if (!match || !match[1]) return { target: value, suffix: "" };
+    return { target: match[1], suffix: match[2] };
+  }
+
+  function fallbackLinkLabel(href: string): string {
+    if (href.startsWith("/")) return href.split("/").filter(Boolean).at(-1) ?? href;
+    try {
+      const url = new URL(href);
+      if (url.protocol === "file:") {
+        return decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? url.pathname);
+      }
+      return url.hostname || href;
+    } catch {
+      return href;
+    }
+  }
+
+  function findClosing(source: string, marker: string, start: number): number {
+    let index = start;
+    while (index < source.length) {
+      const found = source.indexOf(marker, index);
+      if (found === -1) return -1;
+      if (found === 0 || source[found - 1] !== "\\") return found;
+      index = found + marker.length;
+    }
+    return -1;
+  }
+
+  function parseInline(
+    text: string,
+    flags: Omit<InlineSegment, "kind" | "text"> = {}
+  ): InlineSegment[] {
+    const parts: InlineSegment[] = [];
+    let index = 0;
+
+    while (index < text.length) {
+      const rest = text.slice(index);
+
+      if (rest.startsWith("`")) {
+        const close = findClosing(text, "`", index + 1);
+        if (close !== -1) {
+          parts.push({
+            kind: "code",
+            text: text.slice(index + 1, close)
+          });
+          index = close + 1;
+          continue;
+        }
+      }
+
+      if (rest.startsWith("[")) {
+        const labelEnd = findClosing(text, "]", index + 1);
+        if (labelEnd !== -1 && text[labelEnd + 1] === "(") {
+          const hrefEnd = findClosing(text, ")", labelEnd + 2);
+          if (hrefEnd !== -1) {
+            const label = text.slice(index + 1, labelEnd);
+            const href = text.slice(labelEnd + 2, hrefEnd).trim();
+            const displayLabel = label.trim() ? label : fallbackLinkLabel(href);
+            const nested = parseInline(displayLabel, { ...flags, href });
+            parts.push(...nested);
+            index = hrefEnd + 1;
+            continue;
+          }
+        }
+      }
+
+      const strongMarker = rest.startsWith("**") ? "**" : rest.startsWith("__") ? "__" : null;
+      if (strongMarker) {
+        const close = findClosing(text, strongMarker, index + 2);
+        if (close !== -1) {
+          parts.push(
+            ...parseInline(text.slice(index + 2, close), {
+              ...flags,
+              strong: true
+            })
+          );
+          index = close + 2;
+          continue;
+        }
+      }
+
+      if (rest.startsWith("~~")) {
+        const close = findClosing(text, "~~", index + 2);
+        if (close !== -1) {
+          parts.push(
+            ...parseInline(text.slice(index + 2, close), {
+              ...flags,
+              strike: true
+            })
+          );
+          index = close + 2;
+          continue;
+        }
+      }
+
+      const emphasisMarker = rest.startsWith("*") ? "*" : rest.startsWith("_") ? "_" : null;
+      if (emphasisMarker && canOpenEmphasis(text, index, emphasisMarker)) {
+        const close = findClosingEmphasis(text, emphasisMarker, index + 1);
+        if (close !== -1 && close > index + 1) {
+          parts.push(
+            ...parseInline(text.slice(index + 1, close), {
+              ...flags,
+              emphasis: true
+            })
+          );
+          index = close + 1;
+          continue;
+        }
+      }
+
+      const nextMarkers = ["`", "[", "**", "__", "~~", "*", "_"]
+        .map((marker) => {
+          const found = text.indexOf(marker, index + 1);
+          return found === -1 ? text.length : found;
+        })
+        .reduce((left, right) => Math.min(left, right), text.length);
+      appendAutolinkedText(parts, text.slice(index, nextMarkers), flags);
+      index = nextMarkers;
     }
 
-    if (lastIndex < text.length) {
-      parts.push({ kind: "text", text: text.slice(lastIndex) });
-    }
+    return parts.length > 0 ? parts : [{ kind: "text", text, ...flags }];
+  }
 
-    return parts.length > 0 ? parts : [{ kind: "text", text }];
+  function findClosingEmphasis(source: string, marker: string, start: number): number {
+    let index = start;
+    while (index < source.length) {
+      const found = source.indexOf(marker, index);
+      if (found === -1) return -1;
+      if ((found === 0 || source[found - 1] !== "\\") && canCloseEmphasis(source, found, marker)) {
+        return found;
+      }
+      index = found + marker.length;
+    }
+    return -1;
+  }
+
+  function canOpenEmphasis(source: string, index: number, marker: string): boolean {
+    if (marker !== "_") return true;
+    const previous = source[index - 1] ?? "";
+    const next = source[index + 1] ?? "";
+    return !isWordChar(previous) && !isWhitespace(next);
+  }
+
+  function canCloseEmphasis(source: string, index: number, marker: string): boolean {
+    if (marker !== "_") return true;
+    const previous = source[index - 1] ?? "";
+    const next = source[index + 1] ?? "";
+    return !isWhitespace(previous) && !isWordChar(next);
+  }
+
+  function isWordChar(value: string): boolean {
+    return /^[A-Za-z0-9]$/.test(value);
+  }
+
+  function isWhitespace(value: string): boolean {
+    return value === "" || /\s/.test(value);
+  }
+
+  function taskState(text: string): { checked: boolean | null; text: string } {
+    const task = text.match(/^\[([ xX])\]\s+(.*)$/);
+    if (!task) return { checked: null, text };
+    return { checked: task[1].toLowerCase() === "x", text: task[2] };
+  }
+
+  function splitTableRow(line: string): string[] {
+    return line
+      .trim()
+      .replace(/^\|/, "")
+      .replace(/\|$/, "")
+      .split("|")
+      .map((cell) => cell.trim());
+  }
+
+  function isTableSeparator(line: string): boolean {
+    return /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
   }
 
   function parseBlocks(source: string): MessageBlock[] {
@@ -38,13 +266,11 @@
     const lines = source.replace(/\r\n?/g, "\n").split("\n");
     let paragraphLines: string[] = [];
     let quoteLines: string[] = [];
-    let listItems: string[] = [];
+    let listItems: ListItem[] = [];
     let listOrdered = false;
 
     function flushParagraph() {
-      if (paragraphLines.length === 0) {
-        return;
-      }
+      if (paragraphLines.length === 0) return;
       blocks.push({
         kind: "paragraph",
         text: paragraphLines.join("\n").trim()
@@ -53,9 +279,7 @@
     }
 
     function flushQuote() {
-      if (quoteLines.length === 0) {
-        return;
-      }
+      if (quoteLines.length === 0) return;
       blocks.push({
         kind: "quote",
         text: quoteLines.join("\n").trim()
@@ -64,9 +288,7 @@
     }
 
     function flushList() {
-      if (listItems.length === 0) {
-        return;
-      }
+      if (listItems.length === 0) return;
       blocks.push({
         kind: "list",
         ordered: listOrdered,
@@ -77,7 +299,9 @@
 
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];
-      const codeFence = line.match(/^```([\w-]+)?\s*$/);
+      const trimmed = line.trim();
+      const codeFence = line.match(/^```([\w.+-]+)?\s*$/);
+
       if (codeFence) {
         flushParagraph();
         flushQuote();
@@ -97,25 +321,65 @@
         continue;
       }
 
-      if (line.trim() === "") {
+      if (index + 1 < lines.length && line.includes("|") && isTableSeparator(lines[index + 1])) {
+        flushParagraph();
+        flushQuote();
+        flushList();
+        const headers = splitTableRow(line);
+        const rows: string[][] = [];
+        index += 2;
+        while (index < lines.length && lines[index].includes("|") && lines[index].trim() !== "") {
+          rows.push(splitTableRow(lines[index]));
+          index += 1;
+        }
+        index -= 1;
+        blocks.push({ kind: "table", headers, rows });
+        continue;
+      }
+
+      if (/^#{1,6}\s+/.test(line)) {
+        flushParagraph();
+        flushQuote();
+        flushList();
+        const heading = line.match(/^(#{1,6})\s+(.*?)\s*#*\s*$/);
+        if (heading) {
+          blocks.push({
+            kind: "heading",
+            level: heading[1].length as 1 | 2 | 3 | 4 | 5 | 6,
+            text: heading[2]
+          });
+          continue;
+        }
+      }
+
+      if (/^([-*_])(\s*\1){2,}\s*$/.test(trimmed)) {
+        flushParagraph();
+        flushQuote();
+        flushList();
+        blocks.push({ kind: "rule" });
+        continue;
+      }
+
+      if (trimmed === "") {
         flushParagraph();
         flushQuote();
         flushList();
         continue;
       }
 
-      const orderedItem = line.match(/^\d+\.\s+(.*)$/);
-      const unorderedItem = line.match(/^[-*]\s+(.*)$/);
+      const orderedItem = line.match(/^\s*\d+\.\s+(.*)$/);
+      const unorderedItem = line.match(/^\s*[-*+]\s+(.*)$/);
       if (orderedItem || unorderedItem) {
         flushParagraph();
         flushQuote();
         const ordered = Boolean(orderedItem);
-        const text = (orderedItem?.[1] ?? unorderedItem?.[1] ?? "").trim();
+        const rawText = (orderedItem?.[1] ?? unorderedItem?.[1] ?? "").trim();
+        const item = taskState(rawText);
         if (listItems.length > 0 && ordered !== listOrdered) {
           flushList();
         }
         listOrdered = ordered;
-        listItems.push(text);
+        listItems.push(item);
         continue;
       }
 
@@ -140,34 +404,91 @@
   $: blocks = parseBlocks(body);
 </script>
 
+{#snippet inline(text: string)}
+  {#each parseInline(text) as segment}
+    {#if segment.kind === "code"}
+      {@const localFile = chatFileTarget(segment.text)}
+      {#if localFile}
+        <a
+          href={segment.text}
+          class="local-file inline-code-link"
+          onclick={(event) => openFileLink(event, segment.text)}
+        >
+          {segment.text}
+        </a>
+      {:else}
+        <code>{segment.text}</code>
+      {/if}
+    {:else if segment.href && urlPattern.test(segment.href)}
+      {@const localFile = chatFileTarget(segment.href)}
+      <a
+        href={segment.href}
+        target={localFile ? undefined : "_blank"}
+        rel={localFile ? undefined : "noreferrer"}
+        class:local-file={Boolean(localFile)}
+        class:strong={segment.strong}
+        class:emphasis={segment.emphasis}
+        class:strike={segment.strike}
+        onclick={(event) => openFileLink(event, segment.href!)}
+      >
+        {segment.text}
+      </a>
+    {:else}
+      <span
+        class:strong={segment.strong}
+        class:emphasis={segment.emphasis}
+        class:strike={segment.strike}
+      >
+        {segment.text}
+      </span>
+    {/if}
+  {/each}
+{/snippet}
+
 <div class="message-body">
   {#each blocks as block}
     {#if block.kind === "paragraph"}
-      <p>
-        {#each inlineSegments(block.text) as segment}
-          {#if segment.kind === "code"}
-            <code>{segment.text}</code>
-          {:else}
-            {segment.text}
-          {/if}
-        {/each}
-      </p>
+      <p>{@render inline(block.text)}</p>
+    {:else if block.kind === "heading"}
+      <svelte:element this={`h${block.level}`} class="heading">
+        {@render inline(block.text)}
+      </svelte:element>
     {:else if block.kind === "list"}
       <svelte:element this={block.ordered ? "ol" : "ul"} class="list">
         {#each block.items as item}
-          <li>
-            {#each inlineSegments(item) as segment}
-              {#if segment.kind === "code"}
-                <code>{segment.text}</code>
-              {:else}
-                {segment.text}
-              {/if}
-            {/each}
+          <li class:task={item.checked !== null}>
+            {#if item.checked !== null}
+              <input type="checkbox" checked={item.checked} disabled aria-label="task state" />
+            {/if}
+            <span>{@render inline(item.text)}</span>
           </li>
         {/each}
       </svelte:element>
     {:else if block.kind === "quote"}
-      <blockquote>{block.text}</blockquote>
+      <blockquote>{@render inline(block.text)}</blockquote>
+    {:else if block.kind === "table"}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              {#each block.headers as header}
+                <th>{@render inline(header)}</th>
+              {/each}
+            </tr>
+          </thead>
+          <tbody>
+            {#each block.rows as row}
+              <tr>
+                {#each block.headers as _, cellIndex}
+                  <td>{@render inline(row[cellIndex] ?? "")}</td>
+                {/each}
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {:else if block.kind === "rule"}
+      <hr />
     {:else}
       <div class="code-block">
         {#if block.language}
@@ -188,18 +509,43 @@
 
   p,
   blockquote,
-  pre {
+  pre,
+  .heading {
     margin: 0;
   }
 
   p,
   li,
-  blockquote {
+  blockquote,
+  td,
+  th {
     line-height: 1.78;
   }
 
   p {
     white-space: pre-wrap;
+  }
+
+  .heading {
+    color: var(--foreground);
+    font-weight: 760;
+    line-height: 1.25;
+    letter-spacing: 0;
+  }
+
+  h1.heading {
+    font-size: 1.28rem;
+  }
+
+  h2.heading {
+    font-size: 1.16rem;
+  }
+
+  h3.heading,
+  h4.heading,
+  h5.heading,
+  h6.heading {
+    font-size: 1.04rem;
   }
 
   .list {
@@ -209,22 +555,94 @@
     gap: 0.42rem;
   }
 
+  li.task {
+    list-style: none;
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    margin-left: -1.35rem;
+  }
+
+  input[type="checkbox"] {
+    width: 0.9rem;
+    height: 0.9rem;
+    accent-color: var(--accent);
+  }
+
   blockquote {
     padding: 0.9rem 1rem;
-    border-left: 3px solid rgba(20, 99, 86, 0.24);
-    background: rgba(222, 238, 232, 0.38);
+    border-left: 3px solid var(--border);
+    background: var(--muted);
     border-radius: 0;
-    color: var(--text-muted);
+    color: var(--muted-foreground);
     white-space: pre-wrap;
   }
 
-  code {
+  code,
+  a.inline-code-link {
     font-family: var(--font-mono);
     font-size: 0.9em;
     padding: 0.08rem 0.32rem;
     border-radius: 0;
-    background: rgba(247, 243, 235, 0.92);
-    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.55) inset;
+    background: var(--muted);
+    box-shadow: inset 0 0 0 1px var(--border);
+  }
+
+  .strong {
+    font-weight: 720;
+  }
+
+  .emphasis {
+    font-style: italic;
+  }
+
+  .strike {
+    text-decoration: line-through;
+  }
+
+  a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 0.16em;
+  }
+  a.local-file {
+    color: var(--muted-foreground);
+    text-decoration-color: color-mix(in oklab, var(--muted-foreground) 35%, transparent);
+    text-decoration-thickness: 1px;
+  }
+  a.local-file:hover {
+    color: var(--foreground);
+    text-decoration-color: var(--muted-foreground);
+  }
+
+  .table-wrap {
+    overflow: auto;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.94rem;
+  }
+
+  th,
+  td {
+    padding: 0.42rem 0.55rem;
+    border: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+  }
+
+  th {
+    background: var(--muted);
+    font-weight: 720;
+  }
+
+  hr {
+    width: 100%;
+    border: 0;
+    border-top: 1px solid var(--border);
+    margin: 0.2rem 0;
   }
 
   .code-block {
@@ -233,7 +651,7 @@
   }
 
   .language {
-    color: var(--text-muted);
+    color: var(--muted-foreground);
     font-size: 0.74rem;
     letter-spacing: 0.12em;
     text-transform: uppercase;
@@ -242,12 +660,12 @@
   pre {
     padding: 0.95rem 1rem;
     border-radius: 0;
-    background: rgba(247, 243, 235, 0.82);
+    background: var(--muted);
     font-family: var(--font-mono);
     font-size: 0.88rem;
     line-height: 1.68;
     white-space: pre-wrap;
     overflow: auto;
-    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.55) inset;
+    box-shadow: inset 0 0 0 1px var(--border);
   }
 </style>

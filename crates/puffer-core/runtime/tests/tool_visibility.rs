@@ -36,6 +36,7 @@ const TODO_WRITE_DESCRIPTION: &str = "Use this tool to create and manage a struc
 
 #[test]
 fn sleep_tool_is_visible_to_anthropic_and_openai_tool_builders() {
+    require_claude_reference!();
     let resources = bundled_resources();
     let registry = ToolRegistry::from_resources(&resources);
     let expected = reference_sleep_prompt();
@@ -56,18 +57,54 @@ fn sleep_tool_is_visible_to_anthropic_and_openai_tool_builders() {
         .iter()
         .find(|definition| definition.name == "Sleep")
         .expect("Sleep tool definition");
-    assert_eq!(openai_sleep.description, expected);
+    assert_eq!(
+        openai_sleep.description,
+        expected_openai_tool_description("Sleep", "Sleep", &expected)
+    );
     assert_eq!(openai_sleep.parameters["required"], json!(["duration_ms"]));
 }
 
 #[test]
 fn bundled_resources_register_sleep_tool() {
+    require_claude_reference!();
     let resources = bundled_resources();
     let registry = ToolRegistry::from_resources(&resources);
     let definition = registry.definition("Sleep").expect("Sleep tool definition");
 
     assert_eq!(definition.handler, "runtime:sleep");
     assert_eq!(definition.description, reference_sleep_prompt());
+}
+
+#[test]
+fn openai_function_tool_parameters_use_valid_object_roots() {
+    let resources = bundled_resources();
+    let registry = ToolRegistry::from_resources(&resources);
+    let tools = openai_tool_definitions(&registry, None, false).unwrap();
+
+    for tool in tools.iter().filter(|tool| tool.kind == "function") {
+        assert_eq!(
+            tool.parameters
+                .get("type")
+                .and_then(serde_json::Value::as_str),
+            Some("object"),
+            "{} parameters must have an object root for OpenAI",
+            tool.name
+        );
+        for keyword in ["oneOf", "anyOf", "allOf", "enum", "not"] {
+            assert!(
+                tool.parameters.get(keyword).is_none(),
+                "{} parameters must not use top-level `{}` for OpenAI",
+                tool.name,
+                keyword
+            );
+        }
+    }
+
+    let mcp_tool = tools
+        .iter()
+        .find(|tool| tool.name == "McpToolCall")
+        .expect("McpToolCall should be model-visible");
+    assert_eq!(mcp_tool.parameters.get("oneOf"), None);
 }
 
 #[test]
@@ -94,7 +131,10 @@ fn notebook_edit_tool_is_visible_to_anthropic_and_openai_tool_builders() {
         .iter()
         .find(|definition| definition.name == "NotebookEdit")
         .expect("NotebookEdit tool definition");
-    assert_eq!(openai_notebook.description, NOTEBOOK_EDIT_DESCRIPTION);
+    assert_eq!(
+        openai_notebook.description,
+        expected_openai_tool_description("NotebookEdit", "NotebookEdit", NOTEBOOK_EDIT_DESCRIPTION)
+    );
     assert_eq!(
         openai_notebook.parameters["required"],
         json!(["notebook_path", "new_source"])
@@ -156,7 +196,10 @@ fn workflow_tool_descriptions_match_claude_reference_for_anthropic_and_openai() 
             .iter()
             .find(|item| item.name == tool_id)
             .expect("openai tool definition");
-        assert_eq!(openai_definition.description, description);
+        assert_eq!(
+            openai_definition.description,
+            expected_openai_tool_description(tool_id, tool_id, &description)
+        );
     }
 }
 
@@ -192,7 +235,10 @@ fn agent_tool_description_is_rendered_for_anthropic_and_openai() {
         .iter()
         .find(|item| item.name == "Agent")
         .expect("openai Agent tool definition");
-    assert_eq!(openai_definition.description, description);
+    assert_eq!(
+        openai_definition.description,
+        expected_openai_tool_description("Agent", "Agent", &description)
+    );
 }
 
 #[test]
@@ -232,7 +278,10 @@ fn config_tool_description_is_rendered_for_anthropic_and_openai() {
         .iter()
         .find(|item| item.name == "Config")
         .expect("openai Config tool definition");
-    assert_eq!(openai_definition.description, description);
+    assert_eq!(
+        openai_definition.description,
+        expected_openai_tool_description("Config", "Config", &description)
+    );
     assert!(openai_definition.parameters["properties"]["value"]["oneOf"]
         .as_array()
         .is_some_and(|variants| variants.iter().any(|variant| variant["type"] == "integer")));
@@ -240,6 +289,7 @@ fn config_tool_description_is_rendered_for_anthropic_and_openai() {
 
 #[test]
 fn lsp_tool_description_matches_claude_reference_for_anthropic_and_openai() {
+    require_claude_reference!();
     let resources = bundled_resources();
     let registry = ToolRegistry::from_resources(&resources);
     assert_tool_description_matches_expected(&registry, "LSP", reference_lsp_prompt().as_str());
@@ -247,6 +297,7 @@ fn lsp_tool_description_matches_claude_reference_for_anthropic_and_openai() {
 
 #[test]
 fn powershell_tool_description_matches_claude_reference_for_anthropic_and_openai() {
+    require_claude_reference!();
     let resources = bundled_resources();
     let registry = ToolRegistry::from_resources(&resources);
     let expected = reference_powershell_prompt();
@@ -289,7 +340,11 @@ fn powershell_tool_description_matches_claude_reference_for_anthropic_and_openai
         .expect("PowerShell openai tool definition");
     assert_eq!(
         normalize_prompt_lines(&openai_definition.description),
-        normalize_prompt_lines(&expected)
+        normalize_prompt_lines(&expected_openai_tool_description(
+            "PowerShell",
+            "PowerShell",
+            &expected
+        ))
     );
     assert_eq!(
         openai_definition.parameters["properties"]["timeout"]["description"],
@@ -301,16 +356,22 @@ fn powershell_tool_description_matches_claude_reference_for_anthropic_and_openai
             "Set to true to run this command in the background. Use Read to read the output later."
         )
     );
+    let mut property_names = openai_definition.parameters["properties"]
+        .as_object()
+        .expect("properties object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    property_names.sort_unstable();
     assert_eq!(
-        openai_definition.parameters["properties"]["dangerouslyDisableSandbox"]["description"],
-        json!(
-            "Set this to true to dangerously override sandbox mode and run commands without sandboxing."
-        )
+        property_names,
+        vec!["command", "description", "run_in_background", "timeout"]
     );
 }
 
 #[test]
 fn web_search_tool_prompt_matches_claude_reference_for_anthropic_and_openai() {
+    require_claude_reference!();
     let reference = read_repo_file("references/claude-code/src/tools/WebSearchTool/prompt.ts");
     let expected =
         normalize_reference_template(&extract_template_literal(&reference, "  return `"))
@@ -325,16 +386,26 @@ fn web_search_tool_prompt_matches_claude_reference_for_anthropic_and_openai() {
         .expect("WebSearch anthropic tool definition");
     assert_eq!(anthropic_definition["description"], json!(expected.clone()));
 
+    // OpenAI now serializes WebSearch as a native server-side tool rather
+    // than a function-shaped tool with a description. The function-shaped
+    // fallback can still be opted into via PUFFER_OPENAI_NATIVE_WEB_SEARCH=0.
     let openai = openai_tool_definitions(&registry, None, false).unwrap();
-    let openai_definition = openai
+    let native = openai
         .iter()
-        .find(|definition| definition.name == "WebSearch")
-        .expect("WebSearch openai tool definition");
-    assert_eq!(openai_definition.description, expected);
+        .find(|definition| definition.kind == "web_search")
+        .expect("WebSearch openai native tool definition");
+    assert!(native.name.is_empty());
+    assert!(native.description.is_empty());
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        json!({ "type": "web_search", "external_web_access": true })
+    );
+    let _ = expected;
 }
 
 #[test]
 fn selected_tool_prompts_match_claude_reference_for_anthropic_and_openai() {
+    require_claude_reference!();
     let resources = bundled_resources();
     let registry = ToolRegistry::from_resources(&resources);
     let anthropic = anthropic_tool_definitions(&registry, None).unwrap();
@@ -381,7 +452,7 @@ fn selected_tool_prompts_match_claude_reference_for_anthropic_and_openai() {
             .expect("openai tool definition");
         assert_eq!(
             openai_definition.description.trim_end(),
-            expected.trim_end(),
+            expected_openai_tool_description(tool_id, tool_id, &expected).trim_end(),
             "openai description for {tool_id}"
         );
     }
@@ -389,6 +460,7 @@ fn selected_tool_prompts_match_claude_reference_for_anthropic_and_openai() {
 
 #[test]
 fn built_in_agent_resources_match_claude_reference_prompts() {
+    require_claude_reference!();
     let resources = bundled_resources();
 
     for (agent_id, expected_description, expected_prompt) in [
@@ -439,6 +511,7 @@ fn built_in_agent_resources_match_claude_reference_prompts() {
 
 #[test]
 fn file_tool_prompts_and_schemas_match_claude_reference_for_anthropic_and_openai() {
+    require_claude_reference!();
     let resources = bundled_resources();
     let registry = ToolRegistry::from_resources(&resources);
     let anthropic = anthropic_tool_definitions(&registry, None).unwrap();
@@ -497,7 +570,11 @@ fn file_tool_prompts_and_schemas_match_claude_reference_for_anthropic_and_openai
             .expect("openai tool definition");
         assert_eq!(
             trim_line_trailing_whitespace(&openai_definition.description),
-            trim_line_trailing_whitespace(&expected_prompt),
+            trim_line_trailing_whitespace(&expected_openai_tool_description(
+                tool_id,
+                tool_id,
+                &expected_prompt
+            )),
             "openai description for {tool_id}"
         );
         assert_eq!(

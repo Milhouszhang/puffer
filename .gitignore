@@ -1,4 +1,41 @@
+docs/superpowers/
 references/
+# But skill reference docs are real content, not build artifacts.
+!resources/skills/**/references/
 target/
+.release/
+release/
 .worktree/
+.worktrees/
 .puffer/
+.superpowers/
+.DS_Store
+**/.DS_Store
+resources/subscribers/*/state/
+# Generated Terminal Bench harness artifacts.
+benchmark/.venv-harbor/
+benchmark/harbor-cache/
+benchmark/tb2-trajectory/
+benchmark/__pycache__/
+benchmark/*.pyc
+
+# Claude Code + OMX tool metadata
+.claude/
+.omx/
+.playwright-mcp/
+
+# Local audit and bug-triage artifacts.
+audit_scope.txt
+import_scope.json
+droid.resume.txt
+env.txt
+audits/
+bugs/
+apps/puffer-desktop/tests/fuzz/.runs/
+apps/puffer-desktop/tests/fuzz/__pycache__/
+apps/puffer-desktop/tests/fuzz/**/*.pyc
+apps/puffer-desktop/tests/*.tmp.spec.ts
+test-results/
+
+# Git worktrees
+.worktrees/

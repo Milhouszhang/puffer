@@ -118,6 +118,7 @@ mod tests {
             SessionMetadata {
                 id: Uuid::nil(),
                 display_name: None,
+                generated_title: None,
                 cwd: PathBuf::from("."),
                 created_at_ms: 0,
                 updated_at_ms: 0,
@@ -137,6 +138,7 @@ mod tests {
         SessionSummary {
             id: Uuid::new_v4(),
             display_name: Some(name.to_string()),
+            generated_title: None,
             cwd: PathBuf::from("."),
             created_at_ms: 0,
             updated_at_ms: 0,

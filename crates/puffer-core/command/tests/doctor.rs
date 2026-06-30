@@ -15,6 +15,7 @@ fn provider(id: &str, auth_modes: Vec<AuthMode>) -> ProviderDescriptor {
         headers: Default::default(),
         query_params: Default::default(),
         discovery: None,
+        media: None,
         models: vec![ModelDescriptor {
             id: if id == "anthropic" {
                 "claude-sonnet-4-5".to_string()
@@ -31,7 +32,11 @@ fn provider(id: &str, auth_modes: Vec<AuthMode>) -> ProviderDescriptor {
             context_window: 200_000,
             max_output_tokens: 8_192,
             supports_reasoning: true,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
         }],
+        chat_completions_path: None,
     }
 }
 

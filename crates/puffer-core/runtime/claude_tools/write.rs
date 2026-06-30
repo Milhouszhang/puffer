@@ -1,5 +1,7 @@
 use crate::workspace_paths;
 use anyhow::{bail, Context, Result};
+use puffer_runner_api::FilesystemExecutionPolicy;
+use puffer_runner_api::StalenessRejection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -56,7 +58,7 @@ struct ClaudeWriteOutput {
 pub fn execute_claude_write_tool(
     cwd: &Path,
     working_dirs: &[PathBuf],
-    allow_all_paths: bool,
+    filesystem: &FilesystemExecutionPolicy,
     input: Value,
     read_file_state: &mut HashMap<PathBuf, ClaudeReadSnapshot>,
 ) -> Result<String> {
@@ -69,15 +71,10 @@ pub fn execute_claude_write_tool(
     {
         bail!("file_path must be an absolute path");
     }
-    let sandbox_mode = if allow_all_paths {
-        "danger-full-access"
-    } else {
-        "workspace-write"
-    };
-    let path = workspace_paths::resolve_path_for_session(
+    let path = workspace_paths::resolve_path_for_filesystem_policy(
         cwd,
         working_dirs,
-        sandbox_mode,
+        filesystem.sandbox_mode,
         Path::new(&input.file_path),
     )?;
     if path.is_dir() {
@@ -140,7 +137,8 @@ fn validate_existing_write(
         bail!(NOT_READ_ERROR);
     };
     if snapshot.is_partial_view {
-        bail!(NOT_READ_ERROR);
+        // defense-in-depth: pre-flight gate at mod.rs:402 catches first; keep messages aligned with StalenessRejection
+        bail!(StalenessRejection::PARTIAL_READ_MESSAGE);
     }
     let last_write_time = file_timestamp_ms(path)?;
     if last_write_time > snapshot.timestamp_ms {
@@ -226,7 +224,20 @@ fn file_timestamp_ms(path: &Path) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use puffer_runner_api::{FilesystemExecutionPolicy, FilesystemSandboxMode};
     use serde_json::json;
+
+    fn workspace_write_policy() -> FilesystemExecutionPolicy {
+        FilesystemExecutionPolicy {
+            sandbox_mode: FilesystemSandboxMode::WorkspaceWrite,
+        }
+    }
+
+    fn danger_full_access_policy() -> FilesystemExecutionPolicy {
+        FilesystemExecutionPolicy {
+            sandbox_mode: FilesystemSandboxMode::DangerFullAccess,
+        }
+    }
 
     fn write_input(path: &Path, content: &str) -> Value {
         json!({
@@ -244,7 +255,7 @@ mod tests {
         let output = execute_claude_write_tool(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             write_input(&path, "hello"),
             &mut read_state,
         )
@@ -268,7 +279,7 @@ mod tests {
         let error = execute_claude_write_tool(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             write_input(&path, "new"),
             &mut read_state,
         )
@@ -294,13 +305,13 @@ mod tests {
         let error = execute_claude_write_tool(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             write_input(&path, "new"),
             &mut read_state,
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains(NOT_READ_ERROR));
+        assert!(error.contains(StalenessRejection::PARTIAL_READ_MESSAGE));
     }
 
     #[test]
@@ -320,7 +331,7 @@ mod tests {
         let error = execute_claude_write_tool(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             write_input(&path, "new"),
             &mut read_state,
         )
@@ -346,7 +357,7 @@ mod tests {
         let output = execute_claude_write_tool(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             write_input(&path, "new"),
             &mut read_state,
         )
@@ -373,7 +384,7 @@ mod tests {
         let output = execute_claude_write_tool(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             write_input(&path, "hello"),
             &mut read_state,
         )
@@ -385,16 +396,17 @@ mod tests {
     }
 
     #[test]
-    fn write_rejects_paths_outside_working_directories() {
+    fn write_rejects_paths_outside_default_writable_roots() {
+        // Path outside cwd, /tmp, $TMPDIR, and any /add-dir root.
+        // Codex-style default writable set: [cwd, /tmp, $TMPDIR, ...add-dir].
         let temp = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let path = outside.path().join("fresh.txt");
+        let path = std::path::PathBuf::from("/__puffer_test_outside_writable_set__/fresh.txt");
         let mut read_state = HashMap::new();
 
         let error = execute_claude_write_tool(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             write_input(&path, "hello"),
             &mut read_state,
         )
@@ -402,6 +414,40 @@ mod tests {
         .to_string();
 
         assert!(error.contains("outside the current working directories"));
+    }
+
+    #[test]
+    fn write_allows_paths_under_slash_tmp_under_workspace_write() {
+        // Codex-style default writable set includes /tmp on Unix, so the
+        // model writing to /tmp/<test>.txt should not bounce off the path
+        // gate the way it did pre-this-change.
+        if !cfg!(unix) || !std::path::Path::new("/tmp").is_dir() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let uniq = format!(
+            "puffer_test_{}_{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::path::PathBuf::from("/tmp").join(&uniq);
+        let mut read_state = HashMap::new();
+
+        let result = execute_claude_write_tool(
+            temp.path(),
+            &[],
+            &workspace_write_policy(),
+            write_input(&path, "hello"),
+            &mut read_state,
+        );
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_ok(),
+            "write to /tmp must succeed under workspace-write; got: {result:?}"
+        );
     }
 
     #[test]
@@ -414,7 +460,7 @@ mod tests {
         let output = execute_claude_write_tool(
             temp.path(),
             &[],
-            true,
+            &danger_full_access_policy(),
             write_input(&path, "hello"),
             &mut read_state,
         )

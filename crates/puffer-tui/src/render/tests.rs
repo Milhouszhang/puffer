@@ -1,5 +1,6 @@
 use super::*;
 use crate::usage::UsageOverlay;
+use crate::ModelPickerEntry;
 use insta::assert_snapshot;
 use puffer_config::PufferConfig;
 use puffer_core::CommandKind;
@@ -45,8 +46,8 @@ fn header_snapshot_reports_compact_status() {
     .collect::<Vec<_>>()
     .join("\n");
     assert_snapshot!(
-        snapshot,
-        @r"
+                                                                                                                                        snapshot,
+                                                                                                                                        @r"
 Puffer Code
 Account   anthropic via API key
 Model     anthropic/claude-sonnet-4-5 · tools 3/4
@@ -54,7 +55,7 @@ Session   Shipyard · 12345678-1234-5678-1234-567812345678
 Mode      effort high · fast · vim
 Context   puffer · 2 msgs · 2 wds · dockyard@staging
 "
-    );
+                                                                                                                                    );
 }
 
 #[test]
@@ -67,11 +68,11 @@ fn footer_snapshot_reports_compact_prompt_rail() {
         .collect::<Vec<_>>()
         .join("\n");
     assert_snapshot!(
-        snapshot,
-        @r"
-anthropic/claude-sonnet-4-5 · 99% left · /tmp/puffer · sandbox workspace-write
+                                                                                                                                        snapshot,
+                                                                                                                                        @r"
+anthropic/claude-sonnet-4-5 · 99% left · /tmp/puffer · permissions ACL
 "
-    );
+                                                                                                                                    );
 }
 
 #[test]
@@ -94,8 +95,8 @@ fn header_snapshot_includes_oauth_identity_when_available() {
     .collect::<Vec<_>>()
     .join("\n");
     assert_snapshot!(
-        snapshot,
-        @r"
+                                                                                                                                        snapshot,
+                                                                                                                                        @r"
 Puffer Code
 Account   dev@example.com · plan Pro · acct acct-1
 Model     openai/gpt-5 · tools 3/4
@@ -103,7 +104,7 @@ Session   Shipyard · 12345678-1234-5678-1234-567812345678
 Mode      effort high · fast · vim
 Context   puffer · 2 msgs · 2 wds · dockyard@staging
 "
-    );
+                                                                                                                                    );
 }
 
 #[test]
@@ -173,7 +174,7 @@ fn render_layout_includes_header_body_and_composer() {
     assert!(lines.iter().any(|line| line.contains("Session")));
     assert!(lines.iter().any(|line| line.contains("working tree clean")));
     assert!(rendered.contains("anthropic/claude-sonnet-4-5"));
-    assert!(rendered.contains("sandbox workspace-write"));
+    assert!(rendered.contains("permissions ACL"));
 }
 
 #[test]
@@ -207,6 +208,8 @@ fn render_pending_submit_shows_loading_below_prompt() {
                 Vec::new(),
                 Vec::new(),
                 Some(std::time::Instant::now()),
+                false,
+                None,
             );
             render(
                 frame,
@@ -220,7 +223,7 @@ fn render_pending_submit_shows_loading_below_prompt() {
                 0,
                 &sample_commands(),
             );
-            set_pending_submit_state(None, Vec::new(), Vec::new(), None);
+            set_pending_submit_state(None, Vec::new(), Vec::new(), None, false, None);
         })
         .unwrap();
 
@@ -251,12 +254,15 @@ fn render_pending_submit_shows_tool_call_before_output() {
             set_pending_submit_state(
                 Some("check python".to_string()),
                 vec![ToolCallRequest {
+                    call_id: "call_python_version".to_string(),
                     tool_id: "bash".to_string(),
                     input: "{\"command\":\"python --version 2>&1; python3 --version 2>&1\"}"
                         .to_string(),
                 }],
                 Vec::new(),
                 Some(std::time::Instant::now()),
+                false,
+                None,
             );
             render(
                 frame,
@@ -270,7 +276,7 @@ fn render_pending_submit_shows_tool_call_before_output() {
                 0,
                 &sample_commands(),
             );
-            set_pending_submit_state(None, Vec::new(), Vec::new(), None);
+            set_pending_submit_state(None, Vec::new(), Vec::new(), None, false, None);
         })
         .unwrap();
 
@@ -297,6 +303,8 @@ fn render_pending_submit_shows_queued_prompts() {
                 Vec::new(),
                 vec!["second prompt".to_string(), "third prompt".to_string()],
                 Some(std::time::Instant::now()),
+                false,
+                None,
             );
             render(
                 frame,
@@ -310,7 +318,7 @@ fn render_pending_submit_shows_queued_prompts() {
                 0,
                 &sample_commands(),
             );
-            set_pending_submit_state(None, Vec::new(), Vec::new(), None);
+            set_pending_submit_state(None, Vec::new(), Vec::new(), None, false, None);
         })
         .unwrap();
 
@@ -364,6 +372,7 @@ fn render_empty_state_shows_transcript_guidance() {
     let rendered = terminal_view(&terminal);
     assert!(rendered.contains("Puffer Code"));
     assert!(rendered.contains("Account"));
+    assert!(has_top_panel(&rendered));
     assert!(!rendered.contains("Welcome to Puffer Code"));
     assert!(!rendered.contains("Tips to get started"));
 }
@@ -397,10 +406,59 @@ fn render_empty_state_compacts_on_narrow_width() {
 
     let rendered = terminal_view(&terminal);
     assert!(rendered.contains("Puffer Code"));
+    assert!(has_top_panel(&rendered));
     assert!(!rendered.contains("Welcome to Puffer Code"));
     assert!(!rendered.contains("██"));
     assert!(rendered.contains("100% left"));
     assert!(rendered.contains("Review changes, ask a question, or type /"));
+}
+
+#[test]
+fn render_onboarding_empty_state_keeps_fixed_top_panel() {
+    let backend = TestBackend::new(100, 28);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = sample_state();
+    state.transcript.clear();
+    let resources = sample_resources();
+    let providers = sample_providers();
+    let auth_store = sample_auth_store();
+
+    terminal
+        .draw(|frame| {
+            set_active_overlay(Some(OverlayState::ThemePicker {
+                entries: vec![
+                    ModelPickerEntry {
+                        selector: "puffer".to_string(),
+                        description: "Default Puffer text style".to_string(),
+                        command: None,
+                    },
+                    ModelPickerEntry {
+                        selector: "harbor".to_string(),
+                        description: "Calmer contrast for long sessions".to_string(),
+                        command: None,
+                    },
+                ],
+                selection: 0,
+            }));
+            render(
+                frame,
+                &state,
+                &resources,
+                &providers,
+                &auth_store,
+                "",
+                0,
+                0,
+                0,
+                &sample_commands(),
+            );
+            set_active_overlay(None);
+        })
+        .unwrap();
+
+    let rendered = terminal_view(&terminal);
+    assert!(rendered.contains("Puffer Code"));
+    assert!(has_top_panel(&rendered));
 }
 
 #[test]
@@ -507,6 +565,37 @@ fn render_usage_overlay_shows_loading_state() {
     assert!(rendered.contains("Usage"));
     assert!(rendered.contains("Loading usage data..."));
     assert!(rendered.contains("Esc cancel"));
+}
+
+#[test]
+fn read_only_overlay_prompt_does_not_invite_typing() {
+    let state = sample_state();
+    let resources = sample_resources();
+    let providers = sample_providers();
+    let auth_store = sample_auth_store();
+    let overlay =
+        crate::status_overlay::StatusOverlay::open(&state, &resources, &providers, &auth_store);
+
+    assert_eq!(overlay_prompt_placeholder(Some(&overlay)), "Overlay open");
+    assert_eq!(
+        overlay_hint_line("", false, Some(&overlay)),
+        "Esc closes · / starts a command"
+    );
+}
+
+#[test]
+fn picker_overlay_prompt_still_invites_typing() {
+    let overlay = OverlayState::LoginPicker {
+        entries: vec![ModelPickerEntry {
+            selector: "openai".to_string(),
+            description: "OpenAI".to_string(),
+            command: None,
+        }],
+        selection: 0,
+    };
+
+    assert_eq!(overlay_prompt_placeholder(Some(&overlay)), "Type to jump");
+    assert!(overlay_hint_line("", false, Some(&overlay)).contains("Type to jump"));
 }
 
 #[test]
@@ -675,6 +764,7 @@ pub(super) fn sample_state() -> AppState {
         SessionMetadata {
             id: Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap(),
             display_name: Some("Shipyard".to_string()),
+            generated_title: None,
             cwd,
             created_at_ms: 0,
             updated_at_ms: 0,
@@ -743,6 +833,7 @@ pub(super) fn sample_providers() -> ProviderRegistry {
         headers: Default::default(),
         query_params: Default::default(),
         discovery: None,
+        media: None,
         models: vec![ModelDescriptor {
             id: "claude-sonnet-4-5".to_string(),
             display_name: "Claude Sonnet 4.5".to_string(),
@@ -751,7 +842,11 @@ pub(super) fn sample_providers() -> ProviderRegistry {
             context_window: 200_000,
             max_output_tokens: 8_192,
             supports_reasoning: true,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
         }],
+        chat_completions_path: None,
     });
     registry.register(ProviderDescriptor {
         id: "openai".to_string(),
@@ -762,6 +857,7 @@ pub(super) fn sample_providers() -> ProviderRegistry {
         headers: Default::default(),
         query_params: Default::default(),
         discovery: None,
+        media: None,
         models: vec![ModelDescriptor {
             id: "gpt-5".to_string(),
             display_name: "GPT-5".to_string(),
@@ -770,7 +866,11 @@ pub(super) fn sample_providers() -> ProviderRegistry {
             context_window: 128_000,
             max_output_tokens: 8_192,
             supports_reasoning: true,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
         }],
+        chat_completions_path: None,
     });
     registry
 }
@@ -868,6 +968,8 @@ fn loaded_prompt(id: &str, description: &str) -> LoadedItem<puffer_resources::Pr
             model_override: None,
             mode: None,
             chained_from: Vec::new(),
+            for_provider: None,
+            for_model: None,
         },
         source_info: SourceInfo {
             path: PathBuf::from(format!("{id}.yaml")),
@@ -920,6 +1022,12 @@ fn loaded_mcp(id: &str, display_name: &str) -> LoadedItem<puffer_resources::McpS
             endpoint: String::new(),
             target: "cargo run".to_string(),
             description: "mcp".to_string(),
+            env: Default::default(),
+            inherit_env: true,
+            timeout: None,
+            connect_timeout: None,
+            headers: Default::default(),
+            oauth: None,
         },
         source_info: SourceInfo {
             path: PathBuf::from(format!("{id}.yaml")),

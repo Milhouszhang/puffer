@@ -1,5 +1,5 @@
 use super::emit_system;
-use crate::permissions::load_runtime_sandbox_settings;
+use super::lambda_doctor::{append_lambda_skill_section, lambda_skill_doctor_warnings};
 use crate::AppState;
 use anyhow::Result;
 use puffer_config::ConfigPaths;
@@ -47,7 +47,6 @@ pub(crate) fn render_doctor_report(
 ) -> Result<String> {
     let paths = ConfigPaths::discover(&state.cwd);
     let tool_registry = ToolRegistry::from_resources(resources);
-    let sandbox = load_runtime_sandbox_settings(&state.cwd, state)?;
     let git = collect_git_status(&state.cwd);
     let dependencies = collect_dependency_statuses();
     let warnings =
@@ -66,7 +65,7 @@ pub(crate) fn render_doctor_report(
     writeln!(&mut text)?;
 
     append_runtime_section(&mut text, state, &git)?;
-    append_workspace_section(&mut text, state, &paths, &sandbox)?;
+    append_workspace_section(&mut text, state, &paths)?;
     append_provider_section(&mut text, state, providers, auth_store)?;
     append_resource_section(&mut text, state, resources, &tool_registry)?;
     append_dependency_section(&mut text, &dependencies)?;
@@ -157,10 +156,9 @@ fn append_workspace_section(
     text: &mut String,
     state: &AppState,
     paths: &ConfigPaths,
-    sandbox: &crate::permissions::SandboxSettings,
 ) -> Result<()> {
     let permissions_path = paths.workspace_config_dir.join("permissions.toml");
-    let sandbox_path = paths.workspace_config_dir.join("sandbox.toml");
+    let acl_path = crate::permissions::acl::acl_path(&state.cwd);
     let auth_path = paths.user_config_dir.join("auth.json");
     let status_line_command = state
         .config
@@ -205,13 +203,9 @@ fn append_workspace_section(
     )?;
     writeln!(
         text,
-        "- sandbox_file={} exists={} effective_mode={} auto_allow={} fallback={} exclusions={}",
-        sandbox_path.display(),
-        sandbox_path.exists(),
-        sandbox.mode,
-        sandbox.auto_allow,
-        sandbox.allow_unsandboxed_fallback,
-        sandbox.excluded_commands.len()
+        "- permission_acl={} exists={}",
+        acl_path.display(),
+        acl_path.exists()
     )?;
     writeln!(
         text,
@@ -318,10 +312,12 @@ fn append_resource_section(
     writeln!(text, "Resources:")?;
     writeln!(
         text,
-        "- prompts={} tools={} executable_tools={} skills={} plugins={} mcp_servers={} ides={} hooks={}",
+        "- prompts={} tools={} internal_tools={} executable_tools={} internal_executable_tools={} skills={} plugins={} mcp_servers={} ides={} hooks={}",
         resources.prompts.len(),
         resources.tools.len(),
+        resources.internal_tools.len(),
         tool_registry.tools().count(),
+        tool_registry.internal_tools().count(),
         resources.skills.len(),
         resources.plugins.len(),
         resources.mcp_servers.len(),
@@ -355,6 +351,7 @@ fn append_resource_section(
             )?;
         }
     }
+    append_lambda_skill_section(text, resources)?;
     writeln!(text)?;
     Ok(())
 }
@@ -534,6 +531,15 @@ fn collect_doctor_warnings(
         });
     }
 
+    warnings.extend(
+        lambda_skill_doctor_warnings(resources)
+            .into_iter()
+            .map(|warning| DoctorWarning {
+                summary: warning.summary,
+                detail: Some(warning.detail),
+            }),
+    );
+
     if git.root.is_none() {
         warnings.push(DoctorWarning {
             summary: "current working directory is not inside a git worktree".to_string(),
@@ -653,6 +659,7 @@ mod tests {
             headers: Default::default(),
             query_params: Default::default(),
             discovery: None,
+            media: None,
             models: vec![ModelDescriptor {
                 id: if id == "anthropic" {
                     "claude-sonnet-4-5".to_string()
@@ -669,7 +676,11 @@ mod tests {
                 context_window: 200_000,
                 max_output_tokens: 8_192,
                 supports_reasoning: true,
+                compat: None,
+                input: vec![puffer_provider_registry::Modality::Text],
+                cost: None,
             }],
+            chat_completions_path: None,
         }
     }
 
@@ -690,6 +701,7 @@ mod tests {
             SessionMetadata {
                 id: uuid::Uuid::nil(),
                 display_name: Some("doctor".to_string()),
+                generated_title: None,
                 cwd: cwd.to_path_buf(),
                 created_at_ms: 0,
                 updated_at_ms: 0,

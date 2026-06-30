@@ -1,14 +1,16 @@
 use anyhow::{bail, Context, Result};
 use puffer_config::{ensure_workspace_dirs, ConfigPaths};
+use puffer_session_store::MessageActor;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
+use uuid::Uuid;
 
 const WORKFLOW_DIR_NAME: &str = "runtime/claude_workflow";
 
@@ -36,12 +38,23 @@ pub(super) struct StoredTask {
     pub(super) process_id: Option<u32>,
     #[serde(default)]
     pub(super) output_file: Option<String>,
+    #[serde(default, rename = "receivedAt")]
+    pub(super) received_at: Option<String>,
+    #[serde(default, rename = "expiresAt")]
+    pub(super) expires_at: Option<String>,
     #[serde(default)]
     pub(super) started_at_ms: Option<u64>,
+    /// Server-stamped creation time for latency stats. Never touched after
+    /// creation, unlike `updated_at_ms` (clobbered on every update) and
+    /// `started_at_ms` (doubles as the in_progress transition stamp).
+    #[serde(default)]
+    pub(super) created_at_ms: Option<u64>,
     #[serde(default)]
     pub(super) updated_at_ms: Option<u64>,
     #[serde(default)]
     pub(super) exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) completed_via: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +139,8 @@ pub(crate) struct StoredMessage {
     pub(crate) read: bool,
     pub(crate) summary: Option<String>,
     pub(crate) message: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) actor: Option<MessageActor>,
     pub(crate) created_at_ms: u64,
 }
 
@@ -246,8 +261,32 @@ pub(super) struct TaskCreateInput {
     pub(super) description: String,
     #[serde(default, rename = "activeForm")]
     pub(super) active_form: Option<String>,
+    #[serde(default, rename = "receivedAt")]
+    pub(super) received_at: Option<String>,
+    #[serde(default, rename = "expiresAt")]
+    pub(super) expires_at: Option<String>,
+    #[serde(default)]
+    pub(super) actions: Vec<TaskCreateActionInput>,
+    #[serde(default, rename = "sourceEnvelopeId", alias = "source_envelope_id")]
+    pub(super) source_envelope_id: Option<String>,
+    #[serde(default, rename = "sourceEnvelopeIds", alias = "source_envelope_ids")]
+    pub(super) source_envelope_ids: Vec<String>,
+    #[serde(
+        default,
+        rename = "possibleIgnoreReasons",
+        alias = "possible_ignore_reasons"
+    )]
+    pub(super) possible_ignore_reasons: Vec<String>,
     #[serde(default)]
     pub(super) metadata: Option<Map<String, Value>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(super) struct TaskCreateActionInput {
+    #[serde(rename = "actionName", alias = "name")]
+    pub(super) action_name: String,
+    #[serde(rename = "actionPrompt", alias = "prompt")]
+    pub(super) action_prompt: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,34 +335,6 @@ pub(super) struct TaskOutputInput {
 }
 
 #[derive(Debug, Deserialize)]
-pub(super) struct AskUserQuestionInput {
-    pub(super) questions: Vec<AskUserQuestionItem>,
-    #[serde(default)]
-    pub(super) answers: Map<String, Value>,
-    #[serde(default)]
-    pub(super) annotations: Map<String, Value>,
-    #[serde(default)]
-    pub(super) metadata: Map<String, Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct AskUserQuestionItem {
-    pub(super) question: String,
-    pub(super) header: String,
-    pub(super) options: Vec<AskUserQuestionOption>,
-    #[serde(default, rename = "multiSelect")]
-    pub(super) multi_select: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct AskUserQuestionOption {
-    pub(super) label: String,
-    pub(super) description: String,
-    #[serde(default)]
-    pub(super) preview: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 pub(super) struct EnterWorktreeInput {
     #[serde(default)]
     pub(super) name: Option<String>,
@@ -352,8 +363,6 @@ pub(super) struct PowerShellInput {
     pub(super) description: Option<String>,
     #[serde(default)]
     pub(super) run_in_background: bool,
-    #[serde(default, rename = "dangerouslyDisableSandbox")]
-    pub(super) dangerously_disable_sandbox: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -625,8 +634,18 @@ pub(crate) fn register_team_member(
     Ok(())
 }
 
-pub(super) fn tasks_path(cwd: &Path) -> PathBuf {
-    workflow_root(cwd).unwrap().join("tasks.json")
+pub(super) fn tasks_path(cwd: &Path, session_id: &Uuid) -> PathBuf {
+    let dir = workflow_root(cwd)
+        .unwrap()
+        .join("sessions")
+        .join(session_id.to_string());
+    let _ = fs::create_dir_all(&dir);
+    dir.join("tasks.json")
+}
+
+/// Returns the workspace-level task store used by connector monitors.
+pub(super) fn monitor_tasks_path(cwd: &Path) -> PathBuf {
+    workflow_root(cwd).unwrap().join("monitor_tasks.json")
 }
 
 /// Returns the directory used to persist one team's structured task list.
@@ -644,13 +663,17 @@ pub(super) fn team_tasks_path(cwd: &Path, team_name: &str) -> Result<PathBuf> {
 }
 
 /// Returns the structured task store path for the active team when present.
-pub(super) fn structured_tasks_path(cwd: &Path, active_team_name: Option<&str>) -> Result<PathBuf> {
+pub(super) fn structured_tasks_path(
+    cwd: &Path,
+    session_id: &Uuid,
+    active_team_name: Option<&str>,
+) -> Result<PathBuf> {
     match active_team_name
         .map(str::trim)
         .filter(|name| !name.is_empty())
     {
         Some(team_name) => team_tasks_path(cwd, team_name),
-        None => Ok(tasks_path(cwd)),
+        None => Ok(tasks_path(cwd, session_id)),
     }
 }
 
@@ -794,6 +817,27 @@ pub(super) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
     }
 }
 
+pub(super) fn ensure_safe_identifier(value: &str, field: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("{field} must not be empty");
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("{field} must be a simple identifier without path components");
+    }
+    Ok(())
+}
+
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -816,6 +860,18 @@ pub(super) fn next_task_id(tasks: &[StoredTask]) -> String {
         .unwrap_or(0)
         + 1;
     format!("task-{next}")
+}
+
+/// Returns the next sequential monitor task id.
+pub(super) fn next_monitor_task_id(tasks: &[StoredTask]) -> String {
+    let next = tasks
+        .iter()
+        .filter_map(|task| task.task_id.strip_prefix("monitor-"))
+        .filter_map(|suffix| suffix.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    format!("monitor-{next}")
 }
 
 /// Returns true when the operating-system process is still running.
@@ -887,53 +943,6 @@ pub(super) fn validate_cron_expression(cron: &str) -> Result<()> {
     let fields = cron.split_whitespace().collect::<Vec<_>>();
     if fields.len() != 5 || fields.iter().any(|field| field.trim().is_empty()) {
         bail!("cron expression must contain exactly 5 non-empty fields");
-    }
-    Ok(())
-}
-
-/// Validates the bounded multiple-choice shape used by `AskUserQuestion`.
-pub(super) fn validate_ask_user_questions(items: &[AskUserQuestionItem]) -> Result<()> {
-    if items.is_empty() || items.len() > 4 {
-        bail!("AskUserQuestion requires between 1 and 4 questions");
-    }
-    let mut seen_questions = std::collections::BTreeSet::new();
-    for item in items {
-        if item.question.trim().is_empty() {
-            bail!("AskUserQuestion questions must not be empty");
-        }
-        if !seen_questions.insert(item.question.trim().to_ascii_lowercase()) {
-            bail!("AskUserQuestion question texts must be unique");
-        }
-        if item.header.trim().is_empty() {
-            bail!("AskUserQuestion headers must not be empty");
-        }
-        if item.options.len() < 2 || item.options.len() > 4 {
-            bail!(
-                "AskUserQuestion question `{}` must provide between 2 and 4 options",
-                item.header
-            );
-        }
-        let mut seen_labels = std::collections::BTreeSet::new();
-        if item.multi_select && item.options.iter().any(|option| option.preview.is_some()) {
-            bail!(
-                "AskUserQuestion question `{}` cannot use previews with multiSelect",
-                item.header
-            );
-        }
-        for option in &item.options {
-            if option.label.trim().is_empty() || option.description.trim().is_empty() {
-                bail!(
-                    "AskUserQuestion question `{}` has an option with empty label or description",
-                    item.header
-                );
-            }
-            if !seen_labels.insert(option.label.to_ascii_lowercase()) {
-                bail!(
-                    "AskUserQuestion question `{}` has duplicate option labels",
-                    item.header
-                );
-            }
-        }
     }
     Ok(())
 }

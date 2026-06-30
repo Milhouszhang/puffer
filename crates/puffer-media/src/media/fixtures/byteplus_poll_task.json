@@ -1,0 +1,12 @@
+{
+  "id": "cgt-20260608235513-vmdjt",
+  "model": "dreamina-seedance-2-0-260128",
+  "status": "running",
+  "created_at": 1780934113,
+  "updated_at": 1780934113,
+  "service_tier": "default",
+  "execution_expires_after": 172800,
+  "generate_audio": true,
+  "draft": false,
+  "priority": 0
+}

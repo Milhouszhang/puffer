@@ -60,6 +60,7 @@
     loadDefaultWorkspace,
     loadDesktopPins,
     setDesktopPin,
+    subscribeWorkflowRunFinished,
     updateConfig,
     type AgentTurnSubmitOptions,
     type GeneratedMediaArtifactResult,
@@ -1183,9 +1184,23 @@
       });
     }
 
+    // Workflow/task run completions badge the dock when the window is
+    // unfocused (the native badge_bump command is itself focus-gated).
+    let unsubWorkflowRun: (() => void) | null = null;
+    void subscribeWorkflowRunFinished(() => {
+      if (canInvokeTauri()) {
+        void invoke("badge_bump").catch(() => {});
+      }
+    }).then((unsub) => {
+      // If we already unmounted before the subscription resolved, drop it now.
+      if (miniDisposed) unsub();
+      else unsubWorkflowRun = unsub;
+    });
+
     return () => {
       miniDisposed = true;
       miniUnlisten?.();
+      unsubWorkflowRun?.();
       cancelRecapBlurTimer();
       clearDaemonClientListeners();
       sessionSubscriptionGeneration += 1;

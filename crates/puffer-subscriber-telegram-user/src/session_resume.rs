@@ -1,10 +1,19 @@
 //! Persisted Telegram session resume and stream recovery helpers.
 
+use std::time::Duration;
+
 use anyhow::Context as _;
 use grammers_client::{session::Session, Client, Config};
 use serde_json::json;
 
 use crate::state::{default_init_params, resolve_api_credentials, PersistedCredentials, SkillEnv};
+
+/// Bound each MTProto connect attempt so an unreachable Telegram fails in
+/// seconds instead of the ~75s OS TCP timeout. Above a healthy socks5+MTProto
+/// handshake, below the 45s connector-setup wait so a clear error still
+/// surfaces in the UI; also caps the background offline-resume loop's per-
+/// attempt cost (this fn is shared by both paths).
+const RESUME_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Outcome of attempting to resume a persisted session. Callers MUST treat
 /// `Transient` differently from `AuthRequired`: on a transient failure the
@@ -52,9 +61,9 @@ pub(crate) async fn try_resume_session(env: &SkillEnv) -> anyhow::Result<Session
         api_hash,
         params: default_init_params(),
     };
-    let client = match Client::connect(config).await {
-        Ok(c) => c,
-        Err(err) => {
+    let client = match tokio::time::timeout(RESUME_CONNECT_TIMEOUT, Client::connect(config)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(err)) => {
             let detail = err.to_string();
             let class = crate::health::classify_error(&detail);
             crate::health::report_resume_failed(
@@ -73,6 +82,17 @@ pub(crate) async fn try_resume_session(env: &SkillEnv) -> anyhow::Result<Session
             } else {
                 SessionResume::Transient(detail)
             });
+        }
+        Err(_elapsed) => {
+            let detail = format!("connect timed out after {}s", RESUME_CONNECT_TIMEOUT.as_secs());
+            crate::health::report_resume_failed(
+                env,
+                "connect_timeout",
+                true,
+                "network",
+                json!({ "error": detail.clone() }),
+            );
+            return Ok(SessionResume::Transient(detail));
         }
     };
     match client.is_authorized().await {

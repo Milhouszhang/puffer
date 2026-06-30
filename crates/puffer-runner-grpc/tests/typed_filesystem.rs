@@ -114,6 +114,7 @@ fn spawn_server(runner: Arc<dyn ToolRunner>) -> Option<ServerHandle> {
 
 fn make_request(tool_id: &str, cwd: &Path, input: serde_json::Value) -> ToolRequest {
     ToolRequest {
+        request_id: None,
         tool_id: tool_id.to_string(),
         cwd: cwd.to_path_buf(),
         working_dirs: Vec::new(),
@@ -176,6 +177,7 @@ fn missing_filesystem_field_returns_invalid_argument() {
             proto::tool_runner_client::ToolRunnerClient::with_interceptor(channel, interceptor);
         client
             .execute_tool(proto::ToolRequest {
+                request_id: None,
                 tool_id: "Read".into(),
                 cwd: "/workspace".into(),
                 working_dirs: Vec::new(),

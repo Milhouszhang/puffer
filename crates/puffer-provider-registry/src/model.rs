@@ -367,6 +367,16 @@ pub struct MediaBatchDescriptor {
     pub mode: MediaBatchMode,
     #[serde(default)]
     pub max_images_per_call: Option<u8>,
+    /// In `grouped` mode, the request body field that carries the
+    /// requested image count (e.g. `max_images`). Single-level only;
+    /// nested under `count_field_parent` when that is set.
+    #[serde(default)]
+    pub count_field: Option<String>,
+    /// In `grouped` mode, the single parent object that wraps
+    /// `count_field` (e.g. `sequential_image_generation_options`). When
+    /// unset, the count is emitted as a flat top-level field.
+    #[serde(default)]
+    pub count_field_parent: Option<String>,
 }
 
 impl Default for MediaBatchDescriptor {
@@ -374,6 +384,8 @@ impl Default for MediaBatchDescriptor {
         Self {
             mode: MediaBatchMode::PerImage,
             max_images_per_call: None,
+            count_field: None,
+            count_field_parent: None,
         }
     }
 }
@@ -384,6 +396,10 @@ impl Default for MediaBatchDescriptor {
 pub enum MediaBatchMode {
     PerImage,
     Exact,
+    /// One call returns N stylistically coherent images. The requested
+    /// count is emitted via the descriptor's `count_field`
+    /// (`count_field_parent`) recipe rather than the flat `n` field.
+    Grouped,
 }
 
 /// Controls how the text prompt is serialized in the video generation request body.
@@ -536,7 +552,7 @@ impl MediaExecutionDescriptor {
             MediaBatchMode::PerImage => {
                 if self.batch.max_images_per_call.is_some() {
                     errors.push(format!(
-                        "{location}.batch.max_images_per_call is only valid when batch.mode is exact"
+                        "{location}.batch.max_images_per_call is only valid when batch.mode is exact or grouped"
                     ));
                 }
             }
@@ -546,6 +562,34 @@ impl MediaExecutionDescriptor {
                     "{location}.batch.max_images_per_call must be at least 2 when batch.mode is exact"
                 )),
             },
+            MediaBatchMode::Grouped => {
+                match self.batch.max_images_per_call {
+                    Some(limit) if limit >= 2 => {}
+                    _ => errors.push(format!(
+                        "{location}.batch.max_images_per_call must be at least 2 when batch.mode is grouped"
+                    )),
+                }
+                if self
+                    .batch
+                    .count_field
+                    .as_deref()
+                    .is_none_or(|field| field.trim().is_empty())
+                {
+                    errors.push(format!(
+                        "{location}.batch.count_field is required when batch.mode is grouped"
+                    ));
+                }
+                if self
+                    .batch
+                    .count_field_parent
+                    .as_deref()
+                    .is_some_and(|parent| parent.trim().is_empty())
+                {
+                    errors.push(format!(
+                        "{location}.batch.count_field_parent must not be empty when set"
+                    ));
+                }
+            }
         }
     }
 }

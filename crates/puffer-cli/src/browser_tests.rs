@@ -165,6 +165,49 @@ fn render_snapshot_body_uses_origin_snapshot_and_refs_sections() {
 }
 
 #[test]
+fn action_snapshot_body_renders_confirmation_then_fused_snapshot() {
+    let result = serde_json::json!({
+        "ok": true,
+        "url": "https://example.com/checkout",
+        "title": "Checkout",
+        "text": "Pay now",
+        "elements": [
+            { "ref": "@e1", "role": "button", "name": "Pay now", "tag": "button", "href": null }
+        ],
+        "instruction": "Page state after your action"
+    });
+
+    let body = render_action_snapshot_body("click", &result).expect("render action body");
+
+    // The action confirmation leads, then the fused snapshot body follows.
+    assert!(body.starts_with("clicked\n"));
+    assert!(body.contains("title: Checkout"));
+    assert!(body.contains("@e1 button button \"Pay now\""));
+}
+
+#[test]
+fn action_snapshot_body_degrades_to_confirmation_when_snapshot_absent() {
+    // post_action_snapshot degraded to base (snapshot failed): no url/elements.
+    let result = serde_json::json!({ "ok": true });
+    let body = render_action_snapshot_body("click", &result).expect("render action body");
+    assert_eq!(body, "clicked\n");
+}
+
+#[test]
+fn action_snapshot_body_surfaces_hosted_fill_note() {
+    // The hosted/in-frame fill note (#633/#656) must reach an agent reading CLI
+    // output, not only `--json`.
+    let result = serde_json::json!({
+        "ok": true,
+        "mode": "hostedFrame",
+        "note": "confirm via the page's own field validation"
+    });
+    let body = render_action_snapshot_body("fill", &result).expect("render action body");
+    assert!(body.contains("filled"));
+    assert!(body.contains("note: confirm via the page's own field validation"));
+}
+
+#[test]
 fn redact_internal_fields_removes_backend_session_ids() {
     let value = redact_internal_fields(serde_json::json!({
         "tabId": "t1",

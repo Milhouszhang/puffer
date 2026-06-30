@@ -15,6 +15,7 @@ use crate::{browser, files, fs_watch, local_model, lsp, media_capabilities, pty}
 use anyhow::{anyhow, bail, Context, Result};
 use base64::prelude::*;
 use puffer_config::{builtin_captcha_solvers, ConfigPaths};
+use puffer_core::command_surface;
 use puffer_media::{
     discover_exact_media_capabilities, generate_exact_media_with_cache,
     generated_media_timeline_attachments, read_generated_media_preview_by_artifact,
@@ -185,6 +186,12 @@ impl BackendState {
                 ))
             }
             "load_settings_snapshot" => serde_value(self.load_settings_snapshot()?),
+            "list_command_surface" => serde_value(self.list_command_surface()?),
+            "list_workspace_mentions" => serde_value(files::list_workspace_mentions(
+                &params,
+                &self.allowed_roots()?,
+                &self.default_workspace()?,
+            )?),
             "login_with_oauth" => serde_value(self.load_settings_snapshot()?),
             "login_with_api_key" => {
                 let provider_id = string_param(&params, &["providerId", "provider_id"])?;
@@ -759,6 +766,15 @@ impl BackendState {
             browser: legacy_browser_settings(&home),
             secrets: self.secret_settings(&home)?,
         })
+    }
+
+    fn list_command_surface(&self) -> Result<Vec<puffer_core::CommandSpec>> {
+        let paths = ConfigPaths::discover(self.default_workspace()?);
+        let resources = load_resources(&paths, &puffer_runner_local::LocalToolRunner::new())?;
+        Ok(command_surface(&resources)
+            .into_iter()
+            .filter(|command| !command.hidden)
+            .collect())
     }
 
     fn save_secret(&self, params: Value) -> Result<()> {

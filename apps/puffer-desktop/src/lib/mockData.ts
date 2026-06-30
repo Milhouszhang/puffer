@@ -712,6 +712,29 @@ export const mockSettingsSnapshot: SettingsSnapshot = {
     proxies: [],
     lastTest: null
   },
+  remote: {
+    defaultTarget: null,
+    sshHosts: [],
+    agentenv: {
+      enabled: false,
+      apiUrl: "https://api.agentenv.io",
+      runnerHost: null,
+      workspace: null,
+      credentialSecretId: null,
+      hasCredential: false,
+      authMethod: "api_key",
+      defaults: {
+        sandboxType: "small",
+        image: "python:3.11-slim",
+        region: null,
+        cpuMillis: null,
+        memoryMb: null,
+        gpuCount: 0,
+        gpuType: null,
+        maxLifetimeSeconds: null
+      }
+    }
+  },
   secrets: {
     storeFile: "/home/c/.puffer/secrets.json",
     keySource: "local-key-file",

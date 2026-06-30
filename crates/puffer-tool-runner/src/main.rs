@@ -30,6 +30,11 @@ struct Args {
     /// Working directory for tool execution. Also added to the sandbox roots.
     #[arg(long)]
     cwd: Option<PathBuf>,
+
+    /// Directory for durable completed request replay by request_id.
+    /// Defaults to <cwd>/.puffer/tool-runner/idempotency.
+    #[arg(long)]
+    idempotency_dir: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -45,6 +50,12 @@ async fn main() -> Result<()> {
 
     let (service, mcp_count) = build_service_from_cwd(&cwd, token.clone())
         .with_context(|| format!("build tool runner service for {}", cwd.display()))?;
+    let idempotency_dir = args
+        .idempotency_dir
+        .unwrap_or_else(|| cwd.join(".puffer/tool-runner/idempotency"));
+    let service = service
+        .with_idempotency_dir(&idempotency_dir)
+        .with_context(|| format!("open idempotency directory {}", idempotency_dir.display()))?;
 
     if mcp_count == 0 {
         eprintln!(

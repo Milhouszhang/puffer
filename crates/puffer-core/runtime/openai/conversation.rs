@@ -1120,6 +1120,41 @@ pub(crate) fn compact_conversation_with(
     input_tokens_hint: Option<usize>,
     summary_fn: &dyn Fn(&str, &str) -> Option<String>,
 ) -> bool {
+    compact_conversation_inner(items, provider, model_id, input_tokens_hint, summary_fn, false)
+}
+
+/// Like [`compact_conversation_with`] but ignores the context-window
+/// threshold and always attempts to shrink the transcript.
+///
+/// Reactive context-overflow recovery uses this. When an endpoint rejects
+/// a request as too large (e.g. an OpenAI-compatible proxy whose real
+/// window is smaller than the model catalog's `context_window`), the
+/// threshold-gated [`compact_conversation_with`] no-ops because the
+/// estimated token count is below the catalog-derived threshold. Forcing
+/// past the threshold shrinks the transcript so the turn can be retried.
+pub(crate) fn force_compact_conversation_with(
+    items: &mut Vec<ConversationItem>,
+    provider: &ProviderDescriptor,
+    model_id: &str,
+    summary_fn: &dyn Fn(&str, &str) -> Option<String>,
+) -> bool {
+    compact_conversation_inner(items, provider, model_id, None, summary_fn, true)
+}
+
+/// Shared implementation for threshold-gated and forced compaction.
+///
+/// When `force` is true the two context-window threshold early-returns are
+/// skipped and the Phase 3 drop loop targets an empty transcript, so a
+/// compaction always happens regardless of the catalog window. Phase 2
+/// (AI summary) is unaffected and remains the primary reducer either way.
+fn compact_conversation_inner(
+    items: &mut Vec<ConversationItem>,
+    provider: &ProviderDescriptor,
+    model_id: &str,
+    input_tokens_hint: Option<usize>,
+    summary_fn: &dyn Fn(&str, &str) -> Option<String>,
+    force: bool,
+) -> bool {
     if items.len() <= 3 {
         return false;
     }
@@ -1140,7 +1175,7 @@ pub(crate) fn compact_conversation_with(
     };
 
     let current_tokens = input_tokens_hint.unwrap_or_else(|| estimate(items));
-    if current_tokens <= threshold {
+    if !force && current_tokens <= threshold {
         return false;
     }
 
@@ -1164,7 +1199,7 @@ pub(crate) fn compact_conversation_with(
     } else {
         estimate(items)
     };
-    if after_snip <= threshold {
+    if !force && after_snip <= threshold {
         return false;
     }
 
@@ -1189,9 +1224,13 @@ pub(crate) fn compact_conversation_with(
         }
     }
 
-    // Phase 3 (fallback): Drop oldest items with circuit breaker.
+    // Phase 3 (fallback): Drop oldest items with circuit breaker. Under
+    // `force` the catalog threshold is meaningless (the endpoint's real
+    // window is smaller), so drop toward an empty transcript instead —
+    // the circuit breaker still bounds how many we shed per pass.
+    let phase3_target = if force { 0 } else { threshold };
     let mut cycles = 0;
-    while items.len() > 3 && estimate(items) > threshold && cycles < MAX_COMPACT_CYCLES {
+    while items.len() > 3 && estimate(items) > phase3_target && cycles < MAX_COMPACT_CYCLES {
         items.remove(0);
         cycles += 1;
     }
@@ -2143,6 +2182,69 @@ mod tests {
         let compacted = compact_conversation(&mut items, &provider, "gpt-5", &config, None);
         assert!(!compacted);
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn force_compact_runs_below_threshold_via_summary() {
+        // A transcript far below the catalog threshold: the normal
+        // threshold-gated path no-ops, but the forced path (reactive
+        // context-overflow recovery) must still compact.
+        let provider = test_provider(1_041_920, 16_384); // gpt-5.5-sized window
+        let summarize = |_old: &str, _mid: &str| Some("PRIOR CONTEXT SUMMARY".to_string());
+        let make = || {
+            let mut v = Vec::new();
+            for i in 0..8 {
+                v.push(ConversationItem::user_message(format!("user {i}")));
+                v.push(ConversationItem::assistant_message(format!("assistant {i}")));
+            }
+            v
+        };
+
+        // Baseline: threshold-gated compaction is a no-op here.
+        let mut items = make();
+        let before = items.len();
+        assert!(!compact_conversation_with(
+            &mut items, &provider, "gpt-5", None, &summarize
+        ));
+        assert_eq!(items.len(), before);
+
+        // Forced: compaction happens despite being far below threshold.
+        let mut items = make();
+        assert!(force_compact_conversation_with(
+            &mut items, &provider, "gpt-5", &summarize
+        ));
+        assert!(
+            items.len() < before,
+            "forced compaction must shrink the transcript"
+        );
+        assert!(
+            matches!(
+                items.first(),
+                Some(ConversationItem::Message { .. } | ConversationItem::Compaction { .. })
+            ),
+            "kept transcript must start with a Message/Compaction to stay valid"
+        );
+    }
+
+    #[test]
+    fn force_compact_falls_back_to_dropping_when_summary_unavailable() {
+        // When summary generation fails, force mode must still shrink via
+        // the Phase 3 drop loop (otherwise threshold-gated to a no-op).
+        let provider = test_provider(1_041_920, 16_384);
+        let summarize = |_old: &str, _mid: &str| None;
+        let mut items = Vec::new();
+        for i in 0..8 {
+            items.push(ConversationItem::user_message(format!("user {i}")));
+            items.push(ConversationItem::assistant_message(format!("assistant {i}")));
+        }
+        let before = items.len();
+        assert!(force_compact_conversation_with(
+            &mut items, &provider, "gpt-5", &summarize
+        ));
+        assert!(
+            items.len() < before,
+            "drop fallback must shed items under force"
+        );
     }
 
     #[test]

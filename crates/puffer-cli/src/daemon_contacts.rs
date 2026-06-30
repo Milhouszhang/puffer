@@ -6,12 +6,14 @@ use puffer_config::ConfigPaths;
 use puffer_subscriptions::{
     connector_slug_accepts_contact_id, contact_display_name_from_payload, contact_id_prefix,
     contact_ids_from_payload, normalize_contact_id, normalize_contact_ids, ConnectorContact,
-    ContactContext, SavedContact,
+    ContactContext, ContactDisplay, SavedContact,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::info;
 use uuid::Uuid;
 
 #[path = "daemon_contacts_infer.rs"]
@@ -34,7 +36,7 @@ use daemon_contacts_store::{
 };
 use daemon_contacts_telegram::{
     collect_telegram_candidates, read_telegram_peer_avatars, read_telegram_peer_names,
-    recent_telegram_contacts, refresh_telegram_peer_caches,
+    recent_telegram_contacts, refresh_telegram_peer_caches, telegram_contact_picker_ready,
 };
 use daemon_contacts_trace::ContactInferTrace;
 
@@ -64,10 +66,32 @@ pub(crate) fn cached_telegram_peer_names(paths: &ConfigPaths) -> HashMap<String,
 struct Candidate {
     id: String,
     name: Option<String>,
+    public_username: Option<String>,
     avatar: Option<String>,
     score: f64,
     last_message_at_ms: Option<i128>,
     context: Vec<ContactContext>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidatePage {
+    candidates: Vec<ConnectorContact>,
+    candidate_count: usize,
+    has_more: bool,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ContactCursor {
+    Score {
+        score_bits: u64,
+        id: String,
+    },
+    Recent {
+        last_message_at_ms: Option<i128>,
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -141,25 +165,59 @@ pub(crate) fn handle_contacts_list(paths: &ConfigPaths, params: &Value) -> Resul
     let proposals = load_proposals(paths)?;
     let mut saved = filtered_saved_contacts(store.contacts, query);
     enrich_saved_contact_avatars(paths, &mut saved);
-    let (candidates, ready) = if is_recent_telegram_request(&params) {
+    let recent_request = is_recent_telegram_request(&params);
+    let (page, ready) = if recent_request {
         let mut snapshot = recent_telegram_contacts(paths, limit)?;
         reject_bot_candidates(&mut snapshot.candidates);
         (
-            snapshot
-                .candidates
-                .into_iter()
-                .map(Candidate::into_preview_contact)
-                .collect(),
+            paginate_recent_candidates(snapshot.candidates, limit, params.cursor.as_deref())?,
             snapshot.ready,
         )
     } else {
-        (filtered_candidates(paths, limit, query)?, true)
+        let ready = if query.is_some() {
+            true
+        } else {
+            telegram_contact_picker_ready(paths, limit)?
+        };
+        (
+            filtered_candidates(paths, limit, params.cursor.as_deref(), query)?,
+            ready,
+        )
     };
+    let returned_count = page.candidates.len();
+    info!(
+        path = if recent_request {
+            "telegram_recent"
+        } else if query.is_some() {
+            "generic_search"
+        } else {
+            "generic"
+        },
+        connector = params.connector.as_deref().unwrap_or(""),
+        sort = params.sort.as_deref().unwrap_or(""),
+        limit,
+        cursor_present = params
+            .cursor
+            .as_deref()
+            .is_some_and(|cursor| !cursor.trim().is_empty()),
+        query_present = query.is_some(),
+        ready,
+        returned_count,
+        candidate_count = page.candidate_count,
+        has_more = page.has_more,
+        "contacts_list snapshot"
+    );
+    let candidates = page.candidates;
     Ok(json!({
         "contacts": saved,
         "candidates": candidates,
         "proposals": proposals,
         "ready": ready,
+        "limit": limit,
+        "returned_count": returned_count,
+        "candidate_count": page.candidate_count,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
     }))
 }
 
@@ -177,11 +235,19 @@ pub(crate) fn handle_contacts_search(paths: &ConfigPaths, params: &Value) -> Res
     let proposals = load_proposals(paths)?;
     let mut saved = filtered_saved_contacts(store.contacts, query);
     enrich_saved_contact_avatars(paths, &mut saved);
-    let candidates = searched_candidates(paths, limit, query)?;
+    let page = searched_candidates(paths, limit, params.cursor.as_deref(), query)?;
+    let returned_count = page.candidates.len();
+    let candidates = page.candidates;
     Ok(json!({
         "contacts": saved,
         "candidates": candidates,
         "proposals": proposals,
+        "ready": true,
+        "limit": limit,
+        "returned_count": returned_count,
+        "candidate_count": page.candidate_count,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
     }))
 }
 
@@ -381,8 +447,9 @@ pub(crate) fn handle_contacts_infer(state: &DaemonState, params: &Value) -> Resu
 fn filtered_candidates(
     paths: &ConfigPaths,
     limit: usize,
+    cursor: Option<&str>,
     query: Option<&str>,
-) -> Result<Vec<ConnectorContact>> {
+) -> Result<CandidatePage> {
     let mut candidates = ranked_candidates(paths, CandidateContextOptions::none())?;
     if let Some(query) = query {
         let query = query.to_ascii_lowercase();
@@ -396,20 +463,17 @@ fn filtered_candidates(
                     .contains(&query)
         });
     }
-    candidates.truncate(limit);
-    Ok(candidates
-        .into_iter()
-        .map(Candidate::into_preview_contact)
-        .collect())
+    paginate_score_candidates(candidates, limit, cursor)
 }
 
 fn searched_candidates(
     paths: &ConfigPaths,
     limit: usize,
+    cursor: Option<&str>,
     query: Option<&str>,
-) -> Result<Vec<ConnectorContact>> {
+) -> Result<CandidatePage> {
     let Some(query) = query else {
-        return filtered_candidates(paths, limit, None);
+        return filtered_candidates(paths, limit, cursor, None);
     };
     let mut by_id: HashMap<String, Candidate> = HashMap::new();
     let context_options = CandidateContextOptions::none();
@@ -436,11 +500,135 @@ fn searched_candidates(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| left.id.cmp(&right.id))
     });
-    candidates.truncate(limit);
-    Ok(candidates
+    paginate_score_candidates(candidates, limit, cursor)
+}
+
+fn paginate_score_candidates(
+    candidates: Vec<Candidate>,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<CandidatePage> {
+    let cursor = parse_contact_cursor(cursor)?;
+    if cursor
+        .as_ref()
+        .is_some_and(|cursor| !matches!(cursor, ContactCursor::Score { .. }))
+    {
+        anyhow::bail!("contact cursor does not match score-sorted contacts");
+    }
+    paginate_candidates(
+        candidates,
+        limit,
+        cursor.as_ref(),
+        score_candidate_after_cursor,
+        |candidate| ContactCursor::Score {
+            score_bits: candidate.score.to_bits(),
+            id: candidate.id.clone(),
+        },
+    )
+}
+
+fn paginate_recent_candidates(
+    candidates: Vec<Candidate>,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<CandidatePage> {
+    let cursor = parse_contact_cursor(cursor)?;
+    if cursor
+        .as_ref()
+        .is_some_and(|cursor| !matches!(cursor, ContactCursor::Recent { .. }))
+    {
+        anyhow::bail!("contact cursor does not match recent Telegram contacts");
+    }
+    paginate_candidates(
+        candidates,
+        limit,
+        cursor.as_ref(),
+        recent_candidate_after_cursor,
+        |candidate| ContactCursor::Recent {
+            last_message_at_ms: candidate.last_message_at_ms,
+            id: candidate.id.clone(),
+        },
+    )
+}
+
+fn paginate_candidates<F, G>(
+    candidates: Vec<Candidate>,
+    limit: usize,
+    cursor: Option<&ContactCursor>,
+    after_cursor: F,
+    cursor_for: G,
+) -> Result<CandidatePage>
+where
+    F: Fn(&Candidate, &ContactCursor) -> bool,
+    G: Fn(&Candidate) -> ContactCursor,
+{
+    let candidate_count = candidates.len();
+    let mut page_candidates = candidates
         .into_iter()
-        .map(Candidate::into_preview_contact)
-        .collect())
+        .filter(|candidate| cursor.map_or(true, |cursor| after_cursor(candidate, cursor)))
+        .take(limit.saturating_add(1))
+        .collect::<Vec<_>>();
+    let has_more = page_candidates.len() > limit;
+    if has_more {
+        page_candidates.truncate(limit);
+    }
+    let next_cursor = if has_more {
+        page_candidates
+            .last()
+            .map(cursor_for)
+            .map(|cursor| serde_json::to_string(&cursor))
+            .transpose()
+            .context("serialize contact cursor")?
+    } else {
+        None
+    };
+    Ok(CandidatePage {
+        candidates: page_candidates
+            .into_iter()
+            .map(Candidate::into_preview_contact)
+            .collect(),
+        candidate_count,
+        has_more,
+        next_cursor,
+    })
+}
+
+fn parse_contact_cursor(cursor: Option<&str>) -> Result<Option<ContactCursor>> {
+    let Some(cursor) = cursor.map(str::trim).filter(|cursor| !cursor.is_empty()) else {
+        return Ok(None);
+    };
+    serde_json::from_str(cursor).context("invalid contact cursor")
+}
+
+fn score_candidate_after_cursor(candidate: &Candidate, cursor: &ContactCursor) -> bool {
+    let ContactCursor::Score { score_bits, id } = cursor else {
+        return false;
+    };
+    let cursor_score = f64::from_bits(*score_bits);
+    match candidate
+        .score
+        .partial_cmp(&cursor_score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+    {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Equal => candidate.id.as_str() > id.as_str(),
+        std::cmp::Ordering::Greater => false,
+    }
+}
+
+fn recent_candidate_after_cursor(candidate: &Candidate, cursor: &ContactCursor) -> bool {
+    let ContactCursor::Recent {
+        last_message_at_ms,
+        id,
+    } = cursor
+    else {
+        return false;
+    };
+    match candidate.last_message_at_ms.cmp(last_message_at_ms) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Equal => candidate.id.as_str() > id.as_str(),
+        std::cmp::Ordering::Greater => false,
+    }
 }
 
 fn filtered_saved_contacts(
@@ -605,9 +793,11 @@ fn merge_connector_contacts(
         if !connector_slug_accepts_contact_id(connector_slug, &id) {
             continue;
         }
+        let public_username = connector_contact_public_username(&contact, &id);
         let entry = by_id.entry(id.clone()).or_insert_with(|| Candidate {
             id: id.clone(),
             name: contact.name.clone().or_else(|| Some(id.clone())),
+            public_username: public_username.clone(),
             avatar: contact.avatar.clone(),
             score: 0.0,
             last_message_at_ms: contact.last_message_at_ms,
@@ -621,6 +811,7 @@ fn merge_connector_contacts(
         if entry.name.is_none() {
             entry.name = contact.name;
         }
+        merge_candidate_public_username(&mut entry.public_username, public_username.as_deref());
         if entry.avatar.is_none() {
             entry.avatar = contact.avatar;
         }
@@ -692,12 +883,17 @@ fn merge_history_candidate_run(
         let entry = by_id.entry(id.clone()).or_insert_with(|| Candidate {
             id: id.clone(),
             name: candidate_name.clone().or_else(|| Some(id.clone())),
+            public_username: public_username_from_contact_id(&id),
             avatar: candidate_avatar.clone(),
             score: 0.0,
             last_message_at_ms: timestamp_ms,
             context: Vec::new(),
         });
         merge_candidate_name(&mut entry.name, candidate_name.as_deref());
+        merge_candidate_public_username(
+            &mut entry.public_username,
+            public_username_from_contact_id(&id).as_deref(),
+        );
         merge_candidate_last_message_at_ms(&mut entry.last_message_at_ms, timestamp_ms);
         if entry.avatar.is_none() {
             entry.avatar = candidate_avatar;
@@ -821,6 +1017,16 @@ fn candidate_name_is_more_complete(existing: Option<&str>, candidate: &str) -> b
     let candidate_parts = candidate.split_whitespace().count();
     candidate_parts > existing_parts
         || (candidate_parts == existing_parts && candidate.len() > existing.len())
+}
+
+pub(super) fn merge_candidate_public_username(
+    existing: &mut Option<String>,
+    candidate: Option<&str>,
+) {
+    if existing.is_some() {
+        return;
+    }
+    *existing = candidate.and_then(sanitize_public_username);
 }
 
 fn merge_candidate_last_message_at_ms(existing: &mut Option<i128>, candidate: Option<i128>) {
@@ -1035,12 +1241,80 @@ fn days_since(timestamp_ms: i128) -> f64 {
     (delta as f64) / (DAY_MS as f64)
 }
 
+fn connector_contact_public_username(contact: &ConnectorContact, id: &str) -> Option<String> {
+    contact
+        .display
+        .as_ref()
+        .and_then(|display| display.public_username.as_deref())
+        .and_then(sanitize_public_username)
+        .or_else(|| public_username_from_contact_id(id))
+}
+
+pub(super) fn public_username_from_contact_id(id: &str) -> Option<String> {
+    id.strip_prefix("telegram@")
+        .and_then(sanitize_public_username)
+}
+
+fn sanitize_public_username(value: &str) -> Option<String> {
+    let username = value.trim().trim_start_matches('@');
+    if username.is_empty() {
+        None
+    } else {
+        Some(username.to_string())
+    }
+}
+
+fn safe_display_name_for_candidate(candidate: &Candidate) -> Option<String> {
+    candidate
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| *value != candidate.id)
+        .filter(|value| normalize_contact_id(value).is_none())
+        .map(ToOwned::to_owned)
+}
+
+fn display_for_candidate(candidate: &Candidate) -> Option<ContactDisplay> {
+    if !candidate.id.starts_with("telegram@") && !candidate.id.starts_with("telegram-user-id@") {
+        return None;
+    }
+    let name = safe_display_name_for_candidate(candidate);
+    let public_username = candidate
+        .public_username
+        .as_deref()
+        .and_then(sanitize_public_username)
+        .or_else(|| public_username_from_contact_id(&candidate.id));
+    let username_label = public_username
+        .as_ref()
+        .map(|username| format!("@{username}"));
+    let label = name
+        .clone()
+        .or_else(|| username_label.clone())
+        .unwrap_or_else(|| "Telegram contact".to_string());
+    let unavailable_reason = match (name.is_some(), public_username.is_some()) {
+        (true, true) => None,
+        (true, false) => Some("no_public_username".to_string()),
+        (false, true) => None,
+        (false, false) => Some("display_identity_unavailable".to_string()),
+    };
+    Some(ContactDisplay {
+        label,
+        name,
+        public_username,
+        username_label,
+        unavailable_reason,
+    })
+}
+
 impl Candidate {
     fn into_contact(self) -> ConnectorContact {
+        let display = display_for_candidate(&self);
         ConnectorContact {
             id: self.id,
             avatar: self.avatar,
             name: self.name,
+            display,
             context: self.context,
             score: self.score,
             last_message_at_ms: self.last_message_at_ms,
@@ -1048,10 +1322,12 @@ impl Candidate {
     }
 
     fn into_preview_contact(self) -> ConnectorContact {
+        let display = display_for_candidate(&self);
         ConnectorContact {
             id: self.id,
             avatar: None,
             name: self.name,
+            display,
             context: Vec::new(),
             score: self.score,
             last_message_at_ms: self.last_message_at_ms,

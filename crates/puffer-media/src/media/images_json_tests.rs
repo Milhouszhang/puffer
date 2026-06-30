@@ -114,6 +114,8 @@ fn per_image_batch() -> MediaBatchDescriptor {
     MediaBatchDescriptor {
         mode: MediaBatchMode::PerImage,
         max_images_per_call: None,
+        count_field: None,
+        count_field_parent: None,
     }
 }
 
@@ -121,7 +123,75 @@ fn exact_batch(limit: u8) -> MediaBatchDescriptor {
     MediaBatchDescriptor {
         mode: MediaBatchMode::Exact,
         max_images_per_call: Some(limit),
+        count_field: None,
+        count_field_parent: None,
     }
+}
+
+#[test]
+fn to_body_grouped_emits_nested_count_and_suppresses_n() {
+    let mut parameters = BTreeMap::new();
+    parameters.insert(
+        "sequential_image_generation".to_string(),
+        "auto".to_string(),
+    );
+    let recipe = GroupedCountRecipe {
+        field: "max_images".to_string(),
+        parent: Some("sequential_image_generation_options".to_string()),
+    };
+    let body = ImagesJsonRequest::new("seedream-4-5", "three portraits", parameters, 6, Some(recipe))
+        .to_body();
+
+    assert_eq!(
+        body["sequential_image_generation_options"]["max_images"],
+        json!(6)
+    );
+    assert!(body.get("n").is_none());
+    assert_eq!(body["sequential_image_generation"], json!("auto"));
+}
+
+#[test]
+fn to_body_non_grouped_unchanged() {
+    let body = ImagesJsonRequest::new("gpt-image-1", "a cat", BTreeMap::new(), 3, None).to_body();
+
+    assert_eq!(body["n"], json!(3));
+}
+
+#[test]
+fn error_chain_surfaces_underlying_transport_cause() {
+    use std::error::Error;
+    use std::fmt;
+
+    #[derive(Debug)]
+    struct Inner;
+    impl fmt::Display for Inner {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "connection closed before message completed")
+        }
+    }
+    impl Error for Inner {}
+
+    #[derive(Debug)]
+    struct Outer(Inner);
+    impl fmt::Display for Outer {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "error sending request for url (https://example.test)")
+        }
+    }
+    impl Error for Outer {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    let message = error_chain(&Outer(Inner));
+
+    // Top-level reqwest-style message is kept, AND the real cause is appended.
+    assert!(message.contains("error sending request for url"), "{message}");
+    assert!(
+        message.contains("connection closed before message completed"),
+        "{message}"
+    );
 }
 
 fn sequential_generation_parameter() -> Axis {

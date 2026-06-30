@@ -6,8 +6,16 @@ use super::*;
 use grammers_session::Session;
 use puffer_config::ConfigPaths;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
+
+const TELEGRAM_CONTACT_PICKER_CONTRACT_FIXTURE: &str =
+    include_str!("../../../fixtures/contact-contracts/telegram-contact-picker-readiness.json");
+// Contract changes must update the fixture in both puffer and bobo, then
+// update this hash deliberately; do not bypass drift by changing only the hash.
+const TELEGRAM_CONTACT_PICKER_CONTRACT_SHA256: &str =
+    "b53900dd5cd571aa01dd21ea90ac5dd78357cec146b6b04f130121bc6fd8b0b1";
 
 #[test]
 fn telegram_candidates_require_private_users_and_ignore_bots_groups() {
@@ -321,6 +329,7 @@ fn inference_sampling_keeps_top_contacts_per_prefix() {
         candidates.push(Candidate {
             id: format!("telegram@user{index}"),
             name: None,
+            public_username: None,
             avatar: None,
             score: 100.0 - index as f64,
             last_message_at_ms: None,
@@ -331,6 +340,7 @@ fn inference_sampling_keeps_top_contacts_per_prefix() {
         candidates.push(Candidate {
             id: format!("google@user{index}@example.com"),
             name: None,
+            public_username: None,
             avatar: None,
             score: 10.0 - index as f64,
             last_message_at_ms: None,
@@ -364,6 +374,7 @@ fn inference_sampling_excludes_bot_candidates() {
         Candidate {
             id: "telegram@alertbot".to_string(),
             name: Some("Alert Bot".to_string()),
+            public_username: None,
             avatar: None,
             score: 100.0,
             last_message_at_ms: None,
@@ -372,6 +383,7 @@ fn inference_sampling_excludes_bot_candidates() {
         Candidate {
             id: "google@support-bot@example.com".to_string(),
             name: Some("Support Bot".to_string()),
+            public_username: None,
             avatar: None,
             score: 90.0,
             last_message_at_ms: None,
@@ -380,6 +392,7 @@ fn inference_sampling_excludes_bot_candidates() {
         Candidate {
             id: "telegram@alice".to_string(),
             name: Some("Alice".to_string()),
+            public_username: None,
             avatar: None,
             score: 80.0,
             last_message_at_ms: None,
@@ -598,6 +611,14 @@ fn contacts_list_prefers_telegram_peer_cache_names() {
         .unwrap();
 
     assert_eq!(candidate["name"], "Rin Tohsaka");
+    assert_eq!(candidate["display"]["label"], "Rin Tohsaka");
+    assert_eq!(candidate["display"]["name"], "Rin Tohsaka");
+    assert_eq!(candidate["display"]["public_username"], "tohsakar_in");
+    assert_eq!(candidate["display"]["username_label"], "@tohsakar_in");
+    assert!(
+        !candidate["display"].to_string().contains("37253512"),
+        "{candidate:#}"
+    );
     assert!(candidate.get("avatar").is_none(), "{candidate:#}");
 
     let search = handle_contacts_search(&paths, &json!({ "query": "rin", "limit": 10 })).unwrap();
@@ -772,6 +793,487 @@ fn telegram_peer_cache_user(id: i64, title: &str, last_message_at_ms: i64) -> Va
     })
 }
 
+fn write_telegram_peer_cache(account_dir: &Path, count: usize, label: &str) {
+    std::fs::write(
+        account_dir.join("peer-cache.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "peers": (1..=count)
+                .map(|id| telegram_peer_cache_user(
+                    id as i64,
+                    &format!("{label} {id:03}"),
+                    1_700_000_000_000_i64 + id as i64,
+                ))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn read_recent_dialog_cache_marker(account_dir: &Path) -> Value {
+    serde_json::from_slice(&std::fs::read(account_dir.join("recent-dialog-cache.json")).unwrap())
+        .unwrap()
+}
+
+fn telegram_contact_picker_contract_fixture() -> Value {
+    serde_json::from_str(TELEGRAM_CONTACT_PICKER_CONTRACT_FIXTURE).unwrap()
+}
+
+#[test]
+fn telegram_contact_picker_contract_fixture_checksum_is_pinned() {
+    let checksum = Sha256::digest(TELEGRAM_CONTACT_PICKER_CONTRACT_FIXTURE.as_bytes());
+
+    assert_eq!(
+        format!("{checksum:x}"),
+        TELEGRAM_CONTACT_PICKER_CONTRACT_SHA256
+    );
+}
+
+#[test]
+fn contacts_list_ignores_stale_delivery_cursor_for_recent_readiness() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_config_paths(temp.path());
+    let account_dir = paths
+        .user_config_dir
+        .join("telegram-accounts")
+        .join("telegram-user");
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(
+        account_dir.join("delivery-cursor.json"),
+        serde_json::to_vec_pretty(&json!({ "initialized": true })).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        account_dir.join("peer-cache.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "peers": (1..=5)
+                .map(|id| telegram_peer_cache_user(
+                    id,
+                    &format!("Partial Contact {id}"),
+                    1_700_000_000_000_i64 + id,
+                ))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let cold = handle_contacts_list(
+        &paths,
+        &json!({ "connector": "telegram", "sort": "recent", "limit": 50 }),
+    )
+    .unwrap();
+
+    assert_eq!(cold["ready"], false);
+    assert_eq!(cold["candidate_count"], 5);
+
+    super::daemon_contacts_telegram::write_test_recent_dialog_cache_marker(&account_dir, 18, 50)
+        .unwrap();
+    let partial_marker = read_recent_dialog_cache_marker(&account_dir);
+    assert_eq!(partial_marker["ready"], true);
+    assert_eq!(partial_marker["direct_users_seen"], 18);
+    assert_eq!(partial_marker["target"], 50);
+    assert_eq!(partial_marker["dialogs_exhausted"], false);
+    std::fs::write(
+        account_dir.join("peer-cache.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "peers": (1..=18)
+                .map(|id| telegram_peer_cache_user(
+                    id,
+                    &format!("Partial Contact {id}"),
+                    1_700_000_000_000_i64 + id,
+                ))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let partial = handle_contacts_list(
+        &paths,
+        &json!({ "connector": "telegram", "sort": "recent", "limit": 50 }),
+    )
+    .unwrap();
+
+    assert_eq!(partial["ready"], false);
+    assert_eq!(partial["candidate_count"], 18);
+
+    super::daemon_contacts_telegram::write_test_recent_dialog_cache_marker(&account_dir, 50, 50)
+        .unwrap();
+    let complete_marker = read_recent_dialog_cache_marker(&account_dir);
+    assert_eq!(complete_marker["ready"], true);
+    assert_eq!(complete_marker["direct_users_seen"], 50);
+    assert_eq!(complete_marker["target"], 50);
+    assert_eq!(complete_marker["dialogs_exhausted"], false);
+    std::fs::write(
+        account_dir.join("peer-cache.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "peers": (1..=50)
+                .map(|id| telegram_peer_cache_user(
+                    id,
+                    &format!("Complete Contact {id}"),
+                    1_700_000_000_000_i64 + id,
+                ))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let complete = handle_contacts_list(
+        &paths,
+        &json!({ "connector": "telegram", "sort": "recent", "limit": 50 }),
+    )
+    .unwrap();
+
+    assert_eq!(complete["ready"], true);
+    assert_eq!(complete["candidate_count"], 50);
+}
+
+#[test]
+fn contacts_list_rehydrates_recent_cache_when_marker_claims_partial_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_config_paths(temp.path());
+    let account_dir = paths
+        .user_config_dir
+        .join("telegram-accounts")
+        .join("telegram-user");
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(account_dir.join("telegram.session"), b"fake-session").unwrap();
+    super::daemon_contacts_telegram::write_test_recent_dialog_cache_marker(&account_dir, 18, 50)
+        .unwrap();
+    let partial_marker = read_recent_dialog_cache_marker(&account_dir);
+    assert_eq!(partial_marker["ready"], true);
+    assert_eq!(partial_marker["direct_users_seen"], 18);
+    assert_eq!(partial_marker["target"], 50);
+    assert_eq!(partial_marker["dialogs_exhausted"], false);
+    std::fs::write(
+        account_dir.join("peer-cache.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "peers": (1..=18)
+                .map(|id| telegram_peer_cache_user(
+                    id,
+                    &format!("Partial Contact {id}"),
+                    1_700_000_000_000_i64 + id,
+                ))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let _guard = super::daemon_contacts_telegram::install_test_telegram_peer_cache_hydrator({
+        let calls = std::sync::Arc::clone(&calls);
+        move |_paths, account_dir| {
+            *calls.lock().unwrap() += 1;
+            super::daemon_contacts_telegram::write_test_recent_dialog_cache_marker(
+                account_dir,
+                50,
+                50,
+            )
+            .unwrap();
+            std::fs::write(
+                account_dir.join("peer-cache.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "version": 1,
+                    "peers": (1..=50)
+                        .map(|id| telegram_peer_cache_user(
+                            id,
+                            &format!("Complete Contact {id}"),
+                            1_700_000_000_000_i64 + id,
+                        ))
+                        .collect::<Vec<_>>()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            Ok(())
+        }
+    });
+
+    let result = handle_contacts_list(
+        &paths,
+        &json!({ "connector": "telegram", "sort": "recent", "limit": 50 }),
+    )
+    .unwrap();
+
+    assert_eq!(*calls.lock().unwrap(), 1);
+    assert_eq!(result["ready"], true);
+    assert_eq!(result["candidate_count"], 50);
+}
+
+#[test]
+fn contacts_list_generic_telegram_reports_not_ready_for_partial_dialog_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_config_paths(temp.path());
+    let account_dir = paths
+        .user_config_dir
+        .join("telegram-accounts")
+        .join("telegram-user");
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(account_dir.join("telegram.session"), b"fake-session").unwrap();
+    super::daemon_contacts_telegram::write_test_recent_dialog_cache_marker(&account_dir, 18, 120)
+        .unwrap();
+    std::fs::write(
+        account_dir.join("peer-cache.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "peers": (1..=18)
+                .map(|id| telegram_peer_cache_user(
+                    id,
+                    &format!("Partial Contact {id}"),
+                    1_700_000_000_000_i64 + id,
+                ))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let result = handle_contacts_list(&paths, &json!({ "limit": 120 })).unwrap();
+
+    assert_eq!(result["ready"], false);
+    assert_eq!(result["candidate_count"], 18);
+}
+
+#[test]
+fn contacts_list_generic_telegram_ignores_stale_account_dir_without_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_config_paths(temp.path());
+    let account_dir = paths
+        .user_config_dir
+        .join("telegram-accounts")
+        .join("telegram-user");
+    std::fs::create_dir_all(&account_dir).unwrap();
+    super::daemon_contacts_telegram::write_test_recent_dialog_cache_marker(&account_dir, 18, 120)
+        .unwrap();
+
+    let result = handle_contacts_list(&paths, &json!({ "limit": 120 })).unwrap();
+
+    assert_eq!(result["ready"], true);
+    assert_eq!(result["candidate_count"], 0);
+}
+
+#[test]
+fn contacts_list_generic_telegram_matches_readiness_contract_fixture() {
+    let fixture = telegram_contact_picker_contract_fixture();
+    let request_params = fixture
+        .get("request")
+        .and_then(|request| request.get("params"))
+        .cloned()
+        .unwrap();
+    let cases = fixture["cases"].as_array().unwrap();
+
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_config_paths(temp.path());
+        let account_dir = paths
+            .user_config_dir
+            .join("telegram-accounts")
+            .join("telegram-user");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        if case["has_session"].as_bool().unwrap_or(false) {
+            std::fs::write(account_dir.join("telegram.session"), b"fake-session").unwrap();
+        }
+        let marker = &case["marker"];
+        let seen = marker["direct_users_seen"].as_u64().unwrap() as usize;
+        let target = marker["target"].as_u64().unwrap() as usize;
+        if marker["dialogs_exhausted"].as_bool().unwrap_or(false) {
+            super::daemon_contacts_telegram::write_test_recent_dialog_cache_exhausted_marker(
+                &account_dir,
+                seen,
+                target,
+            )
+            .unwrap();
+        } else {
+            super::daemon_contacts_telegram::write_test_recent_dialog_cache_marker(
+                &account_dir,
+                seen,
+                target,
+            )
+            .unwrap();
+        }
+
+        let candidate_count = case["candidate_count"].as_u64().unwrap() as usize;
+        if candidate_count > 0 {
+            write_telegram_peer_cache(&account_dir, candidate_count, "Contract Contact");
+        }
+
+        let result = handle_contacts_list(&paths, &request_params).unwrap();
+        let expected = &case["expected"];
+        assert_eq!(result["ready"], expected["ready"], "{name}: ready");
+        assert_eq!(
+            result["candidate_count"], expected["candidate_count"],
+            "{name}: candidate_count"
+        );
+        assert_eq!(result["has_more"], expected["has_more"], "{name}: has_more");
+    }
+}
+
+#[test]
+fn contacts_list_generic_telegram_rehydrates_when_marker_claims_partial_page() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_config_paths(temp.path());
+    let account_dir = paths
+        .user_config_dir
+        .join("telegram-accounts")
+        .join("telegram-user");
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(account_dir.join("telegram.session"), b"fake-session").unwrap();
+    super::daemon_contacts_telegram::write_test_recent_dialog_cache_marker(&account_dir, 18, 120)
+        .unwrap();
+    std::fs::write(
+        account_dir.join("peer-cache.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "peers": (1..=18)
+                .map(|id| telegram_peer_cache_user(
+                    id,
+                    &format!("Partial Contact {id}"),
+                    1_700_000_000_000_i64 + id,
+                ))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let _guard = super::daemon_contacts_telegram::install_test_telegram_peer_cache_hydrator({
+        let calls = std::sync::Arc::clone(&calls);
+        move |_paths, account_dir| {
+            *calls.lock().unwrap() += 1;
+            super::daemon_contacts_telegram::write_test_recent_dialog_cache_marker(
+                account_dir,
+                120,
+                120,
+            )
+            .unwrap();
+            std::fs::write(
+                account_dir.join("peer-cache.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "version": 1,
+                    "peers": (1..=120)
+                        .map(|id| telegram_peer_cache_user(
+                            id,
+                            &format!("Complete Contact {id}"),
+                            1_700_000_000_000_i64 + id,
+                        ))
+                        .collect::<Vec<_>>()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            Ok(())
+        }
+    });
+
+    let result = handle_contacts_list(&paths, &json!({ "limit": 120 })).unwrap();
+
+    assert_eq!(*calls.lock().unwrap(), 1);
+    assert_eq!(result["ready"], true);
+    assert_eq!(result["candidate_count"], 120);
+}
+
+#[test]
+fn contacts_list_generic_telegram_progresses_monotonically_until_dialogs_exhausted() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_config_paths(temp.path());
+    let account_dir = paths
+        .user_config_dir
+        .join("telegram-accounts")
+        .join("telegram-user");
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(account_dir.join("telegram.session"), b"fake-session").unwrap();
+    super::daemon_contacts_telegram::write_test_recent_dialog_cache_marker(&account_dir, 18, 120)
+        .unwrap();
+    write_telegram_peer_cache(&account_dir, 18, "Partial Contact");
+
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let _guard = super::daemon_contacts_telegram::install_test_telegram_peer_cache_hydrator({
+        let calls = std::sync::Arc::clone(&calls);
+        move |_paths, account_dir| {
+            let mut calls = calls.lock().unwrap();
+            *calls += 1;
+            match *calls {
+                1 => {
+                    super::daemon_contacts_telegram::write_test_recent_dialog_cache_marker(
+                        account_dir,
+                        60,
+                        120,
+                    )
+                    .unwrap();
+                    write_telegram_peer_cache(account_dir, 60, "Progress Contact");
+                }
+                2 => {
+                    super::daemon_contacts_telegram::write_test_recent_dialog_cache_exhausted_marker(
+                        account_dir,
+                        117,
+                        120,
+                    )
+                    .unwrap();
+                    write_telegram_peer_cache(account_dir, 117, "Complete Contact");
+                }
+                extra => panic!("unexpected hydrate call {extra}"),
+            }
+            Ok(())
+        }
+    });
+
+    let first = handle_contacts_list(&paths, &json!({ "limit": 120 })).unwrap();
+    let second = handle_contacts_list(&paths, &json!({ "limit": 120 })).unwrap();
+
+    assert_eq!(*calls.lock().unwrap(), 2);
+    assert_eq!(first["ready"], false);
+    assert_eq!(first["candidate_count"], 60);
+    assert_eq!(second["ready"], true);
+    assert_eq!(second["candidate_count"], 117);
+}
+
+#[test]
+fn contacts_list_generic_telegram_ready_when_dialogs_exhausted_before_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_config_paths(temp.path());
+    let account_dir = paths
+        .user_config_dir
+        .join("telegram-accounts")
+        .join("telegram-user");
+    std::fs::create_dir_all(&account_dir).unwrap();
+    super::daemon_contacts_telegram::write_test_recent_dialog_cache_exhausted_marker(
+        &account_dir,
+        117,
+        120,
+    )
+    .unwrap();
+    std::fs::write(
+        account_dir.join("peer-cache.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "peers": (1..=117)
+                .map(|id| telegram_peer_cache_user(
+                    id,
+                    &format!("Complete Contact {id}"),
+                    1_700_000_000_000_i64 + id,
+                ))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let result = handle_contacts_list(&paths, &json!({ "limit": 120 })).unwrap();
+
+    assert_eq!(result["ready"], true);
+    assert_eq!(result["candidate_count"], 117);
+}
+
 #[test]
 fn contacts_list_repairs_recent_cache_when_service_user_consumed_target() {
     let temp = tempfile::tempdir().unwrap();
@@ -911,6 +1413,102 @@ fn contacts_refresh_forces_telegram_peer_cache_hydration_when_cache_is_non_empty
     assert!(!candidates
         .iter()
         .any(|candidate| candidate["id"] == "telegram-user-id@1"));
+}
+
+#[test]
+fn contacts_list_returns_cursor_pagination_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_config_paths(temp.path());
+    let account_dir = paths
+        .user_config_dir
+        .join("telegram-accounts")
+        .join("telegram-user");
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(
+        account_dir.join("peer-cache.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "peers": [
+                telegram_peer_cache_user(1, "Alice", 1_700_000_001_000_i64),
+                telegram_peer_cache_user(2, "Bob", 1_700_000_002_000_i64),
+                telegram_peer_cache_user(3, "Cara", 1_700_000_003_000_i64)
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let first = handle_contacts_list(&paths, &json!({ "limit": 2 })).unwrap();
+    let first_candidates = first["candidates"].as_array().unwrap();
+
+    assert_eq!(first["limit"], 2);
+    assert_eq!(first["returned_count"], 2);
+    assert_eq!(first["candidate_count"], 3);
+    assert_eq!(first["has_more"], true);
+    let cursor = first["next_cursor"].as_str().unwrap();
+    assert!(!cursor.is_empty());
+
+    let second = handle_contacts_list(&paths, &json!({ "limit": 2, "cursor": cursor })).unwrap();
+    let second_candidates = second["candidates"].as_array().unwrap();
+
+    assert_eq!(second["returned_count"], 1);
+    assert_eq!(second["candidate_count"], 3);
+    assert_eq!(second["has_more"], false);
+    assert!(second["next_cursor"].is_null());
+    assert!(first_candidates
+        .iter()
+        .all(|candidate| candidate["id"] != second_candidates[0]["id"]));
+}
+
+#[test]
+fn contacts_cursor_pagination_survives_new_candidate_ahead_of_cursor() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_config_paths(temp.path());
+    let account_dir = paths
+        .user_config_dir
+        .join("telegram-accounts")
+        .join("telegram-user");
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(
+        account_dir.join("peer-cache.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "peers": [
+                telegram_peer_cache_user(2, "Bob", 1_700_000_002_000_i64),
+                telegram_peer_cache_user(3, "Cara", 1_700_000_003_000_i64),
+                telegram_peer_cache_user(4, "Dina", 1_700_000_004_000_i64)
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let first = handle_contacts_list(&paths, &json!({ "limit": 2 })).unwrap();
+    let first_candidates = first["candidates"].as_array().unwrap();
+    assert_eq!(first_candidates[0]["id"], "telegram-user-id@2");
+    assert_eq!(first_candidates[1]["id"], "telegram-user-id@3");
+    let cursor = first["next_cursor"].as_str().unwrap();
+
+    std::fs::write(
+        account_dir.join("peer-cache.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "peers": [
+                telegram_peer_cache_user(1, "New Contact", 1_700_000_001_000_i64),
+                telegram_peer_cache_user(2, "Bob", 1_700_000_002_000_i64),
+                telegram_peer_cache_user(3, "Cara", 1_700_000_003_000_i64),
+                telegram_peer_cache_user(4, "Dina", 1_700_000_004_000_i64)
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let second = handle_contacts_list(&paths, &json!({ "limit": 2, "cursor": cursor })).unwrap();
+    let second_candidates = second["candidates"].as_array().unwrap();
+
+    assert_eq!(second_candidates.len(), 1);
+    assert_eq!(second_candidates[0]["id"], "telegram-user-id@4");
 }
 
 #[test]
@@ -1148,6 +1746,7 @@ fn read_test_message(payload: Value) -> TelegramDiagMessage {
     TelegramDiagMessage {
         contact_id: telegram_contact_id(&payload, &chat_kind).unwrap(),
         name,
+        public_username: payload_string(&payload, "chat_username"),
         avatar: None,
         destination_name,
         destination_username: payload_string(&payload, "chat_username"),

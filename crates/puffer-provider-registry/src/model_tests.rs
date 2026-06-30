@@ -585,6 +585,69 @@ fn exact_batch_requires_at_least_two_images_per_call() {
 }
 
 #[test]
+fn grouped_batch_parses_count_recipe() {
+    let yaml = provider_with_basic_image_execution(
+        "      adapter: images_json\n      path: /v1/images/generations\n      batch:\n        mode: grouped\n        max_images_per_call: 15\n        count_field: max_images\n        count_field_parent: sequential_image_generation_options",
+    );
+    let provider: ProviderDescriptor = serde_yaml::from_str(&yaml).expect("provider parses");
+    let execution = provider
+        .media
+        .as_ref()
+        .and_then(|media| media.image.as_ref())
+        .and_then(|image| image.execution.as_ref())
+        .expect("image execution");
+
+    assert_eq!(execution.batch.mode, MediaBatchMode::Grouped);
+    assert_eq!(execution.batch.max_images_per_call, Some(15));
+    assert_eq!(execution.batch.count_field.as_deref(), Some("max_images"));
+    assert_eq!(
+        execution.batch.count_field_parent.as_deref(),
+        Some("sequential_image_generation_options")
+    );
+    provider
+        .validate_media_descriptors()
+        .expect("grouped batch validates");
+}
+
+#[test]
+fn grouped_batch_rejects_empty_count_field_parent() {
+    let yaml = provider_with_basic_image_execution(
+        "      adapter: images_json\n      path: /v1/images/generations\n      batch:\n        mode: grouped\n        max_images_per_call: 9\n        count_field: max_images\n        count_field_parent: \"\"",
+    );
+    let provider: ProviderDescriptor = serde_yaml::from_str(&yaml).expect("provider parses");
+
+    let error = provider
+        .validate_media_descriptors()
+        .expect_err("empty count_field_parent must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("media.image.execution.batch.count_field_parent"),
+        "{error}"
+    );
+}
+
+#[test]
+fn grouped_batch_rejects_missing_count_field() {
+    let yaml = provider_with_basic_image_execution(
+        "      adapter: images_json\n      path: /v1/images/generations\n      batch:\n        mode: grouped\n        max_images_per_call: 9",
+    );
+    let provider: ProviderDescriptor = serde_yaml::from_str(&yaml).expect("provider parses");
+
+    let error = provider
+        .validate_media_descriptors()
+        .expect_err("grouped mode without count_field must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("media.image.execution.batch.count_field"),
+        "{error}"
+    );
+}
+
+#[test]
 fn auto_image_model_is_rejected_by_validation() {
     let yaml = provider_with_media_yaml(
         r#"

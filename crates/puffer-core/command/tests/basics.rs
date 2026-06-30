@@ -497,6 +497,7 @@ fn app_state_defaults_expose_command_state() {
             browser: puffer_config::BrowserConfig::default(),
             network: puffer_config::NetworkConfig::default(),
             media: puffer_config::MediaConfig::default(),
+            remote: puffer_config::RemoteConfig::default(),
             mascot: MascotConfig {
                 id: "clawd".to_string(),
                 display_name: "Clawd".to_string(),
@@ -682,6 +683,9 @@ fn resume_switches_to_matching_session_record() {
                 remote_session_id: None,
                 remote_session_url: None,
                 remote_session_status: None,
+                active_remote_runner_auth_token: None,
+                active_remote_runner_auth_secret_id: None,
+                active_remote_cwd: None,
                 active_team_name: None,
                 statusline_enabled: true,
                 working_dirs: vec![tempdir.path().join("secondary").display().to_string()],

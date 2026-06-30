@@ -75,6 +75,33 @@ media:
         variants: { model_id: gpt-image-1 }
 "#;
 
+const GROUPED_IMAGE_YAML: &str = r#"
+id: byteplus
+display_name: BytePlus
+base_url: https://ark.example
+default_api: openai-responses
+auth_modes: [api_key]
+media:
+  image:
+    discovery: { adapter: static }
+    execution:
+      adapter: images_json
+      path: /images/generations
+      batch:
+        mode: grouped
+        max_images_per_call: 15
+        count_field: max_images
+        count_field_parent: sequential_image_generation_options
+    models:
+      - id: seedream-4-5
+        display_name: Seedream 4.5
+        operations: [generate]
+        max_outputs: 9
+        axes:
+          - { id: size, label: Size, role: param, control: !enum { values: ["1024x1024"], default: "1024x1024" }, request_field: size }
+        variants: { model_id: seedream-4-5 }
+"#;
+
 const CANONICAL_IMAGE_YAML: &str = r#"
 id: openai
 display_name: OpenAI
@@ -223,6 +250,39 @@ fn connected_exact_image_capability_carries_axes() {
     assert_eq!(caps[0].adapter, "images_json");
     assert_eq!(caps[0].status, "available");
     assert!(caps[0].axes.iter().any(|a| a.id == "size"));
+}
+
+#[test]
+fn grouped_image_capability_reports_supports_image_set() {
+    let registry = registry_from_yaml(&[GROUPED_IMAGE_YAML]);
+    let auth = auth_for(&["byteplus"]);
+    let caps = resolve_media_capabilities(
+        &registry,
+        &auth,
+        MediaKind::Image,
+        MediaOperation::Generate,
+        0,
+        &MediaDiscoveryCache::default(),
+    );
+    let grouped = caps
+        .iter()
+        .find(|c| c.model_id == "seedream-4-5")
+        .expect("grouped image capability");
+    assert!(grouped.supports_image_set);
+}
+
+#[test]
+fn non_grouped_image_capability_does_not_support_image_set() {
+    let (registry, auth) = test_image_registry();
+    let caps = resolve_media_capabilities(
+        &registry,
+        &auth,
+        MediaKind::Image,
+        MediaOperation::Generate,
+        0,
+        &MediaDiscoveryCache::default(),
+    );
+    assert!(!caps[0].supports_image_set);
 }
 
 #[test]

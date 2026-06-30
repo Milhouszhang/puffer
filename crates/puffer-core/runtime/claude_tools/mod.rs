@@ -10,8 +10,9 @@ use puffer_provider_registry::{AuthStore, ProviderRegistry};
 use puffer_resources::LoadedResources;
 use puffer_runner_api::{
     check_read_freshness, NullChunkSink, ReadStateSnapshot, ReadStateUpdate, StalenessRejection,
-    ToolRequest as RunnerToolRequest, ToolRunner,
+    ToolRequest as RunnerToolRequest, ToolResult as RunnerToolResult, ToolRunner,
 };
+use puffer_runner_grpc::RemoteToolRunner;
 use puffer_tools::{ToolDefinition, ToolExecutionResult, ToolOutput, ToolRegistry};
 use puffer_transport_anthropic::AnthropicRequestConfig;
 use serde_json::Value;
@@ -103,7 +104,7 @@ pub(crate) fn execute_tool(
     input: Value,
     provider_context: ProviderToolContext<'_>,
 ) -> Result<ToolExecutionResult> {
-    let skip_runner = definition.id == "Bash";
+    let skip_runner = definition.id == "Bash" && state.active_remote_target.is_none();
     if !skip_runner && runner_adapter::is_runner_supported(definition.id.as_str()) {
         if let Some(result) =
             try_runner_dispatch(state, definition, cwd, &input, filesystem_policy)?
@@ -361,12 +362,54 @@ pub(crate) fn execute_tool(
     }
 }
 
+/// Runs a parallel-batch `Bash` in-process with its own internal-tool broker so
+/// that subprocess media tools (imagegen/videogen) can call back and execute
+/// concurrently. The broker handler is media-only and uses shared references.
+pub(crate) fn execute_parallel_bash_with_media_broker(
+    definition: &ToolDefinition,
+    cwd: &Path,
+    session_id: &Uuid,
+    args: Value,
+    media_ctx: &super::internal_tool_permissions::MediaCapabilityContext<'_>,
+) -> Result<ToolExecutionResult> {
+    let mut handler = |request: bash_internal_permissions::InternalToolBrokerRequest| match request {
+        bash_internal_permissions::InternalToolBrokerRequest::Execution(req) => {
+            bash_internal_permissions::InternalToolBrokerResponse::Execution(
+                super::internal_tool_permissions::execute_media_internal_tool(media_ctx, cwd, req),
+            )
+        }
+        bash_internal_permissions::InternalToolBrokerRequest::Permission(_) => {
+            bash_internal_permissions::InternalToolBrokerResponse::Permission(
+                puffer_tools::internal_permissions::InternalToolPermissionResponse::deny(
+                    "internal tool permission is not available in a parallel batch; run it as a single command",
+                ),
+            )
+        }
+    };
+    let execution = bash::execute_from_value_with_internal_permissions(
+        cwd,
+        session_id,
+        args,
+        media_ctx.process_store,
+        Some(&mut handler),
+    )?;
+    let output = serde_json::to_string_pretty(&execution.output)
+        .context("failed to serialize Bash output")?;
+    Ok(tool_result(definition, execution.success, output))
+}
+
 /// Executes a parallel-safe tool without `&mut AppState`.
 ///
 /// This handles only tools identified by `is_parallel_safe_tool()` and
 /// replicates the corresponding match arms from `execute_tool`. All data
 /// needed is passed by value/reference; no mutable application state is
 /// touched, enabling concurrent execution via `std::thread::scope`.
+///
+/// `Bash` is special-cased: it runs in-process with its own media broker via
+/// [`execute_parallel_bash_with_media_broker`] (so subprocess imagegen/videogen
+/// can call back), never through the broker-less runner. `media_ctx` is the
+/// shared media-capability context the caller builds when the batch contains a
+/// permitted Bash; it is `None` for Bash-free batches.
 ///
 /// For tools in `runner_adapter::is_runner_supported(...)` (currently
 /// `Glob | Grep | WebFetch` in the parallel path), execution is routed through the supplied
@@ -382,13 +425,25 @@ pub(crate) fn execute_parallel_tool(
     filesystem_policy: &FilesystemPermissionPolicy,
     session_id: &Uuid,
     input: Value,
-    resources: &LoadedResources,
+    _resources: &LoadedResources,
     registry: &ToolRegistry,
     provider_context: &ProviderToolContext<'_>,
     runner: &Arc<dyn ToolRunner>,
+    media_ctx: Option<&super::internal_tool_permissions::MediaCapabilityContext<'_>>,
 ) -> Result<ToolExecutionResult> {
+    if definition.id == "Bash" {
+        // The caller builds the media context whenever a permitted Bash is in the
+        // batch, so this is always present here; guard rather than panic.
+        let media_ctx = media_ctx.ok_or_else(|| {
+            anyhow::anyhow!("parallel Bash dispatched without a media-capability context")
+        })?;
+        return execute_parallel_bash_with_media_broker(
+            definition, cwd, session_id, input, media_ctx,
+        );
+    }
     if runner_adapter::is_runner_supported(definition.id.as_str()) {
         let request = RunnerToolRequest {
+            request_id: None,
             tool_id: definition.id.clone(),
             cwd: cwd.to_path_buf(),
             working_dirs: working_dirs.to_vec(),
@@ -514,19 +569,18 @@ fn try_runner_dispatch(
         }
     }
 
+    ensure_active_remote_runner_connected(state)?;
+
     let request = RunnerToolRequest {
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
         tool_id: tool_id.to_string(),
-        cwd: cwd.to_path_buf(),
+        cwd: runner_cwd(state, cwd),
         working_dirs: filesystem_policy.workspace_roots.clone(),
         filesystem: filesystem_policy.runner_policy(),
         input: input.clone(),
         session_id: Some(state.session.id.to_string()),
     };
-    let runner = state.tool_runner.clone();
-    let mut sink = NullChunkSink;
-    let outcome = runner
-        .execute_tool(request, &mut sink)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let outcome = execute_runner_request_with_reconnect(state, cwd, request)?;
 
     apply_read_state_updates(state, &outcome.read_state_updates);
 
@@ -539,6 +593,72 @@ fn try_runner_dispatch(
             metadata: outcome.metadata,
         },
     }))
+}
+
+fn ensure_active_remote_runner_connected(state: &mut AppState) -> Result<()> {
+    if state.active_remote_target.is_none() || !tool_runner_is_local(state.tool_runner.as_ref()) {
+        return Ok(());
+    }
+    let endpoint = state.remote_session_url.clone().ok_or_else(|| {
+        anyhow::anyhow!("remote target is active but no runner endpoint is saved")
+    })?;
+    let runner =
+        RemoteToolRunner::connect(&endpoint, state.active_remote_runner_auth_token.as_deref())
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "remote target is active but remote runner is not connected: {error}"
+                )
+            })?;
+    if state.local_tool_runner.is_none() {
+        state.local_tool_runner = Some(state.tool_runner.clone());
+    }
+    state.tool_runner = Arc::new(runner);
+    Ok(())
+}
+
+pub(super) fn execute_runner_request_with_reconnect(
+    state: &mut AppState,
+    cwd: &Path,
+    request: RunnerToolRequest,
+) -> Result<RunnerToolResult> {
+    let runner = state.tool_runner.clone();
+    let mut sink = NullChunkSink;
+    match runner.execute_tool(request.clone(), &mut sink) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            let error = anyhow::anyhow!(error);
+            if state.active_remote_target.is_none()
+                || !workflow::remote_execution::remote_error_is_reconnectable(&error)
+            {
+                return Err(error);
+            }
+            state.remote_session_status = Some("reconnecting".to_string());
+            if !workflow::remote_execution::reconnect_active_remote_runner(state, cwd)? {
+                return Err(error);
+            }
+            let runner = state.tool_runner.clone();
+            let mut sink = NullChunkSink;
+            runner
+                .execute_tool(request, &mut sink)
+                .map_err(|retry_error| {
+                    anyhow::anyhow!("remote tool call failed after reconnect: {retry_error}")
+                })
+        }
+    }
+}
+
+fn tool_runner_is_local(runner: &dyn ToolRunner) -> bool {
+    runner
+        .as_any()
+        .and_then(|any| any.downcast_ref::<runner_adapter::LocalToolRunner>())
+        .is_some()
+}
+
+fn runner_cwd(state: &AppState, cwd: &Path) -> PathBuf {
+    state
+        .active_remote_cwd
+        .clone()
+        .unwrap_or_else(|| cwd.to_path_buf())
 }
 
 fn apply_read_state_updates(state: &mut AppState, updates: &[ReadStateUpdate]) {
@@ -809,6 +929,9 @@ fn execute_workflow_tool_with_media_context(
         }
         "ConnectionList" => workflow::connector_tools::execute_connection_list(state, cwd, input),
         "ConnectorAct" => workflow::connector_tools::execute_connector_act(state, cwd, input),
+        "ConnectorActionDraft" => {
+            workflow::connector_tools::execute_connector_action_draft(state, cwd, input)
+        }
         "ConnectorCreation" => {
             workflow::connector_tools::execute_connector_creation(state, cwd, input)
         }
@@ -824,8 +947,8 @@ fn execute_workflow_tool_with_media_context(
         "CronCreate" => workflow::cron_create::execute_cron_create(state, cwd, input),
         "CronDelete" => workflow::cron_delete::execute_cron_delete(state, cwd, input),
         "CronList" => workflow::cron_list::execute_cron_list(state, cwd, input),
-        "Email" => workflow::email_configure::execute_email(state, cwd, input),
-        "EmailConfigure" => workflow::email_configure::execute_email_configure(state, cwd, input),
+        "Email" => workflow::email_configure::execute_email(cwd, input),
+        "EmailConfigure" => workflow::email_configure::execute_email_configure(cwd, input),
         "EnterPlanMode" => workflow::enter_plan_mode::execute_enter_plan_mode(state, cwd, input),
         "EnterWorktree" => workflow::enter_worktree::execute_enter_worktree(state, cwd, input),
         "ExitPlanMode" => workflow::exit_plan_mode::execute_exit_plan_mode(state, cwd, input),
@@ -835,13 +958,13 @@ fn execute_workflow_tool_with_media_context(
         "update_goal" => workflow::goal::execute_update_goal(state, cwd, input),
         "HttpRequest" => workflow::http_request::execute_http_request(state, cwd, input),
         "ImageGeneration" => workflow::image_generation::execute_image_generation(
-            state,
+            state.config.media.image.as_ref(),
             cwd,
             input,
             image_media_context,
         ),
         "VideoGeneration" => workflow::video_generation::execute_video_generation(
-            state,
+            state.config.media.video.as_ref(),
             cwd,
             input,
             video_media_context,
@@ -852,6 +975,9 @@ fn execute_workflow_tool_with_media_context(
         "McpToolCall" => workflow::mcp_tool_call::execute_mcp_tool_call(state, cwd, input),
         "McpStatus" => workflow::mcp_status::execute_mcp_status(state, cwd, input),
         "ModalAction" => workflow::modal_action::execute_modal_action(state, cwd, input),
+        "MonitorActionDraft" => {
+            workflow::monitor_action_draft::execute_monitor_action_draft(state, cwd, input)
+        }
         "MonitorReplyDraft" => {
             workflow::monitor_reply_draft::execute_monitor_reply_draft(state, cwd, input)
         }
@@ -865,6 +991,9 @@ fn execute_workflow_tool_with_media_context(
         "PowerShell" => workflow::powershell::execute_powershell(state, cwd, input),
         "Recall" => workflow::recall::execute_recall(state, cwd, input),
         "Remember" => workflow::remember::execute_remember(state, cwd, input),
+        "RemoteExecution" => {
+            workflow::remote_execution::execute_remote_execution(state, cwd, input)
+        }
         "RequestSecret" => workflow::request_secret::execute_request_secret(state, cwd, input),
         "SecretValue" => workflow::secret_value::execute_secret_value(state, cwd, input),
         "SendMessage" => workflow::send_message::execute_send_message(state, cwd, input),
@@ -920,22 +1049,22 @@ fn execute_workflow_tool_with_media_context(
         "TaskUpdate" => workflow::task_update::execute_task_update(state, cwd, input),
         "TeamCreate" => workflow::team_create::execute_team_create(state, cwd, input),
         "TeamDelete" => workflow::team_delete::execute_team_delete(state, cwd, input),
-        "Telegram" => workflow::telegram_login::execute_telegram(state, cwd, input),
+        "Telegram" => workflow::telegram_login::execute_telegram(cwd, input),
         "TelegramImportDesktop" => {
-            workflow::telegram_login::execute_telegram_import_desktop(state, cwd, input)
+            workflow::telegram_login::execute_telegram_import_desktop(cwd, input)
         }
-        "TelegramLoginQr" => workflow::telegram_login::execute_telegram_login_qr(state, cwd, input),
+        "TelegramLoginQr" => workflow::telegram_login::execute_telegram_login_qr(cwd, input),
         "TelegramLoginQrWait" => {
-            workflow::telegram_login::execute_telegram_login_qr_wait(state, cwd, input)
+            workflow::telegram_login::execute_telegram_login_qr_wait(cwd, input)
         }
         "TelegramLoginStart" => {
-            workflow::telegram_login::execute_telegram_login_start(state, cwd, input)
+            workflow::telegram_login::execute_telegram_login_start(cwd, input)
         }
         "TelegramLoginSubmitCode" => {
-            workflow::telegram_login::execute_telegram_login_submit_code(state, cwd, input)
+            workflow::telegram_login::execute_telegram_login_submit_code(cwd, input)
         }
         "TelegramLoginSubmitPassword" => {
-            workflow::telegram_login::execute_telegram_login_submit_password(state, cwd, input)
+            workflow::telegram_login::execute_telegram_login_submit_password(cwd, input)
         }
         "LambdaInternal" => workflow::lambda_internal::execute_lambda_internal(state, cwd, input),
         "TodoWrite" => workflow::todo_write::execute_todo_write(state, cwd, input),

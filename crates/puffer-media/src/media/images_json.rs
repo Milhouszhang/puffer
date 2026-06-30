@@ -11,7 +11,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use puffer_provider_registry::{
-    AuthStore, MediaExecutionDescriptor, ProviderDescriptor, ProviderRegistry,
+    AuthStore, MediaBatchDescriptor, MediaBatchMode, MediaExecutionDescriptor, ProviderDescriptor,
+    ProviderRegistry,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,34 @@ const IMAGES_JSON_ALLOWED_REQUEST_FIELDS: &[&str] = &[
     "sequential_image_generation",
 ];
 
+/// Grouped (single-call) image-count emission recipe, derived from a
+/// `grouped` batch descriptor. The requested count is written to `field`,
+/// optionally nested under a single `parent` object, instead of the flat
+/// `n` field. Single-level nesting only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GroupedCountRecipe {
+    field: String,
+    parent: Option<String>,
+}
+
+/// Derives the grouped count recipe from a batch descriptor, or `None`
+/// when the descriptor is not in `grouped` mode. A grouped descriptor always
+/// carries a `count_field` — the registry validator enforces this at load
+/// time — so missing it here is a config-invariant violation, not a runtime
+/// branch that should silently fall back to the flat `n` field.
+fn grouped_recipe(batch: &MediaBatchDescriptor) -> Option<GroupedCountRecipe> {
+    if batch.mode != MediaBatchMode::Grouped {
+        return None;
+    }
+    Some(GroupedCountRecipe {
+        field: batch
+            .count_field
+            .clone()
+            .expect("grouped batch descriptor must declare count_field (validated at load)"),
+        parent: batch.count_field_parent.clone(),
+    })
+}
+
 /// Request shape for OpenAI image generation after media settings resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +70,10 @@ struct ImagesJsonRequest {
     prompt: String,
     parameters: BTreeMap<String, String>,
     count: u8,
+    /// When set, the request is in grouped mode: the count is emitted via
+    /// this recipe (nested under `parent`→`field`) and the flat `n` field
+    /// is suppressed.
+    grouped: Option<GroupedCountRecipe>,
 }
 
 impl ImagesJsonRequest {
@@ -49,12 +82,14 @@ impl ImagesJsonRequest {
         prompt: impl Into<String>,
         parameters: BTreeMap<String, String>,
         count: u8,
+        grouped: Option<GroupedCountRecipe>,
     ) -> Self {
         Self {
             model: model.into(),
             prompt: prompt.into(),
             parameters,
             count,
+            grouped,
         }
     }
 
@@ -68,10 +103,50 @@ impl ImagesJsonRequest {
             }
             body.insert(name.clone(), json!(value));
         }
-        if self.count > 1 {
-            body.insert("n".to_string(), json!(self.count));
+        match &self.grouped {
+            Some(recipe) => insert_grouped_count(&mut body, recipe, self.count),
+            None => {
+                if self.count > 1 {
+                    body.insert("n".to_string(), json!(self.count));
+                }
+            }
         }
         Value::Object(body)
+    }
+}
+
+/// Renders an error together with its full `source()` chain. reqwest's
+/// top-level Display for a transport failure is the opaque "error sending
+/// request for url (...)"; the real cause (e.g. a proxy closing a long-running
+/// connection, a TLS or DNS failure) lives in the source chain, so we surface
+/// it — otherwise a dropped grouped request is indistinguishable from a bad URL.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    use std::fmt::Write as _;
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let _ = write!(message, ": {cause}");
+        source = cause.source();
+    }
+    message
+}
+
+/// Inserts the grouped image count under the recipe's `field`, nested in a
+/// single `parent` object when declared (otherwise flat at the top level).
+fn insert_grouped_count(body: &mut Map<String, Value>, recipe: &GroupedCountRecipe, count: u8) {
+    let count = json!(count);
+    match &recipe.parent {
+        Some(parent) => {
+            let entry = body
+                .entry(parent.clone())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(object) = entry.as_object_mut() {
+                object.insert(recipe.field.clone(), count);
+            }
+        }
+        None => {
+            body.insert(recipe.field.clone(), count);
+        }
     }
 }
 
@@ -218,6 +293,7 @@ impl ImagesJsonAdapter {
         let secrets =
             provider_error_secrets(provider, auth_store, CredentialAliasMode::OpenAiCodexAlias);
         let token = bearer_token(provider, auth_store, CredentialAliasMode::OpenAiCodexAlias)?;
+        let grouped = grouped_recipe(&execution.batch);
         let mut outputs = Vec::new();
         for call in &plan.calls {
             let call_result = (|| -> Result<Vec<ImageOutput>> {
@@ -226,6 +302,7 @@ impl ImagesJsonAdapter {
                     &request.prompt,
                     parameters.clone(),
                     call.requested_count,
+                    grouped.clone(),
                 )
                 .to_body();
                 let mut http = self.client.post(url.clone()).json(&body);
@@ -237,12 +314,12 @@ impl ImagesJsonAdapter {
                 }
                 let response = http
                     .send()
-                    .map_err(|error| anyhow!("{}", redact_secrets(&error.to_string(), &secrets)))
+                    .map_err(|error| anyhow!("{}", redact_secrets(&error_chain(&error), &secrets)))
                     .context("send image generation request")?;
                 let status = response.status();
                 let body = response
                     .text()
-                    .map_err(|error| anyhow!("{}", redact_secrets(&error.to_string(), &secrets)))
+                    .map_err(|error| anyhow!("{}", redact_secrets(&error_chain(&error), &secrets)))
                     .context("read image generation response")?;
                 if !status.is_success() {
                     bail!(

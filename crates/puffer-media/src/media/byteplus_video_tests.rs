@@ -55,7 +55,39 @@ fn byteplus_request_body_includes_public_image_references() {
         body["content"][1]["image_url"]["url"],
         json!("https://example.com/person.png")
     );
-    assert!(body["content"][1].get("role").is_none());
+    // Seedance interprets a roleless image_url positionally (first/last frame);
+    // character references must be tagged role=reference_image for subject
+    // consistency, matching the WorldRouter adapter.
+    assert_eq!(body["content"][1]["role"], json!("reference_image"));
+}
+
+#[test]
+fn byteplus_request_body_tags_every_image_reference_as_reference_image() {
+    let request = BytePlusVideoRequest {
+        model: "dreamina-seedance-2-0-fast-260128".to_string(),
+        prompt: "two characters meet".to_string(),
+        image_references: vec![
+            "https://example.com/hero.png".to_string(),
+            "https://example.com/villain.png".to_string(),
+        ],
+        params: vec![],
+    };
+    let body = request.request_body();
+
+    // Both references must be subject references, in order — otherwise Seedance
+    // treats 2 roleless images as first frame + last frame and the job fails.
+    assert_eq!(body["content"][1]["type"], json!("image_url"));
+    assert_eq!(body["content"][1]["role"], json!("reference_image"));
+    assert_eq!(
+        body["content"][1]["image_url"]["url"],
+        json!("https://example.com/hero.png")
+    );
+    assert_eq!(body["content"][2]["type"], json!("image_url"));
+    assert_eq!(body["content"][2]["role"], json!("reference_image"));
+    assert_eq!(
+        body["content"][2]["image_url"]["url"],
+        json!("https://example.com/villain.png")
+    );
 }
 
 #[test]

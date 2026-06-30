@@ -33,4 +33,7 @@ pub(crate) struct MediaCapability {
     pub(crate) source: String,
     pub(crate) reason: Option<String>,
     pub(crate) checked_at_ms: u64,
+    /// True when the model's image execution is in `grouped` batch mode, i.e.
+    /// one call returns a coherent set of N images. Always false for video.
+    pub(crate) supports_image_set: bool,
 }

@@ -7,6 +7,7 @@
   import { chatFileTarget, fileOpenIntent, type ChatOpenIntent } from "../../chatOpenIntent";
   import type { ToolTimelineItem } from "../../types";
   import InlineCanvas from "./InlineCanvas.svelte";
+  import { normalizeCanvasSpec } from "./canvasSpec";
 
   type Props = {
     item: ToolTimelineItem;
@@ -824,7 +825,8 @@
   );
   let isTerminalTool = $derived(["bash", "shell", "powershell"].includes(toolName.toLowerCase()));
   let isBrowserTool = $derived(isBrowserToolCall(toolName, inputJson));
-  let isCanvasTool = $derived(isCanvasToolCall(toolName, inputJson));
+  let canvasSpec = $derived(normalizeCanvasSpec(inputJson));
+  let isCanvasTool = $derived(isCanvasToolCall(toolName, canvasSpec));
   let canvasId = $derived(stringField(outputJson, ["canvasId", "canvas_id"]));
   let recordingFrames = $state<RecordingFrame[]>([]);
   let selectedFrameId = $state<string | null>(null);
@@ -1094,8 +1096,8 @@
   </button>
   {#if hasOutput && !collapsed}
     <div class:pf-tool-canvas-body={isCanvasTool} class="pf-tool-body">
-      {#if isCanvasTool && inputJson}
-        <InlineCanvas spec={inputJson} {canvasId} {sessionId} {onSubmitCanvasState} />
+      {#if isCanvasTool && canvasSpec}
+        <InlineCanvas spec={canvasSpec} {canvasId} {sessionId} {onSubmitCanvasState} />
       {:else if isBrowserTool}
         <div class="pf-browser-recording-render">
           {#if selectedFrame}

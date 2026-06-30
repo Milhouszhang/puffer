@@ -27,6 +27,7 @@ import type {
   RepoStatus,
   ChromeSecretsImportResult,
   SaveBrowserSettingsInput,
+  SaveRemoteSettingsInput,
   SaveSecretInput,
   SaveWorkflowBackendSettingsInput,
   SaveProxySettingsInput,
@@ -315,6 +316,7 @@ type BackendNetworkProxySettings = SettingsSnapshot["networkProxy"];
 type BackendSecretsSettings = SettingsSnapshot["secrets"];
 type BackendBrowserSettings = SettingsSnapshot["browser"];
 type BackendWorkflowBackendSettings = SettingsSnapshot["workflowBackend"];
+type BackendRemoteSettings = SettingsSnapshot["remote"];
 
 type BackendSettingsSnapshot = {
   workspaceRoot: string;
@@ -330,6 +332,7 @@ type BackendSettingsSnapshot = {
   browser: BackendBrowserSettings;
   workflowBackend: BackendWorkflowBackendSettings;
   networkProxy: BackendNetworkProxySettings;
+  remote: BackendRemoteSettings;
   secrets: BackendSecretsSettings;
 };
 
@@ -839,6 +842,14 @@ export async function loadSettingsSnapshot(remote?: RemoteConnection): Promise<S
   return invoke<BackendSettingsSnapshot>("load_settings_snapshot", remoteArgs(remote));
 }
 
+// The daemon's OAuth login handler blocks until the user finishes the browser
+// authorization (it waits for the localhost callback) and then exchanges the
+// code for tokens. The default 30s request timeout fires long before a user
+// can realistically complete interactive sign-in, surfacing a misleading
+// "request timed out: login_with_oauth" even though auth succeeds. Give the
+// interactive flow a much longer budget.
+const OAUTH_LOGIN_TIMEOUT_MS = 90_000;
+
 export async function loginWithOauth(
   providerId: string,
   remote?: RemoteConnection
@@ -851,9 +862,13 @@ export async function loginWithOauth(
   }
   if (canReachDaemon()) {
     const client = await ensureLocalDaemonClient();
-    return client.request<BackendSettingsSnapshot>("login_with_oauth", {
-      providerId
-    });
+    return client.request<BackendSettingsSnapshot>(
+      "login_with_oauth",
+      {
+        providerId
+      },
+      { timeoutMs: OAUTH_LOGIN_TIMEOUT_MS }
+    );
   }
   if (!canInvokeTauri()) {
     return mockSettingsSnapshot;
@@ -984,6 +999,13 @@ export async function saveWorkflowBackendConfig(
 /** Test the configured workflow backend using the runtime client. */
 export async function testWorkflowBackendConnection(): Promise<WorkflowBackendConnectionTest> {
   return workflowRequest<WorkflowBackendConnectionTest>("workflow_backend_test_connection");
+}
+
+export async function saveRemoteSettings(
+  input: SaveRemoteSettingsInput
+): Promise<SettingsSnapshot> {
+  const client = await ensureLocalDaemonClient();
+  return client.request<BackendSettingsSnapshot>("save_remote_settings", input);
 }
 
 export async function saveSecret(input: SaveSecretInput): Promise<SettingsSnapshot> {
@@ -1833,6 +1855,30 @@ export type AgentTurnOptions = {
 export type AgentTurnSubmitOptions = AgentTurnOptions & {
   displayAttachments?: ChatAttachmentUpload[];
 };
+export type CommandSurfaceItem = {
+  name: string;
+  aliases: string[];
+  description: string;
+  argumentHint: string | null;
+  kind: "Prompt" | "Local" | "Ui";
+  hidden: boolean;
+};
+type BackendCommandSurfaceItem = Omit<CommandSurfaceItem, "argumentHint"> & {
+  argumentHint?: string | null;
+  argument_hint?: string | null;
+};
+export type WorkspaceMentionItem = {
+  kind: "file" | "directory";
+  path: string;
+  absolutePath: string;
+  name: string;
+  parent: string;
+  size: number;
+};
+type BackendWorkspaceMentionItem = Omit<WorkspaceMentionItem, "absolutePath"> & {
+  absolutePath?: string;
+  absolute_path?: string;
+};
 export type StaleTurnRecoveryResult =
   | { recovery: "retry_started"; turnId: string }
   | { recovery: "already_retried" }
@@ -1964,6 +2010,43 @@ export async function dispatchSlashCommand(
     message
   });
   return result.turnId;
+}
+
+export async function listCommandSurface(): Promise<CommandSurfaceItem[]> {
+  const client = await ensureLocalDaemonClient();
+  const commands = await client.request<BackendCommandSurfaceItem[]>("list_command_surface", {});
+  return commands.map((command) => ({
+    name: command.name,
+    aliases: command.aliases ?? [],
+    description: command.description,
+    argumentHint: command.argumentHint ?? command.argument_hint ?? null,
+    kind: command.kind,
+    hidden: command.hidden
+  }));
+}
+
+export async function listWorkspaceMentions(
+  query: string,
+  cwd?: string | null,
+  limit = 40
+): Promise<WorkspaceMentionItem[]> {
+  const client = await ensureLocalDaemonClient();
+  const result = await client.request<{ items: BackendWorkspaceMentionItem[] }>(
+    "list_workspace_mentions",
+    {
+      query,
+      limit,
+      ...(cwd ? { cwd } : {})
+    }
+  );
+  return result.items.map((item) => ({
+    kind: item.kind,
+    path: item.path,
+    absolutePath: item.absolutePath ?? item.absolute_path ?? "",
+    name: item.name,
+    parent: item.parent,
+    size: item.size
+  }));
 }
 
 /** Runs deterministic connector setup without creating a persisted session.

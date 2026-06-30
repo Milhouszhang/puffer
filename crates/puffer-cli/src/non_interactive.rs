@@ -337,10 +337,11 @@ fn append_tool_invocations(
     invocations: &[puffer_core::ToolInvocation],
 ) -> Result<()> {
     for invocation in invocations {
+        let input = puffer_core::sanitized_tool_invocation_input(invocation);
         state.push_tool_invocation(
             &invocation.call_id,
             &invocation.tool_id,
-            &invocation.input,
+            &input,
             &invocation.output,
             invocation.success,
         );
@@ -349,7 +350,7 @@ fn append_tool_invocations(
             TranscriptEvent::ToolInvocation {
                 call_id: invocation.call_id.clone(),
                 tool_id: invocation.tool_id.clone(),
-                input: invocation.input.clone(),
+                input,
                 output: invocation.output.clone(),
                 success: invocation.success,
                 metadata: (!invocation.metadata.is_null()).then(|| invocation.metadata.clone()),

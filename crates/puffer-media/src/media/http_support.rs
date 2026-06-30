@@ -4,6 +4,7 @@ use puffer_provider_registry::{
     StoredCredential,
 };
 use reqwest::blocking::Client;
+use std::time::Duration;
 
 /// Controls whether OpenAI media execution can use legacy Codex credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +89,36 @@ pub(crate) fn redact_secrets(text: &str, secrets: &[String]) -> String {
     })
 }
 
-/// Downloads an image URL while rejecting unsafe plain HTTP targets.
+/// Attempts before giving up on a media download, and the base backoff between
+/// attempts (scaled by attempt index).
+const DOWNLOAD_MAX_ATTEMPTS: u32 = 4;
+const DOWNLOAD_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Builds a blocking HTTP client for downloading generated media bytes.
+///
+/// Carries a generous per-request timeout (the default client has none) so a
+/// stalled transfer is bounded and the retry loop in [`download_image_url`] can
+/// re-attempt instead of hanging indefinitely. Proxy handling is left at the
+/// client default — any ambient `HTTP(S)_PROXY` is honored as-is.
+pub(crate) fn media_download_client() -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(180))
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .context("build media download HTTP client")
+}
+
+/// Worth a retry vs. not, so [`download_image_url`] can fail fast on a definitive
+/// 4xx but keep trying through transient network and server hiccups.
+enum DownloadError {
+    Transient(anyhow::Error),
+    Definitive(anyhow::Error),
+}
+
+/// Downloads media bytes from a remote URL, retrying transient transport and
+/// server errors with backoff. Plain HTTP is rejected unless the host is
+/// loopback. A definitive client error (4xx other than 408/429) fails
+/// immediately — retrying a 404/403 is pointless.
 pub(crate) fn download_image_url(client: &Client, url: &str, label: &str) -> Result<Vec<u8>> {
     let parsed =
         reqwest::Url::parse(url).with_context(|| format!("{label} URL must be absolute"))?;
@@ -97,18 +127,58 @@ pub(crate) fn download_image_url(client: &Client, url: &str, label: &str) -> Res
         "http" if url_host_is_loopback(&parsed) => {}
         other => bail!("unsupported {label} URL scheme `{other}`"),
     }
-    let response = client
-        .get(parsed)
-        .send()
-        .with_context(|| format!("download {label}"))?;
+    let mut last_error = None;
+    for attempt in 0..DOWNLOAD_MAX_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(DOWNLOAD_RETRY_BACKOFF * attempt);
+        }
+        match try_download_once(client, parsed.clone(), label) {
+            Ok(bytes) => return Ok(bytes),
+            Err(DownloadError::Definitive(error)) => return Err(error),
+            Err(DownloadError::Transient(error)) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("download {label} failed"))
+        .context(format!(
+            "download {label} failed after {DOWNLOAD_MAX_ATTEMPTS} attempts"
+        )))
+}
+
+/// Performs one download attempt, classifying any failure as transient or
+/// definitive for the caller's retry loop.
+fn try_download_once(
+    client: &Client,
+    url: reqwest::Url,
+    label: &str,
+) -> std::result::Result<Vec<u8>, DownloadError> {
+    let response = match client.get(url).send() {
+        Ok(response) => response,
+        // A transport failure (timeout, connection reset, proxy sever) is
+        // always worth retrying.
+        Err(error) => {
+            return Err(DownloadError::Transient(
+                anyhow::Error::new(error).context(format!("download {label}")),
+            ))
+        }
+    };
     let status = response.status();
     if !status.is_success() {
-        bail!("download {label} failed with status {}", status.as_u16());
+        let error = anyhow::anyhow!("download {label} failed with status {}", status.as_u16());
+        if status.is_server_error()
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            return Err(DownloadError::Transient(error));
+        }
+        return Err(DownloadError::Definitive(error));
     }
-    Ok(response
+    response
         .bytes()
-        .with_context(|| format!("read {label} bytes"))?
-        .to_vec())
+        .map(|bytes| bytes.to_vec())
+        .map_err(|error| {
+            DownloadError::Transient(anyhow::Error::new(error).context(format!("read {label} bytes")))
+        })
 }
 
 fn provider_credential<'a>(

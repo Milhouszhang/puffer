@@ -403,6 +403,7 @@ export type MediaCapabilityInfo = {
   source: string;
   reason: string | null;
   checkedAtMs: number;
+  supportsImageSet: boolean;
 };
 
 export type ResourceCounts = {
@@ -680,10 +681,83 @@ export type SettingsSnapshot = {
   browser: BrowserSettings;
   workflowBackend: WorkflowBackendSettings;
   networkProxy: NetworkProxySettings;
+  remote: RemoteSettings;
   secrets: SecretsSettings;
 };
 
 export type WorkflowRuntimeRecord = Record<string, unknown>;
+
+export type RemoteSettings = {
+  defaultTarget: string | null;
+  sshHosts: SshHostSettings[];
+  agentenv: AgentEnvSettings | null;
+};
+
+export type SshHostSettings = {
+  id: string;
+  label: string;
+  target: string;
+  port: number | null;
+  cwd: string | null;
+};
+
+export type AgentEnvSettings = {
+  enabled: boolean;
+  apiUrl: string;
+  runnerHost: string | null;
+  workspace: string | null;
+  credentialSecretId: string | null;
+  hasCredential: boolean;
+  authMethod: "api_key" | "access_token" | string;
+  defaults: AgentEnvSandboxDefaults;
+};
+
+export type AgentEnvSandboxDefaults = {
+  sandboxType: string;
+  image: string;
+  region: string | null;
+  cpuMillis: number | null;
+  memoryMb: number | null;
+  gpuCount: number | null;
+  gpuType: string | null;
+  maxLifetimeSeconds: number | null;
+};
+
+export type SaveRemoteSettingsInput = {
+  defaultTarget: string | null;
+  sshHosts: {
+    id: string;
+    label: string;
+    target: string;
+    port: number | null;
+    cwd: string | null;
+  }[];
+  agentenv: {
+    enabled: boolean;
+    apiUrl: string;
+    runnerHost: string | null;
+    workspace: string | null;
+    credentialSecretId: string | null;
+    authMethod: "api_key" | "access_token";
+    defaults: AgentEnvSandboxDefaults;
+  } | null;
+};
+
+export type WorkflowTrigger =
+  | { type: "cron"; cron: string }
+  | {
+      type: "subscription";
+      source_topic: string;
+      pattern?: string | null;
+      classify_prompt?: string | null;
+    }
+  | {
+      type: "connection";
+      connection_slug: string;
+      filter?: Record<string, unknown> | null;
+      pattern?: string | null;
+      classify_prompt?: string | null;
+    };
 
 export type WorkflowExecutionRecord = Record<string, unknown>;
 

@@ -1,8 +1,10 @@
+use crate::runtime::agent_memory::build_agent_memory_section;
 use crate::tool_names::tool_spec_matches_selector;
 use crate::{AppState, MessageRole};
 use anyhow::{bail, Result};
 use puffer_provider_registry::ProviderRegistry;
 use puffer_resources::{plugin_mcp_servers, skill_by_name, AgentSpec, LoadedResources, ToolSpec};
+use std::path::Path;
 
 const IMPLICIT_AGENT_DISALLOWED_TOOLS: &[&str] = &[
     "Agent",
@@ -99,12 +101,16 @@ pub(crate) fn tool_matches_selector(tool: &ToolSpec, selector: &str) -> bool {
     tool_spec_matches_selector(tool, selector)
 }
 
-/// Builds the system prompt for a spawned agent, including preloaded skills.
+/// Builds the system prompt for a spawned agent, including persistent memory and preloaded skills.
 pub(crate) fn build_agent_system_prompt(
+    cwd: &Path,
     resources: &LoadedResources,
     agent: &AgentSpec,
 ) -> Result<String> {
     let mut sections = vec![agent.prompt.trim().to_string()];
+    if let Some(memory_section) = build_agent_memory_section(cwd, agent)? {
+        sections.push(memory_section);
+    }
     for skill_name in &agent.skills {
         let Some(skill) = skill_by_name(resources, skill_name) else {
             bail!(

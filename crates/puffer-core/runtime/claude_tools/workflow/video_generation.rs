@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::AppState;
 use anyhow::{bail, Context, Result};
 use puffer_config::MediaGenerationConfig;
@@ -32,6 +33,10 @@ struct VideoGenerationInput {
     parameters: BTreeMap<String, String>,
     #[serde(default)]
     purpose: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -47,19 +52,14 @@ struct VideoRequest {
 
 /// Builds a text-to-video request from tool input and executes the media runtime.
 pub fn execute_video_generation(
-    state: &mut AppState,
+    video_settings: Option<&MediaGenerationConfig>,
     cwd: &Path,
     input: Value,
     media_context: Option<VideoGenerationMediaContext<'_>>,
 ) -> Result<String> {
     let parsed: VideoGenerationInput =
         serde_json::from_value(input).context("invalid VideoGeneration input")?;
-    let settings = state
-        .config
-        .media
-        .video
-        .as_ref()
-        .context("video media provider/model is not configured")?;
+    let settings = video_settings;
     let request = build_video_request(cwd, parsed, settings)?;
     let media_context = media_context.context("VideoGeneration media runtime is not configured")?;
     let generated = generate_exact_media_with_cache(
@@ -75,14 +75,14 @@ pub fn execute_video_generation(
 fn build_video_request(
     cwd: &Path,
     input: VideoGenerationInput,
-    settings: &MediaGenerationConfig,
+    settings: Option<&MediaGenerationConfig>,
 ) -> Result<VideoRequest> {
     let prompt = prompt_text(cwd, &input.prompt)?;
     let image_references = validate_video_image_references(&input.image_references)?;
-    let (provider, model) = required_video_selection(settings)?;
     // Merge the persisted axis selections with any per-call overrides; the
     // runtime resolves these against the logical model's axes/variants.
-    let mut parameters = settings.selections.clone();
+    let (provider, model, mut parameters) =
+        resolve_video_selection(input.provider.as_deref(), input.model.as_deref(), settings)?;
     parameters.extend(input.parameters);
     Ok(VideoRequest {
         provider,
@@ -93,6 +93,26 @@ fn build_video_request(
         parameters,
         purpose: input.purpose,
     })
+}
+
+fn resolve_video_selection(
+    provider: Option<&str>,
+    model: Option<&str>,
+    settings: Option<&MediaGenerationConfig>,
+) -> Result<(String, String, BTreeMap<String, String>)> {
+    let provider = provider.map(str::trim).filter(|value| !value.is_empty());
+    let model = model.map(str::trim).filter(|value| !value.is_empty());
+    match (provider, model) {
+        (Some(provider), Some(model)) => {
+            Ok((provider.to_string(), model.to_string(), BTreeMap::new()))
+        }
+        (None, None) => {
+            let settings = settings.context("video media provider/model is not configured")?;
+            let (provider, model) = required_video_selection(settings)?;
+            Ok((provider, model, settings.selections.clone()))
+        }
+        _ => bail!("video generation requires both provider and model, or neither"),
+    }
 }
 
 fn deserialize_scalar_parameters<'de, D>(
@@ -249,7 +269,6 @@ mod tests {
     use crate::permissions::profile::{EffectiveApprovalPolicy, EffectiveSandboxMode};
     use crate::permissions::FilesystemPermissionPolicy;
     use crate::runtime::claude_tools::{execute_tool, ProviderToolContext};
-    use crate::AppState;
     use indexmap::IndexMap;
     use puffer_config::MediaGenerationConfig;
     use puffer_media::MediaFailureDiagnostic;
@@ -557,10 +576,10 @@ mod tests {
         let registry = ProviderRegistry::new();
         let auth_store = AuthStore::default();
         let discovery_cache = ExactMediaDiscoveryCache::empty();
-        let mut state = test_state(None, dir.path());
+        let state = test_state(None, dir.path());
 
         let error = execute_video_generation(
-            &mut state,
+            state.config.media.video.as_ref(),
             dir.path(),
             json!({"prompt": "make a ship launch video"}),
             Some(VideoGenerationMediaContext {
@@ -578,6 +597,45 @@ mod tests {
     }
 
     #[test]
+    fn video_input_provider_model_override_config() {
+        let dir = tempdir().unwrap();
+        let request = build_video_request(
+            dir.path(),
+            VideoGenerationInput {
+                prompt: "a calm sea".to_string(),
+                image_references: Vec::new(),
+                parameters: BTreeMap::new(),
+                purpose: None,
+                provider: Some("byteplus".to_string()),
+                model: Some("seedance".to_string()),
+            },
+            Some(&video_settings()),
+        )
+        .unwrap();
+        assert_eq!(request.provider, "byteplus");
+        assert_eq!(request.model, "seedance");
+    }
+
+    #[test]
+    fn video_missing_input_falls_back_to_config() {
+        let dir = tempdir().unwrap();
+        let request = build_video_request(
+            dir.path(),
+            VideoGenerationInput {
+                prompt: "a calm sea".to_string(),
+                image_references: Vec::new(),
+                parameters: BTreeMap::new(),
+                purpose: None,
+                provider: None,
+                model: None,
+            },
+            Some(&video_settings()),
+        )
+        .unwrap();
+        assert_eq!(request.provider, "relaydance");
+    }
+
+    #[test]
     fn build_request_rejects_empty_prompt() {
         let dir = tempdir().unwrap();
 
@@ -588,8 +646,10 @@ mod tests {
                 image_references: Vec::new(),
                 parameters: BTreeMap::new(),
                 purpose: None,
+                provider: None,
+                model: None,
             },
-            &video_settings(),
+            Some(&video_settings()),
         )
         .unwrap_err();
 
@@ -719,8 +779,10 @@ mod tests {
                     ("resolution".to_string(), "1080p".to_string()),
                 ]),
                 purpose: Some("short launch clip".to_string()),
+                provider: None,
+                model: None,
             },
-            &video_settings(),
+            Some(&video_settings()),
         )
         .unwrap();
 
@@ -820,10 +882,10 @@ mod tests {
         let registry = video_registry(base_url);
         let auth_store = auth_store();
         let discovery_cache = ExactMediaDiscoveryCache::empty();
-        let mut state = test_state(Some(video_settings()), dir.path());
+        let state = test_state(Some(video_settings()), dir.path());
 
         let output = execute_video_generation(
-            &mut state,
+            state.config.media.video.as_ref(),
             dir.path(),
             json!({
                 "prompt": "make a ship launch video",

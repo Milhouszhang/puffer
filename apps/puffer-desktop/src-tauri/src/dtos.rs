@@ -460,6 +460,7 @@ pub(crate) struct MediaCapabilityInfoDto {
     pub source: String,
     pub reason: Option<String>,
     pub checked_at_ms: u64,
+    pub supports_image_set: bool,
 }
 
 /// Describes one selectable media axis.

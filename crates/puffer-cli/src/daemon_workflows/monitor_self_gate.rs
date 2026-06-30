@@ -2,7 +2,6 @@ use puffer_config::ConfigPaths;
 use puffer_subscriber_runtime::Event;
 use puffer_subscriptions::SelfMessageGate;
 use serde_json::Value;
-use std::sync::Arc;
 
 use super::monitor_task_ignore::monitor_tasks_path;
 

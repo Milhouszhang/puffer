@@ -36,6 +36,12 @@ pub(crate) struct MediaJob {
     pub(crate) provider_job_id: Option<String>,
     pub(crate) remote_status: Option<String>,
     pub(crate) remote_get_url: Option<String>,
+    /// Resolved direct download URL of the rendered output, captured once the
+    /// remote task succeeds. Persisted so a download that fails (or never runs)
+    /// can be re-attempted from the known URL without re-polling or regenerating
+    /// — recovery for the "remote succeeded, local file missing" case.
+    #[serde(default)]
+    pub(crate) remote_video_url: Option<String>,
     pub(crate) artifact_ids: Vec<String>,
     pub(crate) requested_count: u8,
     pub(crate) error: Option<String>,
@@ -66,6 +72,7 @@ impl MediaJob {
             provider_job_id: None,
             remote_status: None,
             remote_get_url: None,
+            remote_video_url: None,
             artifact_ids: Vec::new(),
             requested_count,
             error: None,

@@ -31,9 +31,16 @@ impl BytePlusVideoRequest {
             "type": "text",
             "text": self.prompt.trim()
         })];
+        // Tag every reference as a subject reference. A roleless image_url is
+        // interpreted positionally by Seedance (1 image = first frame, 2 =
+        // first + last frame), so multiple untagged character images get
+        // treated as frame endpoints and the job fails. `role=reference_image`
+        // keeps each one a subject/identity reference (matches the WorldRouter
+        // Seedance adapter).
         for reference in &self.image_references {
             content.push(json!({
                 "type": "image_url",
+                "role": "reference_image",
                 "image_url": {
                     "url": reference.trim()
                 }
@@ -268,7 +275,12 @@ impl BytePlusVideoAdapter<ReqwestBytePlusVideoTransport> {
             api_token,
             submit_url: submit_url.into().trim_end_matches('/').to_string(),
             provider_id: provider_id.into(),
-            transport: ReqwestBytePlusVideoTransport::default(),
+            // Use a client with a bounded download timeout (the default has
+            // none) so the retrying downloader can re-attempt a stalled transfer
+            // instead of hanging.
+            transport: ReqwestBytePlusVideoTransport {
+                client: super::http_support::media_download_client()?,
+            },
         })
     }
 }

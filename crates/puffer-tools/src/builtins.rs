@@ -502,9 +502,7 @@ fn run_bash_command(
     command: &str,
     timeout_ms: Option<u64>,
 ) -> Result<TimedCommandOutput> {
-    let mut child = Command::new(detected_shell())
-        .arg("-lc")
-        .arg(command)
+    let mut child = shell_command(command)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -546,6 +544,20 @@ fn run_bash_command(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(windows)]
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new("cmd.exe");
+    cmd.arg("/C").arg(command);
+    cmd
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new(detected_shell());
+    cmd.arg("-lc").arg(command);
+    cmd
 }
 
 fn bash_stderr_message(stderr: &[u8], timed_out: bool, timeout_ms: Option<u64>) -> String {

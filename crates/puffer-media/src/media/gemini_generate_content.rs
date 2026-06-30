@@ -427,6 +427,8 @@ mod tests {
                             batch: MediaBatchDescriptor {
                                 mode: MediaBatchMode::PerImage,
                                 max_images_per_call: None,
+                                count_field: None,
+                                count_field_parent: None,
                             },
                             prompt_format: Default::default(),
                         }),

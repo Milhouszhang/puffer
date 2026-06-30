@@ -195,6 +195,12 @@ pub(crate) fn complete_video_job(
 }
 
 /// Downloads and persists an MP4 artifact using an injected poster extractor.
+///
+/// The resolved download URL is persisted onto the job ([`MediaJob::remote_video_url`])
+/// before the download runs, so a download that fails terminally still leaves the
+/// URL on record for a later re-download within its TTL. Transient download
+/// failures (timeout, proxy sever, 5xx) are absorbed by the retrying download
+/// client itself; only a definitive failure reaches here and fails the job.
 pub(crate) fn complete_video_job_with_poster_extractor(
     service: &MediaGenerationService,
     mut job: MediaJob,
@@ -209,6 +215,11 @@ pub(crate) fn complete_video_job_with_poster_extractor(
         return Ok(job);
     }
     let url = task.video_url.context(task.missing_url_message)?;
+    // Persist the direct download URL the moment the remote task succeeds, so a
+    // failed download stays recoverable from it (re-download within the URL's TTL)
+    // without re-polling or regenerating — the "remote succeeded, local file
+    // missing" case. The URL is saved onto the job below even when it fails.
+    job.remote_video_url = Some(url.to_string());
     let bytes = match download_bytes(url) {
         Ok(bytes) => bytes,
         Err(error) => {

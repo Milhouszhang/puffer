@@ -1,9 +1,9 @@
 use super::capabilities::{MediaCapability, MediaKind};
 use anyhow::{bail, Context, Result};
 use puffer_provider_registry::{
-    canonical_provider_id, AuthStore, Axis, AxisRole, ControlKind, MediaExecutionDescriptor,
-    MediaExecutionKind, MediaMap, MediaModelDescriptor, MediaOperation, ProviderDescriptor,
-    ProviderRegistry, Variants, WireType,
+    canonical_provider_id, AuthStore, Axis, AxisRole, ControlKind, MediaBatchMode,
+    MediaExecutionDescriptor, MediaExecutionKind, MediaMap, MediaModelDescriptor, MediaOperation,
+    ProviderDescriptor, ProviderRegistry, Variants, WireType,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -433,6 +433,7 @@ fn resolve_image_capabilities(
                 source: source.to_string(),
                 reason: None,
                 checked_at_ms,
+                supports_image_set: execution.batch.mode == MediaBatchMode::Grouped,
             });
         }
     }
@@ -484,6 +485,7 @@ fn resolve_video_capabilities(
                 source: CAPABILITY_SOURCE_STATIC.to_string(),
                 reason: reason.map(str::to_string),
                 checked_at_ms,
+                supports_image_set: false,
             });
         }
     }

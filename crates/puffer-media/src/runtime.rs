@@ -55,6 +55,9 @@ pub struct MediaCapabilityView {
     pub source: String,
     pub reason: Option<String>,
     pub checked_at_ms: u64,
+    /// True when one call returns a coherent set of N images (grouped image
+    /// batch mode). Always false for video. Drives skill set-vs-parallel routing.
+    pub supports_image_set: bool,
 }
 
 /// Carries an exact image generation request from UI or tool configuration.
@@ -509,6 +512,7 @@ impl From<crate::media::capabilities::MediaCapability> for MediaCapabilityView {
             source: capability.source,
             reason: capability.reason,
             checked_at_ms: capability.checked_at_ms,
+            supports_image_set: capability.supports_image_set,
         }
     }
 }

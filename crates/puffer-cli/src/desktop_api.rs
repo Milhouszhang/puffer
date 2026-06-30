@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use puffer_config::{
-    load_config, save_user_config, ConfigPaths, MediaGenerationConfig, PufferConfig,
+    load_config, save_user_config, AgentEnvAccountConfig, AgentEnvSandboxDefaults, ConfigPaths,
+    MediaGenerationConfig, PufferConfig, RemoteConfig, SshHostConfig,
 };
 use puffer_media::{generated_media_timeline_attachments, GeneratedMediaTimelineAttachment};
 use puffer_provider_registry::{
@@ -29,6 +30,7 @@ use crate::desktop_api_types::{
     RepoStatusDto, ResourceCountsDto, SanitizedProxyEndpointDto, SecretSourceDto, SecretSummaryDto,
     SecretsSettingsDto, SessionDetailDto, SessionGroupsPageDto, SessionListItemDto,
     SettingsConfigDto, SettingsSessionSummaryDto, SettingsSnapshotDto, TimelineItemDto,
+    AgentEnvSandboxDefaultsDto, AgentEnvSettingsDto, RemoteSettingsDto, SshHostSettingsDto,
     WorkflowBackendOptionDto, WorkflowBackendSettingsDto,
 };
 
@@ -384,6 +386,8 @@ pub(crate) fn load_settings_snapshot(
         })
         .collect::<std::collections::BTreeSet<PathBuf>>()
         .len();
+    let provider_summaries = desktop_provider_summaries(providers);
+
     Ok(SettingsSnapshotDto {
         workspace_root: paths.workspace_root.display().to_string(),
         workspace_config_file: paths.workspace_config_file().display().to_string(),
@@ -426,12 +430,131 @@ pub(crate) fn load_settings_snapshot(
             folder_groups,
         },
         auth: auth_statuses(auth_store),
-        providers: providers.provider_entries().map(provider_summary).collect(),
+        providers: provider_summaries,
         browser: browser_settings_dto(paths, config),
         workflow_backend: workflow_backend_settings_dto(paths, config)?,
         network_proxy: network_proxy_settings_dto(config),
+        remote: remote_settings_dto(config),
         secrets: secrets_settings_dto(paths)?,
     })
+}
+
+fn desktop_provider_summaries(providers: &ProviderRegistry) -> Vec<ProviderSummaryDto> {
+    let mut summaries: Vec<_> = providers.provider_entries().map(provider_summary).collect();
+    if !summaries.iter().any(|provider| provider.id == "puffer") {
+        summaries.insert(0, native_puffer_provider_summary());
+    }
+    summaries
+}
+
+fn native_puffer_provider_summary() -> ProviderSummaryDto {
+    ProviderSummaryDto {
+        id: "puffer".to_string(),
+        display_name: "Puffer".to_string(),
+        base_url: "local-cli://puffer".to_string(),
+        default_api: "cli".to_string(),
+        model_count: 1,
+        auth_modes: vec!["native".to_string()],
+        source_kind: "builtin".to_string(),
+        source_path: None,
+    }
+}
+
+fn remote_settings_dto(config: &PufferConfig) -> RemoteSettingsDto {
+    RemoteSettingsDto {
+        default_target: config.remote.default_target.clone(),
+        ssh_hosts: config
+            .remote
+            .ssh_hosts
+            .iter()
+            .map(|host| SshHostSettingsDto {
+                id: host.id.clone(),
+                label: host.label.clone(),
+                target: host.target.clone(),
+                port: host.port,
+                cwd: host.cwd.clone(),
+            })
+            .collect(),
+        agentenv: config
+            .remote
+            .agentenv
+            .as_ref()
+            .map(|agentenv| AgentEnvSettingsDto {
+                enabled: agentenv.enabled,
+                api_url: agentenv.api_url.clone(),
+                runner_host: agentenv.runner_host.clone(),
+                workspace: agentenv.workspace.clone(),
+                credential_secret_id: agentenv.credential_secret_id.clone(),
+                has_credential: agentenv.credential_secret_id.is_some(),
+                auth_method: agentenv.auth_method.clone(),
+                defaults: agentenv_defaults_dto(&agentenv.defaults),
+            }),
+    }
+}
+
+fn agentenv_defaults_dto(defaults: &AgentEnvSandboxDefaults) -> AgentEnvSandboxDefaultsDto {
+    AgentEnvSandboxDefaultsDto {
+        sandbox_type: defaults.sandbox_type.clone(),
+        image: defaults.image.clone(),
+        region: defaults.region.clone(),
+        cpu_millis: defaults.cpu_millis,
+        memory_mb: defaults.memory_mb,
+        gpu_count: defaults.gpu_count,
+        gpu_type: defaults.gpu_type.clone(),
+        max_lifetime_seconds: defaults.max_lifetime_seconds,
+    }
+}
+
+pub(crate) fn remote_config_from_settings(
+    input: crate::desktop_api_types::SaveRemoteSettingsParams,
+) -> RemoteConfig {
+    RemoteConfig {
+        default_target: normalize_optional_string(input.default_target),
+        ssh_hosts: input
+            .ssh_hosts
+            .into_iter()
+            .map(|host| SshHostConfig {
+                id: host.id.trim().to_string(),
+                label: host.label.trim().to_string(),
+                target: host.target.trim().to_string(),
+                port: host.port,
+                cwd: normalize_optional_string(host.cwd),
+            })
+            .filter(|host| !host.id.is_empty() && !host.target.is_empty())
+            .collect(),
+        agentenv: input.agentenv.map(|agentenv| AgentEnvAccountConfig {
+            enabled: agentenv.enabled,
+            api_url: agentenv.api_url.trim().trim_end_matches('/').to_string(),
+            runner_host: normalize_optional_string(agentenv.runner_host),
+            workspace: normalize_optional_string(agentenv.workspace),
+            credential_secret_id: normalize_optional_string(agentenv.credential_secret_id),
+            auth_method: normalize_agentenv_auth_method(&agentenv.auth_method),
+            defaults: AgentEnvSandboxDefaults {
+                sandbox_type: agentenv.defaults.sandbox_type.trim().to_string(),
+                image: agentenv.defaults.image.trim().to_string(),
+                region: normalize_optional_string(agentenv.defaults.region),
+                cpu_millis: agentenv.defaults.cpu_millis,
+                memory_mb: agentenv.defaults.memory_mb,
+                gpu_count: agentenv.defaults.gpu_count,
+                gpu_type: normalize_optional_string(agentenv.defaults.gpu_type),
+                max_lifetime_seconds: agentenv.defaults.max_lifetime_seconds,
+            },
+        }),
+    }
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn normalize_agentenv_auth_method(value: &str) -> String {
+    match value.trim() {
+        "access_token" | "accessToken" => "access_token".to_string(),
+        _ => "api_key".to_string(),
+    }
 }
 
 fn media_settings_dto(config: &PufferConfig) -> MediaSettingsDto {
@@ -1330,7 +1453,7 @@ fn timeline_items(session_store: &SessionStore, record: &SessionRecord) -> Vec<T
                 if let Some(text) = send_user_message_text(tool_id, input) {
                     flush_pending_assistant(&mut items, &mut pending_assistant);
                     items.push(TimelineItemDto::AssistantMessage {
-                        id: format!("timeline-{index}-{call_id}-message"),
+                        id: format!("tool-{call_id}-message"),
                         text,
                         attachments: std::mem::take(&mut pending_generated_attachments),
                         turn_id: current_turn_id.clone(),
@@ -1341,7 +1464,7 @@ fn timeline_items(session_store: &SessionStore, record: &SessionRecord) -> Vec<T
                 let status = if *success { "ok" } else { "error" };
                 let summary = summarize_tool_input(tool_id, input);
                 items.push(TimelineItemDto::ToolCall {
-                    id: format!("timeline-{index}-{call_id}"),
+                    id: format!("tool-{call_id}"),
                     tool_id: tool_id.clone(),
                     status: status.to_string(),
                     summary: summary.clone(),
@@ -1355,7 +1478,7 @@ fn timeline_items(session_store: &SessionStore, record: &SessionRecord) -> Vec<T
                 });
                 if let Some(text) = lambda_gate_timeline_text(metadata, tool_id) {
                     items.push(TimelineItemDto::SystemMessage {
-                        id: format!("timeline-{index}-{call_id}-lambda-gate"),
+                        id: format!("tool-{call_id}-lambda-gate"),
                         text,
                         turn_id: current_turn_id.clone(),
                         actor: actor.clone(),
@@ -1363,7 +1486,7 @@ fn timeline_items(session_store: &SessionStore, record: &SessionRecord) -> Vec<T
                 }
                 if let Some((state, reason)) = permission_state(output) {
                     items.push(TimelineItemDto::PermissionDialog {
-                        id: format!("timeline-{index}-{call_id}-permission"),
+                        id: format!("tool-{call_id}-permission"),
                         tool_id: tool_id.clone(),
                         state: state.to_string(),
                         summary,
@@ -2063,7 +2186,14 @@ fn command_exists(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_session_detail, timeline_items, ChatAttachmentSourceDto, TimelineItemDto};
+    use super::{
+        load_session_detail, remote_config_from_settings, timeline_items, ChatAttachmentSourceDto,
+        TimelineItemDto,
+    };
+    use crate::desktop_api_types::{
+        AgentEnvSandboxDefaultsDto, SaveAgentEnvSettingsParams, SaveRemoteSettingsParams,
+        SaveSshHostParams,
+    };
     use puffer_config::ConfigPaths;
     use puffer_session_store::{
         SessionMetadata, SessionRecord, SessionStore, TranscriptEvent, TranscriptRewrite,
@@ -2102,6 +2232,65 @@ mod tests {
         let mut record = record(events);
         record.metadata.cwd = cwd;
         record
+    }
+
+    #[test]
+    fn remote_config_from_settings_normalizes_user_input() {
+        let config = remote_config_from_settings(SaveRemoteSettingsParams {
+            default_target: Some(" ssh:dev ".to_string()),
+            ssh_hosts: vec![
+                SaveSshHostParams {
+                    id: " dev ".to_string(),
+                    label: " Dev box ".to_string(),
+                    target: " walden@example.com ".to_string(),
+                    port: Some(2222),
+                    cwd: Some(" /work/puffer ".to_string()),
+                },
+                SaveSshHostParams {
+                    id: "missing-target".to_string(),
+                    label: "Incomplete".to_string(),
+                    target: " ".to_string(),
+                    port: None,
+                    cwd: None,
+                },
+            ],
+            agentenv: Some(SaveAgentEnvSettingsParams {
+                enabled: true,
+                api_url: " https://api.agentenv.io/ ".to_string(),
+                runner_host: Some(" 93.115.25.198 ".to_string()),
+                workspace: Some(" wk_demo ".to_string()),
+                credential_secret_id: Some(" secret-agentenv ".to_string()),
+                auth_method: "accessToken".to_string(),
+                defaults: AgentEnvSandboxDefaultsDto {
+                    sandbox_type: " small ".to_string(),
+                    image: " docker.io/acme/tool-runner:latest ".to_string(),
+                    region: Some(" us-west-2 ".to_string()),
+                    cpu_millis: Some(2000),
+                    memory_mb: Some(4096),
+                    gpu_count: Some(0),
+                    gpu_type: None,
+                    max_lifetime_seconds: Some(3600),
+                },
+            }),
+        });
+
+        assert_eq!(config.default_target.as_deref(), Some("ssh:dev"));
+        assert_eq!(config.ssh_hosts.len(), 1);
+        assert_eq!(config.ssh_hosts[0].id, "dev");
+        assert_eq!(config.ssh_hosts[0].target, "walden@example.com");
+
+        let agentenv = config.agentenv.expect("agentenv config");
+        assert!(agentenv.enabled);
+        assert_eq!(agentenv.api_url, "https://api.agentenv.io");
+        assert_eq!(agentenv.runner_host.as_deref(), Some("93.115.25.198"));
+        assert_eq!(agentenv.workspace.as_deref(), Some("wk_demo"));
+        assert_eq!(
+            agentenv.credential_secret_id.as_deref(),
+            Some("secret-agentenv")
+        );
+        assert_eq!(agentenv.auth_method, "access_token");
+        assert_eq!(agentenv.defaults.sandbox_type, "small");
+        assert_eq!(agentenv.defaults.image, "docker.io/acme/tool-runner:latest");
     }
 
     fn write_generated_image_artifact(
@@ -2512,6 +2701,70 @@ mod tests {
             }
             other => panic!("expected lambda gate system event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_invocation_ids_use_call_id_scheme() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![TranscriptEvent::ToolInvocation {
+                call_id: "call-1".to_string(),
+                tool_id: "LambdaHostCall".to_string(),
+                input: "{}".to_string(),
+                output: "Permission required: approve gh_pr_view".to_string(),
+                success: true,
+                metadata: Some(json!({
+                    "lambda_skill": {
+                        "event": "host_call_admitted",
+                        "host_tool": "gh_pr_view",
+                        "host_args": {"number": 42},
+                        "concrete_tool": "Bash",
+                        "concrete_input": {"command": "gh pr view 42"}
+                    }
+                })),
+                actor: None,
+                subject: None,
+            }]),
+        );
+
+        assert_eq!(items.len(), 3);
+        let TimelineItemDto::ToolCall { id, .. } = &items[0] else {
+            panic!("expected tool call, got {:?}", items[0]);
+        };
+        assert_eq!(id, "tool-call-1");
+        let TimelineItemDto::SystemMessage { id, .. } = &items[1] else {
+            panic!("expected lambda gate system message, got {:?}", items[1]);
+        };
+        assert_eq!(id, "tool-call-1-lambda-gate");
+        let TimelineItemDto::PermissionDialog { id, .. } = &items[2] else {
+            panic!("expected permission dialog, got {:?}", items[2]);
+        };
+        assert_eq!(id, "tool-call-1-permission");
+    }
+
+    #[test]
+    fn send_user_message_item_id_uses_call_id_scheme() {
+        let (_temp, store) = test_store();
+        let items = timeline_items(
+            &store,
+            &record(vec![TranscriptEvent::ToolInvocation {
+                call_id: "call-msg-1".to_string(),
+                tool_id: "SendUserMessage".to_string(),
+                input: r#"{"message":"Starting Phase 1.","status":"normal"}"#.to_string(),
+                output: "{}".to_string(),
+                success: true,
+                metadata: None,
+                actor: None,
+                subject: None,
+            }]),
+        );
+
+        assert_eq!(items.len(), 1);
+        let TimelineItemDto::AssistantMessage { id, .. } = &items[0] else {
+            panic!("expected assistant message, got {:?}", items[0]);
+        };
+        assert_eq!(id, "tool-call-msg-1-message");
     }
 
     #[test]

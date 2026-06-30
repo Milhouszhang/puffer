@@ -731,6 +731,12 @@ mod tests {
 
         assert!(error.to_string().contains("remote URL expired"));
         assert_eq!(saved.status, MediaJobStatus::Failed);
+        // The resolved download URL is persisted even on a terminal download
+        // failure, so a later re-download attempt has the URL on record.
+        assert_eq!(
+            saved.remote_video_url.as_deref(),
+            Some("https://replicate.delivery/expired.mp4")
+        );
         assert!(saved.error.unwrap().contains("remote URL expired"));
     }
 }

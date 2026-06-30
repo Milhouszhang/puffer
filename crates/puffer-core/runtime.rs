@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod agent_loop;
+mod agent_memory;
 #[cfg(test)]
 mod agent_runtime_tests;
 mod agent_support;

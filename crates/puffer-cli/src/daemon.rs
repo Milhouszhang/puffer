@@ -115,8 +115,8 @@ use crate::desktop_api;
 use crate::desktop_api_types::{
     ExternalCredentialDto, FolderGroupDto, McpServerDto, MediaCapabilityAxisDto,
     MediaCapabilityInfoDto, ModelDescriptorDto, ProxyEndpointInputDto, ProxyTestResultDto,
-    RepoActionResultDto, RepoStatusDto, SaveProxySettingsParams, SessionDetailDto,
-    SettingsSnapshotDto, ThinkingOptionDto,
+    RepoActionResultDto, RepoStatusDto, SaveProxySettingsParams, SaveRemoteSettingsParams,
+    SessionDetailDto, SettingsSnapshotDto, ThinkingOptionDto,
 };
 
 const PROTOCOL_VERSION: &str = "1";
@@ -454,8 +454,6 @@ pub(crate) struct DaemonState {
     /// window so a runaway browser checkout can't keep running once the user's
     /// app has gone away (issue #600).
     live_connections: Arc<AtomicUsize>,
-    /// Monitor reply action sessions stay source-bound across follow-up turns.
-    monitor_reply_sessions: Arc<Mutex<HashMap<String, String>>>,
 }
 
 const RECENT_EVENT_CAPACITY: usize = 500;
@@ -688,6 +686,35 @@ fn send_user_message_text(tool_id: &str, input: &str) -> Option<String> {
     Some(message)
 }
 
+/// Resolves browser launch settings, degrading to the empty default when
+/// staging fails so a captcha-extension staging error never blocks daemon
+/// startup (issue #670).
+///
+/// `BrowserLaunchSettings::from_config` stages bundled browser extensions (most
+/// notably the NopeCHA captcha extension) into a SHARED per-user dir. On a Bobo
+/// launch two stagers race for that dir — the native CEF host and the freshly
+/// spawned daemon — and before this guard a transient staging failure (e.g. the
+/// race deleting the destination mid-copy) propagated out of `DaemonState::load`
+/// via `?`. The daemon then exited before printing its handshake and Bobo
+/// surfaced a fatal "empty handshake line" startup dialog. The shared stage is
+/// now lock-serialized in `puffer-config`, but we additionally never let a
+/// staging error be fatal: on failure we log and start with no browser
+/// extensions so chat still comes up and the handshake is printed.
+fn browser_launch_settings_or_default(
+    result: Result<BrowserLaunchSettings>,
+) -> BrowserLaunchSettings {
+    match result {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!(
+                "puffer daemon: browser extension staging failed ({error:#}); \
+                 continuing without browser extensions"
+            );
+            BrowserLaunchSettings::default()
+        }
+    }
+}
+
 impl DaemonState {
     fn load(
         cwd: std::path::PathBuf,
@@ -698,7 +725,11 @@ impl DaemonState {
         yolo: bool,
     ) -> Result<Self> {
         let config = load_config(&paths)?;
-        let browser_launch_settings = BrowserLaunchSettings::from_config(&paths, &config)?;
+        // Browser extension staging (e.g. the NopeCHA captcha extension) must
+        // never block the daemon from coming up and printing its handshake.
+        // See `browser_launch_settings_or_default` for the rationale (#670).
+        let browser_launch_settings =
+            browser_launch_settings_or_default(BrowserLaunchSettings::from_config(&paths, &config));
         let (events, _rx) = broadcast::channel::<ServerEnvelope>(256);
         let browser_profile_root = paths.user_config_dir.join("browser-profiles");
         let ptys = Arc::new(PtyRegistry::new());
@@ -725,7 +756,6 @@ impl DaemonState {
             generated_video_tickets: Arc::new(Mutex::new(HashMap::new())),
             recent_events: Arc::new(Mutex::new(VecDeque::with_capacity(RECENT_EVENT_CAPACITY))),
             live_connections: Arc::new(AtomicUsize::new(0)),
-            monitor_reply_sessions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1423,6 +1453,7 @@ async fn dispatch_request(
         "set_lambda_skill_approval" => {
             respond!(detached!(|s, p| handle_set_lambda_skill_approval(&s, &p)))
         }
+        "list_command_surface" => respond!(detached!(|s| handle_list_command_surface(&s))),
         "list_provider_models" => {
             respond!(detached!(|s, p| handle_list_provider_models(&s, &p)))
         }
@@ -1444,6 +1475,7 @@ async fn dispatch_request(
             respond!(detached!(|s, p| handle_create_file_media_access(&s, &p)))
         }
         "save_proxy_settings" => respond!(detached!(|s, p| handle_save_proxy_settings(&s, &p))),
+        "save_remote_settings" => respond!(detached!(|s, p| handle_save_remote_settings(&s, &p))),
         "save_secret" => respond!(detached!(|s, p| handle_save_secret(&s, &p))),
         "delete_secret" => respond!(detached!(|s, p| handle_delete_secret(&s, &p))),
         "contacts_list" => {
@@ -1525,6 +1557,9 @@ async fn dispatch_request(
         "pty_resize" => respond!(handle_pty_resize(&state, &params)),
         "pty_close" => respond!(handle_pty_close(&state, &params)),
         "list_dir" => respond!(crate::daemon_files::handle_list_dir(&state, &params)),
+        "list_workspace_mentions" => respond!(crate::daemon_files::handle_list_workspace_mentions(
+            &state, &params
+        )),
         "read_file" => respond!(crate::daemon_files::handle_read_file(&state, &params)),
         "write_file" => respond!(crate::daemon_files::handle_write_file(&state, &params)),
         "lsp_inspect" => respond!(detached!(|s, p| crate::daemon_lsp::handle_lsp_inspect(
@@ -1634,6 +1669,12 @@ async fn dispatch_request(
         ),
         "monitor_reply_send" | "task_monitor_reply_send" => respond!(
             crate::daemon_workflows::handle_monitor_reply_send(&state.paths, &params)
+        ),
+        "monitor_action_execute" | "task_monitor_action_execute" => respond!(
+            crate::daemon_workflows::handle_monitor_action_execute(&state.paths, &params)
+        ),
+        "connector_action_execute" => respond!(
+            crate::daemon_workflows::handle_connector_action_execute(&state.paths, &params)
         ),
         "monitor_memory_save" | "task_monitor_memory_save" => respond!(
             crate::daemon_workflows::handle_monitor_memory_save(&state.paths, &params)
@@ -2341,6 +2382,26 @@ fn handle_save_proxy_settings(state: &DaemonState, params: &Value) -> Result<Val
     Ok(serde_json::to_value(snapshot)?)
 }
 
+fn handle_save_remote_settings(state: &DaemonState, params: &Value) -> Result<Value> {
+    let input: SaveRemoteSettingsParams =
+        serde_json::from_value(params.clone()).context("invalid remote settings")?;
+    let mut config = state.config.lock().unwrap().clone();
+    config.remote = desktop_api::remote_config_from_settings(input);
+    save_user_config(&state.paths, &config).context("save user config")?;
+    reload_daemon_config(state)?;
+    let fresh = state.build_runtime_inputs()?;
+    let config = state.config.lock().unwrap().clone();
+    let snapshot: SettingsSnapshotDto = desktop_api::load_settings_snapshot(
+        &state.paths,
+        &config,
+        &fresh.resources,
+        &fresh.providers,
+        &fresh.auth_store,
+        &fresh.session_store,
+    )?;
+    Ok(serde_json::to_value(snapshot)?)
+}
+
 fn handle_test_proxy(state: &DaemonState, params: &Value) -> Result<Value> {
     let input: TestProxyParams =
         serde_json::from_value(params.clone()).context("invalid proxy test params")?;
@@ -2440,7 +2501,17 @@ fn handle_login_with_oauth(state: &DaemonState, params: &Value) -> Result<Value>
 
     let mut inputs = state.build_runtime_inputs()?;
     let auth_path = state.paths.user_config_dir.join("auth.json");
-    let listener = crate::authflow::CallbackListener::bind_localhost("/callback")?;
+    // OpenAI/Codex registers an exact redirect URI
+    // (`http://localhost:1455/auth/callback`); an ephemeral callback port makes
+    // the provider reject the authorize request with
+    // `authorize_hydra_invalid_request`. Anthropic accepts a dynamic localhost
+    // port, so it keeps the OS-assigned ephemeral listener.
+    let listener = match oauth_family_for_provider(&inputs.providers, &provider_id) {
+        Some(OauthFamily::OpenAi) => {
+            crate::authflow::CallbackListener::bind_localhost_port("/auth/callback", 1455)?
+        }
+        _ => crate::authflow::CallbackListener::bind_localhost("/callback")?,
+    };
     let bundle =
         oauth_login_bundle_for_provider(&inputs.providers, &provider_id, listener.redirect_uri())?;
     let launch_url = bundle
@@ -2729,6 +2800,15 @@ fn mcp_server_dtos(resources: &LoadedResources) -> Vec<McpServerDto> {
         .collect()
 }
 
+fn handle_list_command_surface(state: &DaemonState) -> Result<Value> {
+    let inputs = state.build_runtime_inputs_without_discovery()?;
+    let commands = command_surface(&inputs.resources)
+        .into_iter()
+        .filter(|command| !command.hidden)
+        .collect::<Vec<_>>();
+    Ok(serde_json::to_value(commands)?)
+}
+
 /// Returns the full model list for one provider. The snapshot only carries
 /// a count; the Settings → Models pane calls this to populate the picker.
 fn handle_list_provider_models(state: &DaemonState, params: &Value) -> Result<Value> {
@@ -2738,6 +2818,12 @@ fn handle_list_provider_models(state: &DaemonState, params: &Value) -> Result<Va
         .and_then(|v| v.as_str())
         .context("missing providerId")?;
     let provider_id = canonical_desktop_provider_id(requested_provider_id);
+    if provider_id == "puffer" {
+        return Ok(json!({
+            "providerId": provider_id,
+            "models": [native_puffer_model_descriptor()],
+        }));
+    }
     let mut inputs = state.build_runtime_inputs_without_discovery()?;
     let config = state.config.lock().unwrap().clone();
     let needs_fresh_discovery = inputs
@@ -2781,6 +2867,20 @@ fn handle_list_provider_models(state: &DaemonState, params: &Value) -> Result<Va
         .map(|model| model_descriptor_dto(family, model))
         .collect();
     Ok(json!({ "providerId": provider_id, "models": models }))
+}
+
+fn native_puffer_model_descriptor() -> Value {
+    json!({
+        "id": "default",
+        "displayName": "Default",
+        "provider": "puffer",
+        "api": "cli",
+        "contextWindow": 200000,
+        "maxOutputTokens": 8192,
+        "supportsReasoning": false,
+        "supportsTools": true,
+        "isDefault": true,
+    })
 }
 
 fn handle_list_media_capabilities(state: &DaemonState, params: &Value) -> Result<Value> {
@@ -2832,6 +2932,7 @@ fn media_capability_info_dto(capability: MediaCapabilityView) -> MediaCapability
         source: capability.source,
         reason: capability.reason,
         checked_at_ms: capability.checked_at_ms,
+        supports_image_set: capability.supports_image_set,
     }
 }
 
@@ -3552,6 +3653,12 @@ fn resolve_create_session_routing(
     let inputs = state.build_runtime_inputs_without_discovery()?;
     if let Some(provider_id) = provider_id {
         let provider_id = canonical_desktop_provider_id(&provider_id);
+        if is_native_puffer_provider_id(&provider_id) {
+            return Ok(DesktopSessionRouting {
+                provider_id: Some(provider_id),
+                model_id: Some("default".to_string()),
+            });
+        }
         let provider = inputs
             .providers
             .provider(&provider_id)
@@ -4422,12 +4529,13 @@ fn append_ordered_turn_progress(
             }
             TurnProgressItem::ToolInvocation(invocation) => {
                 let subject = subject_for_tool(&invocation);
+                let input = puffer_core::sanitized_tool_invocation_input(&invocation);
                 session_store.append_event(
                     session_uuid,
                     TranscriptEvent::ToolInvocation {
                         call_id: invocation.call_id,
                         tool_id: invocation.tool_id,
-                        input: invocation.input,
+                        input,
                         output: invocation.output,
                         success: invocation.success,
                         metadata: (!invocation.metadata.is_null()).then_some(invocation.metadata),
@@ -4440,12 +4548,14 @@ fn append_ordered_turn_progress(
                 if !fail_pending_tools {
                     continue;
                 }
+                let input =
+                    puffer_core::sanitize_tool_invocation_input(&request.tool_id, &request.input);
                 session_store.append_event(
                     session_uuid,
                     TranscriptEvent::ToolInvocation {
                         call_id: request.call_id,
                         tool_id: request.tool_id,
-                        input: request.input,
+                        input,
                         output: CANCELLED_TURN_MESSAGE.to_string(),
                         success: false,
                         metadata: Some(json!({
@@ -4707,6 +4817,8 @@ fn turn_browser_tab_context(
 }
 
 const MONITOR_REPLY_ACTION_PROMPT_SCOPE: &str = "monitor-reply-action";
+const MONITOR_GMAIL_ACTION_PROMPT_SCOPE: &str = "monitor-gmail-action";
+const MONITOR_TELEGRAM_ACTION_PROMPT_SCOPE: &str = "monitor-telegram-action";
 const MONITOR_ACTION_PROMPT_PREFIX: &str = "Act on monitored task ";
 
 #[derive(Clone, Debug)]
@@ -4717,6 +4829,21 @@ struct MonitorReplyTurnScope {
     prompt_tool_scope: &'static str,
 }
 
+/// Resolves the monitor-reply tool scope for one turn.
+///
+/// A scope is granted ONLY on the genuine action-prompt turn — the turn that
+/// carries the seeded `Act on monitored task <id>:` message together with a
+/// matching `monitorActionTaskId` param. That turn is hard-locked to the draft
+/// `allowed_tools` set so it produces a single human-gated reply draft.
+///
+/// Every other turn resolves `None` (#561): the draft tool is neither offered to
+/// the model nor bound to a task, so an unrelated follow-up question can never be
+/// re-scoped into (re-)drafting the reply. The scope is strictly per-turn — it is
+/// never made sticky to the session and never recovered from the transcript.
+/// Refining a saved draft is done by editing it in the Bobo review modal (both
+/// `ReplyDraftModal` and `PendingActionModal` expose the draft text for editing)
+/// or by re-running the task action, which re-sends the action prompt and
+/// re-arms the scope for that single turn.
 fn resolve_monitor_reply_turn_scope(
     state: &DaemonState,
     params: &Value,
@@ -4728,7 +4855,13 @@ fn resolve_monitor_reply_turn_scope(
         if monitor_action_task_id_param(params).is_some() {
             anyhow::bail!("monitorActionTaskId requires a monitor action prompt");
         }
-        return resolve_existing_monitor_reply_session_scope(state, session_id, turn_id);
+        if monitor_action_kind_param(params).is_some() {
+            anyhow::bail!("monitorActionKind requires a monitor action prompt");
+        }
+        // Not the action turn → no reply scope (#561). The follow-up runs with
+        // the full tool set and cannot draft; the prior session-sticky behavior
+        // (re-bind from the in-memory map or by scanning the transcript) is gone.
+        return Ok(None);
     };
     let Some(explicit_task_id) = monitor_action_task_id_param(params) else {
         anyhow::bail!("human-gated monitor action prompt requires matching monitorActionTaskId");
@@ -4740,101 +4873,59 @@ fn resolve_monitor_reply_turn_scope(
     }
 
     let task = load_monitor_task_for_scope(&state.paths, &prompt_task_id)?;
-    if !monitor_task_is_human_gated(&task) {
-        return Ok(None);
+    let stored_kind = monitor_task_kind(&task);
+    if stored_kind.is_some() && monitor_action_kind_param(params).is_none() {
+        anyhow::bail!("typed monitor action prompt requires matching monitorActionKind");
     }
-    if !monitor_task_has_delivery_target(&task) {
-        anyhow::bail!("monitor task `{prompt_task_id}` is missing a source delivery target");
+    if let (Some(explicit_kind), Some(stored_kind)) =
+        (monitor_action_kind_param(params), stored_kind.as_deref())
+    {
+        if explicit_kind != stored_kind {
+            anyhow::bail!(
+                "monitorActionKind `{explicit_kind}` does not match monitor task kind `{stored_kind}`"
+            );
+        }
     }
-    state
-        .monitor_reply_sessions
-        .lock()
-        .unwrap()
-        .insert(session_id.to_string(), prompt_task_id.clone());
+    let prompt_tool_scope = match stored_kind.as_deref() {
+        Some("gmail.reply") => {
+            if monitor_task_is_terminal(&task) {
+                return Ok(None);
+            }
+            if !monitor_task_has_gmail_thread_target(&task) {
+                anyhow::bail!("monitor task `{prompt_task_id}` is missing a Gmail thread target");
+            }
+            MONITOR_GMAIL_ACTION_PROMPT_SCOPE
+        }
+        Some("telegram.reply") => {
+            if monitor_task_is_terminal(&task) {
+                return Ok(None);
+            }
+            if !monitor_task_has_delivery_target(&task) {
+                anyhow::bail!(
+                    "monitor task `{prompt_task_id}` is missing a source delivery target"
+                );
+            }
+            MONITOR_TELEGRAM_ACTION_PROMPT_SCOPE
+        }
+        Some(kind) if kind != "telegram.reply" => return Ok(None),
+        _ => {
+            if !monitor_task_is_human_gated(&task) {
+                return Ok(None);
+            }
+            if !monitor_task_has_delivery_target(&task) {
+                anyhow::bail!(
+                    "monitor task `{prompt_task_id}` is missing a source delivery target"
+                );
+            }
+            MONITOR_REPLY_ACTION_PROMPT_SCOPE
+        }
+    };
 
     Ok(Some(MonitorReplyTurnScope {
         task_id: prompt_task_id,
         session_id: session_id.to_string(),
         turn_id: turn_id.to_string(),
-        prompt_tool_scope: MONITOR_REPLY_ACTION_PROMPT_SCOPE,
-    }))
-}
-
-fn resolve_existing_monitor_reply_session_scope(
-    state: &DaemonState,
-    session_id: &str,
-    turn_id: &str,
-) -> Result<Option<MonitorReplyTurnScope>> {
-    let mut scoped_task_id = state
-        .monitor_reply_sessions
-        .lock()
-        .unwrap()
-        .get(session_id)
-        .cloned();
-    if scoped_task_id.is_none() {
-        scoped_task_id = recover_monitor_reply_task_id_from_transcript(state, session_id)?;
-        if let Some(task_id) = &scoped_task_id {
-            state
-                .monitor_reply_sessions
-                .lock()
-                .unwrap()
-                .insert(session_id.to_string(), task_id.clone());
-        }
-    }
-    let Some(task_id) = scoped_task_id else {
-        return Ok(None);
-    };
-
-    let task = match load_monitor_task_for_scope(&state.paths, &task_id) {
-        Ok(task) => task,
-        Err(_) => {
-            state
-                .monitor_reply_sessions
-                .lock()
-                .unwrap()
-                .remove(session_id);
-            return Ok(None);
-        }
-    };
-    if monitor_task_is_terminal(&task) || !monitor_task_is_human_gated(&task) {
-        state
-            .monitor_reply_sessions
-            .lock()
-            .unwrap()
-            .remove(session_id);
-        return Ok(None);
-    }
-    if !monitor_task_has_delivery_target(&task) {
-        anyhow::bail!("monitor task `{task_id}` is missing a source delivery target");
-    }
-
-    Ok(Some(MonitorReplyTurnScope {
-        task_id,
-        session_id: session_id.to_string(),
-        turn_id: turn_id.to_string(),
-        prompt_tool_scope: MONITOR_REPLY_ACTION_PROMPT_SCOPE,
-    }))
-}
-
-fn recover_monitor_reply_task_id_from_transcript(
-    state: &DaemonState,
-    session_id: &str,
-) -> Result<Option<String>> {
-    let Ok(session_uuid) = Uuid::parse_str(session_id) else {
-        return Ok(None);
-    };
-    let Ok(session_store) = SessionStore::from_paths(&state.paths) else {
-        return Ok(None);
-    };
-    let Ok(record) = session_store.load_session(session_uuid) else {
-        return Ok(None);
-    };
-
-    Ok(record.events.iter().rev().find_map(|event| {
-        let TranscriptEvent::UserMessage { text, .. } = event else {
-            return None;
-        };
-        parse_monitor_action_prompt_task_id(text)
+        prompt_tool_scope,
     }))
 }
 
@@ -4852,6 +4943,35 @@ fn monitor_action_task_id_param(params: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .and_then(non_empty_str)
         .map(ToString::to_string)
+}
+
+fn monitor_action_kind_param(params: &Value) -> Option<String> {
+    params
+        .get("monitorActionKind")
+        .or_else(|| params.get("monitor_action_kind"))
+        .and_then(Value::as_str)
+        .and_then(non_empty_str)
+        .map(ToString::to_string)
+}
+
+fn monitor_task_kind(task: &Value) -> Option<String> {
+    task.get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("monitor"))
+        .and_then(Value::as_object)
+        .and_then(|monitor| {
+            let schema_version = monitor
+                .get("schema_version")
+                .or_else(|| monitor.get("schemaVersion"))
+                .and_then(Value::as_u64)?;
+            (schema_version == 2).then(|| {
+                monitor
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .and_then(non_empty_str)
+                    .map(ToString::to_string)
+            })?
+        })
 }
 
 fn load_monitor_task_for_scope(paths: &ConfigPaths, task_id: &str) -> Result<Value> {
@@ -4910,6 +5030,8 @@ fn monitor_task_has_delivery_target(task: &Value) -> bool {
         .or_else(|| task.pointer("/metadata/sourceContext/deliveryTarget/chatId"))
         .or_else(|| task.pointer("/metadata/sourceContext/deliveryTarget/chat_id"))
         .or_else(|| task.pointer("/metadata/source_context/deliveryTarget/chatId"))
+        .or_else(|| task.pointer("/metadata/monitor/source/chat_id"))
+        .or_else(|| task.pointer("/metadata/monitor/source/chatId"))
         .and_then(value_to_non_empty_string)
         .is_some()
         || task
@@ -4922,6 +5044,15 @@ fn monitor_task_has_delivery_target(task: &Value) -> bool {
                 .or_else(|| task.pointer("/metadata/chatId"))
                 .and_then(value_to_non_empty_string)
                 .is_some()
+}
+
+fn monitor_task_has_gmail_thread_target(task: &Value) -> bool {
+    monitor_task_kind(task).as_deref() == Some("gmail.reply")
+        && task
+            .pointer("/metadata/monitor/source/thread_id")
+            .or_else(|| task.pointer("/metadata/monitor/source/threadId"))
+            .and_then(value_to_non_empty_string)
+            .is_some()
 }
 
 fn monitor_task_is_terminal(task: &Value) -> bool {
@@ -6441,6 +6572,13 @@ impl TurnRequestOptions {
     }
 
     fn apply_session_routing(&mut self, routing: DesktopSessionRouting) {
+        if routing
+            .provider_id
+            .as_deref()
+            .is_some_and(is_native_puffer_provider_id)
+        {
+            return;
+        }
         if self.provider_id.is_none() {
             self.provider_id = routing
                 .provider_id
@@ -6517,6 +6655,9 @@ fn apply_turn_provider_selection(
     fast_mode: bool,
 ) -> Result<()> {
     let provider_id = canonical_desktop_provider_id(provider_id);
+    if is_native_puffer_provider_id(&provider_id) {
+        return Ok(());
+    }
     let provider = providers
         .provider(&provider_id)
         .with_context(|| format!("provider {provider_id} not found"))?;
@@ -6534,6 +6675,9 @@ fn apply_turn_model_selection(
     effort: &str,
     fast_mode: bool,
 ) -> Result<()> {
+    if provider_id.is_some_and(is_native_puffer_provider_id) {
+        return Ok(());
+    }
     let requested = if let Some(provider_id) = provider_id {
         let provider_id = canonical_desktop_provider_id(provider_id);
         let provider = providers
@@ -6555,6 +6699,13 @@ fn apply_turn_model_override_with_preferences(
     effort: &str,
     fast_mode: bool,
 ) -> Result<()> {
+    if requested
+        .split_once('/')
+        .is_some_and(|(provider_id, _)| is_native_puffer_provider_id(provider_id))
+        || is_native_puffer_provider_id(requested)
+    {
+        return Ok(());
+    }
     let (provider_id, model_id) = resolve_turn_model(providers, requested)?;
     apply_turn_model_preferences(app_state, &provider_id, &model_id, effort, fast_mode);
     Ok(())
@@ -6596,6 +6747,9 @@ fn resolve_turn_model(providers: &ProviderRegistry, requested: &str) -> Result<(
     let (provider_id, model_id) = if let Some((provider_id, model_id)) = requested.split_once('/') {
         let provider_id = canonical_desktop_provider_id(provider_id);
         let model_id = model_id.trim();
+        if is_native_puffer_provider_id(&provider_id) {
+            return Ok((provider_id, "default".to_string()));
+        }
         let provider = providers
             .provider(&provider_id)
             .with_context(|| format!("provider {provider_id} not found"))?;
@@ -6634,6 +6788,10 @@ fn canonical_desktop_provider_id(provider_id: &str) -> String {
     }
 }
 
+fn is_native_puffer_provider_id(provider_id: &str) -> bool {
+    provider_id.trim().eq_ignore_ascii_case("puffer")
+}
+
 fn desktop_provider_ids_match(left: &str, right: &str) -> bool {
     canonical_desktop_provider_id(left) == canonical_desktop_provider_id(right)
 }
@@ -6659,8 +6817,9 @@ fn apply_daemon_yolo_mode(app_state: &mut AppState) {
 mod tests {
     use super::{
         append_ordered_turn_progress, apply_daemon_yolo_mode, apply_turn_model_override,
-        apply_turn_request_options, browser_permission_payload_json, browser_status_for_turn,
-        cancel_all_active_turns, connector_setup_connect_args, connector_setup_id, daemon_now_ms,
+        apply_turn_request_options, browser_launch_settings_or_default,
+        browser_permission_payload_json, browser_status_for_turn, cancel_all_active_turns,
+        connector_setup_connect_args, connector_setup_id, daemon_now_ms,
         desktop_latency_ms, file_media_mime_type, generated_video_handler,
         handle_create_file_media_access, handle_create_generated_video_access,
         handle_create_openai_realtime_client_secret, handle_create_session, handle_generate_media,
@@ -6673,8 +6832,9 @@ mod tests {
         handle_set_lambda_skill_enabled, handle_update_config, model_descriptor_dto,
         parse_single_byte_range, permission_review_payload_json,
         realtime_session_config_from_params, report_cancelled_turn, requires_explicit_subscription,
-        resolve_create_session_model_id, run_off_runtime, session_used_browser_tool,
-        start_connector_setup_turn, turn_browser_tab_context, CancelToken, ConnectionGuard,
+        resolve_create_session_model_id, resolve_monitor_reply_turn_scope, run_off_runtime,
+        session_used_browser_tool, start_connector_setup_turn, turn_browser_tab_context,
+        CancelToken, ConnectionGuard, MONITOR_REPLY_ACTION_PROMPT_SCOPE,
         DaemonState, GenerateMediaArtifactResult, GenerateMediaResult, GeneratedVideoRangeError,
         GeneratedVideoTicket, ServerEnvelope, TurnHandle, TurnProgress, TurnProgressItem,
         TurnRequestOptions,
@@ -7268,6 +7428,38 @@ models: []
             .expect("daemon state")
     }
 
+    /// Issue #670: a captcha-extension staging failure must NOT be fatal to the
+    /// daemon. Previously `BrowserLaunchSettings::from_config(...)?` propagated
+    /// the error out of `DaemonState::load`, so `run_async` returned `Err`
+    /// before printing its handshake and Bobo showed a fatal "empty handshake
+    /// line" startup dialog. The fix routes that `Result` through
+    /// `browser_launch_settings_or_default`, which swallows the error and falls
+    /// back to empty (no-extension) settings so startup proceeds.
+    ///
+    /// Tested at the helper seam (not via `DaemonState::load`) because forcing a
+    /// real staging failure requires a revealed secret, and `SecretVault::open`
+    /// hits the macOS Keychain — unavailable/cancelled in headless CI. The
+    /// reproduction of the underlying ENOENT race lives in puffer-config's
+    /// `concurrent_staging_into_shared_root_never_errors`.
+    #[test]
+    fn browser_launch_settings_staging_error_is_non_fatal() {
+        use crate::daemon_browser::BrowserLaunchSettings;
+
+        // A staging error must degrade to default (empty) settings, not propagate.
+        let degraded = browser_launch_settings_or_default(Err(anyhow::anyhow!(
+            "copy extension file .../awscaptcha.js to .../awscaptcha.js: No such file or directory (os error 2)"
+        )));
+        assert_eq!(degraded, BrowserLaunchSettings::default());
+        assert!(degraded.extension_dirs().is_empty());
+
+        // The happy path is untouched: a successful settings value passes through.
+        let staged = BrowserLaunchSettings::with_extension_dirs(vec![std::path::PathBuf::from(
+            "/tmp/ext/nopecha",
+        )]);
+        let passthrough = browser_launch_settings_or_default(Ok(staged.clone()));
+        assert_eq!(passthrough, staged);
+    }
+
     fn insert_session_turn(state: &DaemonState, session_id: Uuid, turn_id: &str) {
         let cancel = CancelToken::new();
         let mut handle = empty_turn_handle(cancel);
@@ -7482,6 +7674,119 @@ models: []
             "live CLI tab must be visible through the chat-session lookup"
         );
         assert_eq!(context.url.as_deref(), Some("https://example.com/cart"));
+    }
+
+    /// Issue #667: the visible in-app BrowserPane lists/subscribes by chat
+    /// session UUID, but the Bash `browser` skill registers tabs under the
+    /// workspace-stable cli-browser id. The `browser_agent` "list" arm must fall
+    /// back to the CLI keyspace when the chat UUID owns no tabs (so the pane is
+    /// not blank), and must register an event bridge so later CLI tab-list
+    /// changes are mirrored onto `browser:<chat-uuid>:tabs` for live updates.
+    #[test]
+    fn browser_agent_list_falls_back_to_cli_keyspace_and_bridges_events() {
+        let _home_guard = PufferHomeEnvGuard::set();
+        let state = Arc::new(test_daemon_state());
+        let chat_root = Uuid::new_v4().to_string();
+
+        // A live CLI-browser tab opened by the Bash `browser` skill.
+        let cli_id =
+            crate::daemon_browser::default_cli_session_id(&state.paths).expect("cli session id");
+        state
+            .browsers
+            .test_record_tab(&cli_id, "t1", "https://example.com/cart", "Cart");
+
+        // The pane lists by its chat-session UUID, which owns no tabs of its own.
+        let listed: crate::daemon_browser::BrowserTabsState = serde_json::from_value(
+            crate::daemon_browser::handle_browser_agent(
+                &state,
+                &json!({ "action": "list", "sessionId": chat_root }),
+            )
+            .expect("browser_agent list"),
+        )
+        .expect("decode tabs state");
+        assert_eq!(
+            listed.tabs.len(),
+            1,
+            "pane list must surface the live CLI tab instead of a blank pane"
+        );
+        assert_eq!(listed.tabs[0].url, "https://example.com/cart");
+
+        // Listing also registered an event bridge cli_id -> chat_root. A
+        // subsequent CLI tab-list publish must mirror onto the pane's channel.
+        let mut events = state.event_sender().subscribe();
+        crate::daemon_browser::test_publish_tabs(&state, &cli_id);
+
+        let mut saw_chat_channel = false;
+        let mut saw_cli_channel = false;
+        while let Ok(env) = events.try_recv() {
+            if let ServerEnvelope::Event { event, payload } = env {
+                if event == format!("browser:{chat_root}:tabs") {
+                    saw_chat_channel = true;
+                    assert_eq!(
+                        payload["tabs"][0]["url"], "https://example.com/cart",
+                        "mirrored payload must carry the live CLI tab"
+                    );
+                } else if event == format!("browser:{cli_id}:tabs") {
+                    saw_cli_channel = true;
+                }
+            }
+        }
+        assert!(
+            saw_cli_channel,
+            "CLI keyspace always publishes its own channel"
+        );
+        assert!(
+            saw_chat_channel,
+            "bridged pane must receive mirrored CLI tab updates on its chat-uuid channel"
+        );
+    }
+
+    /// Precedence invariant (#667): when the chat-session UUID owns its own
+    /// typed-Browser tab, the list must return that tab and must NOT fall back
+    /// to (or bridge) the CLI keyspace.
+    #[test]
+    fn browser_agent_list_prefers_chat_own_tabs_over_cli_fallback() {
+        let _home_guard = PufferHomeEnvGuard::set();
+        let state = Arc::new(test_daemon_state());
+        let chat_root = Uuid::new_v4().to_string();
+
+        let cli_id =
+            crate::daemon_browser::default_cli_session_id(&state.paths).expect("cli session id");
+        state
+            .browsers
+            .test_record_tab(&cli_id, "t1", "https://cli.example/cart", "CLI");
+        // The chat session has its own tab (typed Browser tool path).
+        state
+            .browsers
+            .test_record_tab(&chat_root, "t1", "https://chat.example/own", "Own");
+
+        let listed: crate::daemon_browser::BrowserTabsState = serde_json::from_value(
+            crate::daemon_browser::handle_browser_agent(
+                &state,
+                &json!({ "action": "list", "sessionId": chat_root }),
+            )
+            .expect("browser_agent list"),
+        )
+        .expect("decode tabs state");
+        assert_eq!(listed.tabs.len(), 1);
+        assert_eq!(
+            listed.tabs[0].url, "https://chat.example/own",
+            "chat-session's own tab must win over the CLI fallback"
+        );
+
+        // No bridge should have been registered; a CLI publish must NOT leak
+        // onto the chat-uuid channel.
+        let mut events = state.event_sender().subscribe();
+        crate::daemon_browser::test_publish_tabs(&state, &cli_id);
+        while let Ok(env) = events.try_recv() {
+            if let ServerEnvelope::Event { event, .. } = env {
+                assert_ne!(
+                    event,
+                    format!("browser:{chat_root}:tabs"),
+                    "no bridge must exist when the chat session owns its tabs"
+                );
+            }
+        }
     }
 
     /// Issue #560: a restarted daemon has an empty tab registry, so a resumed
@@ -8014,6 +8319,122 @@ models: []
             false,
         )
         .expect("daemon state")
+    }
+
+    // ── #561: monitor-reply scope must not lock unrelated follow-up turns ──────
+
+    /// Builds a daemon state whose monitor task store holds one open, human-gated
+    /// (legacy `MonitorReplyDraft`) Telegram task `monitor-16` with a delivery
+    /// target. The returned `TempDir` must outlive the state.
+    fn monitor_reply_env() -> (tempfile::TempDir, DaemonState) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("workspace");
+        let paths = ConfigPaths {
+            workspace_root: workspace_root.clone(),
+            workspace_config_dir: workspace_root.join(".puffer"),
+            user_config_dir: temp.path().join("home").join(".puffer"),
+            builtin_resources_dir: workspace_root.join("resources"),
+        };
+        ensure_workspace_dirs(&paths).expect("workspace dirs");
+        let task_dir = paths
+            .workspace_config_dir
+            .join("runtime")
+            .join("claude_workflow");
+        std::fs::create_dir_all(&task_dir).expect("task dir");
+        std::fs::write(
+            task_dir.join("monitor_tasks.json"),
+            serde_json::to_string(&json!({
+                "tasks": [{
+                    "task_id": "monitor-16",
+                    "status": "open",
+                    "metadata": {
+                        "completion_policy": { "mode": "draft_then_approve" },
+                        "source_context": { "delivery_target": { "chat_id": 7842887746_i64 } }
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .expect("write monitor task");
+        let state = test_state_with_paths(paths);
+        (temp, state)
+    }
+
+    const MONITOR_ACTION_MSG: &str =
+        "Act on monitored task monitor-16: tonight's release window moved\n\n\
+         Task description:\nValidate your endpoint before the new window.";
+
+    /// The #561 regression: only the genuine action turn (seeded prompt + a
+    /// matching `monitorActionTaskId`) resolves a draft scope. An unrelated
+    /// follow-up question in the same session resolves NO scope, so the draft
+    /// tool is never offered to the model and the earlier reply can't be
+    /// re-drafted. Re-running the task action re-arms the scope for that one turn.
+    #[test]
+    fn monitor_reply_scope_is_action_turn_only() {
+        let (_temp, state) = monitor_reply_env();
+        let session_id = Uuid::new_v4().to_string();
+
+        // Action turn: scoped (hard-locked to the draft toolset downstream).
+        let action = resolve_monitor_reply_turn_scope(
+            &state,
+            &json!({ "monitorActionTaskId": "monitor-16" }),
+            MONITOR_ACTION_MSG,
+            &session_id,
+            "turn-action",
+        )
+        .expect("action scope resolves")
+        .expect("action turn is scoped");
+        assert_eq!(action.task_id, "monitor-16");
+        assert_eq!(action.prompt_tool_scope, MONITOR_REPLY_ACTION_PROMPT_SCOPE);
+
+        // Unrelated follow-up in the SAME session (the #561 transcript): no param,
+        // an ordinary question → no scope at all, so the model cannot draft.
+        let follow_up = resolve_monitor_reply_turn_scope(
+            &state,
+            &json!({}),
+            "帮我查我绑定的link卡号是多少",
+            &session_id,
+            "turn-follow-up",
+        )
+        .expect("follow-up scope resolves");
+        assert!(
+            follow_up.is_none(),
+            "an unrelated follow-up must not inherit any monitor-reply scope (#561)"
+        );
+
+        // Re-running the task action re-arms the scope for that turn only.
+        let rearm = resolve_monitor_reply_turn_scope(
+            &state,
+            &json!({ "monitorActionTaskId": "monitor-16" }),
+            MONITOR_ACTION_MSG,
+            &session_id,
+            "turn-rearm",
+        )
+        .expect("re-arm scope resolves")
+        .expect("re-running the action re-scopes the turn");
+        assert_eq!(rearm.prompt_tool_scope, MONITOR_REPLY_ACTION_PROMPT_SCOPE);
+    }
+
+    /// A plain (non-action) message carrying a `monitorActionTaskId` param is
+    /// rejected — the param is only valid alongside the seeded action prompt, so
+    /// it can't be used to smuggle a draft scope onto an arbitrary turn.
+    #[test]
+    fn monitor_action_task_id_param_requires_action_prompt() {
+        let (_temp, state) = monitor_reply_env();
+        let session_id = Uuid::new_v4().to_string();
+
+        let err = resolve_monitor_reply_turn_scope(
+            &state,
+            &json!({ "monitorActionTaskId": "monitor-16" }),
+            "帮我查我绑定的link卡号是多少",
+            &session_id,
+            "turn-x",
+        )
+        .expect_err("param without an action prompt must be rejected");
+        assert!(
+            err.to_string().contains("requires a monitor action prompt"),
+            "unexpected error: {err}"
+        );
     }
 
     fn write_generated_image_artifact(
@@ -9264,6 +9685,9 @@ models: []
                         }
                     ],
                     "cached_at_ms": now_ms,
+                    // Must match puffer-provider-registry's CAPABILITY_SCHEMA_VERSION,
+                    // or the entry is treated as schema-stale and never applied.
+                    "capability_schema_version": 1,
                 }
             }
         });

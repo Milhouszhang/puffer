@@ -1,5 +1,5 @@
 use crate::browser_args::BrowserArgs;
-use crate::media_internal_tools::{ImageGenerationArgs, VideoGenerationArgs};
+use crate::media_internal_tools::{ImageGenerationArgs, MediaCapabilitiesArgs, VideoGenerationArgs};
 use crate::non_interactive::NonInteractiveArgs;
 use crate::subscriber_tool_args::{EmailArgs, SlackArgs, TelegramArgs};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -280,6 +280,9 @@ pub(crate) enum InternalToolCommand {
     /// Generate images through the parent media runtime.
     #[command(name = "image-generation", alias = "imagegen")]
     ImageGeneration(#[command(flatten)] ImageGenerationArgs),
+    /// List connected image/video generation providers and models.
+    #[command(name = "media-capabilities", alias = "mediacaps")]
+    MediaCapabilities(#[command(flatten)] MediaCapabilitiesArgs),
     /// Log in to Slack or look up Slack conversations through the parent runtime.
     Slack(#[command(flatten)] SlackArgs),
     /// Log in to Telegram or look up Telegram peers through the parent runtime.
@@ -599,7 +602,11 @@ pub(crate) enum McpCommand {
         scope: ResourceScope,
     },
     /// Import MCP servers from Claude Desktop.
-    AddFromClaudeDesktop,
+    AddFromClaudeDesktop {
+        /// Configuration scope.
+        #[arg(short = 's', long = "scope", value_enum, default_value_t = ResourceScope::Local)]
+        scope: ResourceScope,
+    },
     /// Get details about one MCP server.
     Get {
         /// Stable MCP server id.
@@ -718,6 +725,65 @@ pub(crate) enum McpTransport {
     Stdio,
     Sse,
     Http,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, McpCommand, ResourceScope};
+    use clap::Parser;
+
+    #[test]
+    fn resume_flag_without_value_uses_empty_sentinel() {
+        let cli = Cli::parse_from(["puffer", "--resume"]);
+        assert_eq!(cli.resume.as_deref(), Some(""));
+        assert!(cli.prompt.is_none());
+    }
+
+    #[test]
+    fn resume_flag_with_value_keeps_positional_prompt() {
+        let cli = Cli::parse_from(["puffer", "--resume", "dockyard", "follow up"]);
+        assert_eq!(cli.resume.as_deref(), Some("dockyard"));
+        assert_eq!(cli.prompt.as_deref(), Some("follow up"));
+    }
+
+    #[test]
+    fn remote_prompt_collects_trailing_words() {
+        let cli = Cli::parse_from([
+            "puffer",
+            "remote",
+            "c@localhost",
+            "--cwd",
+            "/tmp/demo",
+            "hello",
+            "from",
+            "remote",
+        ]);
+        let Some(Command::Remote {
+            target,
+            cwd,
+            no_alt_screen,
+            prompt,
+        }) = cli.subcommand
+        else {
+            panic!("expected remote command");
+        };
+        assert_eq!(target, "c@localhost");
+        assert_eq!(cwd.as_deref(), Some("/tmp/demo"));
+        assert!(!no_alt_screen);
+        assert_eq!(prompt, ["hello", "from", "remote"]);
+    }
+
+    #[test]
+    fn mcp_add_from_desktop_accepts_scope_override() {
+        let cli = Cli::parse_from(["puffer", "mcp", "add-from-claude-desktop", "--scope", "user"]);
+        let Some(Command::Mcp {
+            command: Some(McpCommand::AddFromClaudeDesktop { scope }),
+        }) = cli.subcommand
+        else {
+            panic!("expected mcp add-from-claude-desktop command");
+        };
+        assert_eq!(scope, ResourceScope::User);
+    }
 }
 
 #[derive(Debug, Subcommand)]

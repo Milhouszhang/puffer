@@ -39,6 +39,8 @@ pub use command::{
 pub use command_helpers::append_trace_events;
 pub use command_helpers::execute_connect_flow;
 pub use command_helpers::execute_monitor_flow;
+pub use command_helpers::sanitize_tool_invocation_input;
+pub use command_helpers::sanitized_tool_invocation_input;
 pub use command_helpers::CommandActionEntry;
 pub use command_helpers::CopyActionEntry;
 pub use command_helpers::LambdaSkillStatus;
@@ -78,6 +80,13 @@ pub use runtime::mcp_discovery;
 pub use runtime::quota::{QuotaError, QuotaErrorKind, QUOTA_EXIT_CODE};
 pub use runtime::resource_watcher;
 pub use runtime::resource_watcher::ResourceWatcher;
+
+pub mod monitor_contract {
+    pub use crate::runtime::claude_tools::workflow::monitor_contract::{
+        display_source_context, monitor_contract_hash, parse_monitor_contract, MonitorContract,
+        MonitorTaskKind, MONITOR_SCHEMA_VERSION,
+    };
+}
 pub use runtime::subscription_manager;
 pub use runtime::teammate_loop;
 pub use runtime::{
@@ -107,8 +116,8 @@ pub use runtime::{
 };
 pub use runtime::{install_observability, observability_handle};
 pub use state::{
-    AppState, MessageRole, MonitorTaskCreateGateContext, RenderedAttachment, RenderedMessage,
-    TaskRecord, TaskStatus,
+    AppState, MessageRole, MonitorSourceStampContext, MonitorTaskCreateGateContext,
+    RenderedAttachment, RenderedMessage, TaskRecord, TaskStatus,
 };
 
 use anyhow::Result;

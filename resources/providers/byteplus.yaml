@@ -67,7 +67,13 @@ media:
       adapter: images_json
       path: /images/generations
       batch:
-        mode: per_image
+        # Seedream natively supports up to 15 images per sequential call, but
+        # puffer's image pipeline caps a single request at 9 (see
+        # MAX_IMAGE_GENERATION_COUNT); the effective grouped cap is min(9, this).
+        mode: grouped
+        max_images_per_call: 9
+        count_field: max_images
+        count_field_parent: sequential_image_generation_options
     models:
       - id: seedream-5-0-260128
         display_name: Seedream 5.0 Lite
@@ -83,7 +89,7 @@ media:
             values:
               "2K HD":
                 Auto: "2K"
-        variants: { model_id: seedream-5-0-260128, base_params: { output_format: jpeg, response_format: url, sequential_image_generation: disabled } }
+        variants: { model_id: seedream-5-0-260128, base_params: { output_format: jpeg, response_format: url, sequential_image_generation: auto } }
       - id: seedream-4-5-251128
         display_name: Seedream 4.5
         operations:
@@ -98,7 +104,7 @@ media:
             values:
               "2K HD":
                 Auto: "2K"
-        variants: { model_id: seedream-4-5-251128, base_params: { response_format: url, sequential_image_generation: disabled } }
+        variants: { model_id: seedream-4-5-251128, base_params: { response_format: url, sequential_image_generation: auto } }
       - id: seedream-4-0-250828
         display_name: Seedream 4.0
         operations:
@@ -113,4 +119,4 @@ media:
             values:
               "2K HD":
                 Auto: "2K"
-        variants: { model_id: seedream-4-0-250828, base_params: { response_format: url, sequential_image_generation: disabled } }
+        variants: { model_id: seedream-4-0-250828, base_params: { response_format: url, sequential_image_generation: auto } }

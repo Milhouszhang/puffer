@@ -550,6 +550,8 @@ mod tests {
             MediaBatchDescriptor {
                 mode: MediaBatchMode::Exact,
                 max_images_per_call: Some(2),
+                count_field: None,
+                count_field_parent: None,
             },
         );
         let service_dir = tempdir().expect("tempdir");

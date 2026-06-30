@@ -47,6 +47,8 @@ mod upload;
 mod worker;
 
 pub(crate) use agent::handle_browser_agent;
+#[cfg(test)]
+pub(crate) use agent::publish_tabs as test_publish_tabs;
 pub(super) use cdp::parse_cdp_call_response;
 pub(super) use cdp::parse_evaluation_response;
 pub(super) use cdp::send_cdp;
@@ -118,6 +120,15 @@ pub(crate) struct BrowserRegistry {
     agent_refs: Arc<Mutex<HashMap<String, Vec<BrowserElementRef>>>>,
     console_logs: Arc<Mutex<BrowserConsoleRegistry>>,
     recordings: Arc<Mutex<BrowserRecordingRegistry>>,
+    /// Frontend pane keyspace bridges: maps a workspace `cli-browser-*` root
+    /// session id to the set of chat-session UUIDs whose in-app BrowserPane is
+    /// currently mirroring its tabs (issue #667). The Bash `browser` skill drives
+    /// tabs under the workspace-stable cli-browser id, but the visible pane
+    /// subscribes to `browser:<chat-uuid>:tabs`; without this map the daemon has
+    /// no way to know which chat-uuid channel to also publish CLI tab updates on,
+    /// so the pane would render once on open (via the list fallback) but never
+    /// see live tab-list changes.
+    tab_bridges: Arc<Mutex<HashMap<String, std::collections::HashSet<String>>>>,
 }
 
 impl BrowserRegistry {
@@ -151,6 +162,7 @@ impl BrowserRegistry {
             agent_refs,
             console_logs,
             recordings: Arc::new(Mutex::new(BrowserRecordingRegistry::default())),
+            tab_bridges: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -337,6 +349,35 @@ impl BrowserRegistry {
             ),
         );
         state
+    }
+
+    /// Records that the in-app BrowserPane for `viewer_session_id` (a chat
+    /// session UUID) is mirroring the tabs of `cli_session_id` (a workspace
+    /// `cli-browser-*` root). Subsequent `publish_tabs(cli_session_id)` calls
+    /// also fan out to `browser:<viewer>:tabs` so the pane gets live updates
+    /// without any frontend change (issue #667). Read-only: it never touches the
+    /// agent's live worker, registry tabs, or input — only event routing.
+    pub(crate) fn register_tab_bridge(&self, cli_session_id: &str, viewer_session_id: &str) {
+        if cli_session_id == viewer_session_id {
+            return;
+        }
+        self.tab_bridges
+            .lock()
+            .unwrap()
+            .entry(cli_session_id.to_string())
+            .or_default()
+            .insert(viewer_session_id.to_string());
+    }
+
+    /// Returns the chat-session UUIDs whose pane is bridged to `cli_session_id`.
+    /// Used by `publish_tabs` to mirror CLI tab-list events onto pane channels.
+    pub(crate) fn bridged_viewers(&self, cli_session_id: &str) -> Vec<String> {
+        self.tab_bridges
+            .lock()
+            .unwrap()
+            .get(cli_session_id)
+            .map(|viewers| viewers.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Returns the active-tab context snapshot for one browser root session.

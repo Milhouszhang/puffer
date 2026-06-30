@@ -25,6 +25,7 @@ function capability(overrides: Partial<MediaCapabilityInfo> = {}): MediaCapabili
     source: "static",
     reason: "missing_auth",
     checkedAtMs: 42,
+    supportsImageSet: false,
     ...overrides
   };
 }

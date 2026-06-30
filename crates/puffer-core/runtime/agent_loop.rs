@@ -35,9 +35,10 @@ use super::microcompact::{
     MicrocompactTrigger,
 };
 use super::openai::conversation::{
-    compact_conversation_with, inject_post_compact_context, transcript_to_items, ConversationItem,
-    ToolOutputPayload,
+    compact_conversation_with, force_compact_conversation_with, inject_post_compact_context,
+    transcript_to_items, ConversationItem, ToolOutputPayload,
 };
+use super::overflow::is_context_overflow;
 use super::plan_events::stream_events_for_tool_invocations;
 use super::reflection::{ReflectionConfig, ReflectionTraceEvent, ReflectionTracker};
 use super::request_tool_filter::RequestToolFilter;
@@ -298,7 +299,12 @@ pub(crate) fn run_streaming_loop(
     // clear, so the boundary message isn't spammed.
     maybe_microcompact(inputs.state, &mut items, Some(&mut agent_span));
 
+    // Max consecutive context-overflow recoveries before surfacing the
+    // error. Each recovery force-compacts and retries the same turn; the
+    // cap stops a transcript that can't be shrunk far enough from looping.
+    const MAX_OVERFLOW_RECOVERIES: usize = 3;
     let mut turn_index: u32 = 0;
+    let mut overflow_recoveries: usize = 0;
     loop {
         // Cancel boundary: check before each turn's provider round-trip.
         // Mark the root span cancelled before bailing so the trace
@@ -578,8 +584,49 @@ pub(crate) fn run_streaming_loop(
             provider_span.set_f64("gen_ai.response.first_token_ms", ttft_ms);
         }
         let turn = match result {
-            Ok(turn) => turn,
+            Ok(turn) => {
+                // A successful turn clears the consecutive-overflow budget so
+                // a long session can recover as many times as it needs over
+                // its lifetime. The cap only guards against a single turn that
+                // can't be shrunk far enough even after repeated compaction.
+                overflow_recoveries = 0;
+                turn
+            }
             Err(error) => {
+                // Reactive context-overflow recovery. When the endpoint
+                // rejects the input as too large (e.g. a proxy whose real
+                // window is smaller than the model catalog's
+                // `context_window`), proactive threshold compaction never
+                // fires — the estimated token count is below the
+                // catalog-derived threshold. Force a compaction and retry
+                // the turn instead of surfacing the overflow. Bounded by
+                // `MAX_OVERFLOW_RECOVERIES`, and we only retry when the
+                // compaction actually shrank the transcript so an
+                // already-minimal turn can't loop.
+                if overflow_recoveries < MAX_OVERFLOW_RECOVERIES
+                    && is_context_overflow(&error.to_string())
+                {
+                    let before_len = items.len();
+                    let compacted = {
+                        let summary_fn =
+                            |old: &str, mid: &str| session.generate_summary(old, mid);
+                        force_compact_conversation_with(
+                            &mut items,
+                            inputs.provider,
+                            inputs.model_id,
+                            &summary_fn,
+                        )
+                    };
+                    if compacted && items.len() < before_len {
+                        inject_post_compact_context(&mut items, inputs.state);
+                        session.notify_compacted();
+                        overflow_recoveries += 1;
+                        provider_span.set_str("puffer.context_overflow_recovery", "true");
+                        provider_span.end();
+                        drop(observability_handle);
+                        continue;
+                    }
+                }
                 provider_span.mark_error(error.to_string());
                 turn_span.mark_error(error.to_string());
                 agent_span.mark_error(error.to_string());

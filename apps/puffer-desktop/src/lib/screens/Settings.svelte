@@ -7,6 +7,7 @@
   import LocalModelSetupCard from "../components/LocalModelSetupCard.svelte";
   import BrowserSettings from "./settings/BrowserSettings.svelte";
   import NetworkSettings from "./settings/NetworkSettings.svelte";
+  import RemoteSettings from "./settings/RemoteSettings.svelte";
   import SecretsSettings from "./settings/SecretsSettings.svelte";
   import BrowserPane from "./agent/BrowserPane.svelte";
   import { focusTrap } from "../focusTrap";
@@ -113,7 +114,7 @@
     props.onRefresh();
   }
 
-  type Section = "general" | "providers" | "secrets" | "network" | "browser" | "workflow-backend" | "connectors" | "permissions" | "skills" | "mcp" | "git" | "appearance" | "shortcuts";
+  type Section = "general" | "providers" | "secrets" | "network" | "remote" | "browser" | "workflow-backend" | "connectors" | "permissions" | "skills" | "mcp" | "git" | "appearance" | "shortcuts";
   let section = $state<Section>("general");
 
   const navItems: { id: Section; label: string; icon: IconName }[] = [
@@ -121,6 +122,7 @@
     { id: "providers",   label: "Providers",  icon: "plug" },
     { id: "secrets",     label: "Secrets",    icon: "key" },
     { id: "network",     label: "Network",    icon: "globe" },
+    { id: "remote",      label: "Remote",     icon: "server" },
     { id: "browser",     label: "Browser",    icon: "globe" },
     { id: "workflow-backend", label: "Workflows", icon: "git" },
     { id: "connectors",  label: "Connectors", icon: "server" },
@@ -1796,6 +1798,14 @@
 
     {:else if section === "network"}
       <NetworkSettings snapshot={props.snapshot} onSaved={(_next) => props.onRefresh()} />
+
+    {:else if section === "remote"}
+      <RemoteSettings
+        snapshot={props.snapshot}
+        daemonReachable={daemonReachable}
+        onSaved={(_next) => props.onRefresh()}
+        onRefresh={props.onRefresh}
+      />
 
     {:else if section === "browser"}
       <BrowserSettings

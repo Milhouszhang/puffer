@@ -125,6 +125,7 @@ mod tests {
     fn unknown_tool_id_is_unsupported() {
         let runner = LocalToolRunner::new();
         let req = ToolRequest {
+            request_id: None,
             tool_id: "DefinitelyUnknown".into(),
             cwd: PathBuf::from("/"),
             working_dirs: Vec::new(),

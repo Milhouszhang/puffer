@@ -11,6 +11,7 @@ mod browser_output;
 mod browser_profiles;
 mod cli_args;
 mod command_surface;
+mod command_surface_desktop;
 mod connect;
 mod connectors;
 mod daemon;

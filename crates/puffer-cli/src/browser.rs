@@ -10,7 +10,8 @@ use crate::browser_output::{
 };
 #[cfg(test)]
 use crate::browser_output::{
-    ok_message, render_snapshot_body, BrowserSnapshotOutput, BrowserSnapshotRef,
+    ok_message, render_action_snapshot_body, render_snapshot_body, BrowserSnapshotOutput,
+    BrowserSnapshotRef,
 };
 use crate::daemon::Handshake;
 use crate::daemon_browser::{default_cli_session_id, ensure_daemon, send_daemon_request};
@@ -220,7 +221,7 @@ fn execute_browser_command(
                 handshake,
                 "click",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -232,7 +233,7 @@ fn execute_browser_command(
                 handshake,
                 "dblclick",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -244,7 +245,7 @@ fn execute_browser_command(
                 handshake,
                 "hover",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -256,7 +257,7 @@ fn execute_browser_command(
                 handshake,
                 "focus_ref",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -273,7 +274,7 @@ fn execute_browser_command(
                 handshake,
                 "fill",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -290,7 +291,7 @@ fn execute_browser_command(
                 handshake,
                 "select",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -311,7 +312,7 @@ fn execute_browser_command(
                 handshake,
                 "upload",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -323,7 +324,7 @@ fn execute_browser_command(
                 handshake,
                 "check",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -335,7 +336,7 @@ fn execute_browser_command(
                 handshake,
                 "uncheck",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -352,7 +353,7 @@ fn execute_browser_command(
                 handshake,
                 "type",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -364,7 +365,7 @@ fn execute_browser_command(
                 handshake,
                 "press",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -408,7 +409,7 @@ fn execute_browser_command(
                 handshake,
                 "scroll",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -420,7 +421,7 @@ fn execute_browser_command(
                 handshake,
                 "scrollIntoView",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -514,7 +515,7 @@ fn execute_keyboard_command(
                 handshake,
                 "type",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -526,7 +527,7 @@ fn execute_keyboard_command(
                 handshake,
                 "insertText",
                 payload,
-                BrowserPrintKind::Ok,
+                BrowserPrintKind::ActionSnapshot,
                 internal_permission_required,
             )
         }
@@ -546,7 +547,7 @@ fn execute_targeted_ok_action(
         handshake,
         action,
         payload,
-        BrowserPrintKind::Ok,
+        BrowserPrintKind::ActionSnapshot,
         internal_permission_required,
     )
 }

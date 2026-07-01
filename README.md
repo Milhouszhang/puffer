@@ -47,9 +47,13 @@ gates: `cargo build --workspace`, `cargo test -p puffer-core --lib` (the core
 unit suite), and the desktop `vite build` + svelte-check + node tests. The
 test gate is scoped to `puffer-core` for now — the wider workspace still has
 pre-existing non-deterministic tests in other crates; build still gates every
-crate's compilation. Integration targets (`--tests`) are not gated (some need a
-terminal/tmux or the local workflow-runtime image); run them locally. Rustfmt
-and clippy run in CI as informational only.
+crate's compilation. Every other crate's unit suite
+(`cargo test --workspace --exclude puffer-core --lib`) also runs on each PR as
+an **informational** step, so non-core failures stay visible without blocking;
+crates graduate into the hard gate as their suites are made deterministic.
+Integration targets (`--tests`) are not gated (some need a terminal/tmux or the
+local workflow-runtime image); run them locally. Rustfmt and clippy run in CI as
+informational only.
 
 ## Repo Map
 

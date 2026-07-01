@@ -57,6 +57,15 @@ jobs:
       - name: Test (unit)
         run: cargo test -p puffer-core --lib --locked
 
+      # Informational: run every OTHER crate's unit suite so non-core test
+      # failures (and test-code compile breakage) are visible on each PR
+      # without blocking the merge. `build` above only compiles production
+      # code, not `#[cfg(test)]`, so this is the only signal for those. Promote
+      # crates into the hard gate above as their suites are made deterministic.
+      - name: Test (other crates, informational)
+        run: cargo test --workspace --exclude puffer-core --lib --locked
+        continue-on-error: true
+
       - name: Rustfmt (informational)
         run: cargo fmt --all --check
         continue-on-error: true

@@ -62,9 +62,12 @@ jobs:
         run: cargo fmt --all --check
         continue-on-error: true
 
-      - name: Clippy (informational)
-        run: cargo clippy --workspace --all-targets --locked
-        continue-on-error: true
+      # --- Hard gate: clippy's `correctness` group flags real defects (bad
+      # comparisons, ignored #[must_use], always-true/false conditions, etc.)
+      # at compile time. Only `correctness` is deny-level, so pre-existing
+      # style/pedantic warnings stay informational and never block. ---
+      - name: Clippy (correctness gate)
+        run: cargo clippy --workspace --all-targets --locked -- -D clippy::correctness
 
   desktop:
     name: Desktop (build + check)

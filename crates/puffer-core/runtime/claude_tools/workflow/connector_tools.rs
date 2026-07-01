@@ -354,9 +354,10 @@ pub fn execute_connector_action_draft(
 ) -> Result<String> {
     let parsed: ConnectorActionDraftInput =
         serde_json::from_value(input).context("invalid ConnectorActionDraft input")?;
-    let template = subscription_manager()
-        .ok()
-        .and_then(|manager| manager.connector_store().get(&parsed.connector_slug))
+    let manager = subscription_manager()?;
+    let template = manager
+        .connector_store()
+        .get(&parsed.connector_slug)
         .or_else(|| puffer_subscriptions::builtin_connector_template(&parsed.connector_slug))
         .ok_or_else(|| anyhow::anyhow!("connector `{}` not found", parsed.connector_slug))?;
     let action_definition = template.actions.get(&parsed.action).ok_or_else(|| {
@@ -377,6 +378,7 @@ pub fn execute_connector_action_draft(
         parsed.connection_slug.as_deref(),
         &parsed.input,
     );
+    ensure_connector_action_draft_connection(&manager, &parsed.connector_slug, &connection)?;
     let mut action_input = parsed.input.clone();
     if let Some(object) = action_input.as_object_mut() {
         object
@@ -540,6 +542,37 @@ fn connector_action_connection(
                 .map(ToString::to_string)
         })
         .unwrap_or_else(|| connector_slug.to_string())
+}
+
+fn ensure_connector_action_draft_connection(
+    manager: &puffer_subscriptions::SubscriptionManager,
+    connector_slug: &str,
+    connection_slug: &str,
+) -> Result<()> {
+    let connection = manager
+        .connection_store()
+        .get(connection_slug)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "connection `{connection_slug}` is not connected; run `/connect {connector_slug} {connection_slug}` before drafting a message"
+            )
+        })?;
+    if connection.connector_slug != connector_slug {
+        anyhow::bail!(
+            "connection `{connection_slug}` uses connector `{}`, not `{connector_slug}`",
+            connection.connector_slug
+        );
+    }
+    if !matches!(
+        connection.state,
+        ConnectionState::Authenticated | ConnectionState::Active
+    ) {
+        anyhow::bail!(
+            "connection `{connection_slug}` is not connected (state: {:?}); run `/connect {connector_slug} {connection_slug}` before drafting a message",
+            connection.state
+        );
+    }
+    Ok(())
 }
 
 /// Executes `ConnectionDelete`.
@@ -842,7 +875,7 @@ if __name__ == "__main__":
 #[cfg(test)]
 mod tests {
     use super::*;
-    use puffer_config::{ensure_workspace_dirs, PufferConfig};
+    use puffer_config::{ensure_workspace_dirs, set_puffer_home_override, PufferConfig};
     use puffer_session_store::SessionStore;
     use puffer_subscriptions::{
         ActionResult, ConnectorPermissionDefinition, SubscriptionManagerBuilder,
@@ -877,6 +910,37 @@ mod tests {
                 .unwrap(),
         );
         let _ = crate::install_subscription_manager(manager);
+    }
+
+    fn ensure_connected_test_connection(connection_slug: &str, connector_slug: &str) {
+        ensure_test_subscription_manager();
+        let manager = subscription_manager().unwrap();
+        if manager.connection_store().get(connection_slug).is_some() {
+            manager
+                .connection_store()
+                .update(connection_slug, |connection| {
+                    connection.connector_slug = connector_slug.to_string();
+                    connection.state = ConnectionState::Authenticated;
+                })
+                .unwrap();
+            return;
+        }
+        manager
+            .connection_store()
+            .create(ConnectionRecord::authenticated(
+                connection_slug,
+                connector_slug,
+                "test connection",
+            ))
+            .unwrap();
+    }
+
+    fn delete_test_connection(connection_slug: &str) {
+        ensure_test_subscription_manager();
+        let manager = subscription_manager().unwrap();
+        if manager.connection_store().get(connection_slug).is_some() {
+            manager.connection_store().delete(connection_slug).unwrap();
+        }
     }
 
     #[derive(Default)]
@@ -1018,6 +1082,10 @@ mod tests {
 
     #[test]
     fn connector_action_draft_saves_side_effect_free_external_send() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_override = set_puffer_home_override(home.path());
+        let connection_slug = "telegram-user-draft-ok";
+        ensure_connected_test_connection(connection_slug, "telegram-login");
         let (mut state, tmp) = make_state();
 
         let raw = execute_connector_action_draft(
@@ -1025,7 +1093,7 @@ mod tests {
             tmp.path(),
             json!({
                 "connector_slug": "telegram-login",
-                "connection_slug": "telegram-user",
+                "connection_slug": connection_slug,
                 "action": "send_message",
                 "input": {
                     "chat_id": 123456789,
@@ -1044,5 +1112,33 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("sha256:"));
+    }
+
+    #[test]
+    fn connector_action_draft_rejects_deleted_connection_after_disconnect() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_override = set_puffer_home_override(home.path());
+        let connection_slug = "telegram-user-deleted-draft";
+        delete_test_connection(connection_slug);
+        let (mut state, tmp) = make_state();
+
+        let err = execute_connector_action_draft(
+            &mut state,
+            tmp.path(),
+            json!({
+                "connector_slug": "telegram-login",
+                "connection_slug": connection_slug,
+                "action": "send_message",
+                "input": {
+                    "chat_id": 123456789,
+                    "message": "this should not become a sendable draft"
+                }
+            }),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("is not connected"));
+        assert!(message.contains("/connect telegram-login"));
     }
 }

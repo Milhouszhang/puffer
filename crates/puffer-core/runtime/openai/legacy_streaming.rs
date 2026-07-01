@@ -212,7 +212,10 @@ where
             None
         };
         let max_attempts = openai_stream_max_attempts();
-        let response = 'stream_retry: loop {
+        // Labeled block (not a loop): retries happen in the inner `for`; the
+        // block exists only so a successful attempt can `break 'stream_retry`
+        // out with the response value.
+        let response = 'stream_retry: {
             for attempt in 1..=max_attempts {
                 match send_openai_request_with_refresh_streaming(
                     auth_store,

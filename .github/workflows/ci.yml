@@ -25,6 +25,10 @@ env:
   # them — much smaller target/, faster linking, identical test behavior.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
+  # Runners ship tmux, so `require_tmux_or_skip` would RUN the TUI snapshot
+  # tests — which are terminal-/timing-fragile in CI and fail deterministically.
+  # Force them to skip; they still run locally for anyone who wants them.
+  PUFFER_SKIP_TMUX_TESTS: "1"
 
 jobs:
   rust:

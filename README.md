@@ -43,9 +43,10 @@ lefthook install        # writes .git/hooks/*
 - Emergency bypass is `git commit/push --no-verify` — prefer fixing the finding.
 
 CI (`.github/workflows/ci.yml`) is the authoritative full-tree gate. Hard
-gates: `cargo build --workspace`, `cargo test --workspace --lib`, and the
-desktop `vite build` + svelte-check + node tests. Rustfmt and clippy run in
-CI as informational only.
+gates: `cargo build --workspace`, `cargo test --workspace --tests`
+(unit + integration; the environment-sensitive tmux TUI snapshot tests are
+skipped), and the desktop `vite build` + svelte-check + node tests. Rustfmt
+and clippy run in CI as informational only.
 
 ## Repo Map
 

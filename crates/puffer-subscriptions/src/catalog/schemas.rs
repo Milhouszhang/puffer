@@ -23,12 +23,14 @@ pub(super) fn slack_message_action_schema() -> Value {
 
 fn slack_common_properties() -> Value {
     serde_json::json!({
+        "channel_id": {"type": "string"},
+        "channel": {"type": "string"},
         "to": {"type": "string"},
         "target": {"type": "string"},
-        "channel": {"type": "string"},
         "user": {"type": "string"},
-        "message": {"type": "string"},
         "text": {"type": "string"},
+        "message": {"type": "string"},
+        "body": {"type": "string"},
         "caption": {"type": "string"},
         "thread_ts": {"type": "string"},
         "reply_to": {"oneOf": [{"type": "string"}, {"type": "object"}]},
@@ -39,6 +41,7 @@ fn slack_common_properties() -> Value {
         "message_id": {"type": "string"},
         "emoji": {"type": "string"},
         "reaction": {"type": "string"},
+        "limit": {"type": "integer"},
         "remove": {"type": "boolean"},
         "path": {"type": "string"},
         "file": {"oneOf": [{"type": "string"}, {"type": "object"}]},

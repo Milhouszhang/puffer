@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "event_source": "slack-browser",
+  "text_fields": [
+    { "path": "sender", "label": "Sender" },
+    { "path": "channel_name", "label": "Channel" },
+    { "path": "text", "label": "Message text" }
+  ],
+  "fields": [
+    {
+      "path": "event_type",
+      "label": "Event type",
+      "type": "enum",
+      "operators": ["equals"],
+      "values": [{ "value": "message", "label": "Message" }]
+    },
+    {
+      "path": "channel_name",
+      "label": "Channel name",
+      "type": "string",
+      "operators": ["contains", "equals", "matches"]
+    },
+    {
+      "path": "conversation_type",
+      "label": "Conversation type",
+      "type": "enum",
+      "operators": ["equals"],
+      "values": [
+        { "value": "channel", "label": "Channel" },
+        { "value": "dm", "label": "DM" },
+        { "value": "group_dm", "label": "Group DM" }
+      ]
+    },
+    { "path": "unread", "label": "Unread", "type": "boolean", "operators": ["equals"] },
+    { "path": "mention", "label": "Mention", "type": "boolean", "operators": ["equals"] }
+  ]
+}

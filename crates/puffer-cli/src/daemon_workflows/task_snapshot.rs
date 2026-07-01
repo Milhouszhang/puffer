@@ -251,7 +251,7 @@ fn task_json(task: TaskSnapshotRecord, source: &str, scope: &str, scope_label: &
             &["ignore_analysis_completed_at_ms", "ignoreAnalysisCompletedAtMs"],
             &["completed_at_ms", "completedAtMs"]
         ),
-        "actions": monitor_actions(&task.metadata),
+        "actions": monitor_actions_for_status(&task.metadata, &task.status),
         "possible_ignore_reasons": monitor_ignore_reasons(&task.metadata),
     })
 }
@@ -516,6 +516,20 @@ fn monitor_actions(metadata: &Map<String, Value>) -> Vec<Value> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn monitor_actions_for_status(metadata: &Map<String, Value>, status: &str) -> Vec<Value> {
+    if monitor_task_status_is_terminal(status) {
+        return Vec::new();
+    }
+    monitor_actions(metadata)
+}
+
+fn monitor_task_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "completed" | "cancelled" | "deleted" | "ignored" | "stopped"
+    )
 }
 
 pub(super) fn monitor_source_context(metadata: &Map<String, Value>) -> Option<Value> {
@@ -975,6 +989,27 @@ mod tests {
                             "actionPrompt": "Draft a concise reply."
                         }]
                     }
+                }, {
+                    "task_id": "monitor-sent",
+                    "subject": "Handle sent support reply",
+                    "description": "Alice already received a Telegram reply.",
+                    "status": "completed",
+                    "metadata": {
+                        "_monitor": true,
+                        "monitor_connection": "telegram-user",
+                        "monitor_connector": "telegram-login",
+                        "actions": [{
+                            "actionName": "Send",
+                            "actionPrompt": "Send the approved Telegram reply."
+                        }],
+                        "pending_action": {
+                            "id": "telegram-action-1",
+                            "type": "telegram_reply_draft_intent",
+                            "status": "sent",
+                            "version": 4,
+                            "agent_draft_text": "Thanks, sent."
+                        }
+                    }
                 }]
             }))
             .unwrap(),
@@ -985,7 +1020,7 @@ mod tests {
         add_task_context(&paths, &mut snapshot);
         let tasks = snapshot["tasks"].as_array().unwrap();
 
-        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks.len(), 4);
         let session_task = tasks
             .iter()
             .find(|task| task["task_id"] == "task-1")
@@ -1027,6 +1062,12 @@ mod tests {
         );
         assert_eq!(monitor_task["ignore_analysis_usage"]["spent_tokens"], 13);
         assert_eq!(monitor_task["actions"][0]["name"], "Draft reply");
+        let sent_monitor_task = tasks
+            .iter()
+            .find(|task| task["task_id"] == "monitor-sent")
+            .unwrap();
+        assert_eq!(sent_monitor_task["pending_action"]["status"], "sent");
+        assert!(sent_monitor_task["actions"].as_array().unwrap().is_empty());
         assert!(snapshot["task_error"].is_null());
     }
 

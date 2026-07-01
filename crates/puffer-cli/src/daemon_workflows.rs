@@ -30,7 +30,9 @@ mod telegram_diagnostics_export_tests;
 pub(crate) use binding_create::handle_workflow_binding_create;
 pub(crate) use binding_delete::handle_workflow_binding_delete;
 pub(crate) use connection_delete::handle_workflow_connection_delete;
-pub(crate) use connector_action_execute::handle_connector_action_execute;
+pub(crate) use connector_action_execute::{
+    handle_connector_action_draft_status, handle_connector_action_execute,
+};
 pub(crate) use monitor_action_execute::handle_monitor_action_execute;
 pub(crate) use monitor_create::handle_monitor_create;
 pub(crate) use monitor_history::handle_monitor_history_list;

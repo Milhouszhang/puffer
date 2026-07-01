@@ -1,7 +1,12 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
   import { ensureLocalDaemonClient } from "../../api/daemonClient";
-  import { browserRecording, executeConnectorActionDraft, type BrowserRecordedFrame } from "../../api/desktop";
+  import {
+    browserRecording,
+    connectorActionDraftStatus,
+    executeConnectorActionDraft,
+    type BrowserRecordedFrame
+  } from "../../api/desktop";
   import Icon, { type IconName } from "../../design/Icon.svelte";
   import HighlightedLine from "../../components/HighlightedLine.svelte";
   import { chatFileTarget, fileOpenIntent, type ChatOpenIntent } from "../../chatOpenIntent";
@@ -866,6 +871,7 @@
   let canvasId = $derived(stringField(outputJson, ["canvasId", "canvas_id"]));
   let connectorDraftSendState = $state<"idle" | "sending" | "sent" | "error">("idle");
   let connectorDraftSendError = $state("");
+  let connectorDraftStatusKey = "";
   let recordingFrames = $state<RecordingFrame[]>([]);
   let selectedFrameId = $state<string | null>(null);
   let recordingDisposer: (() => void) | null = null;
@@ -1116,6 +1122,53 @@
     }
     return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   }
+
+  function applyConnectorDraftStatus(status: string, error: unknown = null) {
+    if (status === "sent" || status === "already_sent") {
+      connectorDraftSendState = "sent";
+      connectorDraftSendError = "";
+      return;
+    }
+    if (status === "sending") {
+      connectorDraftSendState = "sending";
+      connectorDraftSendError = "";
+      return;
+    }
+    if (status === "send_uncertain") {
+      connectorDraftSendState = "error";
+      connectorDraftSendError = "Send status is uncertain. Check Telegram before retrying.";
+      return;
+    }
+    if (status === "send_failed") {
+      connectorDraftSendState = "error";
+      connectorDraftSendError = valueText(error) || "Send failed.";
+      return;
+    }
+    connectorDraftSendState = "idle";
+    connectorDraftSendError = "";
+  }
+
+  async function refreshConnectorDraftStatus(draft: ConnectorDraftRender, expectedKey: string) {
+    try {
+      const result = await connectorActionDraftStatus({
+        draftId: draft.draftId,
+        version: draft.version
+      });
+      if (connectorDraftStatusKey !== expectedKey) return;
+      applyConnectorDraftStatus(result.status, result.error);
+    } catch {
+      if (connectorDraftStatusKey !== expectedKey) return;
+    }
+  }
+
+  $effect(() => {
+    if (toolRender?.mode !== "connector-draft") return;
+    const key = `${toolRender.draftId}:${toolRender.version}`;
+    if (connectorDraftStatusKey === key) return;
+    connectorDraftStatusKey = key;
+    applyConnectorDraftStatus(toolRender.status);
+    void refreshConnectorDraftStatus(toolRender, key);
+  });
 
   async function sendConnectorDraft(draft: ConnectorDraftRender) {
     if (connectorDraftSendState === "sending") return;

@@ -43,11 +43,13 @@ lefthook install        # writes .git/hooks/*
 - Emergency bypass is `git commit/push --no-verify` — prefer fixing the finding.
 
 CI (`.github/workflows/ci.yml`) is the authoritative full-tree gate. Hard
-gates: `cargo build --workspace`, `cargo test --workspace --lib` (unit
-suite), and the desktop `vite build` + svelte-check + node tests. Integration
-test targets (`--tests`) are not gated — some need a terminal/tmux or external
-infra (the local workflow-runtime image); run them locally. Rustfmt and clippy
-run in CI as informational only.
+gates: `cargo build --workspace`, `cargo test -p puffer-core --lib` (the core
+unit suite), and the desktop `vite build` + svelte-check + node tests. The
+test gate is scoped to `puffer-core` for now — the wider workspace still has
+pre-existing non-deterministic tests in other crates; build still gates every
+crate's compilation. Integration targets (`--tests`) are not gated (some need a
+terminal/tmux or the local workflow-runtime image); run them locally. Rustfmt
+and clippy run in CI as informational only.
 
 ## Repo Map
 

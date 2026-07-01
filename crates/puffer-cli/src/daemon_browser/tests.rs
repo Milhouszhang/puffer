@@ -342,7 +342,11 @@ fn native_cef_sync_surfaces_user_opened_tab() {
 
     // Before reconciling, the daemon only knows about its own tab.
     let before = registry.list_tabs(root);
-    assert_eq!(before.tabs.len(), 1, "agent should start with only its own tab");
+    assert_eq!(
+        before.tabs.len(),
+        1,
+        "agent should start with only its own tab"
+    );
 
     registry.sync_native_tabs(&events, root, 800, 600);
 
@@ -451,7 +455,10 @@ fn real_chrome_adopts_and_snapshots_user_opened_tab() {
         {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(20), "Chrome DevTools never came up");
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "Chrome DevTools never came up"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     client
@@ -476,7 +483,14 @@ fn real_chrome_adopts_and_snapshots_user_opened_tab() {
 
         // Agent claims a prewarmed (about:blank) slot for its own tab.
         registry
-            .open(events.clone(), backend_session_id(root, "t1"), None, 1024, 768, false)
+            .open(
+                events.clone(),
+                backend_session_id(root, "t1"),
+                None,
+                1024,
+                768,
+                false,
+            )
             .expect("agent open should claim the about:blank slot");
         registry.tabs.lock().unwrap().record_opened_backend(
             root,
@@ -486,7 +500,10 @@ fn real_chrome_adopts_and_snapshots_user_opened_tab() {
                 .live_session(&backend_session_id(root, "t1"))
                 .unwrap()
                 .native_cef_session_id(),
-            registry.live_session(&backend_session_id(root, "t1")).unwrap().state(),
+            registry
+                .live_session(&backend_session_id(root, "t1"))
+                .unwrap()
+                .state(),
         );
 
         // Reconcile: the user's file:// tab must be discovered + adopted.
@@ -515,7 +532,10 @@ fn real_chrome_adopts_and_snapshots_user_opened_tab() {
             snap_text.contains("RIDGE-CHECKOUT-649") || snap_text.contains("Pay 42 dollars"),
             "snapshot should contain the user page content, got: {snap_text}"
         );
-        eprintln!("[real-chrome] adopted url={} snapshot.title ok", adopted.url);
+        eprintln!(
+            "[real-chrome] adopted url={} snapshot.title ok",
+            adopted.url
+        );
     }));
 
     let _ = child.kill();
@@ -574,7 +594,9 @@ fn native_cef_sync_surfaces_user_tab_without_prior_open() {
     }
 
     assert!(
-        tabs.tabs.iter().any(|t| t.url.contains("ridge.com/checkouts/manual")),
+        tabs.tabs
+            .iter()
+            .any(|t| t.url.contains("ridge.com/checkouts/manual")),
         "sync must surface the user tab even with no prior agent open, got {:?}",
         tabs.tabs.iter().map(|t| &t.url).collect::<Vec<_>>()
     );
@@ -1181,7 +1203,10 @@ fn real_chrome_fills_oopif_payment_card_fields() {
         {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(20), "Chrome DevTools never came up");
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "Chrome DevTools never came up"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     client
@@ -1196,13 +1221,23 @@ fn real_chrome_fills_oopif_payment_card_fields() {
     std::env::set_var("PUFFER_CEF_PROFILE_DIR", user_data.display().to_string());
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let registry =
-            BrowserRegistry::new(tmp.path().to_path_buf(), true, BrowserLaunchSettings::default());
+        let registry = BrowserRegistry::new(
+            tmp.path().to_path_buf(),
+            true,
+            BrowserLaunchSettings::default(),
+        );
         let (events, _rx) = tokio::sync::broadcast::channel::<ServerEnvelope>(256);
         let root = "sess-oopif";
 
         registry
-            .open(events.clone(), backend_session_id(root, "t1"), None, 1024, 768, false)
+            .open(
+                events.clone(),
+                backend_session_id(root, "t1"),
+                None,
+                1024,
+                768,
+                false,
+            )
             .expect("agent open should claim the about:blank slot");
         registry.tabs.lock().unwrap().record_opened_backend(
             root,
@@ -1212,7 +1247,10 @@ fn real_chrome_fills_oopif_payment_card_fields() {
                 .live_session(&backend_session_id(root, "t1"))
                 .unwrap()
                 .native_cef_session_id(),
-            registry.live_session(&backend_session_id(root, "t1")).unwrap().state(),
+            registry
+                .live_session(&backend_session_id(root, "t1"))
+                .unwrap()
+                .state(),
         );
         registry.sync_native_tabs(&events, root, 1024, 768);
 
@@ -1248,7 +1286,10 @@ fn real_chrome_fills_oopif_payment_card_fields() {
                     .map(|value| value == role)
                     .unwrap_or(false);
                 if matches_name && matches_role {
-                    element.get("ref").and_then(|value| value.as_str()).map(ToString::to_string)
+                    element
+                        .get("ref")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
                 } else {
                     None
                 }

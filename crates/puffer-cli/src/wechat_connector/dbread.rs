@@ -153,7 +153,10 @@ async fn exec(instance: &WechatInstance, args: &[&str], env: &[(&str, &str)]) ->
     let (ok, stdout, stderr) = instance.exec_python(DBREAD_PY, args, env).await?;
     let line = stdout.trim();
     if line.is_empty() {
-        bail!("dbread produced no output (exit ok={ok}): {}", stderr.trim());
+        bail!(
+            "dbread produced no output (exit ok={ok}): {}",
+            stderr.trim()
+        );
     }
     serde_json::from_str(line).with_context(|| format!("parse dbread output: {line}"))
 }

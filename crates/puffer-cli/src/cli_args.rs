@@ -71,7 +71,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: Option<PluginCommand>,
     },
-    /// Register and inspect native Puffer workflows.
+    /// Inspect and execute workflows through the configured runtime.
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
@@ -335,61 +335,37 @@ pub(crate) enum DesktopApiCommand {
     },
     SettingsSnapshot,
     WorkflowList,
-    WorkflowRunsList {
-        workflow_slug: String,
-    },
-    WorkflowRunsShow {
-        idx: u64,
-    },
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum WorkflowCommand {
-    /// Register a workflow envelope or raw AgentFlow pipeline JSON file.
-    Register {
-        /// JSON file path.
-        json_path: String,
-        /// Optional workflow slug override.
-        #[arg(long = "slug")]
-        slug: Option<String>,
-        /// Cron trigger for raw AgentFlow pipeline imports.
-        #[arg(long = "cron", conflicts_with = "subscription_topic")]
-        cron: Option<String>,
-        /// Connection slug for raw AgentFlow pipeline imports.
-        #[arg(
-            long = "connection-slug",
-            alias = "subscription-topic",
-            conflicts_with = "cron"
-        )]
-        connection_slug: Option<String>,
-        /// Optional connection regex filter.
-        #[arg(long = "connection-pattern", alias = "subscription-pattern")]
-        connection_pattern: Option<String>,
-        /// Optional subscription classifier prompt.
-        #[arg(long = "classify-prompt")]
-        classify_prompt: Option<String>,
-    },
-    /// List registered workflows.
+    /// List workflows from the configured workflow runtime.
     Ls {
         /// Output JSON.
         #[arg(long = "json", default_value_t = false)]
         json: bool,
     },
-    /// Inspect workflow run records.
+    /// Inspect workflow runtime execution records.
     Runs {
         #[command(subcommand)]
         command: WorkflowRunsCommand,
     },
-    /// Run one workflow once. Use --dry-run for deterministic local execution.
+    /// Run one deployed workflow once through the configured runtime.
     Run {
         /// Workflow slug.
         workflow_slug: String,
-        /// Trigger JSON payload used for prompt interpolation.
+        /// Input JSON object sent to the workflow runtime.
         #[arg(long = "trigger-json")]
         trigger_json: Option<String>,
-        /// Use a deterministic local executor instead of calling an LLM provider.
-        #[arg(long = "dry-run", default_value_t = false)]
-        dry_run: bool,
+        /// Output JSON.
+        #[arg(long = "json", default_value_t = false)]
+        json: bool,
+    },
+    /// Run a runtime-only AgentEnv API smoke test.
+    SmokeTest {
+        /// Existing workflow id or slug to use instead of creating one.
+        #[arg(long = "workflow-id")]
+        workflow_id: Option<String>,
         /// Output JSON.
         #[arg(long = "json", default_value_t = false)]
         json: bool,
@@ -398,18 +374,10 @@ pub(crate) enum WorkflowCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum WorkflowRunsCommand {
-    /// List runs for a workflow slug.
+    /// List executions for a workflow id or slug.
     Ls {
         /// Workflow slug.
         workflow_slug: String,
-        /// Output JSON.
-        #[arg(long = "json", default_value_t = false)]
-        json: bool,
-    },
-    /// Show one run by global index.
-    Show {
-        /// Global run index.
-        idx: u64,
         /// Output JSON.
         #[arg(long = "json", default_value_t = false)]
         json: bool,

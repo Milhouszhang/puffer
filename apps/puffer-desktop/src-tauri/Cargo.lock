@@ -4309,6 +4309,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml 0.9.12+spec-1.1.0",
+ "url",
 ]
 
 [[package]]
@@ -4346,7 +4347,6 @@ dependencies = [
  "puffer-subscriptions",
  "puffer-tools",
  "puffer-transport-anthropic",
- "puffer-workflow",
  "qrcode",
  "rand 0.8.5",
  "regex",
@@ -4628,18 +4628,6 @@ dependencies = [
  "url",
  "uuid",
  "xxhash-rust",
-]
-
-[[package]]
-name = "puffer-workflow"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "time",
- "uuid",
 ]
 
 [[package]]

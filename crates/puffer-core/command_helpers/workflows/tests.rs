@@ -37,32 +37,6 @@ mod tests {
         }
     }
 
-    fn sample_workflow(slug: &str, name: &str, trigger: TriggerSpec) -> WorkflowDefinition {
-        WorkflowDefinition {
-            schema: "puffer.workflow.v1".to_string(),
-            slug: slug.to_string(),
-            enabled: true,
-            trigger,
-            pipeline: puffer_workflow::AgentFlowPipeline {
-                name: name.to_string(),
-                working_dir: None,
-                concurrency: Some(1),
-                nodes: vec![puffer_workflow::PipelineNode {
-                    id: "codex".to_string(),
-                    node_type: Some("agent".to_string()),
-                    agent: Some("Codex".to_string()),
-                    prompt: format!("Run {name}."),
-                    model: None,
-                    tools: Vec::new(),
-                    env: BTreeMap::new(),
-                    depends_on: Vec::new(),
-                    extra: BTreeMap::new(),
-                }],
-                extra: BTreeMap::new(),
-            },
-        }
-    }
-
     #[test]
     fn workflow_arg_split_preserves_quoted_command_tail() {
         let (mode, query) = split_workflows_args(r#"append demo-main /tmp/hi "hello world""#);
@@ -87,18 +61,11 @@ mod tests {
         };
         let mut out = String::new();
 
-        write_header(
-            &mut out,
-            &paths,
-            &[],
-            &[],
-            &context,
-            &monitor_tasks::MonitorTaskContext::default(),
-        );
+        write_header(&mut out, &paths, &context, &monitor_tasks::MonitorTaskContext::default());
 
-        assert!(out.contains("views: /workflows runs | /workflows tasks"));
+        assert!(out.contains("views: /workflows tasks"));
         assert!(out.contains("next: /connect <connector-slug> <connection-name>"));
-        assert!(out.contains("/workflows new <workflow-slug> <connection-slug> [pattern]"));
+        assert!(out.contains("/workflows append <connection-slug> <file-path> [pattern]"));
         assert!(out.contains("/monitor <connection-slug>"));
     }
 
@@ -124,128 +91,20 @@ mod tests {
 
         write_connections(&mut out, &context, &roots, "");
 
-        assert!(out.contains("filters: trigger-ready | no-trigger | draft | append | monitor | repair"));
+        assert!(out.contains(
+            "filters: trigger-ready | no-trigger | append | monitor | repair"
+        ));
         assert!(out.contains("- demo-main [Authenticated] connector=demo-chat consumer=idle trigger=ready Demo main channel"));
-        assert!(out.contains("commands: repair=/connect demo-chat demo-main | draft=/workflows new demo-main-workflow demo-main | append=/workflows append demo-main /tmp/demo-main.log | monitor=/monitor demo-main"));
+        assert!(out.contains("commands: repair=/connect demo-chat demo-main | append=/workflows append demo-main /tmp/demo-main.log | monitor=/monitor demo-main"));
     }
 
     #[test]
-    fn workflow_list_labels_subscription_triggers_as_subscriptions() {
-        let workflow = WorkflowDefinition {
-            schema: "puffer.workflow.v1".to_string(),
-            slug: "agent-review".to_string(),
-            enabled: false,
-            trigger: TriggerSpec::Subscription {
-                source_topic: "workspace.task.created".to_string(),
-                pattern: Some("review".to_string()),
-                classify_prompt: None,
-            },
-            pipeline: puffer_workflow::AgentFlowPipeline {
-                name: "Agent review".to_string(),
-                working_dir: None,
-                concurrency: Some(1),
-                nodes: vec![puffer_workflow::PipelineNode {
-                    id: "codex".to_string(),
-                    node_type: Some("codex".to_string()),
-                    agent: Some("Codex".to_string()),
-                    prompt: "Review the event.".to_string(),
-                    model: None,
-                    tools: Vec::new(),
-                    env: BTreeMap::new(),
-                    depends_on: Vec::new(),
-                    extra: BTreeMap::new(),
-                }],
-                extra: BTreeMap::new(),
-            },
-        };
+    fn workflow_list_notes_runtime_owned_definitions() {
         let mut out = String::new();
 
-        write_workflows(&mut out, &[workflow], &[], "");
+        write_runtime_workflow_note(&mut out);
 
-        assert!(out.contains("trigger=subscription:workspace.task.created"));
-    }
-
-    #[test]
-    fn workflow_list_filters_and_reports_counts() {
-        let review = sample_workflow(
-            "agent-review",
-            "Agent review",
-            TriggerSpec::Subscription {
-                source_topic: "workspace.task.created".to_string(),
-                pattern: Some("review".to_string()),
-                classify_prompt: None,
-            },
-        );
-        let digest = sample_workflow(
-            "daily-digest",
-            "Daily digest",
-            TriggerSpec::Cron {
-                cron: "0 9 * * *".to_string(),
-            },
-        );
-        let mut out = String::new();
-
-        write_workflows(&mut out, &[review, digest], &[], "review subscription");
-
-        assert!(out.contains("showing 1/2 workflows for query=\"review subscription\""));
-        assert!(out.contains("- agent-review [enabled]"));
-        assert!(!out.contains("- daily-digest ["));
-
-        out.clear();
-        write_workflows(&mut out, &[], &[], "missing");
-
-        assert!(out.contains("showing 0/0 workflows for query=\"missing\""));
-        assert!(out.contains("- none registered"));
-    }
-
-    #[test]
-    fn workflow_runs_report_filtered_counts() {
-        let runs = vec![
-            WorkflowRun {
-                idx: 1,
-                workflow_slug: "agent-review".to_string(),
-                run_id: "run-review".to_string(),
-                trigger: json!({"text": "review this"}),
-                status: puffer_workflow::WorkflowRunStatus::Completed,
-                started_at_ms: 1,
-                ended_at_ms: Some(2),
-                nodes: vec![puffer_workflow::WorkflowRunNode {
-                    id: "review".to_string(),
-                    status: puffer_workflow::WorkflowRunStatus::Completed,
-                    started_at_ms: Some(1),
-                    ended_at_ms: Some(2),
-                    output: Some("approved".to_string()),
-                    error: None,
-                }],
-                error: None,
-                trigger_key: Some("review-key".to_string()),
-            },
-            WorkflowRun {
-                idx: 2,
-                workflow_slug: "daily-digest".to_string(),
-                run_id: "run-digest".to_string(),
-                trigger: json!({"text": "digest"}),
-                status: puffer_workflow::WorkflowRunStatus::Failed,
-                started_at_ms: 3,
-                ended_at_ms: Some(4),
-                nodes: Vec::new(),
-                error: Some("delivery failed".to_string()),
-                trigger_key: None,
-            },
-        ];
-        let mut out = String::new();
-
-        write_runs(&mut out, &runs, "failed delivery");
-
-        assert!(out.contains("showing 1/2 runs for query=\"failed delivery\""));
-        assert!(out.contains("- #2 daily-digest Failed"));
-        assert!(!out.contains("- #1 agent-review"));
-
-        out.clear();
-        write_runs(&mut out, &runs, "does-not-exist");
-
-        assert!(out.contains("showing 0/2 runs for query=\"does-not-exist\""));
-        assert!(out.contains("- no matching runs"));
+        assert!(out.contains("configured workflow runtime"));
     }
 
     #[test]
@@ -328,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn workflow_connections_filter_matches_repair_and_draft_command_terms() {
+    fn workflow_connections_filter_matches_repair_and_append_command_terms() {
         let roots = SubscriberManifestRoots::new("/tmp/workspace", "/tmp/user", "/tmp/builtin");
         let context = ConnectorContext {
             connectors: vec![trigger_template()],
@@ -352,13 +211,6 @@ mod tests {
         assert!(out.contains("showing 1/1 connections for query=\"repair demo-chat\""));
         assert!(out.contains("repair=/connect demo-chat demo-main"));
 
-        out.clear();
-        write_connections(&mut out, &context, &roots, "draft demo-main");
-
-        assert!(out.contains("showing 1/1 connections for query=\"draft demo-main\""));
-        assert!(out.contains("draft=/workflows new demo-main-workflow demo-main"));
-
-        out.clear();
         write_connections(&mut out, &context, &roots, "append /tmp/demo-main.log");
 
         assert!(out.contains("showing 1/1 connections for query=\"append /tmp/demo-main.log\""));
@@ -526,7 +378,6 @@ mod tests {
         assert!(out.contains("showing 1/1 connectors"));
         assert!(out.contains("connections=team-demo"));
         assert!(out.contains("connect=/connect demo-chat demo-chat"));
-        assert!(out.contains("draft=/workflows new team-demo-workflow team-demo"));
         assert!(out.contains("append=/workflows append team-demo /tmp/team-demo.log"));
     }
 
@@ -601,27 +452,6 @@ mod tests {
     }
 
     #[test]
-    fn workflow_connectors_filter_matches_draft_command_terms() {
-        let roots = SubscriberManifestRoots::new("/tmp/workspace", "/tmp/user", "/tmp/builtin");
-        let mut other = trigger_template();
-        other.slug = "other-chat".to_string();
-        other.description = "Other chat".to_string();
-        let context = ConnectorContext {
-            connectors: vec![trigger_template(), other],
-            connections: Vec::new(),
-            bindings: Vec::new(),
-            error: None,
-        };
-        let mut out = String::new();
-
-        write_connectors(&mut out, &context, &roots, true, "draft /workflows new demo-chat");
-
-        assert!(out.contains("- demo-chat"));
-        assert!(out.contains("draft=/workflows new demo-chat-workflow demo-chat"));
-        assert!(!out.contains("- other-chat"));
-    }
-
-    #[test]
     fn workflow_connectors_filter_matches_append_command_terms() {
         let roots = SubscriberManifestRoots::new("/tmp/workspace", "/tmp/user", "/tmp/builtin");
         let mut other = trigger_template();
@@ -663,7 +493,9 @@ mod tests {
         write_connectors(&mut out, &context, &roots, true, "no trigger");
 
         assert!(out.contains("showing 1/2 connectors for query=\"no trigger\""));
-        assert!(out.contains("filters: trigger-ready | no-trigger | draft | append | has-actions | serve"));
+        assert!(out.contains(
+            "filters: trigger-ready | no-trigger | append | has-actions | serve"
+        ));
         assert!(out.contains("- setup-chat [no-trigger]"));
         assert!(!out.contains("draft=/workflows new setup-chat"));
         assert!(!out.contains("- demo-chat"));

@@ -204,7 +204,10 @@ fn load_master_key(key4_db: &Path) -> Result<Option<Vec<u8>>> {
         &decrypted
     };
     if !matches!(key.len(), 24 | 32) {
-        bail!("Firefox master key has an unexpected length ({} bytes)", key.len());
+        bail!(
+            "Firefox master key has an unexpected length ({} bytes)",
+            key.len()
+        );
     }
     Ok(Some(key.to_vec()))
 }
@@ -389,7 +392,12 @@ fn derive_moz_3des(global_salt: &[u8], primary: &[u8], entry_salt: &[u8]) -> ([u
 }
 
 /// NSS `decryptPBES2` key derivation (PBKDF2-HMAC-SHA256 over `SHA1(salt||pw)`).
-fn derive_pbes2_key(global_salt: &[u8], primary: &[u8], entry_salt: &[u8], iterations: u32) -> [u8; 32] {
+fn derive_pbes2_key(
+    global_salt: &[u8],
+    primary: &[u8],
+    entry_salt: &[u8],
+    iterations: u32,
+) -> [u8; 32] {
     let pw_hash = sha1_concat(global_salt, primary);
     let mut key = [0u8; 32];
     pbkdf2_hmac::<Sha256>(&pw_hash, entry_salt, iterations, &mut key);
@@ -597,7 +605,11 @@ mod tests {
                 "encryptedPassword": pass_b64,
             }]
         });
-        fs::write(dir.join("logins.json"), serde_json::to_string(&json).unwrap()).unwrap();
+        fs::write(
+            dir.join("logins.json"),
+            serde_json::to_string(&json).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -647,7 +659,11 @@ mod tests {
         write_logins(dir.path(), "https://legacy.example", &user_b64, &pass_b64);
 
         let creds = load_profile(dir.path()).unwrap();
-        assert_eq!(creds.len(), 1, "pad-like-ending 3DES key must still decrypt");
+        assert_eq!(
+            creds.len(),
+            1,
+            "pad-like-ending 3DES key must still decrypt"
+        );
         assert_eq!(creds[0].username, "dave@example.com");
         assert_eq!(creds[0].password, "tr0ub4dour");
     }
@@ -674,7 +690,12 @@ mod tests {
         let iv8 = [0x57u8; 8];
         let user_b64 = login_blob(&master_key, &iv8, b"bob@example.org");
         let pass_b64 = login_blob(&master_key, &iv8, b"correct horse");
-        write_logins(dir.path(), "https://login.example.org", &user_b64, &pass_b64);
+        write_logins(
+            dir.path(),
+            "https://login.example.org",
+            &user_b64,
+            &pass_b64,
+        );
 
         let creds = load_profile(dir.path()).unwrap();
         assert_eq!(creds.len(), 1);

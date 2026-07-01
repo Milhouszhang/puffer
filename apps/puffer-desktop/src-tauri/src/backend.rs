@@ -282,9 +282,18 @@ impl BackendState {
                 self.rename_session(&session_id, title)?;
                 serde_value(self.load_session_detail(&session_id)?)
             }
-            "workflow_list" => serde_value(json!({"workflows": [], "runs": []})),
-            "workflow_runs_list" => serde_value(Vec::<Value>::new()),
-            "workflow_run_show" => Ok(Value::Null),
+            "workflow_list"
+            | "workflow_backend_get_config"
+            | "workflow_backend_save_config"
+            | "workflow_backend_test_connection"
+            | "workflow_open_ui"
+            | "workflow_create"
+            | "workflow_deploy"
+            | "workflow_execute"
+            | "workflow_list_executions"
+            | "workflow_get_execution"
+            | "workflow_runs_list"
+            | "workflow_run_show" => workflow_runtime_unavailable(method),
             "run_agent_turn" => self.run_agent_turn(events.clone(), params),
             "resolve_permission" | "resolve_user_question" => Ok(json!({})),
             "cancel_turn" => {
@@ -2404,6 +2413,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn workflow_fallback_methods_fail_without_daemon_runtime() {
+        let backend = BackendState::new();
+        for method in [
+            "workflow_list",
+            "workflow_backend_get_config",
+            "workflow_backend_save_config",
+            "workflow_backend_test_connection",
+            "workflow_open_ui",
+            "workflow_create",
+            "workflow_deploy",
+            "workflow_execute",
+            "workflow_list_executions",
+            "workflow_get_execution",
+            "workflow_runs_list",
+            "workflow_run_show",
+        ] {
+            let error = backend
+                .handle(EventEmitter::websocket_only(), method, json!({}))
+                .unwrap_err();
+            let message = error.to_string();
+
+            assert!(
+                message.contains("Puffer daemon"),
+                "{method} error should mention Puffer daemon: {message}"
+            );
+            assert!(
+                message.contains("configured AgentEnv workflow runtime"),
+                "{method} error should mention AgentEnv runtime: {message}"
+            );
+        }
+    }
+
     fn generated_media_images_dir(workspace_root: &Path) -> PathBuf {
         workspace_root.join(".puffer").join("media").join("images")
     }
@@ -3832,6 +3874,13 @@ fn optional_trimmed_string_param(params: &Value, names: &[&str]) -> Option<Strin
 
 fn serde_value<T: Serialize>(value: T) -> Result<Value> {
     Ok(serde_json::to_value(value)?)
+}
+
+fn workflow_runtime_unavailable(method: &str) -> Result<Value> {
+    bail!(
+        "workflow method `{method}` is unavailable in the BackendState fallback; \
+         it requires the Puffer daemon and a configured AgentEnv workflow runtime"
+    )
 }
 
 fn stored_session_activity_status(events: &[StoredEvent]) -> &'static str {

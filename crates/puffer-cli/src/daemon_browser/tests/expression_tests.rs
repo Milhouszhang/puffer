@@ -472,11 +472,35 @@ fn amazon_apx_pierced_document() -> serde_json::Value {
     });
     let inner_fields = json!([
         dom_node("INPUT", 8780, &["type", "hidden", "name", "ue_back"]),
-        dom_node("INPUT", 561, &["type", "tel", "name", "addCreditCardNumber", "autocomplete", "off"]),
-        dom_node("INPUT", 562, &["type", "text", "name", "ppw-accountHolderName"]),
+        dom_node(
+            "INPUT",
+            561,
+            &[
+                "type",
+                "tel",
+                "name",
+                "addCreditCardNumber",
+                "autocomplete",
+                "off"
+            ]
+        ),
+        dom_node(
+            "INPUT",
+            562,
+            &["type", "text", "name", "ppw-accountHolderName"]
+        ),
         month,
         dom_node("SELECT", 559, &["name", "ppw-expirationDate_year"]),
-        dom_node("INPUT", 9126, &["type", "submit", "name", "ppw-widgetEvent:AddCreditCardEvent"]),
+        dom_node(
+            "INPUT",
+            9126,
+            &[
+                "type",
+                "submit",
+                "name",
+                "ppw-widgetEvent:AddCreditCardEvent"
+            ]
+        ),
     ]);
     let content_document = dom_document(json!(null), inner_fields);
     let iframe = json!({
@@ -501,9 +525,17 @@ fn collect_in_frame_field_nodes_descends_only_into_payment_frames() {
     // The hidden field is excluded.
     assert!(!ids.contains(&8780), "hidden field must be skipped");
     // The top-document field (outside the payment frame) is excluded.
-    assert!(!ids.contains(&99), "top-document field must not be surfaced");
+    assert!(
+        !ids.contains(&99),
+        "top-document field must not be surfaced"
+    );
 
-    let role_for = |id: i64| nodes.iter().find(|n| n.backend_node_id == id).map(|n| n.role.as_str());
+    let role_for = |id: i64| {
+        nodes
+            .iter()
+            .find(|n| n.backend_node_id == id)
+            .map(|n| n.role.as_str())
+    };
     assert_eq!(role_for(561), Some("textbox"));
     assert_eq!(role_for(558), Some("combobox"));
     assert_eq!(role_for(9126), Some("button"));
@@ -554,7 +586,8 @@ fn parse_cdp_call_response_returns_raw_result_object() {
 
 #[test]
 fn parse_cdp_call_response_surfaces_protocol_error() {
-    let value = json!({ "id": 7, "error": { "code": -32000, "message": "No node with given id found" } });
+    let value =
+        json!({ "id": 7, "error": { "code": -32000, "message": "No node with given id found" } });
     let err = parse_cdp_call_response(&value).unwrap_err();
     assert!(format!("{err:#}").contains("No node with given id"));
 }
@@ -624,7 +657,10 @@ fn payment_frame_ids_from_tree_matches_known_processor_hosts() {
     let frames = payment_frame_ids_from_tree(&result);
     assert!(frames.contains("APX"), "Amazon APX frame must be gated in");
     assert!(!frames.contains("AD"), "ad frames must be excluded");
-    assert!(!frames.contains("MAIN"), "the main frame is never a payment frame");
+    assert!(
+        !frames.contains("MAIN"),
+        "the main frame is never a payment frame"
+    );
 }
 
 #[test]
@@ -643,9 +679,18 @@ fn payment_frame_gate_anchors_host_match_to_domain_boundary() {
         }
     });
     let frames = payment_frame_ids_from_tree(&result);
-    assert!(!frames.contains("LOOKALIKE"), "substring lookalike host must not match");
-    assert!(!frames.contains("SUFFIX"), "suffix-injection host must not match");
-    assert!(frames.contains("SUBDOMAIN"), "a real subdomain of a payment host must match");
+    assert!(
+        !frames.contains("LOOKALIKE"),
+        "substring lookalike host must not match"
+    );
+    assert!(
+        !frames.contains("SUFFIX"),
+        "suffix-injection host must not match"
+    );
+    assert!(
+        frames.contains("SUBDOMAIN"),
+        "a real subdomain of a payment host must match"
+    );
 }
 
 #[test]
@@ -663,7 +708,11 @@ fn field_nodes_to_refs_builds_addressable_refs_with_quad_centers() {
     // a ref the runtime can't click is worse than no ref.
     let refs: Vec<BrowserElementRef> = field_nodes_to_refs(&nodes, &quads, 11);
 
-    assert_eq!(refs.len(), 4, "fields without a quad center must be skipped");
+    assert_eq!(
+        refs.len(),
+        4,
+        "fields without a quad center must be skipped"
+    );
     // Ref numbering continues from the top-document count (11 -> @e12..).
     assert_eq!(refs[0].ref_id, "@e12");
     assert_eq!(refs[3].ref_id, "@e15");
@@ -672,7 +721,10 @@ fn field_nodes_to_refs_builds_addressable_refs_with_quad_centers() {
     // (in_frame + backend node id; DOM.resolveNode resolves the node into its
     // owning frame, so the ref needs no separate frame id).
     let card = &refs[0];
-    assert!(card.in_frame, "in-frame refs must be flagged for fill routing");
+    assert!(
+        card.in_frame,
+        "in-frame refs must be flagged for fill routing"
+    );
     assert_eq!(card.backend_node_id, Some(561));
     assert_eq!(card.role, "textbox");
     assert_eq!(card.x, 410.0);

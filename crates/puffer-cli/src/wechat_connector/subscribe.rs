@@ -79,7 +79,11 @@ pub(crate) async fn run() -> Result<()> {
         drain_stdin(host_stdin).await;
         return Ok(());
     }
-    write_frame(&health("ok", format!("monitoring WeChat `{}`", instance.name()))).await?;
+    write_frame(&health(
+        "ok",
+        format!("monitoring WeChat `{}`", instance.name()),
+    ))
+    .await?;
 
     // 3. Shutdown signal: a task drains host stdin and fires on EOF, so a slow
     //    vision call can be raced against it (M12) — no SIGKILL past the grace.
@@ -93,7 +97,9 @@ pub(crate) async fn run() -> Result<()> {
     //    else screenshot+vision.
     let db_mode = dbread::enabled();
     if db_mode {
-        write_frame(&health("ok", "using direct chat-DB reader".to_string())).await.ok();
+        write_frame(&health("ok", "using direct chat-DB reader".to_string()))
+            .await
+            .ok();
     }
     let mut seen = SeenStore::load(instance.name());
     // DB mode + a persisted `seen` means RESTART: start primed so the first poll
@@ -169,7 +175,11 @@ async fn poll_db(
     let mut emitted = false;
     for message in read.messages {
         let key = hash_hex(
-            format!("{}\u{1}{}\u{1}{}", message.chat, message.text, message.create_time).as_bytes(),
+            format!(
+                "{}\u{1}{}\u{1}{}",
+                message.chat, message.text, message.create_time
+            )
+            .as_bytes(),
         );
         if seen.contains(&key) {
             continue;
@@ -250,7 +260,11 @@ async fn poll_once(
     if now_logged_in != *logged_in {
         *logged_in = now_logged_in;
         if now_logged_in {
-            write_frame(&health("ok", format!("WeChat `{}` login restored", instance.name()))).await?;
+            write_frame(&health(
+                "ok",
+                format!("WeChat `{}` login restored", instance.name()),
+            ))
+            .await?;
         } else {
             write_frame(&health(
                 "error",
@@ -297,7 +311,11 @@ async fn poll_once(
     let mut emitted = false;
     for message in messages {
         let key = hash_hex(
-            format!("{}\u{1}{}\u{1}{}", message.chat, message.sender, message.text).as_bytes(),
+            format!(
+                "{}\u{1}{}\u{1}{}",
+                message.chat, message.sender, message.text
+            )
+            .as_bytes(),
         );
         if seen.contains(&key) {
             continue;

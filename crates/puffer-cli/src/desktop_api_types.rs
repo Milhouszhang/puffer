@@ -1,3 +1,4 @@
+use puffer_config::WorkflowBackendMode;
 use puffer_session_store::{
     AttachmentState, MessageActor, SessionStore, StoredAttachment, StoredAttachmentKind,
 };
@@ -353,9 +354,21 @@ pub(crate) struct SettingsSnapshotDto {
     pub(crate) auth: Vec<AuthProviderStatusDto>,
     pub(crate) providers: Vec<ProviderSummaryDto>,
     pub(crate) browser: BrowserSettingsDto,
+    pub(crate) workflow_backend: WorkflowBackendSettingsDto,
     pub(crate) network_proxy: NetworkProxySettingsDto,
     pub(crate) remote: RemoteSettingsDto,
     pub(crate) secrets: SecretsSettingsDto,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkflowBackendSettingsDto {
+    pub(crate) mode: WorkflowBackendMode,
+    pub(crate) api_url: String,
+    pub(crate) ui_url: String,
+    pub(crate) workspace_id: String,
+    pub(crate) has_token: bool,
+    pub(crate) options: Vec<WorkflowBackendOptionDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -364,6 +377,16 @@ pub(crate) struct RemoteSettingsDto {
     pub(crate) default_target: Option<String>,
     pub(crate) ssh_hosts: Vec<SshHostSettingsDto>,
     pub(crate) agentenv: Option<AgentEnvSettingsDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkflowBackendOptionDto {
+    pub(crate) mode: WorkflowBackendMode,
+    pub(crate) label: String,
+    pub(crate) description: String,
+    pub(crate) api_url: String,
+    pub(crate) ui_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -592,6 +615,22 @@ pub(crate) struct SaveBrowserCaptchaSolverParams {
     pub(crate) base_url: Option<String>,
     #[serde(default)]
     pub(crate) api_key_secret_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SaveWorkflowBackendSettingsParams {
+    pub(crate) mode: WorkflowBackendMode,
+    #[serde(default)]
+    pub(crate) api_url: String,
+    #[serde(default)]
+    pub(crate) ui_url: String,
+    #[serde(default)]
+    pub(crate) workspace_id: String,
+    #[serde(default)]
+    pub(crate) api_token: Option<String>,
+    #[serde(default)]
+    pub(crate) keep_token: bool,
 }
 
 fn default_enabled() -> bool {

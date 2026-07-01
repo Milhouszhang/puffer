@@ -131,7 +131,9 @@ impl PolicyConfig {
             day_cap_steady: env_u32("WECHAT_MAX_PER_DAY", 480),
             min_gap_ms: parse_range_env("WECHAT_MIN_GAP_MS").unwrap_or((3000, 8000)),
             reply_probability: env_f64("WECHAT_REPLY_PROB", 0.9),
-            warmup: std::env::var("WECHAT_WARMUP").map(|v| v.trim() == "1").unwrap_or(false),
+            warmup: std::env::var("WECHAT_WARMUP")
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false),
             recent_content_window: env_u32("WECHAT_CONTENT_WINDOW", 8) as usize,
             distinct_recipients_per_hour: env_u32("WECHAT_MAX_DISTINCT_RECIPIENTS", 20),
             sensitive_words: sensitive_words_from_env(),
@@ -214,7 +216,13 @@ impl Policy {
             .recent_recipients
             .retain(|(_, ts)| now.saturating_sub(*ts) < 3_600_000);
         let r = recipient.trim();
-        if !r.is_empty() && !self.state.recent_recipients.iter().any(|(name, _)| name == r) {
+        if !r.is_empty()
+            && !self
+                .state
+                .recent_recipients
+                .iter()
+                .any(|(name, _)| name == r)
+        {
             let distinct = self
                 .state
                 .recent_recipients
@@ -328,7 +336,7 @@ impl Policy {
 
     fn in_active_hours(&self, hour: u32) -> bool {
         let (start, end) = match self.cfg.active_hours {
-            None => return true,        // no time restriction (default)
+            None => return true, // no time restriction (default)
             Some(window) => window,
         };
         if start == end {
@@ -465,7 +473,9 @@ impl Drop for UiLock {
 
 /// `~/.puffer/wechat/<instance>.ui.lock` — the per-instance UI serialization lock.
 fn ui_lock_path(instance: &str) -> Option<PathBuf> {
-    state_path(instance).ok().map(|p| p.with_file_name(format!("{instance}.ui.lock")))
+    state_path(instance)
+        .ok()
+        .map(|p| p.with_file_name(format!("{instance}.ui.lock")))
 }
 
 /// Normalizes message text for duplicate detection: collapse all whitespace,
@@ -501,13 +511,19 @@ fn read_state(instance: &str) -> ReadState {
         Ok(raw) => match serde_json::from_str::<PolicyState>(&raw) {
             Ok(state) => ReadState::Ok(state),
             Err(error) => {
-                eprintln!("wechat policy: corrupt state {} ({error}); failing closed", path.display());
+                eprintln!(
+                    "wechat policy: corrupt state {} ({error}); failing closed",
+                    path.display()
+                );
                 ReadState::Corrupt
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReadState::Missing,
         Err(error) => {
-            eprintln!("wechat policy: cannot read {} ({error}); failing closed", path.display());
+            eprintln!(
+                "wechat policy: cannot read {} ({error}); failing closed",
+                path.display()
+            );
             ReadState::Corrupt
         }
     }
@@ -552,15 +568,24 @@ fn rand_in(range: (u64, u64)) -> u64 {
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_i64(key: &str, default: i64) -> i64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 fn parse_range_env(key: &str) -> Option<(u64, u64)> {
@@ -634,7 +659,10 @@ mod tests {
         let mut p = test_policy(base_cfg());
         let now = now_ms();
         p.state.recent_sends_ms = vec![now, now, now];
-        assert_eq!(p.check_send("r", "x"), Err(PolicyBlock::RateMinute { cap: 3 }));
+        assert_eq!(
+            p.check_send("r", "x"),
+            Err(PolicyBlock::RateMinute { cap: 3 })
+        );
     }
 
     #[test]
@@ -651,7 +679,10 @@ mod tests {
     fn paused_blocks_everything() {
         let mut p = test_policy(base_cfg());
         p.state.paused_until_ms = now_ms() + 60_000;
-        assert!(matches!(p.check_send("r", "x"), Err(PolicyBlock::Paused { .. })));
+        assert!(matches!(
+            p.check_send("r", "x"),
+            Err(PolicyBlock::Paused { .. })
+        ));
     }
 
     #[test]
@@ -679,7 +710,10 @@ mod tests {
     #[test]
     fn normalize_collapses_variants() {
         // Whitespace, case, and surrounding punctuation are normalized away.
-        assert_eq!(normalize_content("  Hello  World! "), normalize_content("hello world"));
+        assert_eq!(
+            normalize_content("  Hello  World! "),
+            normalize_content("hello world")
+        );
         assert_eq!(normalize_content("OK."), normalize_content("ok"));
     }
 

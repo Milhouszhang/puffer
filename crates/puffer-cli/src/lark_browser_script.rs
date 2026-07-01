@@ -63,7 +63,10 @@ pub(crate) const LARK_FEED_SCRIPT: &str = r#"(() => {
 /// initialization so an unloaded/logged-out page doesn't permanently seed an
 /// empty baseline.
 pub(crate) fn feed_loaded(result: &serde_json::Value) -> bool {
-    result.get("loaded").and_then(|v| v.as_bool()).unwrap_or(false)
+    result
+        .get("loaded")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,20 +80,45 @@ pub(crate) struct FeedRow {
 }
 
 pub(crate) fn parse_feed_rows(result: &serde_json::Value) -> Vec<FeedRow> {
-    result.get("rows").and_then(|v| v.as_array()).map(|rows| {
-        rows.iter().filter_map(|r| {
-            let chat_id = r.get("chat_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            if chat_id.is_empty() { return None; }
-            Some(FeedRow {
-                chat_id,
-                name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                preview: r.get("preview").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                unread: r.get("unread").and_then(|v| v.as_bool()).unwrap_or(false),
-                is_outgoing: r.get("outgoing").and_then(|v| v.as_bool()).unwrap_or(false),
-                conversation_type: r.get("conversation_type").and_then(|v| v.as_str()).unwrap_or("person").to_string(),
-            })
-        }).collect()
-    }).unwrap_or_default()
+    result
+        .get("rows")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    let chat_id = r
+                        .get("chat_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if chat_id.is_empty() {
+                        return None;
+                    }
+                    Some(FeedRow {
+                        chat_id,
+                        name: r
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        preview: r
+                            .get("preview")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        unread: r.get("unread").and_then(|v| v.as_bool()).unwrap_or(false),
+                        is_outgoing: r.get("outgoing").and_then(|v| v.as_bool()).unwrap_or(false),
+                        conversation_type: r
+                            .get("conversation_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("person")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ── Task 8: Observer JS ──────────────────────────────────────────────────────
@@ -153,18 +181,35 @@ pub(crate) fn is_snowflake_id(id: &str) -> bool {
 }
 
 pub(crate) fn parse_active_drain(result: &serde_json::Value) -> (String, Vec<ActiveMsg>) {
-    let chat_id = result.get("chat_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let msgs = result.get("items").and_then(|v| v.as_array()).map(|items| {
-        items.iter().filter_map(|m| {
-            let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            if !is_snowflake_id(id) { return None; } // drop pending optimistic ids
-            Some(ActiveMsg {
-                id: id.to_string(),
-                is_outgoing: m.get("dir").and_then(|v| v.as_str()) == Some("out"),
-                text: m.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            })
-        }).collect()
-    }).unwrap_or_default();
+    let chat_id = result
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let msgs = result
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if !is_snowflake_id(id) {
+                        return None;
+                    } // drop pending optimistic ids
+                    Some(ActiveMsg {
+                        id: id.to_string(),
+                        is_outgoing: m.get("dir").and_then(|v| v.as_str()) == Some("out"),
+                        text: m
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     (chat_id, msgs)
 }
 
@@ -176,7 +221,7 @@ mod active_tests {
     #[test]
     fn snowflake_detection_filters_optimistic_ids() {
         assert!(is_snowflake_id("7652607780750119026"));
-        assert!(!is_snowflake_id("gApEI0EY3S"));   // optimistic temp id
+        assert!(!is_snowflake_id("gApEI0EY3S")); // optimistic temp id
         assert!(!is_snowflake_id("123"));
     }
 
@@ -199,7 +244,7 @@ mod active_tests {
         ]});
         let (chat, msgs) = parse_active_drain(&result);
         assert_eq!(chat, "999");
-        assert_eq!(msgs.len(), 2);                  // optimistic id dropped
+        assert_eq!(msgs.len(), 2); // optimistic id dropped
         assert_eq!(msgs[0].id, "7652607780750119026");
         assert!(msgs[0].is_outgoing);
         assert!(!msgs[1].is_outgoing);

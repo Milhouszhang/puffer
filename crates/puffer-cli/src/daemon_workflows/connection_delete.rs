@@ -342,7 +342,7 @@ mod tests {
                 }
             } else {
                 ActionSpec::RunWorkflow {
-                    slug: "workflow".to_string(),
+                    workflow_id: "workflow".to_string(),
                 }
             },
             created_at_ms: 0,

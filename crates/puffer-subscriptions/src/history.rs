@@ -1,8 +1,8 @@
 //! Historical run storage for connection-triggered workflow bindings.
 //!
-//! Native AgentFlow workflows persist runs in `puffer-workflow`. Direct
-//! connection workflows live in this crate, so their trigger/action history
-//! is stored here.
+//! Puffer-owned connection workflows live in this crate, so their
+//! trigger/action history is stored here. Deployed workflow definitions and
+//! execution history live in the configured workflow runtime.
 
 use crate::action::{ActionResult, ActionUsage};
 use crate::spec::{ActionSpec, WorkflowBindingSpec};
@@ -486,7 +486,7 @@ mod tests {
             classify_prompt: None,
             classify_model: None,
             action: ActionSpec::RunWorkflow {
-                slug: "native".into(),
+                workflow_id: "native".into(),
             },
             created_at_ms: 0,
         }
@@ -530,7 +530,7 @@ mod tests {
                 &binding(),
                 &envelope(),
                 &ActionSpec::RunWorkflow {
-                    slug: "native".into(),
+                    workflow_id: "native".into(),
                 },
                 &result,
                 1,

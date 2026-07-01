@@ -32,9 +32,9 @@ mod policy;
 mod read;
 mod subscribe;
 
-use human::Human;
 pub(crate) use config::InstanceConfig;
 pub(crate) use docker::{teardown_runtimes, WechatInstance};
+use human::Human;
 
 /// Runs one `puffer __connector wechat-user <op> ...` invocation. `identity`
 /// is currently always `"user"` (personal WeChat has no bot identity); it is
@@ -188,7 +188,10 @@ async fn run_act(instance: &WechatInstance, action: &str) -> Result<()> {
     // Hard safety interlock (code, not docs): money + mass-broadcast are blocked
     // outright and never retried — a human must handle those.
     if let Some(reason) = forbidden_reason(action, &input) {
-        println!("{}", json!({ "success": false, "summary": reason, "retryable": false }));
+        println!(
+            "{}",
+            json!({ "success": false, "summary": reason, "retryable": false })
+        );
         return Ok(());
     }
 
@@ -218,9 +221,7 @@ async fn run_act(instance: &WechatInstance, action: &str) -> Result<()> {
 
     let outcome = match action {
         "send_message" | "send" | "reply" | "send_file" | "send_image" | "send_media"
-        | "send_photo" | "send_document" => {
-            act::send_message(instance, &cfg, &input, &human).await
-        }
+        | "send_photo" | "send_document" => act::send_message(instance, &cfg, &input, &human).await,
         "mention" | "send_mention" => act::mention(instance, &cfg, &input, &human).await,
         "react" | "send_reaction" | "pat" | "nudge" => {
             act::react(instance, &cfg, &input, &human).await
@@ -230,7 +231,9 @@ async fn run_act(instance: &WechatInstance, action: &str) -> Result<()> {
         }
         "logout" | "sign_out" => act::logout(instance, &cfg, &input, &human).await,
         "read_history" => read_history_action(instance, &input).await,
-        other => Err(anyhow!("wechat connector does not support action `{other}`")),
+        other => Err(anyhow!(
+            "wechat connector does not support action `{other}`"
+        )),
     };
     // Per-step vision token cost (0 for DB-backed ops like read_history).
     let (tp, tc, tt, tn) = read::take_token_usage();
@@ -249,8 +252,8 @@ async fn run_act(instance: &WechatInstance, action: &str) -> Result<()> {
             // a retry would re-blast the messages that already went out. It is marked
             // by an explicit sentinel so other Display strings don't trip this.
             let partial = summary.contains("__WECHAT_PARTIAL_SEND__");
-            let retryable = !partial
-                && (summary.contains("timed out") || summary.contains("Cannot connect"));
+            let retryable =
+                !partial && (summary.contains("timed out") || summary.contains("Cannot connect"));
             json!({ "success": false, "summary": summary, "retryable": retryable, "tokens": tokens })
         }
     };
@@ -266,8 +269,18 @@ fn forbidden_reason(action: &str, input: &Value) -> Option<String> {
     // The ACTION NAME may use the broad list (a `transfer`/`pay` action is always
     // money), since action names are code-ish, not prose.
     const MONEY_ACTION: &[&str] = &[
-        "transfer", "pay", "payment", "redpacket", "red_packet", "hongbao", "money", "wallet",
-        "收款", "转账", "红包", "付款",
+        "transfer",
+        "pay",
+        "payment",
+        "redpacket",
+        "red_packet",
+        "hongbao",
+        "money",
+        "wallet",
+        "收款",
+        "转账",
+        "红包",
+        "付款",
     ];
     if MONEY_ACTION.iter().any(|k| a.contains(k)) {
         return Some(
@@ -314,8 +327,17 @@ fn forbidden_reason(action: &str, input: &Value) -> Option<String> {
     // M14: fan-out via a multi-recipient array under ANY recipient key (unified
     // with resolve_recipient's key set) is broadcast.
     for key in [
-        "recipients", "to", "targets", "contacts", "target", "contact", "chat", "chat_id", "user",
-        "receive_id", "name",
+        "recipients",
+        "to",
+        "targets",
+        "contacts",
+        "target",
+        "contact",
+        "chat",
+        "chat_id",
+        "user",
+        "receive_id",
+        "name",
     ] {
         if let Some(Value::Array(items)) = input.get(key) {
             if items.len() > 1 {
@@ -329,4 +351,3 @@ fn forbidden_reason(action: &str, input: &Value) -> Option<String> {
     }
     None
 }
-

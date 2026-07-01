@@ -32,7 +32,7 @@ fn connector_search_output(query: &str) -> String {
 fn workflows_connectors_catalog_lists_current_builtin_connectors() {
     let text = connector_search_output("");
 
-    assert!(text.contains("showing 12/12 connectors"));
+    assert!(text.contains("showing 13/13 connectors"));
     assert!(text.contains("telegram-login"));
     assert!(text.contains("slack-login"));
     assert!(text.contains("gcal-browser"));
@@ -43,7 +43,7 @@ fn workflows_connectors_catalog_lists_current_builtin_connectors() {
 fn workflows_connectors_catalog_includes_serve_bots_as_non_triggers() {
     let text = connector_search_output("serve");
 
-    assert!(text.contains("showing 3/12 connectors for query=\"serve\""));
+    assert!(text.contains("showing 3/13 connectors for query=\"serve\""));
     assert!(text.contains("telegram-bot"));
     assert!(text.contains("discord-bot"));
     assert!(text.contains("matrix-bot"));
@@ -55,7 +55,7 @@ fn workflows_connectors_catalog_includes_serve_bots_as_non_triggers() {
 fn workflows_connectors_catalog_has_no_http_ingress_presets() {
     let text = connector_search_output("github");
 
-    assert!(text.contains("showing 0/12 connectors for query=\"github\""));
+    assert!(text.contains("showing 0/13 connectors for query=\"github\""));
     assert!(!text.contains("github-"));
     assert!(!text.contains("runtime=serve"));
 }

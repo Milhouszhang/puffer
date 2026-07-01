@@ -202,6 +202,100 @@
   background: color-mix(in oklab, oklch(0.7 0.18 145) 18%, transparent);
   color: oklch(0.4 0.16 145);
 }
+.pf-workflow-backend-mode,
+.pf-workflow-backend-token,
+.pf-workflow-backend-actions {
+  justify-self: end;
+  width: min(420px, 100%);
+}
+.pf-workflow-backend-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pf-workflow-backend-option {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--background);
+  color: var(--foreground);
+}
+.pf-workflow-backend-option input {
+  margin: 2px 0 0;
+}
+.pf-workflow-backend-option span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.pf-workflow-backend-option strong {
+  font-size: 13px;
+  line-height: 16px;
+}
+.pf-workflow-backend-option small {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 17px;
+}
+.pf-workflow-backend-input {
+  justify-self: end;
+  width: min(420px, 100%);
+}
+.pf-workflow-backend-token {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+.pf-workflow-backend-token .pf-workflow-backend-input {
+  width: 100%;
+}
+.pf-workflow-backend-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.pf-workflow-backend-result {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--background) 96%, var(--muted));
+}
+.pf-workflow-backend-result > strong {
+  grid-column: 1 / -1;
+  font-size: 13px;
+}
+.pf-workflow-backend-result[data-success="true"] > strong {
+  color: oklch(0.42 0.16 145);
+}
+.pf-workflow-backend-result[data-success="false"] > strong {
+  color: oklch(0.48 0.2 25);
+}
+.pf-workflow-backend-result div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.pf-workflow-backend-result span {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+.pf-workflow-backend-result small {
+  color: var(--muted-foreground);
+  font-size: 11.5px;
+  line-height: 16px;
+}
 .pf-mcp-form {
   display: flex;
   flex-direction: column;
@@ -762,10 +856,34 @@
   }
 
   .pf-mcp-form,
-  .pf-connector-form {
+  .pf-connector-form,
+  .pf-workflow-backend-mode,
+  .pf-workflow-backend-token,
+  .pf-workflow-backend-actions,
+  .pf-workflow-backend-input {
     justify-self: stretch;
     min-width: 0;
     width: 100%;
+  }
+
+  .pf-workflow-backend-token {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pf-workflow-backend-token .pf-status-pill {
+    justify-self: start;
+  }
+
+  .pf-workflow-backend-actions {
+    justify-content: stretch;
+  }
+
+  .pf-workflow-backend-actions .sc-btn {
+    flex: 1 1 0;
+  }
+
+  .pf-workflow-backend-result {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .pf-connector-toolbar {

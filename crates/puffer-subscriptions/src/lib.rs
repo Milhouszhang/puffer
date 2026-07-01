@@ -32,6 +32,8 @@ mod monitor_trace;
 mod protocol;
 mod proxy;
 mod router;
+#[cfg(test)]
+mod router_action_integration_tests;
 mod router_debounce;
 mod self_gate;
 mod spec;

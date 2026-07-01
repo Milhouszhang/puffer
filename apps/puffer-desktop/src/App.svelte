@@ -4761,7 +4761,7 @@
               />
             {/if}
           {:else if tweaks.screen === "workflows"}
-            <Workflows onRunWorkflowCommand={runWorkflowCommand} />
+            <Workflows />
           {:else if tweaks.screen === "automation"}
             <Automation />
           {:else if tweaks.screen === "tasks"}

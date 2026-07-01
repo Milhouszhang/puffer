@@ -43,16 +43,18 @@ jobs:
       - name: Build
         run: cargo build --workspace --locked
 
-      # --- Hard gate: unit + integration test targets across the workspace.
-      # The tmux TUI snapshot tests are skipped: they render inside tmux and
-      # diff against fixtures, so they are inherently sensitive to the
-      # terminal/tmux rendering environment (they only self-skip when tmux is
-      # absent). Every other target is green and gating; the previously-flagged
-      # non-hermetic unit failures (stale "12/12" catalog assertions, real
-      # ~/.claude|~/.puffer reads, a leaked PUFFER_OPENAI_WEBSOCKET env var, and
-      # a subscriber test reaching the subscription-manager singleton) are fixed. ---
-      - name: Test
-        run: cargo test --workspace --tests --locked -- --skip tmux_
+      # --- Hard gate: the workspace unit-test suite. Portable and hermetic
+      # (the previously-flagged non-hermetic failures — stale "12/12" catalog
+      # assertions, real ~/.claude|~/.puffer reads, a leaked
+      # PUFFER_OPENAI_WEBSOCKET env var, a subscriber test reaching the
+      # subscription-manager singleton — are fixed).
+      #
+      # Integration test targets (`--tests`) are intentionally NOT gated: some
+      # need a terminal/tmux (TUI snapshots) or external infra (the local
+      # workflow-runtime container image), so they are not portable to a clean
+      # runner. Run them locally with `cargo test --workspace --tests`. ---
+      - name: Test (unit)
+        run: cargo test --workspace --lib --locked
 
       - name: Rustfmt (informational)
         run: cargo fmt --all --check

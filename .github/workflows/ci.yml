@@ -39,23 +39,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # --- Hard gate: must pass. Catches compile regressions across the workspace. ---
+      # --- Hard gate: compile the whole workspace including test, integration,
+      # example, and bench targets (`--all-targets`), so a compile break outside
+      # production code (e.g. in a `crates/*/tests/` file) fails CI instead of
+      # only tripping the informational clippy step. ---
       - name: Build
-        run: cargo build --workspace --locked
+        run: cargo build --workspace --all-targets --locked
 
-      # --- Hard gate: the whole-workspace unit-test suite, run single-threaded
-      # (`--test-threads=1`). Much of the suite resolves config via
-      # `ConfigPaths::discover`, which (without a per-test home override) reads
-      # the real ~/.puffer; run in parallel, tests race on that shared session/
-      # project state and fail intermittently (e.g. an empty-file "EOF while
-      # parsing" from a concurrent session write). Serializing removes the
-      # contention deterministically — the proper fix is per-test home isolation
-      # (which also restores parallel speed), a separate follow-up.
+      # --- Hard gate: the whole-workspace unit-test suite over lib AND bin
+      # targets. `--bins` adds `puffer-cli` (a bin-only crate whose daemon/RPC/
+      # workflow tests `--lib` alone would skip). Runs in parallel:
+      # `ConfigPaths::discover` isolates `user_config_dir` under the OS temp dir
+      # in tests, so the suite no longer races on the real ~/.puffer and
+      # `--test-threads=1` is no longer needed.
       #
       # Integration targets (`--tests`) stay ungated: some need a terminal/tmux
       # or the local workflow-runtime container image. ---
       - name: Test (unit)
-        run: cargo test --workspace --lib --locked -- --test-threads=1
+        run: cargo test --workspace --lib --bins --locked
 
       - name: Rustfmt (informational)
         run: cargo fmt --all --check

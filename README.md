@@ -43,13 +43,15 @@ lefthook install        # writes .git/hooks/*
 - Emergency bypass is `git commit/push --no-verify` — prefer fixing the finding.
 
 CI (`.github/workflows/ci.yml`) is the authoritative full-tree gate. Hard
-gates: `cargo build --workspace`, `cargo test --workspace --lib` (the whole
-workspace unit suite), and the desktop `vite build` + svelte-check + node
-tests. Rust tests run single-threaded (`--test-threads=1`): much of the suite
-resolves config via `ConfigPaths::discover` and, without per-test home
-isolation, races on the real `~/.puffer` when run in parallel — serializing
-keeps CI deterministic (per-test home isolation, which would restore parallel
-speed, is the proper follow-up).
+gates: `cargo build --workspace --all-targets` (compiles production, test,
+integration, example, and bench targets, so a compile break anywhere fails CI
+rather than only the informational clippy step), `cargo test --workspace --lib
+--bins` (the whole workspace unit suite, including the bin-only `puffer-cli`),
+and the desktop `vite build` + svelte-check + node tests, plus a `cargo check`
+of the Tauri Rust backend (`apps/puffer-desktop/src-tauri`, a separate
+workspace). Rust tests run in parallel: `ConfigPaths::discover` isolates
+`user_config_dir` under the OS temp dir in tests, so the suite no longer races
+on the real `~/.puffer`.
 Integration targets (`--tests`) are not gated (some need a terminal/tmux or the
 local workflow-runtime image); run them locally. Rustfmt and clippy run in CI as
 informational only.

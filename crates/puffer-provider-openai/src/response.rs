@@ -119,7 +119,7 @@ pub fn extract_chat_completions_reasoning(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return Some(value.to_string());
+        return Some(sanitize_reasoning_text(value)).filter(|s| !s.is_empty());
     }
 
     // (3) <think>…</think> inside content. Catches DeepSeek-R1-style
@@ -128,11 +128,33 @@ pub fn extract_chat_completions_reasoning(
     if let Some(content) = message.content.as_ref() {
         let raw = content_to_text(content);
         if let Some(thinking) = extract_think_block(&raw) {
-            return Some(thinking);
+            return Some(sanitize_reasoning_text(&thinking)).filter(|s| !s.is_empty());
         }
     }
 
     None
+}
+
+/// Removes NUL bytes and other C0 control chars (except `\t`, `\n`, `\r`)
+/// plus DEL from a reasoning-content string so it round-trips cleanly
+/// through vendor validators.
+///
+/// Kimi has been observed emitting a `\x00` inside its own reasoning
+/// output and then rejecting the same string on replay with
+/// `400 "the reasoning_content at position N must be a valid UTF-8
+/// string: string contains \x00"`. Stripping the offending control
+/// bytes here keeps the reasoning round-trip intact.
+pub fn sanitize_reasoning_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            let cp = *c as u32;
+            if cp < 0x20 {
+                matches!(*c, '\t' | '\n' | '\r')
+            } else {
+                cp != 0x7f
+            }
+        })
+        .collect()
 }
 
 /// Returns the visible-to-user portion of the assistant message,

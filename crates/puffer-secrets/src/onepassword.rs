@@ -38,11 +38,22 @@ const OP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// threads (so a large output can't deadlock the child) and the process is killed
 /// on timeout — preventing the app-lock hang documented in onepassword-sdk-go#266.
 fn run_op(op_bin: &str, args: &[&str], timeout: Duration) -> Result<Output> {
-    let mut child = Command::new(op_bin)
+    let mut command = Command::new(op_bin);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Run the child in its own process group so a timeout can kill the whole
+    // tree. `op` (or, in tests, the fake shell) can fork grandchildren that a
+    // plain `child.kill()` leaves running; those keep the stdout/stderr pipe
+    // open and would block the reader-thread joins below until they exit.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("spawn `{op_bin}`"))?;
     let mut out = child.stdout.take().expect("piped stdout");
@@ -63,6 +74,14 @@ fn run_op(op_bin: &str, args: &[&str], timeout: Duration) -> Result<Output> {
             break status;
         }
         if start.elapsed() >= timeout {
+            // Kill the child's whole process group (negative pgid) so forked
+            // grandchildren die too and release the pipe; then reap and join.
+            #[cfg(unix)]
+            // SAFETY: `child` was spawned as its own group leader (pgid == pid),
+            // so signalling `-pid` targets exactly this call's process tree.
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
             let _ = out_reader.join();
@@ -221,9 +240,7 @@ fn install_op_cli() -> Result<()> {
         // Resolve winget to the per-user WindowsApps alias by absolute path (only
         // the same user can write there) instead of trusting PATH ordering.
         let winget = std::env::var_os("LOCALAPPDATA")
-            .map(|local| {
-                std::path::Path::new(&local).join("Microsoft\\WindowsApps\\winget.exe")
-            })
+            .map(|local| std::path::Path::new(&local).join("Microsoft\\WindowsApps\\winget.exe"))
             .filter(|path| path.exists())
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| "winget".to_string());

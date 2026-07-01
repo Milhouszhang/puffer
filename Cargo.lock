@@ -4815,6 +4815,7 @@ dependencies = [
  "des",
  "dirs",
  "hmac 0.12.1",
+ "libc",
  "pbkdf2",
  "rand 0.8.6",
  "rusqlite",

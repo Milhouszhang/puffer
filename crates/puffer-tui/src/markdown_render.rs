@@ -789,4 +789,26 @@ mod tests {
         assert_ne!(text.lines[0].style, text.lines[1].style);
         assert_ne!(text.lines[1].style, text.lines[2].style);
     }
+
+    #[test]
+    fn block_spacing_exactly_one_blank_line() {
+        // Every block-level transition should produce exactly 1 blank line.
+        let text = render_markdown_text(
+            "## Heading\n\nParagraph one.\n\nParagraph two.\n\n## Another\n\n- item\n",
+        );
+        assert_eq!(
+            text_lines(&text),
+            vec![
+                "## Heading",
+                "",               // 1 blank line after heading
+                "Paragraph one.",
+                "",               // 1 blank line between paragraphs
+                "Paragraph two.",
+                "",               // 1 blank line before heading
+                "## Another",
+                "",               // 1 blank line before list
+                "- item",
+            ]
+        );
+    }
 }

@@ -53,7 +53,7 @@ jobs:
         continue-on-error: true
 
   desktop:
-    name: Desktop (svelte-check)
+    name: Desktop (build + check)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -71,6 +71,19 @@ jobs:
       - name: Install deps
         run: npm ci
 
-      - name: svelte-check (informational)
+      # --- Hard gates: all currently green, so the desktop job is now a real
+      # gate (previously every step was informational and could never fail). ---
+      - name: Build (vite)
+        run: npm run build
+
+      - name: svelte-check
         run: npm run check
-        continue-on-error: true
+
+      # Pure-node config/asset assertions (no browser). The Playwright UI
+      # suites are intentionally left out — they need browser binaries and a
+      # running app, which is a separate CI investment.
+      - name: Node tests
+        run: |
+          npm run test:tauri-config
+          npm run test:sidebar-css
+          npm run test:provider-visuals

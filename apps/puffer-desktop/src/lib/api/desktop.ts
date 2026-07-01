@@ -1799,6 +1799,21 @@ export async function executeConnectorActionDraft(params: {
   });
 }
 
+/** Read the persisted status for an outbound connector action draft. */
+export async function connectorActionDraftStatus(params: {
+  draftId: string;
+  version: number;
+}): Promise<{ status: string; draftId: string; version: number; error?: unknown; receipt?: unknown }> {
+  const client = await ensureLocalDaemonClient();
+  return client.request<{ status: string; draftId: string; version: number; error?: unknown; receipt?: unknown }>(
+    "connector_action_draft_status",
+    {
+      draft_id: params.draftId,
+      version: params.version
+    }
+  );
+}
+
 /** Add one include or exclude monitor rule and return the refreshed workflow snapshot. */
 export async function addMonitorRule(params: MonitorRuleAddRequest): Promise<WorkflowSnapshot> {
   const payload: Record<string, unknown> = {

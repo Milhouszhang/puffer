@@ -44,26 +44,26 @@ jobs:
         run: cargo build --workspace --locked
 
       # --- Hard gate: the puffer-core unit suite — the crate holding the agent
-      # runtime, command dispatch, permissions, and tools (where the real logic
-      # and this branch's hermeticity fixes live). Green and deterministic on CI.
+      # runtime, command dispatch, permissions, and tools.
       #
-      # Scoped to puffer-core on purpose: the wider workspace still carries
-      # pre-existing non-deterministic tests in other crates (timing- and
-      # ordering-sensitive) — the repo had no CI to keep them honest. The Build
-      # step above already gates compilation of every crate; widen this to
-      # `--workspace --lib` once the other crates' suites are cleaned up.
-      # Integration targets (`--tests`) also stay ungated: some need a
+      # Run single-threaded (`--test-threads=1`). Much of the suite resolves
+      # config via `ConfigPaths::discover`, which (without a home override)
+      # reads the real ~/.puffer; run in parallel, tests race on that shared
+      # state and fail intermittently (e.g. an empty-file "EOF while parsing"
+      # from a concurrent session write). Serializing removes the contention
+      # deterministically — the proper fix is per-test home isolation, a
+      # separate follow-up. The Build step above already gates compilation of
+      # every crate. Integration targets (`--tests`) stay ungated: some need a
       # terminal/tmux or the local workflow-runtime image. ---
       - name: Test (unit)
-        run: cargo test -p puffer-core --lib --locked
+        run: cargo test -p puffer-core --lib --locked -- --test-threads=1
 
-      # Informational: run every OTHER crate's unit suite so non-core test
-      # failures (and test-code compile breakage) are visible on each PR
-      # without blocking the merge. `build` above only compiles production
-      # code, not `#[cfg(test)]`, so this is the only signal for those. Promote
-      # crates into the hard gate above as their suites are made deterministic.
+      # Informational: run every OTHER crate's unit suite (also single-threaded)
+      # so non-core failures (and test-code compile breakage, which `build`
+      # doesn't cover) are visible on each PR without blocking the merge. Once
+      # this is reliably green, fold it into the hard gate above.
       - name: Test (other crates, informational)
-        run: cargo test --workspace --exclude puffer-core --lib --locked
+        run: cargo test --workspace --exclude puffer-core --lib --locked -- --test-threads=1
         continue-on-error: true
 
       - name: Rustfmt (informational)

@@ -101,3 +101,30 @@ jobs:
           npm run test:tauri-config
           npm run test:sidebar-css
           npm run test:provider-visuals
+
+  desktop-backend:
+    name: Desktop backend (cargo check)
+    runs-on: ubuntu-latest
+    # `apps/puffer-desktop/src-tauri` is a separate Cargo workspace that the
+    # root `cargo build --workspace` skips, so the ~2400-line Tauri Rust
+    # backend was never compiled in CI. `cargo check` (no link/bundle) is the
+    # minimal gate that catches a backend compile break. Runs in parallel with
+    # the other jobs, so no critical-path cost.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libwebkit2gtk-4.1-dev \
+            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/puffer-desktop/src-tauri
+
+      - name: cargo check (src-tauri)
+        run: cargo check --manifest-path apps/puffer-desktop/src-tauri/Cargo.toml --locked

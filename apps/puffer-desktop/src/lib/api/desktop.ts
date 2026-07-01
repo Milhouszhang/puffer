@@ -18,6 +18,7 @@ import type {
   GenerateMediaInput,
   GenerateMediaResult,
   GeneratedVideoAccessResult,
+  LarkChat,
   ProviderSummary,
   ProxyTestResult,
   PullRequest,
@@ -29,6 +30,7 @@ import type {
   SaveBrowserSettingsInput,
   SaveRemoteSettingsInput,
   SaveSecretInput,
+  SaveWorkflowBackendSettingsInput,
   SaveProxySettingsInput,
   SessionDetail,
   SessionGroupsPage,
@@ -43,12 +45,21 @@ import type {
   OpenAIRealtimeClientSecret,
   OpenAIRealtimeClientSecretOptions,
   TimelineItem,
-  WorkflowDefinition,
   WorkflowBindingCreateRequest,
+  WorkflowBackendConnectionTest,
+  WorkflowBackendSettings,
+  WorkflowCreateRequest,
+  WorkflowExecutionListResult,
+  WorkflowExecutionRecord,
   WorkflowFilterRule,
+  WorkflowInMemoryExecuteRequest,
   WorkflowMonitorHistoryMessage,
-  WorkflowRun,
-  WorkflowSnapshot
+  WorkflowNodeDefinition,
+  WorkflowNodeDefinitionLight,
+  WorkflowOpenUiResult,
+  WorkflowRuntimeRecord,
+  WorkflowSnapshot,
+  WorkflowUpdateRequest
 } from "../types";
 import {
   mockCreatePrResult,
@@ -305,6 +316,7 @@ type BackendProviderSummary = ProviderSummary;
 type BackendNetworkProxySettings = SettingsSnapshot["networkProxy"];
 type BackendSecretsSettings = SettingsSnapshot["secrets"];
 type BackendBrowserSettings = SettingsSnapshot["browser"];
+type BackendWorkflowBackendSettings = SettingsSnapshot["workflowBackend"];
 type BackendRemoteSettings = SettingsSnapshot["remote"];
 
 type BackendSettingsSnapshot = {
@@ -319,6 +331,7 @@ type BackendSettingsSnapshot = {
   auth: BackendAuthProviderStatus[];
   providers: BackendProviderSummary[];
   browser: BackendBrowserSettings;
+  workflowBackend: BackendWorkflowBackendSettings;
   networkProxy: BackendNetworkProxySettings;
   remote: BackendRemoteSettings;
   secrets: BackendSecretsSettings;
@@ -327,6 +340,8 @@ type BackendSettingsSnapshot = {
 type BackendChromeSecretsImportResult = ChromeSecretsImportResult;
 
 type BackendRemoteOperation = RemoteOperation;
+
+const WORKFLOW_DAEMON_OPTIONS = { requireWebSocket: true, timeoutMs: 15000 } as const;
 
 type StageChatAttachmentHook = (
   sessionId: string,
@@ -970,6 +985,23 @@ export async function saveBrowserSettings(
   return client.request<BackendSettingsSnapshot>("save_browser_settings", input);
 }
 
+/** Load redacted workflow backend configuration from the daemon. */
+export async function loadWorkflowBackendConfig(): Promise<WorkflowBackendSettings> {
+  return workflowRequest<WorkflowBackendSettings>("workflow_backend_get_config");
+}
+
+/** Persist workflow backend configuration without returning token material. */
+export async function saveWorkflowBackendConfig(
+  input: SaveWorkflowBackendSettingsInput
+): Promise<WorkflowBackendSettings> {
+  return workflowRequest<WorkflowBackendSettings>("workflow_backend_save_config", input);
+}
+
+/** Test the configured workflow backend using the runtime client. */
+export async function testWorkflowBackendConnection(): Promise<WorkflowBackendConnectionTest> {
+  return workflowRequest<WorkflowBackendConnectionTest>("workflow_backend_test_connection");
+}
+
 export async function saveRemoteSettings(
   input: SaveRemoteSettingsInput
 ): Promise<SettingsSnapshot> {
@@ -1587,22 +1619,129 @@ export async function setProjectTags(folderPath: string, tags: string[]): Promis
   return result.tags;
 }
 
-/** Load registered workflows and recent runs from the daemon. */
-export async function loadWorkflowSnapshot(): Promise<WorkflowSnapshot> {
+async function workflowRequest<T>(
+  method: string,
+  params: Record<string, unknown> = {}
+): Promise<T> {
   const client = await ensureLocalDaemonClient();
-  return client.request<WorkflowSnapshot>("workflow_list");
+  return client.request<T>(method, params, WORKFLOW_DAEMON_OPTIONS);
 }
 
-/** Persist one workflow definition through the daemon and return the refreshed snapshot. */
-export async function saveWorkflow(workflow: WorkflowDefinition): Promise<WorkflowSnapshot> {
-  const client = await ensureLocalDaemonClient();
-  return client.request<WorkflowSnapshot>("workflow_save", { workflow });
+/** Load registered workflows from the daemon. */
+export async function loadWorkflowSnapshot(): Promise<WorkflowSnapshot> {
+  return workflowRequest<WorkflowSnapshot>("workflow_list");
+}
+
+/** Open the configured workflow runtime UI through the daemon. */
+export async function openWorkflowConsole(): Promise<WorkflowOpenUiResult> {
+  return workflowRequest<WorkflowOpenUiResult>("workflow_open_ui");
+}
+
+/** Open the configured workflow runtime UI through the daemon. */
+export async function openWorkflowUi(): Promise<WorkflowOpenUiResult> {
+  return openWorkflowConsole();
+}
+
+/** List node definitions exposed by the configured runtime. */
+export async function listWorkflowNodeDefinitions(): Promise<WorkflowNodeDefinitionLight[]> {
+  return workflowRequest<WorkflowNodeDefinitionLight[]>("workflow_node_definitions");
+}
+
+/** Load one node definition exposed by the configured runtime. */
+export async function getWorkflowNodeDefinition(type: string): Promise<WorkflowNodeDefinition> {
+  return workflowRequest<WorkflowNodeDefinition>("workflow_node_definition", { type });
+}
+
+/** Create one workflow in the configured runtime. */
+export async function createRuntimeWorkflow(
+  input: WorkflowCreateRequest
+): Promise<WorkflowRuntimeRecord> {
+  return workflowRequest<WorkflowRuntimeRecord>("workflow_create", { workflow: input });
+}
+
+/** Create one workflow in the configured runtime. */
+export async function createWorkflow(workflow: WorkflowCreateRequest): Promise<WorkflowRuntimeRecord> {
+  return createRuntimeWorkflow(workflow);
+}
+
+/** Update one workflow draft in the configured runtime. */
+export async function updateRuntimeWorkflow(
+  workflowId: string,
+  workflow: WorkflowUpdateRequest
+): Promise<WorkflowRuntimeRecord> {
+  return workflowRequest<WorkflowRuntimeRecord>("workflow_update", { workflowId, workflow });
+}
+
+/** Update one workflow draft in the configured runtime. */
+export async function updateWorkflow(
+  workflowId: string,
+  workflow: WorkflowUpdateRequest
+): Promise<WorkflowRuntimeRecord> {
+  return updateRuntimeWorkflow(workflowId, workflow);
+}
+
+/** Deploy one workflow in the configured runtime. */
+export async function deployRuntimeWorkflow(workflowId: string): Promise<WorkflowRuntimeRecord> {
+  return workflowRequest<WorkflowRuntimeRecord>("workflow_deploy", { workflowId });
+}
+
+/** Deploy one workflow in the configured runtime. */
+export async function deployWorkflow(workflowId: string): Promise<WorkflowRuntimeRecord> {
+  return deployRuntimeWorkflow(workflowId);
+}
+
+/** Undeploy one workflow in the configured runtime. */
+export async function undeployRuntimeWorkflow(workflowId: string): Promise<WorkflowRuntimeRecord> {
+  return workflowRequest<WorkflowRuntimeRecord>("workflow_undeploy", { workflowId });
+}
+
+/** Execute one workflow in the configured runtime. */
+export async function executeRuntimeWorkflow(
+  workflowId: string,
+  request: WorkflowRuntimeRecord = {}
+): Promise<WorkflowExecutionRecord> {
+  return workflowRequest<WorkflowExecutionRecord>("workflow_execute", {
+    workflowId,
+    request
+  });
+}
+
+/** Execute one workflow in the configured runtime. */
+export async function executeWorkflow(
+  workflowId: string,
+  request: WorkflowRuntimeRecord = {}
+): Promise<WorkflowExecutionRecord> {
+  return executeRuntimeWorkflow(workflowId, request);
+}
+
+/** Execute the current workflow definition without saving it first. */
+export async function executeWorkflowInMemory(
+  request: WorkflowInMemoryExecuteRequest
+): Promise<WorkflowExecutionRecord> {
+  return workflowRequest<WorkflowExecutionRecord>("workflow_execute_in_memory", { request });
+}
+
+/** List executions for one workflow in the configured runtime. */
+export async function listWorkflowExecutions(
+  workflowId: string
+): Promise<WorkflowExecutionListResult> {
+  return workflowRequest<WorkflowExecutionListResult>("workflow_list_executions", { workflowId });
+}
+
+/** Load one workflow execution from the configured runtime. */
+export async function getWorkflowExecution(
+  workflowId: string,
+  executionId: string
+): Promise<WorkflowExecutionRecord> {
+  return workflowRequest<WorkflowExecutionRecord>("workflow_get_execution", {
+    workflowId,
+    executionId
+  });
 }
 
 /** Create or update one connection-triggered workflow binding. */
 export async function createWorkflowBinding(binding: WorkflowBindingCreateRequest): Promise<WorkflowSnapshot> {
-  const client = await ensureLocalDaemonClient();
-  return client.request<WorkflowSnapshot>("workflow_binding_create", binding);
+  return workflowRequest<WorkflowSnapshot>("workflow_binding_create", binding);
 }
 
 /** Create or resume a connector monitor and return the refreshed workflow snapshot. */
@@ -1611,7 +1750,6 @@ export async function createMonitor(
   model?: string | null,
   contactIds?: string[]
 ): Promise<WorkflowSnapshot> {
-  const client = await ensureLocalDaemonClient();
   const params: { connection_slug: string; model?: string | null; contact_ids?: string[] } = {
     connection_slug: connectionSlug
   };
@@ -1621,7 +1759,7 @@ export async function createMonitor(
   if (contactIds !== undefined) {
     params.contact_ids = contactIds;
   }
-  return client.request<WorkflowSnapshot>("task_monitor_create", params);
+  return workflowRequest<WorkflowSnapshot>("task_monitor_create", params);
 }
 
 /** Delete one connector monitor and return the refreshed workflow snapshot. */
@@ -1631,8 +1769,7 @@ export async function deleteMonitor(slug: string): Promise<WorkflowSnapshot> {
 
 /** Ignore one monitor-created task and return the refreshed workflow snapshot. */
 export async function ignoreMonitorTask(taskId: string, reason?: string): Promise<WorkflowSnapshot> {
-  const client = await ensureLocalDaemonClient();
-  return client.request<WorkflowSnapshot>("task_monitor_ignore", {
+  return workflowRequest<WorkflowSnapshot>("task_monitor_ignore", {
     task_id: taskId,
     reason: reason?.trim() || undefined
   });
@@ -1640,8 +1777,7 @@ export async function ignoreMonitorTask(taskId: string, reason?: string): Promis
 
 /** Save one monitor memory file and return the refreshed workflow snapshot. */
 export async function saveMonitorMemory(connectionSlug: string, content: string): Promise<WorkflowSnapshot> {
-  const client = await ensureLocalDaemonClient();
-  return client.request<WorkflowSnapshot>("task_monitor_memory_save", {
+  return workflowRequest<WorkflowSnapshot>("task_monitor_memory_save", {
     connection_slug: connectionSlug,
     content
   });
@@ -1649,7 +1785,6 @@ export async function saveMonitorMemory(connectionSlug: string, content: string)
 
 /** Add one include or exclude monitor rule and return the refreshed workflow snapshot. */
 export async function addMonitorRule(params: MonitorRuleAddRequest): Promise<WorkflowSnapshot> {
-  const client = await ensureLocalDaemonClient();
   const payload: Record<string, unknown> = {
     connection_slug: params.connection_slug,
     mode: params.mode,
@@ -1664,7 +1799,7 @@ export async function addMonitorRule(params: MonitorRuleAddRequest): Promise<Wor
     payload.operator = params.operator;
     payload.value = params.value ?? null;
   }
-  return client.request<WorkflowSnapshot>("task_monitor_rule_add", payload);
+  return workflowRequest<WorkflowSnapshot>("task_monitor_rule_add", payload);
 }
 
 /** Delete one displayed include or exclude monitor rule. */
@@ -1673,8 +1808,7 @@ export async function deleteMonitorRule(
   mode: "exclude" | "include",
   rule: WorkflowFilterRule
 ): Promise<WorkflowSnapshot> {
-  const client = await ensureLocalDaemonClient();
-  return client.request<WorkflowSnapshot>("task_monitor_rule_delete", {
+  return workflowRequest<WorkflowSnapshot>("task_monitor_rule_delete", {
     connection_slug: connectionSlug,
     mode,
     rule
@@ -1683,8 +1817,7 @@ export async function deleteMonitorRule(
 
 /** Load recent received monitor messages and their agent outcomes. */
 export async function loadMonitorHistory(limit = 200): Promise<WorkflowMonitorHistoryMessage[]> {
-  const client = await ensureLocalDaemonClient();
-  const result = await client.request<{ messages?: WorkflowMonitorHistoryMessage[] }>(
+  const result = await workflowRequest<{ messages?: WorkflowMonitorHistoryMessage[] }>(
     "task_monitor_history_list",
     { limit }
   );
@@ -1693,32 +1826,17 @@ export async function loadMonitorHistory(limit = 200): Promise<WorkflowMonitorHi
 
 /** Delete one connection-triggered workflow binding. */
 export async function deleteWorkflowBinding(slug: string): Promise<WorkflowSnapshot> {
-  const client = await ensureLocalDaemonClient();
-  return client.request<WorkflowSnapshot>("workflow_binding_delete", { slug });
+  return workflowRequest<WorkflowSnapshot>("workflow_binding_delete", { slug });
 }
 
 /** Delete one connector connection. */
 export async function deleteWorkflowConnection(slug: string): Promise<WorkflowSnapshot> {
-  const client = await ensureLocalDaemonClient();
-  return client.request<WorkflowSnapshot>("workflow_connection_delete", { slug });
+  return workflowRequest<WorkflowSnapshot>("workflow_connection_delete", { slug });
 }
 
-/** Toggle a native workflow or subscription workflow binding. */
+/** Toggle a workflow binding. */
 export async function toggleWorkflow(slug: string, enabled: boolean): Promise<WorkflowSnapshot> {
-  const client = await ensureLocalDaemonClient();
-  return client.request<WorkflowSnapshot>("workflow_toggle", { slug, enabled });
-}
-
-/** Load runs for one workflow slug from the daemon. */
-export async function listWorkflowRuns(workflowSlug: string): Promise<WorkflowRun[]> {
-  const client = await ensureLocalDaemonClient();
-  return client.request<WorkflowRun[]>("workflow_runs_list", { workflowSlug });
-}
-
-/** Load one workflow run by global run index from the daemon. */
-export async function showWorkflowRun(idx: number): Promise<WorkflowRun | null> {
-  const client = await ensureLocalDaemonClient();
-  return client.request<WorkflowRun | null>("workflow_run_show", { idx });
+  return workflowRequest<WorkflowSnapshot>("workflow_toggle", { slug, enabled });
 }
 
 export type PermissionAction = "allow_once" | "allow_session" | "allow_all_session" | "deny";
@@ -3015,4 +3133,14 @@ export async function qwen35Recommend(): Promise<Qwen35Recommendation> {
  *  events; completion arrives as `qwen35://install-done` ({ success }). */
 export async function qwen35Install(): Promise<void> {
   await invoke("qwen35_install");
+}
+
+/** List chats available in a lark-browser or feishu-browser connector's feed.
+ *  Returns an empty array if the feed hasn't loaded yet — callers should retry. */
+export async function loadLarkChats(connectionSlug: string): Promise<LarkChat[]> {
+  const client = await ensureLocalDaemonClient();
+  const result = await client.request<{ chats: LarkChat[] }>("lark_browser_list_chats", {
+    connection_slug: connectionSlug
+  });
+  return result.chats ?? [];
 }

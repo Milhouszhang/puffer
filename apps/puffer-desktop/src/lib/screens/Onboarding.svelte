@@ -16,7 +16,14 @@
   import { listen } from "@tauri-apps/api/event";
   import type { ExternalCredential, SettingsSnapshot } from "../types";
 
-  type OnboardingStepId = "mode" | "provider" | "tools" | "learn" | "analyzing" | "profile";
+  type OnboardingStepId =
+    | "mode"
+    | "provider"
+    | "remote"
+    | "tools"
+    | "learn"
+    | "analyzing"
+    | "profile";
 
   type Props = {
     snapshot: SettingsSnapshot | null;
@@ -64,7 +71,15 @@
   );
   let signedIn = $derived(agentProviderCount > 0);
 
-  let stepOrder: OnboardingStepId[] = ["mode", "provider", "tools", "learn", "analyzing", "profile"];
+  let stepOrder: OnboardingStepId[] = [
+    "mode",
+    "provider",
+    "remote",
+    "tools",
+    "learn",
+    "analyzing",
+    "profile"
+  ];
   let currentStepIndex = $derived(stepOrder.indexOf(currentStep));
   let steps = $derived([
     {
@@ -82,23 +97,30 @@
       active: currentStep === "provider"
     },
     {
-      id: "tools",
-      label: "Connect",
+      id: "remote",
+      label: "AgentEnv",
       reachable: signedIn && currentStepIndex >= 2,
       done: currentStepIndex > 2,
+      active: currentStep === "remote"
+    },
+    {
+      id: "tools",
+      label: "Connect",
+      reachable: signedIn && currentStepIndex >= 3,
+      done: currentStepIndex > 3,
       active: currentStep === "tools"
     },
     {
       id: "learn",
       label: "Learn",
-      reachable: signedIn && currentStepIndex >= 3,
-      done: currentStepIndex > 3,
+      reachable: signedIn && currentStepIndex >= 4,
+      done: currentStepIndex > 4,
       active: currentStep === "learn"
     },
     {
       id: "profile",
       label: currentStep === "analyzing" ? "Analyzing" : "Profile",
-      reachable: signedIn && currentStepIndex >= 4,
+      reachable: signedIn && currentStepIndex >= 5,
       done: currentStep === "profile",
       active: currentStep === "analyzing" || currentStep === "profile"
     }
@@ -164,6 +186,10 @@
   }
 
   function nextFromProvider() {
+    currentStep = "remote";
+  }
+
+  function nextFromRemote() {
     currentStep = "tools";
   }
 
@@ -316,9 +342,34 @@
           />
         {/if}
       </section>
+    {:else if currentStep === "remote"}
+      <section class="pf-onboard-panel" aria-labelledby="onboard-remote-title">
+        <div class="pf-onboard-kicker">Step 3</div>
+        <h2 id="onboard-remote-title">Connect AgentEnv</h2>
+        <p class="lead">Use an existing AgentEnv account for remote tool execution, or skip it for now.</p>
+
+        <div class="pf-onboard-remote">
+          <RemoteSettings
+            variant="onboarding"
+            snapshot={props.snapshot}
+            daemonReachable={!props.loading}
+            onSaved={props.onRemoteSettingsSaved}
+            onRefresh={props.onRefresh}
+          />
+        </div>
+
+        <div class="pf-onboard-actions">
+          <button type="button" class="sc-btn" data-variant="ghost" onclick={() => goTo("provider")}>
+            Back
+          </button>
+          <button type="button" class="sc-btn" data-variant="default" onclick={nextFromRemote}>
+            Next<Icon name="arrow" size={14} />
+          </button>
+        </div>
+      </section>
     {:else if currentStep === "tools"}
       <section class="pf-onboard-panel" aria-labelledby="onboard-tools-title">
-        <div class="pf-onboard-kicker">Step 3</div>
+        <div class="pf-onboard-kicker">Step 4</div>
         <h2 id="onboard-tools-title">Connect your tools</h2>
         <p class="lead">Optional tool switches are stubs for now, so the flow can land before integrations are final.</p>
 
@@ -346,7 +397,7 @@
         </div>
 
         <div class="pf-onboard-actions">
-          <button type="button" class="sc-btn" data-variant="ghost" onclick={() => goTo("provider")}>
+          <button type="button" class="sc-btn" data-variant="ghost" onclick={() => goTo("remote")}>
             Back
           </button>
           <button type="button" class="sc-btn" data-variant="default" onclick={() => goTo("learn")}>
@@ -356,7 +407,7 @@
       </section>
     {:else if currentStep === "learn"}
       <section class="pf-onboard-panel" aria-labelledby="onboard-learn-title">
-        <div class="pf-onboard-kicker">Step 4</div>
+        <div class="pf-onboard-kicker">Step 5</div>
         <h2 id="onboard-learn-title">What may Puffer learn?</h2>
         <p class="lead">These local-only permissions shape the generated profile preview.</p>
 
@@ -386,7 +437,7 @@
       </section>
     {:else if currentStep === "analyzing"}
       <section class="pf-onboard-panel pf-analyzing" aria-labelledby="onboard-analyzing-title">
-        <div class="pf-onboard-kicker">Step 5</div>
+        <div class="pf-onboard-kicker">Step 6</div>
         <h2 id="onboard-analyzing-title">Reading you in...</h2>
         <div class="pf-analysis-card" aria-label="Profile analysis in progress">
           <span></span><span></span><span></span><span></span><span></span>
@@ -395,7 +446,7 @@
       </section>
     {:else}
       <section class="pf-onboard-panel" aria-labelledby="onboard-profile-title">
-        <div class="pf-onboard-kicker">Step 5</div>
+        <div class="pf-onboard-kicker">Step 6</div>
         <h2 id="onboard-profile-title">Workspace is ready</h2>
         <p class="lead">Meet your local profile. It is editable later from Settings.</p>
 
@@ -404,15 +455,6 @@
           <div><span>Hosts</span><strong>prod-web-1, gpu-box</strong></div>
           <div><span>Focus</span><strong>payments refactor</strong></div>
           <div><span>Run mode</span><strong>{runMode === "cloud" ? "Cloud stub" : "Local"}</strong></div>
-        </div>
-
-        <div class="pf-onboard-remote">
-          <RemoteSettings
-            snapshot={props.snapshot}
-            daemonReachable={!props.loading}
-            onSaved={props.onRemoteSettingsSaved}
-            onRefresh={props.onRefresh}
-          />
         </div>
 
         <div class="pf-onboard-actions">

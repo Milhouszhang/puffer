@@ -38,7 +38,10 @@ pub(crate) fn connect_args_are_lark_browser(connect_args: &str) -> bool {
 }
 
 pub(crate) fn brand_from_connect_args(connect_args: &str) -> Option<Brand> {
-    connect_args.split_whitespace().next().and_then(Brand::from_slug)
+    connect_args
+        .split_whitespace()
+        .next()
+        .and_then(Brand::from_slug)
 }
 
 /// Executes daemon-native Lark/Feishu browser connector setup.
@@ -51,13 +54,9 @@ pub(crate) fn execute_lark_browser_setup(
     pending_questions: PendingQuestions,
     cancel: CancelToken,
 ) -> Result<String> {
-    let brand = brand_from_connect_args(&connect_args)
-        .context("unknown lark brand slug")?;
+    let brand = brand_from_connect_args(&connect_args).context("unknown lark brand slug")?;
     let (connection_slug, _) = parse_setup_target(&connect_args, brand)?;
-    let session_id = format!(
-        "lark-browser-setup-{}",
-        safe_session_part(&turn_id)
-    );
+    let session_id = format!("lark-browser-setup-{}", safe_session_part(&turn_id));
     let mut flow = SetupFlow {
         state,
         channel,
@@ -127,10 +126,7 @@ impl SetupFlow {
                 }),
             )
             .context("evaluate Lark login marker")?;
-            let result_str = value
-                .get("value")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
+            let result_str = value.get("value").and_then(Value::as_str).unwrap_or("{}");
             let result: Value = serde_json::from_str(result_str).unwrap_or(Value::Null);
             let logged_in = result
                 .get("loggedIn")
@@ -220,10 +216,7 @@ fn parse_setup_target(connect_args: &str, brand: Brand) -> Result<(String, Brand
         .unwrap_or(brand.slug())
         .to_string();
     if parts.next().is_some() {
-        bail!(
-            "Usage: /connect {} <connection-name>",
-            brand.slug()
-        );
+        bail!("Usage: /connect {} <connection-name>", brand.slug());
     }
     Ok((connection_slug, brand))
 }
@@ -296,8 +289,14 @@ mod tests {
 
     #[test]
     fn infers_brand_from_first_token() {
-        assert_eq!(brand_from_connect_args("lark-browser foo"), Some(Brand::Lark));
-        assert_eq!(brand_from_connect_args("feishu-browser"), Some(Brand::Feishu));
+        assert_eq!(
+            brand_from_connect_args("lark-browser foo"),
+            Some(Brand::Lark)
+        );
+        assert_eq!(
+            brand_from_connect_args("feishu-browser"),
+            Some(Brand::Feishu)
+        );
         assert_eq!(brand_from_connect_args("nope"), None);
     }
 

@@ -51,9 +51,15 @@ impl<'a> DerReader<'a> {
 
     /// Reads the next TLV node, advancing the cursor past it.
     pub(crate) fn next(&mut self) -> Result<Der<'a>> {
-        let tag = *self.data.get(self.pos).context("DER: unexpected end (tag)")?;
+        let tag = *self
+            .data
+            .get(self.pos)
+            .context("DER: unexpected end (tag)")?;
         self.pos += 1;
-        let first = *self.data.get(self.pos).context("DER: unexpected end (length)")?;
+        let first = *self
+            .data
+            .get(self.pos)
+            .context("DER: unexpected end (length)")?;
         self.pos += 1;
         let len = if first & 0x80 == 0 {
             first as usize
@@ -73,10 +79,7 @@ impl<'a> DerReader<'a> {
             }
             len
         };
-        let end = self
-            .pos
-            .checked_add(len)
-            .context("DER: length overflow")?;
+        let end = self.pos.checked_add(len).context("DER: length overflow")?;
         let contents = self
             .data
             .get(self.pos..end)

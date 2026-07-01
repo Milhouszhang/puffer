@@ -200,18 +200,39 @@ fn run_workflow_dispatches_connection_trigger() {
     });
     dispatcher.set_workflow_runner(runner.clone());
     let action = ActionSpec::RunWorkflow {
-        slug: "daily-review".into(),
+        workflow_id: "Wf_01HX.Runtime-123".into(),
     };
-    let result = dispatcher.dispatch(&action, &envelope("hello", json!({"chat":"@x"})));
+    let mut envelope = envelope("hello", json!({"chat":"@x", "message_id": 7}));
+    envelope.envelope_id = "env-7".into();
+    envelope.event.topic = "telegram-user/inbox".into();
+    envelope.event.kind = "direct_message".into();
+    envelope.event.dedup_key = Some("chat:7".into());
+
+    let result = dispatcher.dispatch(&action, &envelope);
+
     assert!(result.success, "{}", result.summary);
     let calls = runner.calls.lock().unwrap();
-    assert_eq!(calls[0].0, "daily-review");
-    assert_eq!(calls[0].1["type"], "connection");
-    assert_eq!(calls[0].1["connection_id"], "telegram-user");
-    assert_eq!(calls[0].1["receivedAt"], "1970-01-01T00:00:00Z");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "Wf_01HX.Runtime-123");
+    assert_eq!(
+        calls[0].1,
+        json!({
+            "type": "connection",
+            "envelope_id": "env-7",
+            "connection_id": "telegram-user",
+            "receivedAt": "1970-01-01T00:00:00Z",
+            "topic": "telegram-user/inbox",
+            "kind": "direct_message",
+            "dedup_key": "chat:7",
+            "text": "hello",
+            "payload": {
+                "chat": "@x",
+                "message_id": 7
+            }
+        })
+    );
     assert!(calls[0].1.get("received_at").is_none());
     assert!(calls[0].1.get("received_at_ms").is_none());
-    assert_eq!(calls[0].1["text"], "hello");
 }
 
 struct RecordingTriageRunner {

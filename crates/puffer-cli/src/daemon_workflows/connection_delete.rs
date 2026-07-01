@@ -66,7 +66,10 @@ fn external_auth_clear_commands(
 }
 
 fn is_lark_connection(connection: &ConnectionRecord) -> bool {
-    connection.connector_slug.starts_with("lark-")
+    // Only the lark-cli OpenAPI connectors own lark-cli auth/config to clean up.
+    // The browser-based connectors (lark-browser/feishu-browser) authenticate via
+    // QR in the embedded CEF browser and have no lark-cli state.
+    matches!(connection.connector_slug.as_str(), "lark-login" | "lark-bot")
 }
 
 /// Best-effort FULL teardown of a WeChat connection (container + data + state).
@@ -271,6 +274,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lark_browser_connection_delete_does_not_clear_lark_cli_auth() {
+        for connector_slug in ["lark-browser", "feishu-browser"] {
+            let connection =
+                ConnectionRecord::authenticated(connector_slug, connector_slug, "Lark browser");
+
+            assert!(
+                external_auth_clear_commands(&connection, std::slice::from_ref(&connection))
+                    .is_empty(),
+                "{connector_slug} must not run lark-cli cleanup (it is browser-based, not lark-cli)"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn external_auth_clear_runner_invokes_command() {
@@ -325,7 +342,7 @@ mod tests {
                 }
             } else {
                 ActionSpec::RunWorkflow {
-                    slug: "workflow".to_string(),
+                    workflow_id: "workflow".to_string(),
                 }
             },
             created_at_ms: 0,

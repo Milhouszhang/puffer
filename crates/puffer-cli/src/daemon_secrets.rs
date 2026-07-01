@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
-use puffer_secrets::{
-    BrowserSource, ImportReport, SecretUpsert, SecretVault, SourceAvailability,
-};
+use puffer_secrets::{BrowserSource, ImportReport, SecretUpsert, SecretVault, SourceAvailability};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -57,10 +55,7 @@ pub(crate) fn import_chrome_secrets(paths: &ConfigPaths) -> Result<ImportReport>
 
 /// Imports saved credentials from one named source (browser or 1Password).
 /// 1Password imports every accessible vault.
-pub(crate) fn import_browser_secrets(
-    paths: &ConfigPaths,
-    source_id: &str,
-) -> Result<ImportReport> {
+pub(crate) fn import_browser_secrets(paths: &ConfigPaths, source_id: &str) -> Result<ImportReport> {
     if source_id == "1password" {
         return vault(paths)?.sync_onepassword_references();
     }

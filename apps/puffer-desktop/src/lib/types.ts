@@ -555,6 +555,55 @@ export type BrowserSettings = {
   captcha: BrowserCaptchaSettings;
 };
 
+export type WorkflowBackendMode = "local" | "agent_env_cloud";
+
+export type WorkflowBackendOption = {
+  mode: WorkflowBackendMode;
+  label: string;
+  description: string;
+  apiUrl: string;
+  uiUrl: string;
+};
+
+export type WorkflowBackendSettings = {
+  mode: WorkflowBackendMode;
+  apiUrl: string;
+  uiUrl: string;
+  workspaceId: string;
+  hasToken: boolean;
+  options: WorkflowBackendOption[];
+};
+
+export type SaveWorkflowBackendSettingsInput = {
+  mode: WorkflowBackendMode;
+  apiUrl: string;
+  uiUrl: string;
+  workspaceId: string;
+  apiToken?: string | null;
+  keepToken?: boolean;
+};
+
+export type WorkflowBackendConnectionState = "passed" | "failed" | "skipped";
+
+export type WorkflowBackendConnectionError = {
+  kind: string;
+  message: string;
+  statusCode?: number | null;
+};
+
+export type WorkflowBackendConnectionCheck = {
+  state: WorkflowBackendConnectionState;
+  message: string;
+  error?: WorkflowBackendConnectionError | null;
+};
+
+export type WorkflowBackendConnectionTest = {
+  success: boolean;
+  runtime: WorkflowBackendConnectionCheck;
+  auth: WorkflowBackendConnectionCheck;
+  workspace: WorkflowBackendConnectionCheck;
+};
+
 export type SaveBrowserExtensionInput = {
   id: string;
   displayName: string;
@@ -630,10 +679,13 @@ export type SettingsSnapshot = {
   auth: AuthProviderStatus[];
   providers: ProviderSummary[];
   browser: BrowserSettings;
+  workflowBackend: WorkflowBackendSettings;
   networkProxy: NetworkProxySettings;
   remote: RemoteSettings;
   secrets: SecretsSettings;
 };
+
+export type WorkflowRuntimeRecord = Record<string, unknown>;
 
 export type RemoteSettings = {
   defaultTarget: string | null;
@@ -707,52 +759,77 @@ export type WorkflowTrigger =
       classify_prompt?: string | null;
     };
 
-export type WorkflowPipelineNode = {
-  id: string;
-  type?: string | null;
-  agent?: string | null;
-  prompt: string;
-  model?: string | null;
-  tools?: string[];
-  env?: Record<string, string>;
-  depends_on?: string[];
-};
+export type WorkflowExecutionRecord = Record<string, unknown>;
+
+export type WorkflowExecutionListResult = WorkflowExecutionRecord[];
 
 export type WorkflowDefinition = {
-  schema: string;
-  slug: string;
-  enabled: boolean;
-  trigger: WorkflowTrigger;
-  pipeline: {
-    name: string;
-    working_dir?: string | null;
-    concurrency?: number | null;
-    nodes: WorkflowPipelineNode[];
-  };
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
 };
 
-export type WorkflowRunStatus = "pending" | "running" | "completed" | "failed" | "skipped";
-
-export type WorkflowRunNode = {
+export type WorkflowNode = {
   id: string;
-  status: WorkflowRunStatus;
-  started_at_ms?: number | null;
-  ended_at_ms?: number | null;
-  output?: string | null;
-  error?: string | null;
+  type: string;
+  name?: string;
+  config: Record<string, unknown>;
+  trusted?: boolean;
+  position?: WorkflowPosition;
 };
 
-export type WorkflowRun = {
-  idx: number;
-  workflow_slug: string;
-  run_id: string;
-  trigger: Record<string, unknown>;
-  status: WorkflowRunStatus;
-  started_at_ms: number;
-  ended_at_ms?: number | null;
-  nodes: WorkflowRunNode[];
-  error?: string | null;
-  trigger_key?: string | null;
+export type WorkflowPosition = {
+  x: number;
+  y: number;
+};
+
+export type WorkflowEdge = {
+  source: string;
+  target: string;
+  conditionScript?: string;
+};
+
+export type WorkflowCreateRequest = {
+  name: string;
+  description?: string;
+  definition: WorkflowDefinition;
+};
+
+export type WorkflowUpdateRequest = {
+  name?: string;
+  description?: string;
+  definition?: WorkflowDefinition;
+  status?: "draft" | "active" | "archived";
+};
+
+export type WorkflowInMemoryExecuteRequest = {
+  definition: WorkflowDefinition;
+  input?: Record<string, unknown>;
+  triggerNodeId?: string;
+};
+
+export type WorkflowNodeDefinitionLight = {
+  type: string;
+  category: string;
+  name: string;
+  description?: string | null;
+  icon?: string | null;
+  trusted: boolean;
+  isBuiltin: boolean;
+};
+
+export type WorkflowNodeDefinition = WorkflowNodeDefinitionLight & {
+  schemas: {
+    config: Record<string, unknown>;
+    input?: Record<string, unknown> | null;
+    output?: Record<string, unknown> | null;
+  };
+  handler: Record<string, unknown>;
+  secrets?: Record<string, unknown> | null;
+};
+
+export type WorkflowOpenUiResult = {
+  url: string;
+  opened: boolean;
 };
 
 export type WorkflowConnector = {
@@ -914,6 +991,7 @@ export type MonitorRuleSchemaField = {
   type: MonitorRuleFieldType;
   operators: MonitorRuleOperator[];
   values?: MonitorRuleSchemaValue[];
+  options_source?: string;
 };
 
 export type MonitorRuleSchema = {
@@ -1011,8 +1089,9 @@ export type WorkflowBindingCreateRequest = {
 };
 
 export type WorkflowSnapshot = {
-  workflows: WorkflowDefinition[];
-  runs: WorkflowRun[];
+  workflows: WorkflowRuntimeRecord[];
+  runs: WorkflowRuntimeRecord[];
+  workflow_error?: string | null;
   connectors?: WorkflowConnector[];
   connections?: WorkflowConnection[];
   connector_error?: string | null;
@@ -1041,3 +1120,10 @@ export type ExternalCredential = {
   description: string;
   sourcePath: string;
 };
+
+export interface LarkChat {
+  chat_id: string;
+  name: string;
+  conversation_type: string;
+  unread: boolean;
+}

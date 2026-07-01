@@ -151,10 +151,17 @@ pub enum ActionSpec {
         #[serde(default)]
         template: Option<String>,
     },
-    /// Trigger a registered native Puffer workflow.
+    /// Trigger a deployed workflow in the configured workflow runtime.
     RunWorkflow {
-        /// Workflow slug to run.
-        slug: String,
+        /// Stable runtime workflow id to execute, as returned by the
+        /// AgentEnv-compatible runtime and used in `POST /v1/workflows/:id/execute`.
+        ///
+        /// Not a Puffer-local node id, connection id, or human-readable
+        /// name/slug (names may be duplicated or change; execution needs the
+        /// stable id). The JSON field is serialized as `slug` purely for
+        /// backwards compatibility with existing binding payloads.
+        #[serde(rename = "slug")]
+        workflow_id: String,
     },
     /// Invoke a connector action.
     ConnectorAct {
@@ -260,6 +267,24 @@ fn validate_slug(label: &str, slug: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_runtime_workflow_id(id: &str) -> Result<(), String> {
+    if id.trim().is_empty() {
+        return Err("run_workflow.slug must not be empty".into());
+    }
+    if id.trim() != id {
+        return Err("run_workflow.slug must not include surrounding whitespace".into());
+    }
+    if !id.chars().all(|ch| {
+        ch.is_ascii()
+            && !ch.is_ascii_control()
+            && !ch.is_ascii_whitespace()
+            && !matches!(ch, '/' | '?' | '#')
+    }) {
+        return Err("run_workflow.slug must be a URL-safe AgentEnv workflow runtime id".into());
+    }
+    Ok(())
+}
+
 fn validate_filter(filter: &FilterSpec) -> Result<(), String> {
     match filter {
         FilterSpec::Tagged(TaggedFilterSpec::Regex { pattern, .. }) => {
@@ -332,7 +357,7 @@ fn validate_action(action: &ActionSpec) -> Result<(), String> {
                 return Err("forward_message.target must not be empty".into());
             }
         }
-        ActionSpec::RunWorkflow { slug } => validate_slug("run_workflow.slug", slug)?,
+        ActionSpec::RunWorkflow { workflow_id } => validate_runtime_workflow_id(workflow_id)?,
         ActionSpec::ConnectorAct {
             connector_slug,
             action,
@@ -800,6 +825,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn run_workflow_accepts_agentenv_runtime_ids() {
+        let action = ActionSpec::RunWorkflow {
+            workflow_id: "Wf_01HX.Runtime:123".into(),
+        };
+
+        validate_action_spec(&action).unwrap();
+    }
+
+    #[test]
+    fn run_workflow_rejects_whitespace_runtime_ids() {
+        let action = ActionSpec::RunWorkflow {
+            workflow_id: "Bad Slug".into(),
+        };
+
+        let error = validate_action_spec(&action).unwrap_err();
+
+        assert!(error.contains("AgentEnv workflow runtime id"));
     }
 
     #[test]

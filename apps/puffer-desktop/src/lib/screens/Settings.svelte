@@ -10,6 +10,7 @@
   import RemoteSettings from "./settings/RemoteSettings.svelte";
   import SecretsSettings from "./settings/SecretsSettings.svelte";
   import BrowserPane from "./agent/BrowserPane.svelte";
+  import LarkChatPicker from "./connectors/LarkChatPicker.svelte";
   import { focusTrap } from "../focusTrap";
   import {
     providerIdCanRunAgent,
@@ -30,6 +31,7 @@
     listPermissions,
     listProviderModels,
     loadWorkflowSnapshot,
+    saveWorkflowBackendConfig,
     removeLambdaSkillLibrary,
     resolveUserQuestion,
     saveLambdaSkillLibrary,
@@ -37,6 +39,7 @@
     setLambdaSkillApproval,
     setLambdaSkillEnabled,
     startConnectorSetupCommand,
+    testWorkflowBackendConnection,
     updateConfig,
     type LambdaSkillLibraryInfo,
     type LambdaSkillLibrariesSnapshot,
@@ -54,6 +57,10 @@
     RemoteOperation,
     SettingsSnapshot,
     WorkflowConnector,
+    WorkflowBackendConnectionCheck,
+    WorkflowBackendConnectionTest,
+    WorkflowBackendMode,
+    WorkflowBackendSettings,
     WorkflowSnapshot
   } from "../types";
 
@@ -108,7 +115,7 @@
     props.onRefresh();
   }
 
-  type Section = "general" | "providers" | "secrets" | "network" | "remote" | "browser" | "connectors" | "permissions" | "skills" | "mcp" | "git" | "appearance" | "shortcuts";
+  type Section = "general" | "providers" | "secrets" | "network" | "remote" | "browser" | "workflow-backend" | "connectors" | "permissions" | "skills" | "mcp" | "git" | "appearance" | "shortcuts";
   let section = $state<Section>("general");
 
   const navItems: { id: Section; label: string; icon: IconName }[] = [
@@ -118,6 +125,7 @@
     { id: "network",     label: "Network",    icon: "globe" },
     { id: "remote",      label: "Remote",     icon: "server" },
     { id: "browser",     label: "Browser",    icon: "globe" },
+    { id: "workflow-backend", label: "Workflows", icon: "git" },
     { id: "connectors",  label: "Connectors", icon: "server" },
     { id: "permissions", label: "Permissions", icon: "bolt" },
     { id: "skills",      label: "Verified Skills", icon: "shield" },
@@ -156,6 +164,37 @@
   };
 
   type ConnectorTab = "connections" | "catalog";
+
+  const fallbackWorkflowBackend: WorkflowBackendSettings = {
+    mode: "local",
+    apiUrl: "http://127.0.0.1:3000",
+    uiUrl: "http://localhost:5173",
+    workspaceId: "",
+    hasToken: false,
+    options: [
+      {
+        mode: "local",
+        label: "Run locally",
+        description: "Connects to a workflow runtime running on this device.",
+        apiUrl: "http://127.0.0.1:3000",
+        uiUrl: "http://localhost:5173"
+      },
+      {
+        mode: "agent_env_cloud",
+        label: "Run on AgentEnv Cloud",
+        description: "Sends required workflow data to AgentEnv Cloud for execution.",
+        apiUrl: "https://api.agentenv.io",
+        uiUrl: "https://agentenv.io"
+      }
+    ]
+  };
+
+  type WorkflowBackendForm = {
+    mode: WorkflowBackendMode;
+    apiUrl: string;
+    uiUrl: string;
+    workspaceId: string;
+  };
 
   // Live permissions loaded from the daemon. `permissionRows` is the
   // editable working copy — changes are staged in memory and flushed on
@@ -209,6 +248,22 @@
   let connectorDeleting = $state<string | null>(null);
   let connectorMonitoring = $state<string | null>(null);
   let lastConnectorSlug = "";
+  // Set after a lark-browser / feishu-browser turn-complete to show the group-picker wizard
+  let larkPickerConnectionSlug = $state<string | null>(null);
+  let larkPickerConnectorSlug = $state<string | null>(null);
+
+  let workflowBackendForm = $state<WorkflowBackendForm>({
+    mode: fallbackWorkflowBackend.mode,
+    apiUrl: fallbackWorkflowBackend.apiUrl,
+    uiUrl: fallbackWorkflowBackend.uiUrl,
+    workspaceId: fallbackWorkflowBackend.workspaceId
+  });
+  let workflowBackendToken = $state("");
+  let workflowBackendSaving = $state(false);
+  let workflowBackendTesting = $state(false);
+  let workflowBackendError = $state<string | null>(null);
+  let workflowBackendSaved = $state<string | null>(null);
+  let workflowBackendTestResult = $state<WorkflowBackendConnectionTest | null>(null);
 
   let lambdaSnapshot = $state<LambdaSkillLibrariesSnapshot | null>(null);
   let lambdaLoaded = $state(false);
@@ -229,6 +284,7 @@
   let modelPickerModel = $state<string>("");
   let modelSaving = $state(false);
   let modelError = $state<string | null>(null);
+  let workflowBackendSnapshot = $derived(props.snapshot?.workflowBackend ?? fallbackWorkflowBackend);
   let connectors = $derived(connectorSnapshot?.connectors ?? []);
   let connections = $derived(connectorSnapshot?.connections ?? []);
   let selectedConnector = $derived(
@@ -669,9 +725,15 @@
       connectorQuestionRequest = null;
       connectorQuestionAnswers = {};
       connectorSaved = `Connector setup finished for ${connectorConnectionSlug.trim()}.`;
+      // Show the group-picker wizard for lark-browser / feishu-browser connectors
+      const finishedConnectorSlug = connectorSetupSlug;
       connectorSetupSlug = null;
       connectorTab = "connections";
       void loadConnectorSnapshot();
+      if (finishedConnectorSlug === "lark-browser" || finishedConnectorSlug === "feishu-browser") {
+        larkPickerConnectionSlug = connectorConnectionSlug.trim();
+        larkPickerConnectorSlug = finishedConnectorSlug;
+      }
       return;
     }
     if (event.type === "turn-error") {
@@ -1185,6 +1247,91 @@
     }
   }
 
+  function workflowBackendOption(mode: WorkflowBackendMode) {
+    return (
+      workflowBackendSnapshot.options.find((option) => option.mode === mode) ??
+      fallbackWorkflowBackend.options.find((option) => option.mode === mode) ??
+      fallbackWorkflowBackend.options[0]
+    );
+  }
+
+  function applyWorkflowBackendSettings(settings: WorkflowBackendSettings) {
+    workflowBackendForm = {
+      mode: settings.mode,
+      apiUrl: settings.apiUrl,
+      uiUrl: settings.uiUrl,
+      workspaceId: settings.workspaceId
+    };
+  }
+
+  function selectWorkflowBackendMode(mode: WorkflowBackendMode) {
+    const option = workflowBackendOption(mode);
+    workflowBackendForm = {
+      ...workflowBackendForm,
+      mode,
+      apiUrl: option?.apiUrl ?? workflowBackendForm.apiUrl,
+      uiUrl: option?.uiUrl ?? workflowBackendForm.uiUrl
+    };
+    workflowBackendError = null;
+    workflowBackendSaved = null;
+    workflowBackendTestResult = null;
+  }
+
+  async function persistWorkflowBackend(): Promise<WorkflowBackendSettings> {
+    const token = workflowBackendToken.trim();
+    const saved = await saveWorkflowBackendConfig({
+      mode: workflowBackendForm.mode,
+      apiUrl: workflowBackendForm.apiUrl.trim(),
+      uiUrl: workflowBackendForm.uiUrl.trim(),
+      workspaceId: workflowBackendForm.workspaceId.trim(),
+      apiToken: token || null,
+      keepToken: !token && workflowBackendSnapshot.hasToken
+    });
+    workflowBackendToken = "";
+    applyWorkflowBackendSettings(saved);
+    return saved;
+  }
+
+  async function saveWorkflowBackend() {
+    if (workflowBackendSaving || workflowBackendTesting || !daemonReachable) return;
+    workflowBackendSaving = true;
+    workflowBackendError = null;
+    workflowBackendSaved = null;
+    workflowBackendTestResult = null;
+    try {
+      const saved = await persistWorkflowBackend();
+      workflowBackendSaved = saved.hasToken
+        ? "Workflow settings saved. API token is configured."
+        : "Workflow settings saved. API token is not configured.";
+      props.onRefresh();
+    } catch (e) {
+      workflowBackendError = (e as Error).message ?? String(e);
+    } finally {
+      workflowBackendSaving = false;
+    }
+  }
+
+  async function testWorkflowBackend() {
+    if (workflowBackendSaving || workflowBackendTesting || !daemonReachable) return;
+    workflowBackendTesting = true;
+    workflowBackendError = null;
+    workflowBackendSaved = null;
+    workflowBackendTestResult = null;
+    try {
+      await persistWorkflowBackend();
+      workflowBackendTestResult = await testWorkflowBackendConnection();
+      props.onRefresh();
+    } catch (e) {
+      workflowBackendError = (e as Error).message ?? String(e);
+    } finally {
+      workflowBackendTesting = false;
+    }
+  }
+
+  function workflowBackendCheckText(check: WorkflowBackendConnectionCheck): string {
+    return check.error?.message || check.message;
+  }
+
   let authedProviderIds = $derived(new Set((props.snapshot?.auth ?? []).map((a) => a.providerId)));
   let defaultRouteProviders = $derived.by(() => {
     const authIds = (props.snapshot?.auth ?? []).map((auth) => auth.providerId);
@@ -1244,7 +1391,12 @@
       (props.snapshot?.auth ?? []).map((auth) => auth.providerId).sort().join(","),
       (props.snapshot?.providers ?? []).map((provider) => provider.id).sort().join(","),
       props.snapshot?.config.defaultProvider ?? "",
-      props.snapshot?.config.defaultModel ?? ""
+      props.snapshot?.config.defaultModel ?? "",
+      props.snapshot?.workflowBackend.mode ?? "",
+      props.snapshot?.workflowBackend.apiUrl ?? "",
+      props.snapshot?.workflowBackend.uiUrl ?? "",
+      props.snapshot?.workflowBackend.workspaceId ?? "",
+      props.snapshot?.workflowBackend.hasToken ? "token" : "no-token"
     ].join("\0");
     if (nextKey === settingsSourceKey) return;
     settingsSourceKey = nextKey;
@@ -1289,6 +1441,12 @@
     connectorQuestionRequest = null;
     connectorQuestionAnswers = {};
     lastConnectorSlug = "";
+
+    applyWorkflowBackendSettings(props.snapshot?.workflowBackend ?? fallbackWorkflowBackend);
+    workflowBackendToken = "";
+    workflowBackendSaving = false;
+    workflowBackendTesting = false;
+    workflowBackendError = null;
 
     providerModels = {};
     modelLoadingByProvider = {};
@@ -1667,6 +1825,170 @@
         onRefresh={props.onRefresh}
       />
 
+    {:else if section === "workflow-backend"}
+      <h2>Workflows</h2>
+      <p class="lead">Choose where workflow data is sent when opening the Workflow Console.</p>
+
+      {#if !daemonReachable}
+        <div class="pf-settings-note">Preview mode - launch Puffer in the desktop app to configure Workflows.</div>
+      {/if}
+      {#if workflowBackendError}
+        <div class="pf-settings-note warn" role="alert">{workflowBackendError}</div>
+      {/if}
+      {#if workflowBackendSaved}
+        <div class="pf-settings-note" role="status">{workflowBackendSaved}</div>
+      {/if}
+
+      <div class="pf-settings-row" style="align-items: start;">
+        <div class="meta">
+          <div class="label">Mode</div>
+          <div class="desc">Select the workflow runtime Puffer should connect to.</div>
+        </div>
+        <div class="pf-workflow-backend-mode" role="radiogroup" aria-label="Workflow mode">
+          <label class="pf-workflow-backend-option">
+            <input
+              type="radio"
+              name="workflow-backend-mode"
+              value="local"
+              checked={workflowBackendForm.mode === "local"}
+              onchange={() => selectWorkflowBackendMode("local")}
+            />
+            <span>
+              <strong>Run locally</strong>
+              <small>Connects to a workflow runtime running on this device. Requires local services to be installed and running.</small>
+            </span>
+          </label>
+          <label class="pf-workflow-backend-option">
+            <input
+              type="radio"
+              name="workflow-backend-mode"
+              value="agent_env_cloud"
+              checked={workflowBackendForm.mode === "agent_env_cloud"}
+              onchange={() => selectWorkflowBackendMode("agent_env_cloud")}
+            />
+            <span>
+              <strong>Run on AgentEnv Cloud</strong>
+              <small>Sends required workflow data to AgentEnv Cloud for execution.</small>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <div class="pf-settings-row">
+        <div class="meta">
+          <div class="label">API URL</div>
+          <div class="desc">Workflow runtime API endpoint.</div>
+        </div>
+        <input
+          class="sc-input pf-workflow-backend-input"
+          aria-label="API URL"
+          value={workflowBackendForm.apiUrl}
+          disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
+          oninput={(e) => (workflowBackendForm = { ...workflowBackendForm, apiUrl: (e.currentTarget as HTMLInputElement).value })}
+        />
+      </div>
+
+      <div class="pf-settings-row">
+        <div class="meta">
+          <div class="label">Workflow Console URL</div>
+          <div class="desc">External UI opened from the Workflows page.</div>
+        </div>
+        <input
+          class="sc-input pf-workflow-backend-input"
+          aria-label="Workflow Console URL"
+          value={workflowBackendForm.uiUrl}
+          disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
+          oninput={(e) => (workflowBackendForm = { ...workflowBackendForm, uiUrl: (e.currentTarget as HTMLInputElement).value })}
+        />
+      </div>
+
+      <div class="pf-settings-row">
+        <div class="meta">
+          <div class="label">Workspace ID</div>
+          <div class="desc">Workspace used for workflow runtime calls.</div>
+        </div>
+        <input
+          class="sc-input pf-workflow-backend-input"
+          aria-label="Workspace ID"
+          value={workflowBackendForm.workspaceId}
+          disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
+          oninput={(e) => (workflowBackendForm = { ...workflowBackendForm, workspaceId: (e.currentTarget as HTMLInputElement).value })}
+        />
+      </div>
+
+      <div class="pf-settings-row">
+        <div class="meta">
+          <div class="label">API Token</div>
+          <div class="desc">Saved in the user-level secret store. Existing tokens are retained when this field is empty.</div>
+        </div>
+        <div class="pf-workflow-backend-token">
+          <input
+            class="sc-input pf-workflow-backend-input"
+            aria-label="API Token"
+            type="password"
+            value={workflowBackendToken}
+            placeholder={workflowBackendSnapshot.hasToken ? "Configured - enter a new token to replace" : "Not configured"}
+            disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
+            oninput={(e) => (workflowBackendToken = (e.currentTarget as HTMLInputElement).value)}
+          />
+          <span class="pf-status-pill" class:ready={workflowBackendSnapshot.hasToken}>
+            {workflowBackendSnapshot.hasToken ? "Configured" : "Not configured"}
+          </span>
+        </div>
+      </div>
+
+      <div class="pf-settings-row" style="border-bottom: 0;">
+        <div class="meta">
+          <div class="label">Connection</div>
+          <div class="desc">Test the saved runtime, authentication, and workspace access.</div>
+        </div>
+        <div class="pf-workflow-backend-actions">
+          <button
+            type="button"
+            class="sc-btn"
+            data-variant="outline"
+            data-size="sm"
+            disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
+            onclick={() => void testWorkflowBackend()}
+          >
+            <Icon name="bolt" size={13} />{workflowBackendTesting ? "Testing..." : "Test Connection"}
+          </button>
+          <button
+            type="button"
+            class="sc-btn"
+            data-variant="default"
+            data-size="sm"
+            disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
+            onclick={() => void saveWorkflowBackend()}
+          >
+            <Icon name="check" size={13} />{workflowBackendSaving ? "Saving..." : "Save"}
+          </button>
+        </div>
+      </div>
+
+      {#if workflowBackendTestResult}
+        <div
+          class="pf-workflow-backend-result"
+          data-success={workflowBackendTestResult.success}
+          role="status"
+          aria-label="Workflow connection result"
+        >
+          <strong>{workflowBackendTestResult.success ? "Connection succeeded." : "Unable to connect to workflow runtime."}</strong>
+          <div>
+            <span>Runtime</span>
+            <small>{workflowBackendCheckText(workflowBackendTestResult.runtime)}</small>
+          </div>
+          <div>
+            <span>Auth</span>
+            <small>{workflowBackendCheckText(workflowBackendTestResult.auth)}</small>
+          </div>
+          <div>
+            <span>Workspace</span>
+            <small>{workflowBackendCheckText(workflowBackendTestResult.workspace)}</small>
+          </div>
+        </div>
+      {/if}
+
     {:else if section === "connectors"}
       <h2>Connectors</h2>
       <p class="lead">Connector catalog, saved connections, and setup flows backed by AskUserQuestion.</p>
@@ -2037,6 +2359,17 @@
             </div>
           </div>
         </div>
+      {/if}
+
+      {#if larkPickerConnectionSlug && larkPickerConnectorSlug}
+        <LarkChatPicker
+          connectionSlug={larkPickerConnectionSlug}
+          connectorSlug={larkPickerConnectorSlug}
+          onDone={() => {
+            larkPickerConnectionSlug = null;
+            larkPickerConnectorSlug = null;
+          }}
+        />
       {/if}
 
       <div class="pf-connector-tabs" role="tablist" aria-label="Connector views">

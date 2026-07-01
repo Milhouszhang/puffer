@@ -39,7 +39,7 @@ mod monitor_rule_tests {
                 classify_prompt: None,
                 classify_model: None,
                 action: ActionSpec::RunWorkflow {
-                    slug: "downstream".into(),
+                    workflow_id: "downstream".into(),
                 },
                 created_at_ms: 0,
             })
@@ -118,7 +118,7 @@ mod monitor_rule_tests {
                 classify_prompt: None,
                 classify_model: None,
                 action: ActionSpec::RunWorkflow {
-                    slug: "downstream".into(),
+                    workflow_id: "downstream".into(),
                 },
                 created_at_ms: 0,
             })
@@ -325,13 +325,13 @@ mod monitor_rule_tests {
                 "lark-browser",
                 "lark-browser",
                 bundled_schema("lark-browser"),
-                12,
+                11,
             ),
             (
                 "feishu-browser",
                 "feishu-browser",
                 bundled_schema("feishu-browser"),
-                12,
+                11,
             ),
         ]
     }
@@ -390,6 +390,11 @@ mod monitor_rule_tests {
     ) -> Vec<MatrixCase> {
         let mut cases = Vec::new();
         for field in &schema.fields {
+            // Skip dynamic-options fields: their values are fetched at runtime from the
+            // connector (e.g. connector_chats) and cannot be synthesised here.
+            if field.options_source.is_some() {
+                continue;
+            }
             for operator in &field.operators {
                 for value in matrix_rule_values(field, *operator) {
                     let (matching_payload, nonmatching_payload) =
@@ -761,9 +766,9 @@ mod monitor_rule_tests {
         assert_eq!(per_connector["telegram-bot"], 7);
         assert_eq!(per_connector["lark-login"], 15);
         assert_eq!(per_connector["lark-bot"], 15);
-        assert_eq!(per_connector["lark-browser"], 12);
-        assert_eq!(per_connector["feishu-browser"], 12);
-        assert_eq!(cases.len(), 130);
+        assert_eq!(per_connector["lark-browser"], 11);
+        assert_eq!(per_connector["feishu-browser"], 11);
+        assert_eq!(cases.len(), 128);
 
         let mut mode_template_count = 0;
         let mut expected_actions = 0;
@@ -841,8 +846,8 @@ mod monitor_rule_tests {
             }
         }
 
-        assert_eq!(mode_template_count, 260);
-        assert_eq!(expected_actions, 256);
+        assert_eq!(mode_template_count, 256);
+        assert_eq!(expected_actions, 252);
         assert_eq!(recording.topics.lock().unwrap().len(), expected_actions);
     }
 
@@ -887,7 +892,7 @@ mod monitor_rule_tests {
         assert_eq!(lark.fields, feishu.fields, "lark and feishu schemas must match");
         // exactly the five declared filter fields, in order
         let paths: Vec<&str> = lark.fields.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(paths, vec!["event_type", "sender", "chat_id", "unread", "conversation_type"]);
+        assert_eq!(paths, vec!["event_type", "sender", "chat_name", "unread", "conversation_type"]);
         // event_type only declares the one source the connector actually emits
         // (the sub-app sources — calendar/task/approval/doc/mail — aren't built,
         // so listing them would offer filter values that never match)
@@ -904,6 +909,11 @@ mod monitor_rule_tests {
         // unread is a boolean field
         let unread = lark.fields.iter().find(|f| f.path == "unread").unwrap();
         assert_eq!(unread.field_type, EventFieldType::Boolean);
+        // chat_name is a dynamic-options enum — options fetched at runtime from connector_chats
+        let cn = lark.fields.iter().find(|f| f.path == "chat_name").unwrap();
+        assert_eq!(cn.field_type, EventFieldType::Enum);
+        assert!(cn.values.is_empty(), "chat_name has no static values — options come from options_source");
+        assert_eq!(cn.options_source.as_deref(), Some("connector_chats"));
         // schema validates and every declared field compiles into a filter rule
         validate_event_schema(&lark).unwrap();
         for field in &lark.fields {

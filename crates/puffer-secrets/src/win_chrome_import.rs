@@ -285,7 +285,10 @@ fn do_import(user: &str, token_pid: u32, vault_dir: &str) -> Result<String> {
 
     let v10_b64 = os_crypt["encrypted_key"].as_str().map(|s| s.to_string());
     let (after_user, os_key) = impersonating(token_pid, || {
-        let after_user = after_system.as_ref().map(|a| dpapi_unprotect(a)).transpose();
+        let after_user = after_system
+            .as_ref()
+            .map(|a| dpapi_unprotect(a))
+            .transpose();
         let os_key = v10_b64
             .as_ref()
             .map(|b| -> Result<[u8; 32]> {

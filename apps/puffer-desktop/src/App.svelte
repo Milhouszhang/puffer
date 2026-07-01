@@ -20,6 +20,7 @@
   import AgentDetail from "./lib/screens/agent/AgentDetail.svelte";
   import { isAlreadyPersistedTool, persistedToolIdSet } from "./lib/screens/agent/timelineToolDedup";
   import Workflows from "./lib/screens/Workflows.svelte";
+  import Automation from "./lib/screens/Automation.svelte";
   import Tasks from "./lib/screens/Tasks.svelte";
   import Contacts from "./lib/screens/Contacts.svelte";
   import BuildBadge from "./lib/components/BuildBadge.svelte";
@@ -362,11 +363,18 @@
         !dismissedPermissionIds.includes(scopedSessionItemId(selectedSession?.id, t.id))
     )
   );
+  // A pending question only blocks the composer while it is *live and
+  // answerable* — i.e. tracked in turnQuestionLookup for an in-flight turn. A
+  // question re-derived from a settled turn's reloaded transcript (e.g. after
+  // the user interrupted the turn) is no longer answerable and must not lock
+  // the session. Interrupting a turn clears this lookup, so the composer frees
+  // up immediately instead of getting stuck on a dead question. (#671)
   let pendingQuestions = $derived<UserQuestionTimelineItem[]>(
     combinedTimeline.filter(
       (t): t is UserQuestionTimelineItem =>
         t.kind === "question" &&
         t.status === "pending" &&
+        turnQuestionLookup[t.id] !== undefined &&
         !dismissedQuestionIds.includes(scopedSessionItemId(selectedSession?.id, t.id))
     )
   );
@@ -3550,6 +3558,20 @@
         statusMessage = `Turn ${turnId.slice(0, 8)} already finished.`;
         return;
       }
+      // The interrupt was accepted. Clear any pending prompts for this turn now
+      // so the user can keep working even if the backend's settle event
+      // (turn-complete / workspace-settled) is delayed or never arrives. The
+      // turn itself stays marked active (Stop turn remains, disabled) until that
+      // settle event lands.
+      if (currentTurnId === turnId) {
+        liveStreamItems = withoutLivePromptsForTurn(liveStreamItems, turnId);
+        turnQuestionLookup = Object.fromEntries(
+          Object.entries(turnQuestionLookup).filter(([, mapping]) => mapping.turnId !== turnId)
+        );
+        turnPermissionLookup = Object.fromEntries(
+          Object.entries(turnPermissionLookup).filter(([, mapping]) => mapping.turnId !== turnId)
+        );
+      }
       statusMessage = `Cancel requested for turn ${turnId.slice(0, 8)}.`;
     } catch (error) {
       if (currentTurnId !== turnId) return;
@@ -4152,6 +4174,21 @@
 
   function withoutLiveItemsForTurn(items: TimelineItem[], turnId: string): TimelineItem[] {
     return items.filter((item) => !liveItemBelongsToTurn(item, turnId));
+  }
+
+  // Drop only the pending interaction prompts (permission gates and
+  // AskUserQuestion) for a turn, preserving any streamed assistant/tool output.
+  // Used when the user interrupts a turn so the session is not left blocking on
+  // a prompt that can no longer be answered.
+  function withoutLivePromptsForTurn(items: TimelineItem[], turnId: string): TimelineItem[] {
+    return items.filter(
+      (item) =>
+        !(
+          item.id.startsWith(`live-gate-${turnId}-`) ||
+          item.id.startsWith(`live-perm-${turnId}-`) ||
+          item.id.startsWith(`live-question-${turnId}-`)
+        )
+    );
   }
 
   function snapshotFromTransientState(state: TransientConversationState): StreamAttemptSnapshot {
@@ -4760,7 +4797,9 @@
               />
             {/if}
           {:else if tweaks.screen === "workflows"}
-            <Workflows onRunWorkflowCommand={runWorkflowCommand} />
+            <Workflows />
+          {:else if tweaks.screen === "automation"}
+            <Automation />
           {:else if tweaks.screen === "tasks"}
             <Tasks onRunTaskCommand={runWorkflowCommand} />
           {:else if tweaks.screen === "contacts"}

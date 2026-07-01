@@ -1427,6 +1427,15 @@ async fn dispatch_request(
                 crate::daemon_browser_settings::handle_save_browser_settings(&s, &p)
             }))
         }
+        "workflow_backend_get_config" => respond!(detached!(|s| {
+            crate::daemon_workflow_runtime::handle_workflow_backend_get_config(&s)
+        })),
+        "workflow_backend_save_config" => respond!(detached!(|s, p| {
+            crate::daemon_workflow_runtime::handle_workflow_backend_save_config(&s, &p)
+        })),
+        "workflow_backend_test_connection" => respond!(detached!(|s| {
+            crate::daemon_workflow_runtime::handle_workflow_backend_test_connection(&s)
+        })),
         "list_mcp_servers" => respond!(detached!(|s| handle_list_mcp_servers(&s))),
         "add_mcp_server" => respond!(detached!(|s, p| handle_add_mcp_server(&s, &p))),
         "list_lambda_skill_libraries" => {
@@ -1604,11 +1613,42 @@ async fn dispatch_request(
         "install_local_model" => {
             respond!(detached!(|s, p| handle_install_local_model(&s, &p)))
         }
-        "workflow_list" => respond!(crate::daemon_workflows::handle_workflow_list(&state.paths)),
-        "workflow_save" => respond!(crate::daemon_workflows::handle_workflow_save(
-            &state.paths,
-            &params
-        )),
+        "workflow_list" => respond!(detached!(|s| {
+            crate::daemon_workflows::handle_workflow_list(s.config_paths())
+        })),
+        "workflow_create" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_create(s.config_paths(), &p)
+        })),
+        "workflow_update" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_update(s.config_paths(), &p)
+        })),
+        "workflow_deploy" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_deploy(s.config_paths(), &p)
+        })),
+        "workflow_undeploy" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_undeploy(s.config_paths(), &p)
+        })),
+        "workflow_node_definitions" => respond!(detached!(|s| {
+            crate::daemon_workflows::handle_workflow_node_definitions(s.config_paths())
+        })),
+        "workflow_node_definition" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_node_definition(s.config_paths(), &p)
+        })),
+        "workflow_execute" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_execute(s.config_paths(), &p)
+        })),
+        "workflow_execute_in_memory" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_execute_in_memory(s.config_paths(), &p)
+        })),
+        "workflow_list_executions" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_list_executions(s.config_paths(), &p)
+        })),
+        "workflow_get_execution" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_get_execution(s.config_paths(), &p)
+        })),
+        "workflow_open_ui" => respond!(detached!(|s| {
+            crate::daemon_workflow_runtime::handle_workflow_open_ui(&s)
+        })),
         "workflow_binding_create" => respond!(
             crate::daemon_workflows::handle_workflow_binding_create(&state.paths, &params)
         ),
@@ -1658,15 +1698,6 @@ async fn dispatch_request(
             &state.paths,
             &params
         )),
-        "workflow_runs_list" => respond!(crate::daemon_workflows::handle_workflow_runs_list(
-            &state.paths,
-            &params
-        )),
-        "workflow_run_show" => respond!(crate::daemon_workflows::handle_workflow_run_show(
-            &state.paths,
-            &params
-        )),
-
         "run_agent_turn" => {
             let tx_clone = tx.clone();
             let state_clone = state.clone();
@@ -1770,6 +1801,9 @@ async fn dispatch_request(
         "resolve_permission" => respond!(handle_resolve_permission(&state, &params)),
         "resolve_user_question" => respond!(handle_resolve_user_question(&state, &params)),
         "cancel_turn" => respond!(handle_cancel_turn(&state, &params)),
+        "lark_browser_list_chats" => {
+            respond!(detached!(|s, p| handle_lark_browser_list_chats(&s, &p)))
+        }
 
         other => {
             let _ = send_envelope(
@@ -1791,6 +1825,23 @@ async fn dispatch_request(
 // ---------------------------------------------------------------------------
 // RPC handlers — blocking work runs in a tokio::task::spawn_blocking closure.
 // ---------------------------------------------------------------------------
+
+/// RPC handler for `lark_browser_list_chats`.
+///
+/// Params: `{ connection_slug: string }` (optional — defaults to "lark-browser")
+/// Returns: `{ chats: [{chat_id, name, conversation_type, unread}] }`
+fn handle_lark_browser_list_chats(state: &DaemonState, params: &Value) -> Result<Value> {
+    let connection_slug = params
+        .get("connection_slug")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let manager = puffer_core::subscription_manager()?;
+    crate::lark_browser::list_chats_via_subscriber(
+        &manager,
+        state.config_paths(),
+        connection_slug,
+    )
+}
 
 fn handle_canvas_state_update(state: &DaemonState, params: &Value) -> Result<Value> {
     let session_id = params
@@ -5598,7 +5649,14 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
         let perm_turn = turn_id_thread.clone();
         let perm_pending = pending.clone();
         let perm_actor = stream_actor.clone();
+        let perm_cancel = cancel.clone();
         let on_permission = move |req: PermissionPromptRequest| -> PermissionPromptAction {
+            // Turn already interrupted: deny immediately instead of surfacing a
+            // fresh prompt. Re-emitting after cancel is what made a canceled
+            // turn pop its prompt back up. (#671)
+            if perm_cancel.is_cancelled() {
+                return PermissionPromptAction::Deny;
+            }
             let request_id = next_req_id.fetch_add(1, Ordering::SeqCst).to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             perm_pending.lock().unwrap().insert(request_id.clone(), tx);
@@ -5629,7 +5687,18 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
         let question_pending = pending_questions.clone();
         let question_next_id = setup_state.next_request_id.clone();
         let question_actor = stream_actor.clone();
+        let question_cancel = cancel.clone();
         let on_user_question = move |req: UserQuestionPromptRequest| -> UserQuestionPromptResponse {
+            // Don't re-surface a question once the user interrupted the turn.
+            // Returning an empty answer lets the tool record "pending" and the
+            // agent loop bails at its next cancel boundary, instead of popping
+            // the prompt back up after it was dismissed. (#671)
+            if question_cancel.is_cancelled() {
+                return UserQuestionPromptResponse {
+                    answers: serde_json::Map::new(),
+                    annotations: serde_json::Map::new(),
+                };
+            }
             let request_id = question_next_id.fetch_add(1, Ordering::SeqCst).to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             question_pending
@@ -5916,7 +5985,18 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
         let question_pending = pending_questions.clone();
         let question_next_id = next_req_id.clone();
         let question_actor = stream_actor.clone();
+        let question_cancel = cancel.clone();
         let on_user_question = move |req: UserQuestionPromptRequest| -> UserQuestionPromptResponse {
+            // Don't re-surface a question once the user interrupted the turn.
+            // Returning an empty answer lets the tool record "pending" and the
+            // agent loop bails at its next cancel boundary, instead of popping
+            // the prompt back up after it was dismissed. (#671)
+            if question_cancel.is_cancelled() {
+                return UserQuestionPromptResponse {
+                    answers: serde_json::Map::new(),
+                    annotations: serde_json::Map::new(),
+                };
+            }
             let request_id = question_next_id.fetch_add(1, Ordering::SeqCst).to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             question_pending
@@ -6295,7 +6375,18 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
         let question_pending = pending_questions.clone();
         let question_next_id = next_req_id.clone();
         let question_actor = stream_actor.clone();
+        let question_cancel = cancel.clone();
         let on_user_question = move |req: UserQuestionPromptRequest| -> UserQuestionPromptResponse {
+            // Don't re-surface a question once the user interrupted the turn.
+            // Returning an empty answer lets the tool record "pending" and the
+            // agent loop bails at its next cancel boundary, instead of popping
+            // the prompt back up after it was dismissed. (#671)
+            if question_cancel.is_cancelled() {
+                return UserQuestionPromptResponse {
+                    answers: serde_json::Map::new(),
+                    annotations: serde_json::Map::new(),
+                };
+            }
             let request_id = question_next_id.fetch_add(1, Ordering::SeqCst).to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             question_pending

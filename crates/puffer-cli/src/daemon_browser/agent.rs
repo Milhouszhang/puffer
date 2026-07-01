@@ -751,7 +751,11 @@ impl BrowserRegistry {
 /// bulk `Input.insertText` value, so per-character typing is required. Finally
 /// reads the value back to confirm it persisted, which — unlike a top-document
 /// hosted fill — is possible here.
-fn in_frame_fill(session: &BrowserSession, target: &BrowserElementRef, text: &str) -> Result<Value> {
+fn in_frame_fill(
+    session: &BrowserSession,
+    target: &BrowserElementRef,
+    text: &str,
+) -> Result<Value> {
     let backend_node_id = target
         .backend_node_id
         .context("in-frame ref is missing a backend node id; re-snapshot")?;
@@ -983,7 +987,11 @@ fn dom_code_for_char(ch: char) -> String {
 /// coordinate clicks, so the value is set inside the frame via `callFunctionOn`,
 /// firing `input`/`change`. Fails loudly when no option matches (#580: never
 /// claim success silently).
-fn in_frame_select(session: &BrowserSession, target: &BrowserElementRef, value: &str) -> Result<()> {
+fn in_frame_select(
+    session: &BrowserSession,
+    target: &BrowserElementRef,
+    value: &str,
+) -> Result<()> {
     let backend_node_id = target
         .backend_node_id
         .context("in-frame ref is missing a backend node id; re-snapshot")?;
@@ -1054,7 +1062,10 @@ fn in_frame_backend_node_id(target: &BrowserElementRef) -> Option<i64> {
 /// Resolves a backend node inside a cross-origin frame to a JS object id in that
 /// frame's own context, so `Runtime.callFunctionOn` runs inside the OOPIF.
 fn resolve_in_frame_object_id(session: &BrowserSession, backend_node_id: i64) -> Result<String> {
-    let resolved = session.cdp_call("DOM.resolveNode", json!({ "backendNodeId": backend_node_id }))?;
+    let resolved = session.cdp_call(
+        "DOM.resolveNode",
+        json!({ "backendNodeId": backend_node_id }),
+    )?;
     resolved
         .pointer("/object/objectId")
         .and_then(Value::as_str)

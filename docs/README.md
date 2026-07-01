@@ -7,6 +7,12 @@ when they disagree with dated plans/specs.
 
 - `architecture/agent-loop.md` - provider-neutral turn loop and provider adapter
   contract.
+- `architecture/automation-design-handoff.md` - current desktop Automation tab
+  behavior, state boundaries, and remaining interaction gaps.
+- `architecture/automation-design-handoff.zh.md` - Chinese version of the
+  desktop Automation design handoff.
+- `architecture/automation-design-roadmap.md` - desktop Automation tab product
+  and interaction roadmap.
 - `architecture/bobo-daemon-contract.md` - daemon RPC and compatibility surface
   consumed by Bobo.
 - `architecture/permissions-and-skills.md` - permission profiles, project ACL,

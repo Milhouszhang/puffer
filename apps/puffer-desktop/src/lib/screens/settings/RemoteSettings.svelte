@@ -17,11 +17,13 @@
     daemonReachable: boolean;
     onSaved: (snapshot: SettingsSnapshot) => void;
     onRefresh: () => void;
+    variant?: "settings" | "onboarding";
   };
 
   type SshDraft = SshHostSettings;
 
   let props: Props = $props();
+  let onboarding = $derived(props.variant === "onboarding");
 
   const defaultAgentEnv: AgentEnvSettings = {
     enabled: false,
@@ -213,8 +215,10 @@
   }
 </script>
 
-<h2>Remote Execution</h2>
-<p class="lead">Connect an existing AgentEnv account or SSH hosts for future remote tool execution.</p>
+{#if !onboarding}
+  <h2>Remote Execution</h2>
+  <p class="lead">Connect an existing AgentEnv account or SSH hosts for future remote tool execution.</p>
+{/if}
 
 {#if error}
   <div class="pf-settings-note warn">{error}</div>
@@ -229,8 +233,12 @@
 <section class="pf-card">
   <div class="pf-card-head">
     <div>
-      <h3>AgentEnv account</h3>
-      <p>Use an existing AgentEnv Cloud account. The credential is stored as a Puffer secret.</p>
+      <h3>{onboarding ? "AgentEnv account" : "AgentEnv account"}</h3>
+      <p>
+        {onboarding
+          ? "Paste a credential to use AgentEnv for remote execution. Everything else can stay on defaults."
+          : "Use an existing AgentEnv Cloud account. The credential is stored as a Puffer secret."}
+      </p>
     </div>
     <label class="pf-switch">
       <input
@@ -243,180 +251,285 @@
     </label>
   </div>
 
-  <div class="pf-form-grid">
-    <label>
-      API URL
-      <input
-        class="sc-input"
-        value={agentenv.apiUrl}
-        disabled={disabled}
-        placeholder="https://api.agentenv.io"
-        oninput={(e) => (agentenv = { ...agentenv, apiUrl: (e.currentTarget as HTMLInputElement).value })}
-      />
-    </label>
-    <label>
-      Workspace ID
-      <input
-        class="sc-input"
-        value={agentenv.workspace ?? ""}
-        disabled={disabled}
-        placeholder="wk_..."
-        oninput={(e) => (agentenv = { ...agentenv, workspace: (e.currentTarget as HTMLInputElement).value })}
-      />
-    </label>
-    <label>
-      Runner host
-      <input
-        class="sc-input"
-        value={agentenv.runnerHost ?? ""}
-        disabled={disabled}
-        placeholder="Optional, e.g. 93.115.25.198"
-        oninput={(e) => (agentenv = { ...agentenv, runnerHost: (e.currentTarget as HTMLInputElement).value })}
-      />
-    </label>
-    <label>
-      Auth method
-      <select
-        class="sc-input"
-        value={agentenv.authMethod}
-        disabled={disabled}
-        onchange={(e) =>
-          (agentenv = {
-            ...agentenv,
-            authMethod: (e.currentTarget as HTMLSelectElement).value as "api_key" | "access_token"
-          })}
-      >
-        <option value="api_key">API key</option>
-        <option value="access_token">Access token</option>
-      </select>
-    </label>
-    <label>
-      Credential
-      <input
-        class="sc-input"
-        type="password"
-        value={agentenvCredentialDraft}
-        disabled={disabled}
-        placeholder={agentenv.hasCredential ? "Stored secret configured" : "Paste token to save"}
-        oninput={(e) => (agentenvCredentialDraft = (e.currentTarget as HTMLInputElement).value)}
-      />
-    </label>
-  </div>
-
-  <div class="pf-form-grid">
-    <label>
-      Sandbox size
-      <select
-        class="sc-input"
-        value={agentenv.defaults.sandboxType}
-        disabled={disabled}
-        onchange={(e) => updateAgentEnvDefaults({ sandboxType: (e.currentTarget as HTMLSelectElement).value })}
-      >
-        <option value="micro">micro</option>
-        <option value="small">small</option>
-        <option value="medium">medium</option>
-        <option value="large">large</option>
-        <option value="xl">xl</option>
-      </select>
-    </label>
-    <label>
-      Image
-      <input
-        class="sc-input"
-        value={agentenv.defaults.image}
-        disabled={disabled}
-        placeholder="python:3.11-slim"
-        oninput={(e) => updateAgentEnvDefaults({ image: (e.currentTarget as HTMLInputElement).value })}
-      />
-    </label>
-    <label>
-      Region
-      <input
-        class="sc-input"
-        value={agentenv.defaults.region ?? ""}
-        disabled={disabled}
-        placeholder="Optional"
-        oninput={(e) => updateAgentEnvDefaults({ region: (e.currentTarget as HTMLInputElement).value })}
-      />
-    </label>
-    <label>
-      Max lifetime seconds
-      <input
-        class="sc-input"
-        inputmode="numeric"
-        value={agentenv.defaults.maxLifetimeSeconds ?? ""}
-        disabled={disabled}
-        placeholder="Optional"
-        oninput={(e) => updateAgentEnvDefaults({ maxLifetimeSeconds: numberOrNull((e.currentTarget as HTMLInputElement).value) })}
-      />
-    </label>
-  </div>
-</section>
-
-<section class="pf-card">
-  <div class="pf-card-head">
-    <div>
-      <h3>SSH hosts</h3>
-      <p>Save host records now; runner bootstrap and tunnel lifecycle will use these next.</p>
+  {#if onboarding}
+    <div class="pf-agentenv-quick">
+      <label>
+        Credential
+        <input
+          class="sc-input"
+          type="password"
+          value={agentenvCredentialDraft}
+          disabled={disabled}
+          placeholder={agentenv.hasCredential ? "Stored secret configured" : "Paste API key or access token"}
+          oninput={(e) => (agentenvCredentialDraft = (e.currentTarget as HTMLInputElement).value)}
+        />
+      </label>
+      <label>
+        API URL
+        <input
+          class="sc-input"
+          value={agentenv.apiUrl}
+          disabled={disabled}
+          placeholder="https://api.agentenv.io"
+          oninput={(e) => (agentenv = { ...agentenv, apiUrl: (e.currentTarget as HTMLInputElement).value })}
+        />
+      </label>
     </div>
-    <button type="button" class="sc-btn" data-variant="outline" data-size="sm" disabled={disabled} onclick={addSshHost}>
-      <Icon name="plus" size={13} />Add SSH host
-    </button>
-  </div>
 
-  {#each sshHosts as host (host.id)}
-    <div class="pf-remote-host">
+    <details class="pf-advanced-settings">
+      <summary>Advanced AgentEnv settings</summary>
       <div class="pf-form-grid">
         <label>
-          ID
-          <input class="sc-input" value={host.id} disabled={disabled} oninput={(e) => updateSshHost(host.id, { id: (e.currentTarget as HTMLInputElement).value })} />
-        </label>
-        <label>
-          Label
-          <input class="sc-input" value={host.label} disabled={disabled} oninput={(e) => updateSshHost(host.id, { label: (e.currentTarget as HTMLInputElement).value })} />
-        </label>
-        <label>
-          Target
-          <input class="sc-input" value={host.target} disabled={disabled} placeholder="user@hostname" oninput={(e) => updateSshHost(host.id, { target: (e.currentTarget as HTMLInputElement).value })} />
-        </label>
-        <label>
-          Port
+          Workspace ID
           <input
             class="sc-input"
-            inputmode="numeric"
-            value={host.port ?? ""}
+            value={agentenv.workspace ?? ""}
             disabled={disabled}
-            placeholder="22"
-            oninput={(e) => updateSshHost(host.id, { port: numberOrNull((e.currentTarget as HTMLInputElement).value) })}
+            placeholder="Optional full workspace UUID"
+            oninput={(e) => (agentenv = { ...agentenv, workspace: (e.currentTarget as HTMLInputElement).value })}
           />
         </label>
         <label>
-          CWD
-          <input class="sc-input" value={host.cwd ?? ""} disabled={disabled} placeholder="/home/user/project" oninput={(e) => updateSshHost(host.id, { cwd: (e.currentTarget as HTMLInputElement).value })} />
+          Runner host
+          <input
+            class="sc-input"
+            value={agentenv.runnerHost ?? ""}
+            disabled={disabled}
+            placeholder="Optional"
+            oninput={(e) => (agentenv = { ...agentenv, runnerHost: (e.currentTarget as HTMLInputElement).value })}
+          />
+        </label>
+        <label>
+          Auth method
+          <select
+            class="sc-input"
+            value={agentenv.authMethod}
+            disabled={disabled}
+            onchange={(e) =>
+              (agentenv = {
+                ...agentenv,
+                authMethod: (e.currentTarget as HTMLSelectElement).value as "api_key" | "access_token"
+              })}
+          >
+            <option value="api_key">API key</option>
+            <option value="access_token">Access token</option>
+          </select>
+        </label>
+        <label>
+          Sandbox size
+          <select
+            class="sc-input"
+            value={agentenv.defaults.sandboxType}
+            disabled={disabled}
+            onchange={(e) => updateAgentEnvDefaults({ sandboxType: (e.currentTarget as HTMLSelectElement).value })}
+          >
+            <option value="micro">micro</option>
+            <option value="small">small</option>
+            <option value="medium">medium</option>
+            <option value="large">large</option>
+            <option value="xl">xl</option>
+          </select>
+        </label>
+        <label>
+          Image
+          <input
+            class="sc-input"
+            value={agentenv.defaults.image}
+            disabled={disabled}
+            placeholder="python:3.11-slim"
+            oninput={(e) => updateAgentEnvDefaults({ image: (e.currentTarget as HTMLInputElement).value })}
+          />
+        </label>
+        <label>
+          Region
+          <input
+            class="sc-input"
+            value={agentenv.defaults.region ?? ""}
+            disabled={disabled}
+            placeholder="Optional"
+            oninput={(e) => updateAgentEnvDefaults({ region: (e.currentTarget as HTMLInputElement).value })}
+          />
         </label>
       </div>
-      <div class="pf-remote-actions">
-        <button type="button" class="sc-btn" data-variant="outline" data-size="sm" disabled={disabled} onclick={() => (defaultTarget = `ssh:${host.id}`)}>
-          {defaultTarget === `ssh:${host.id}` ? "Default host" : "Set default"}
-        </button>
-        <button type="button" class="sc-btn" data-variant="ghost" data-size="sm" disabled={disabled} onclick={() => removeSshHost(host.id)}>
-          <Icon name="trash" size={13} />Remove
-        </button>
-      </div>
+    </details>
+  {:else}
+    <div class="pf-form-grid">
+      <label>
+        API URL
+        <input
+          class="sc-input"
+          value={agentenv.apiUrl}
+          disabled={disabled}
+          placeholder="https://api.agentenv.io"
+          oninput={(e) => (agentenv = { ...agentenv, apiUrl: (e.currentTarget as HTMLInputElement).value })}
+        />
+      </label>
+      <label>
+        Workspace ID
+        <input
+          class="sc-input"
+          value={agentenv.workspace ?? ""}
+          disabled={disabled}
+          placeholder="wk_..."
+          oninput={(e) => (agentenv = { ...agentenv, workspace: (e.currentTarget as HTMLInputElement).value })}
+        />
+      </label>
+      <label>
+        Runner host
+        <input
+          class="sc-input"
+          value={agentenv.runnerHost ?? ""}
+          disabled={disabled}
+          placeholder="Optional, e.g. 93.115.25.198"
+          oninput={(e) => (agentenv = { ...agentenv, runnerHost: (e.currentTarget as HTMLInputElement).value })}
+        />
+      </label>
+      <label>
+        Auth method
+        <select
+          class="sc-input"
+          value={agentenv.authMethod}
+          disabled={disabled}
+          onchange={(e) =>
+            (agentenv = {
+              ...agentenv,
+              authMethod: (e.currentTarget as HTMLSelectElement).value as "api_key" | "access_token"
+            })}
+        >
+          <option value="api_key">API key</option>
+          <option value="access_token">Access token</option>
+        </select>
+      </label>
+      <label>
+        Credential
+        <input
+          class="sc-input"
+          type="password"
+          value={agentenvCredentialDraft}
+          disabled={disabled}
+          placeholder={agentenv.hasCredential ? "Stored secret configured" : "Paste token to save"}
+          oninput={(e) => (agentenvCredentialDraft = (e.currentTarget as HTMLInputElement).value)}
+        />
+      </label>
     </div>
-  {/each}
 
-  {#if sshHosts.length === 0}
-    <div class="pf-empty">No SSH hosts configured.</div>
+    <div class="pf-form-grid">
+      <label>
+        Sandbox size
+        <select
+          class="sc-input"
+          value={agentenv.defaults.sandboxType}
+          disabled={disabled}
+          onchange={(e) => updateAgentEnvDefaults({ sandboxType: (e.currentTarget as HTMLSelectElement).value })}
+        >
+          <option value="micro">micro</option>
+          <option value="small">small</option>
+          <option value="medium">medium</option>
+          <option value="large">large</option>
+          <option value="xl">xl</option>
+        </select>
+      </label>
+      <label>
+        Image
+        <input
+          class="sc-input"
+          value={agentenv.defaults.image}
+          disabled={disabled}
+          placeholder="python:3.11-slim"
+          oninput={(e) => updateAgentEnvDefaults({ image: (e.currentTarget as HTMLInputElement).value })}
+        />
+      </label>
+      <label>
+        Region
+        <input
+          class="sc-input"
+          value={agentenv.defaults.region ?? ""}
+          disabled={disabled}
+          placeholder="Optional"
+          oninput={(e) => updateAgentEnvDefaults({ region: (e.currentTarget as HTMLInputElement).value })}
+        />
+      </label>
+      <label>
+        Max lifetime seconds
+        <input
+          class="sc-input"
+          inputmode="numeric"
+          value={agentenv.defaults.maxLifetimeSeconds ?? ""}
+          disabled={disabled}
+          placeholder="Optional"
+          oninput={(e) => updateAgentEnvDefaults({ maxLifetimeSeconds: numberOrNull((e.currentTarget as HTMLInputElement).value) })}
+        />
+      </label>
+    </div>
   {/if}
 </section>
+
+{#if !onboarding}
+  <section class="pf-card">
+    <div class="pf-card-head">
+      <div>
+        <h3>SSH hosts</h3>
+        <p>Save host records now; runner bootstrap and tunnel lifecycle will use these next.</p>
+      </div>
+      <button type="button" class="sc-btn" data-variant="outline" data-size="sm" disabled={disabled} onclick={addSshHost}>
+        <Icon name="plus" size={13} />Add SSH host
+      </button>
+    </div>
+
+    {#each sshHosts as host (host.id)}
+      <div class="pf-remote-host">
+        <div class="pf-form-grid">
+          <label>
+            ID
+            <input class="sc-input" value={host.id} disabled={disabled} oninput={(e) => updateSshHost(host.id, { id: (e.currentTarget as HTMLInputElement).value })} />
+          </label>
+          <label>
+            Label
+            <input class="sc-input" value={host.label} disabled={disabled} oninput={(e) => updateSshHost(host.id, { label: (e.currentTarget as HTMLInputElement).value })} />
+          </label>
+          <label>
+            Target
+            <input class="sc-input" value={host.target} disabled={disabled} placeholder="user@hostname" oninput={(e) => updateSshHost(host.id, { target: (e.currentTarget as HTMLInputElement).value })} />
+          </label>
+          <label>
+            Port
+            <input
+              class="sc-input"
+              inputmode="numeric"
+              value={host.port ?? ""}
+              disabled={disabled}
+              placeholder="22"
+              oninput={(e) => updateSshHost(host.id, { port: numberOrNull((e.currentTarget as HTMLInputElement).value) })}
+            />
+          </label>
+          <label>
+            CWD
+            <input class="sc-input" value={host.cwd ?? ""} disabled={disabled} placeholder="/home/user/project" oninput={(e) => updateSshHost(host.id, { cwd: (e.currentTarget as HTMLInputElement).value })} />
+          </label>
+        </div>
+        <div class="pf-remote-actions">
+          <button type="button" class="sc-btn" data-variant="outline" data-size="sm" disabled={disabled} onclick={() => (defaultTarget = `ssh:${host.id}`)}>
+            {defaultTarget === `ssh:${host.id}` ? "Default host" : "Set default"}
+          </button>
+          <button type="button" class="sc-btn" data-variant="ghost" data-size="sm" disabled={disabled} onclick={() => removeSshHost(host.id)}>
+            <Icon name="trash" size={13} />Remove
+          </button>
+        </div>
+      </div>
+    {/each}
+
+    {#if sshHosts.length === 0}
+      <div class="pf-empty">No SSH hosts configured.</div>
+    {/if}
+  </section>
+{/if}
 
 <div class="pf-settings-actions">
   <button type="button" class="sc-btn" data-variant="outline" disabled={disabled} onclick={props.onRefresh}>
     <Icon name="refresh" size={13} />Refresh
   </button>
   <button type="button" class="sc-btn" data-variant="default" disabled={disabled} onclick={saveSettings}>
-    <Icon name="check" size={13} />{saving ? "Saving..." : "Save remote settings"}
+    <Icon name="check" size={13} />{saving ? "Saving..." : onboarding ? "Save AgentEnv" : "Save remote settings"}
   </button>
 </div>
 
@@ -457,11 +570,41 @@
     gap: 12px;
   }
 
+  .pf-agentenv-quick {
+    display: grid;
+    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+    gap: 12px;
+  }
+
   .pf-form-grid label {
     display: grid;
     gap: 6px;
     font-size: 12px;
     color: var(--pf-muted, var(--muted-foreground));
+  }
+
+  .pf-agentenv-quick label {
+    display: grid;
+    gap: 6px;
+    color: var(--pf-muted, var(--muted-foreground));
+    font-size: 12px;
+  }
+
+  .pf-advanced-settings {
+    border-top: 1px solid var(--pf-border, var(--border));
+    padding-top: 12px;
+  }
+
+  .pf-advanced-settings summary {
+    width: fit-content;
+    cursor: pointer;
+    color: var(--pf-muted, var(--muted-foreground));
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .pf-advanced-settings .pf-form-grid {
+    margin-top: 12px;
   }
 
   .pf-switch {
@@ -476,5 +619,11 @@
     gap: 10px;
     border-top: 1px solid var(--pf-border, var(--border));
     padding-top: 12px;
+  }
+
+  @media (max-width: 760px) {
+    .pf-agentenv-quick {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

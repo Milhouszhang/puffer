@@ -42,9 +42,18 @@ fn record_usage(value: &Value) {
         Some(u) => u,
         None => return,
     };
-    let p = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let c = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let t = usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(p + c);
+    let p = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let c = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let t = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(p + c);
     TOK_PROMPT.fetch_add(p, Ordering::Relaxed);
     TOK_COMPLETION.fetch_add(c, Ordering::Relaxed);
     TOK_TOTAL.fetch_add(t, Ordering::Relaxed);
@@ -119,12 +128,7 @@ fn resolve_openai() -> Result<(String, String, String)> {
         .default_model
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            value
-                .strip_prefix("openai/")
-                .unwrap_or(&value)
-                .to_string()
-        })
+        .map(|value| value.strip_prefix("openai/").unwrap_or(&value).to_string())
         .unwrap_or_else(|| "gpt-4o".to_string());
 
     let auth_path = paths.user_config_dir.join("auth.json");
@@ -324,9 +328,13 @@ real chats/contacts/groups/features (联系人 / 群聊 / 功能), shown with an
 opens a chat/contact/group/feature whose name matches the requested target, NOT a web-search row. \
 Respond with ONLY compact JSON: {\"x\":<int>,\"y\":<int>} giving the pixel center of that row, or \
 {\"found\":false} if there is no such local result.";
-    let user = format!("Target name: {recipient}. Give the click coordinates of its local result row.");
+    let user =
+        format!("Target name: {recipient}. Give the click coordinates of its local result row.");
     let content = vision_complete(system, &user, png)?;
-    if std::env::var("WECHAT_DEBUG_VISION").map(|v| v.trim() == "1").unwrap_or(false) {
+    if std::env::var("WECHAT_DEBUG_VISION")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+    {
         eprintln!("wechat read_result_coords raw reply: {content}");
     }
     Ok(parse_xy(&content))
@@ -358,7 +366,10 @@ Respond with ONLY compact JSON {\"x\":<int>,\"y\":<int>} = the pixel center of t
 {\"found\":false} if no such message is visible.";
     let user = format!("Snippet to find: {snippet}");
     let content = vision_complete(system, &user, png)?;
-    if std::env::var("WECHAT_DEBUG_VISION").map(|v| v.trim() == "1").unwrap_or(false) {
+    if std::env::var("WECHAT_DEBUG_VISION")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+    {
         eprintln!("wechat read_message_coords raw reply: {content}");
     }
     Ok(parse_xy(&content))
@@ -373,7 +384,10 @@ matches the requested one. Respond with ONLY compact JSON {\"x\":<int>,\"y\":<in
 of that item, or {\"found\":false} if the menu has no such item.";
     let user = format!("Menu item label: {label}");
     let content = vision_complete(system, &user, png)?;
-    if std::env::var("WECHAT_DEBUG_VISION").map(|v| v.trim() == "1").unwrap_or(false) {
+    if std::env::var("WECHAT_DEBUG_VISION")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+    {
         eprintln!("wechat read_menu_item_coords raw reply: {content}");
     }
     Ok(parse_xy(&content))
@@ -391,7 +405,10 @@ icon in the conversation (NOT the chat list, NOT the bubble). Respond with ONLY 
 {\"x\":<int>,\"y\":<int>}, or {\"found\":false} if that person's avatar is not visible in the conversation.";
     let user = format!("Person: {who}");
     let content = vision_complete(system, &user, png)?;
-    if std::env::var("WECHAT_DEBUG_VISION").map(|v| v.trim() == "1").unwrap_or(false) {
+    if std::env::var("WECHAT_DEBUG_VISION")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+    {
         eprintln!("wechat read_avatar_coords raw reply: {content}");
     }
     Ok(parse_xy(&content))
@@ -447,7 +464,10 @@ fn parse_messages(content: &str) -> Vec<WechatMessage> {
 
 /// Strips a leading/trailing markdown code fence if present.
 fn strip_code_fence(text: &str) -> &str {
-    let text = text.strip_prefix("```json").or_else(|| text.strip_prefix("```")).unwrap_or(text);
+    let text = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .unwrap_or(text);
     text.strip_suffix("```").unwrap_or(text).trim()
 }
 
@@ -463,7 +483,11 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(
             msgs[0],
-            WechatMessage { chat: "Group".into(), sender: "Alice".into(), text: "hi".into() }
+            WechatMessage {
+                chat: "Group".into(),
+                sender: "Alice".into(),
+                text: "hi".into()
+            }
         );
     }
 
@@ -485,7 +509,8 @@ mod tests {
 
     #[test]
     fn parses_fenced_json_with_prose() {
-        let msgs = parse_messages("Here you go:\n```json\n[{\"sender\":\"A\",\"text\":\"hello\"}]\n```");
+        let msgs =
+            parse_messages("Here you go:\n```json\n[{\"sender\":\"A\",\"text\":\"hello\"}]\n```");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].text, "hello");
     }

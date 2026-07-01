@@ -12,6 +12,12 @@
 
 pre-commit:
   parallel: true
+  # Skip while completing a merge/rebase: the staged set then includes files
+  # you never hand-edited, so file-scoped format/type checks would flag other
+  # people's drift and block the merge (mirrors the pre-push clippy skip).
+  skip:
+    - merge
+    - rebase
   commands:
     # Format-check only the staged Rust files — fast, file-scoped.
     rustfmt:

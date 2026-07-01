@@ -38,6 +38,8 @@ mod daemon_turn_routing;
 mod daemon_ui_state;
 #[cfg(unix)]
 mod daemon_wechat_browser_setup;
+mod daemon_workflow_backend_settings;
+mod daemon_workflow_runtime;
 mod daemon_workflows;
 mod desktop_activity;
 mod desktop_api;
@@ -66,6 +68,7 @@ mod subscriptions;
 #[cfg(unix)]
 mod wechat_connector;
 mod workflow_runtime;
+mod workflow_runtime_helpers;
 mod workflows;
 
 use anyhow::{Context, Result};

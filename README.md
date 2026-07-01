@@ -43,17 +43,13 @@ lefthook install        # writes .git/hooks/*
 - Emergency bypass is `git commit/push --no-verify` — prefer fixing the finding.
 
 CI (`.github/workflows/ci.yml`) is the authoritative full-tree gate. Hard
-gates: `cargo build --workspace`, `cargo test -p puffer-core --lib` (the core
-unit suite), and the desktop `vite build` + svelte-check + node tests. Rust
-tests run single-threaded (`--test-threads=1`): much of the suite resolves
-config via `ConfigPaths::discover` and, without per-test home isolation, races
-on the real `~/.puffer` when run in parallel — serializing keeps CI
-deterministic (per-test isolation is the proper follow-up). The gate is scoped
-to `puffer-core` for now; build still gates every crate's compilation. Every
-other crate's unit suite
-(`cargo test --workspace --exclude puffer-core --lib`) also runs on each PR as
-an **informational** step, so non-core failures stay visible without blocking;
-crates graduate into the hard gate as their suites prove green.
+gates: `cargo build --workspace`, `cargo test --workspace --lib` (the whole
+workspace unit suite), and the desktop `vite build` + svelte-check + node
+tests. Rust tests run single-threaded (`--test-threads=1`): much of the suite
+resolves config via `ConfigPaths::discover` and, without per-test home
+isolation, races on the real `~/.puffer` when run in parallel — serializing
+keeps CI deterministic (per-test home isolation, which would restore parallel
+speed, is the proper follow-up).
 Integration targets (`--tests`) are not gated (some need a terminal/tmux or the
 local workflow-runtime image); run them locally. Rustfmt and clippy run in CI as
 informational only.

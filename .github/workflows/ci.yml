@@ -43,28 +43,19 @@ jobs:
       - name: Build
         run: cargo build --workspace --locked
 
-      # --- Hard gate: the puffer-core unit suite — the crate holding the agent
-      # runtime, command dispatch, permissions, and tools.
+      # --- Hard gate: the whole-workspace unit-test suite, run single-threaded
+      # (`--test-threads=1`). Much of the suite resolves config via
+      # `ConfigPaths::discover`, which (without a per-test home override) reads
+      # the real ~/.puffer; run in parallel, tests race on that shared session/
+      # project state and fail intermittently (e.g. an empty-file "EOF while
+      # parsing" from a concurrent session write). Serializing removes the
+      # contention deterministically — the proper fix is per-test home isolation
+      # (which also restores parallel speed), a separate follow-up.
       #
-      # Run single-threaded (`--test-threads=1`). Much of the suite resolves
-      # config via `ConfigPaths::discover`, which (without a home override)
-      # reads the real ~/.puffer; run in parallel, tests race on that shared
-      # state and fail intermittently (e.g. an empty-file "EOF while parsing"
-      # from a concurrent session write). Serializing removes the contention
-      # deterministically — the proper fix is per-test home isolation, a
-      # separate follow-up. The Build step above already gates compilation of
-      # every crate. Integration targets (`--tests`) stay ungated: some need a
-      # terminal/tmux or the local workflow-runtime image. ---
+      # Integration targets (`--tests`) stay ungated: some need a terminal/tmux
+      # or the local workflow-runtime container image. ---
       - name: Test (unit)
-        run: cargo test -p puffer-core --lib --locked -- --test-threads=1
-
-      # Informational: run every OTHER crate's unit suite (also single-threaded)
-      # so non-core failures (and test-code compile breakage, which `build`
-      # doesn't cover) are visible on each PR without blocking the merge. Once
-      # this is reliably green, fold it into the hard gate above.
-      - name: Test (other crates, informational)
-        run: cargo test --workspace --exclude puffer-core --lib --locked -- --test-threads=1
-        continue-on-error: true
+        run: cargo test --workspace --lib --locked -- --test-threads=1
 
       - name: Rustfmt (informational)
         run: cargo fmt --all --check

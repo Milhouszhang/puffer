@@ -1647,6 +1647,22 @@ export async function saveMonitorMemory(connectionSlug: string, content: string)
   });
 }
 
+/** Execute a human-approved outbound connector action draft. */
+export async function executeConnectorActionDraft(params: {
+  draftId: string;
+  version: number;
+  approvedMessage: string;
+  clientRequestId: string;
+}): Promise<{ status: string; draftId: string; receipt?: unknown }> {
+  const client = await ensureLocalDaemonClient();
+  return client.request<{ status: string; draftId: string; receipt?: unknown }>("connector_action_execute", {
+    draft_id: params.draftId,
+    version: params.version,
+    approved_message: params.approvedMessage,
+    client_request_id: params.clientRequestId
+  });
+}
+
 /** Add one include or exclude monitor rule and return the refreshed workflow snapshot. */
 export async function addMonitorRule(params: MonitorRuleAddRequest): Promise<WorkflowSnapshot> {
   const client = await ensureLocalDaemonClient();

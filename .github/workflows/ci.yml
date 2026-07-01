@@ -46,17 +46,19 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets --locked
 
-      # --- Hard gate: the whole-workspace unit-test suite over lib AND bin
-      # targets. `--bins` adds `puffer-cli` (a bin-only crate whose daemon/RPC/
-      # workflow tests `--lib` alone would skip). Runs in parallel:
-      # `ConfigPaths::discover` isolates `user_config_dir` under the OS temp dir
-      # in tests, so the suite no longer races on the real ~/.puffer and
-      # `--test-threads=1` is no longer needed.
+      # --- Hard gate: the whole-workspace test suite. `--tests` runs lib + bin
+      # unit tests (incl. the bin-only `puffer-cli`) AND the integration test
+      # targets under `crates/*/tests/`, which were previously compiled but
+      # never executed. Runs in parallel — `ConfigPaths::discover` isolates
+      # `user_config_dir` under the OS temp dir, so no race on the real
+      # ~/.puffer and no need for `--test-threads=1`.
       #
-      # Integration targets (`--tests`) stay ungated: some need a terminal/tmux
-      # or the local workflow-runtime container image. ---
-      - name: Test (unit)
-        run: cargo test --workspace --lib --bins --locked
+      # Integration tests that need infra CI does not provide self-exclude:
+      # tmux TUI tests self-skip when tmux is absent (`require_tmux_or_skip`),
+      # and the few needing the workflow-runtime Docker image / a real browser
+      # are `#[ignore]`d. Run the full set locally with tmux installed. ---
+      - name: Test
+        run: cargo test --workspace --tests --locked
 
       - name: Rustfmt (informational)
         run: cargo fmt --all --check

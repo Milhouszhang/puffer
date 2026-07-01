@@ -1770,6 +1770,9 @@ async fn dispatch_request(
         "resolve_permission" => respond!(handle_resolve_permission(&state, &params)),
         "resolve_user_question" => respond!(handle_resolve_user_question(&state, &params)),
         "cancel_turn" => respond!(handle_cancel_turn(&state, &params)),
+        "lark_browser_list_chats" => {
+            respond!(detached!(|s, p| handle_lark_browser_list_chats(&s, &p)))
+        }
 
         other => {
             let _ = send_envelope(
@@ -1791,6 +1794,23 @@ async fn dispatch_request(
 // ---------------------------------------------------------------------------
 // RPC handlers — blocking work runs in a tokio::task::spawn_blocking closure.
 // ---------------------------------------------------------------------------
+
+/// RPC handler for `lark_browser_list_chats`.
+///
+/// Params: `{ connection_slug: string }` (optional — defaults to "lark-browser")
+/// Returns: `{ chats: [{chat_id, name, conversation_type, unread}] }`
+fn handle_lark_browser_list_chats(state: &DaemonState, params: &Value) -> Result<Value> {
+    let connection_slug = params
+        .get("connection_slug")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let manager = puffer_core::subscription_manager()?;
+    crate::lark_browser::list_chats_via_subscriber(
+        &manager,
+        state.config_paths(),
+        connection_slug,
+    )
+}
 
 fn handle_canvas_state_update(state: &DaemonState, params: &Value) -> Result<Value> {
     let session_id = params

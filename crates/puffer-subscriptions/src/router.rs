@@ -232,6 +232,28 @@ pub(crate) fn process_envelope_result_with_monitor_digest(
             );
             continue;
         }
+        if is_lark_browser_topic(&envelope.event.topic)
+            && spec.filter.is_none()
+            && spec.contact_ids.is_empty()
+        {
+            log_router_skip(&spec, envelope, "monitor_lark_default_deny");
+            record_router_trace(
+                trace_store,
+                &spec,
+                envelope,
+                "router_lark_default_deny",
+                "subscription_router",
+                "Lark/Feishu binding has no positive selector — quiet by default until the user opts in.",
+            );
+            record_monitor_router_outcome(
+                history_store,
+                &spec,
+                envelope,
+                "monitor_lark_default_deny",
+                "Lark/Feishu binding has no positive selector — quiet by default until the user opts in.",
+            );
+            continue;
+        }
         if !contact_filter_matches(&spec.contact_ids, &envelope.event.payload) {
             log_router_skip(&spec, envelope, "monitor_contact_filter_skip");
             record_router_trace(
@@ -1091,6 +1113,10 @@ fn account_action_result(
             action_result.summary
         );
     }
+}
+
+fn is_lark_browser_topic(topic: &str) -> bool {
+    matches!(topic, "lark-browser" | "feishu-browser")
 }
 
 fn log_router_skip(spec: &WorkflowBindingSpec, envelope: &EventEnvelope, reason: &str) {

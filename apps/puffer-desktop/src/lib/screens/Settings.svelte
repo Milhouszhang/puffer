@@ -10,6 +10,7 @@
   import RemoteSettings from "./settings/RemoteSettings.svelte";
   import SecretsSettings from "./settings/SecretsSettings.svelte";
   import BrowserPane from "./agent/BrowserPane.svelte";
+  import LarkChatPicker from "./connectors/LarkChatPicker.svelte";
   import { focusTrap } from "../focusTrap";
   import {
     providerIdCanRunAgent,
@@ -209,6 +210,9 @@
   let connectorDeleting = $state<string | null>(null);
   let connectorMonitoring = $state<string | null>(null);
   let lastConnectorSlug = "";
+  // Set after a lark-browser / feishu-browser turn-complete to show the group-picker wizard
+  let larkPickerConnectionSlug = $state<string | null>(null);
+  let larkPickerConnectorSlug = $state<string | null>(null);
 
   let lambdaSnapshot = $state<LambdaSkillLibrariesSnapshot | null>(null);
   let lambdaLoaded = $state(false);
@@ -669,9 +673,15 @@
       connectorQuestionRequest = null;
       connectorQuestionAnswers = {};
       connectorSaved = `Connector setup finished for ${connectorConnectionSlug.trim()}.`;
+      // Show the group-picker wizard for lark-browser / feishu-browser connectors
+      const finishedConnectorSlug = connectorSetupSlug;
       connectorSetupSlug = null;
       connectorTab = "connections";
       void loadConnectorSnapshot();
+      if (finishedConnectorSlug === "lark-browser" || finishedConnectorSlug === "feishu-browser") {
+        larkPickerConnectionSlug = connectorConnectionSlug.trim();
+        larkPickerConnectorSlug = finishedConnectorSlug;
+      }
       return;
     }
     if (event.type === "turn-error") {
@@ -2037,6 +2047,17 @@
             </div>
           </div>
         </div>
+      {/if}
+
+      {#if larkPickerConnectionSlug && larkPickerConnectorSlug}
+        <LarkChatPicker
+          connectionSlug={larkPickerConnectionSlug}
+          connectorSlug={larkPickerConnectorSlug}
+          onDone={() => {
+            larkPickerConnectionSlug = null;
+            larkPickerConnectorSlug = null;
+          }}
+        />
       {/if}
 
       <div class="pf-connector-tabs" role="tablist" aria-label="Connector views">

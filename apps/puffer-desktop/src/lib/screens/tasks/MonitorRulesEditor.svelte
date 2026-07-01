@@ -1,10 +1,12 @@
 <script lang="ts">
   import Icon from "../../design/Icon.svelte";
+  import { loadLarkChats } from "../../api/desktop";
   import type {
     MonitorRuleAddRequest,
     MonitorRuleMode,
     MonitorRuleOperator,
     MonitorRuleSchema,
+    MonitorRuleSchemaValue,
     WorkflowBinding,
     WorkflowFilterRule
   } from "../../types";
@@ -49,6 +51,18 @@
   let selectedValue = $state("");
   let activeBindingSlug = "";
 
+  // Combobox state for connector_chats value field
+  let comboOpen = $state(false);
+  let comboHighlightIndex = $state(-1);
+  let comboInputEl = $state<HTMLInputElement | null>(null);
+
+  // Dynamic options loading state for connector_chats fields
+  let dynamicOptions = $state<MonitorRuleSchemaValue[]>([]);
+  let dynamicOptionsLoading = $state(false);
+  let dynamicOptionsError = $state(false);
+  // Monotonic counter for fetch-race guard
+  let dynamicOptionsFetchId = 0;
+
   let details = $derived(monitorRuleDetails(schema));
   let eventTextDetail = $derived(details.find((detail) => detail.target === "event_text"));
   let payloadDetails = $derived(details.filter((detail) => detail.target === "payload"));
@@ -59,6 +73,139 @@
   let includeChips = $derived(monitorRuleChipsForMode(binding, "include", schema));
   let excludeChips = $derived(monitorRuleChipsForMode(binding, "exclude", schema));
   let adding = $derived(openMode !== null && savingMode === openMode);
+
+  // Fetch the connector's chat list, retrying while the browser tab is still
+  // warming up (right after a connector starts, list_chats errors or returns
+  // empty until the messenger feed has loaded). Stale fetches are ignored via
+  // the fetchId guard.
+  async function fetchConnectorChats(slug: string, fetchId: number) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      if (fetchId !== dynamicOptionsFetchId) return;
+      try {
+        const chats = await loadLarkChats(slug);
+        if (fetchId !== dynamicOptionsFetchId) return;
+        if (chats.length > 0) {
+          dynamicOptions = chats.map((c) => ({ value: c.name, label: c.name }));
+          // Do NOT pre-fill selectedValue — the combobox filters by it, so a
+          // pre-filled name would collapse the list to a single match. Leave it
+          // empty so the user sees all groups and types to filter / picks one.
+          dynamicOptionsLoading = false;
+          return;
+        }
+        // loaded but empty — connector may still be warming up; retry
+      } catch {
+        // transient (tab warming up) — retry
+        if (fetchId !== dynamicOptionsFetchId) return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    if (fetchId !== dynamicOptionsFetchId) return;
+    // Exhausted: leave the dropdown empty so the free-text fallback shows.
+    dynamicOptions = [];
+    dynamicOptionsLoading = false;
+  }
+
+  // When the selected detail uses connector_chats, fetch options dynamically.
+  // Guard on a stable (field, slug, open) KEY so the fetch is NOT restarted every
+  // time the parent passes a new `binding` object reference (which happens often
+  // while an active monitor refreshes the workflow snapshot). Restarting would
+  // cancel the in-flight fetch via the fetchId guard and the list would never
+  // populate.
+  let lastChatsFetchKey = "";
+  $effect(() => {
+    const detail = selectedDetail;
+    const slug = binding?.connection_slug;
+    const active =
+      !!detail && detail.optionsSource === "connector_chats" && !!slug && openMode !== null;
+    const key = active ? `${detail!.path}::${slug}` : "";
+    if (key === lastChatsFetchKey) return; // nothing relevant changed — keep current options
+    lastChatsFetchKey = key;
+    if (!active) return;
+    dynamicOptions = [];
+    dynamicOptionsLoading = true;
+    dynamicOptionsError = false;
+    const fetchId = ++dynamicOptionsFetchId;
+    void fetchConnectorChats(slug!, fetchId);
+  });
+
+  // Resolve the effective value options for the current detail:
+  // prefer dynamicOptions for connector_chats fields, fall back to static options
+  let effectiveValueOptions = $derived(
+    selectedDetail?.optionsSource === "connector_chats"
+      ? dynamicOptions
+      : selectedValueOptions
+  );
+
+  // Filtered combobox options based on what the user has typed
+  let comboFilteredOptions = $derived.by(() => {
+    if (selectedDetail?.optionsSource !== "connector_chats") return [];
+    const needle = selectedValue.trim().toLowerCase();
+    if (!needle) return dynamicOptions;
+    // If the value already exactly matches a group (the user picked one), show
+    // the full list again so they can re-pick — don't collapse it to one item.
+    if (dynamicOptions.some((opt) => String(opt.label).toLowerCase() === needle)) {
+      return dynamicOptions;
+    }
+    return dynamicOptions.filter((opt) =>
+      String(opt.label).toLowerCase().includes(needle)
+    );
+  });
+
+  function openCombo() {
+    comboOpen = true;
+    comboHighlightIndex = -1;
+  }
+
+  function closeCombo() {
+    comboOpen = false;
+    comboHighlightIndex = -1;
+  }
+
+  function pickComboOption(value: string) {
+    selectedValue = value;
+    closeCombo();
+  }
+
+  function onComboInput(event: Event) {
+    selectedValue = (event.currentTarget as HTMLInputElement).value;
+    comboOpen = true;
+    comboHighlightIndex = -1;
+  }
+
+  function onComboKeydown(event: KeyboardEvent) {
+    if (!comboOpen) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        openCombo();
+        event.preventDefault();
+      }
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      comboHighlightIndex = Math.min(comboHighlightIndex + 1, comboFilteredOptions.length - 1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      comboHighlightIndex = Math.max(comboHighlightIndex - 1, 0);
+    } else if (event.key === "Enter") {
+      const opt = comboFilteredOptions[comboHighlightIndex];
+      if (opt) {
+        event.preventDefault();
+        pickComboOption(String(opt.value));
+      }
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeCombo();
+      comboInputEl?.blur();
+    }
+  }
+
+  function onComboBlur(event: FocusEvent) {
+    // Only close if focus moves outside the combobox wrapper
+    const related = event.relatedTarget as Node | null;
+    const wrapper = (event.currentTarget as HTMLElement).closest(".pf-monitor-rule-combobox");
+    if (wrapper && related && wrapper.contains(related)) return;
+    closeCombo();
+  }
 
   $effect(() => {
     const nextSlug = binding?.slug ?? "";
@@ -87,6 +234,10 @@
     selectedPath = first?.path ?? MESSAGE_TEXT_PATH;
     selectedOperator = first?.operators[0] ?? "contains";
     selectedValue = first ? defaultValueKeyForDetail(first) : "";
+    dynamicOptions = [];
+    dynamicOptionsLoading = false;
+    dynamicOptionsError = false;
+    closeCombo();
   }
 
   function detailForPath(path: string): MonitorRuleDetail {
@@ -98,6 +249,11 @@
     selectedPath = detail.path;
     selectedOperator = detail.operators[0] ?? "contains";
     selectedValue = defaultValueKeyForDetail(detail);
+    // Reset dynamic options so the $effect re-triggers for the new detail.
+    // Eagerly show loading state for connector_chats fields to avoid flashing the text input.
+    dynamicOptions = [];
+    dynamicOptionsLoading = detail.optionsSource === "connector_chats";
+    dynamicOptionsError = false;
   }
 
   function onConditionChange(event: Event) {
@@ -202,23 +358,66 @@
             </select>
           </label>
           {#if selectedNeedsValue}
-            <label>
-              <span>Value</span>
-              {#if selectedValueOptions.length > 0}
-                <select aria-label="Value" value={selectedValue} onchange={onValueInput}>
-                  {#each selectedValueOptions as option (String(option.value))}
-                    <option value={String(option.value)}>{option.label}</option>
-                  {/each}
-                </select>
-              {:else}
-                <input
-                  aria-label="Value"
-                  value={selectedValue}
-                  placeholder="Value"
-                  oninput={onValueInput}
-                />
+            {#if selectedDetail?.optionsSource === "connector_chats"}
+              <label>
+                <span>Value</span>
+                {#if dynamicOptionsLoading}
+                  <input aria-label="Value" value="" placeholder="Loading groups…" disabled />
+                {:else}
+                  <div class="pf-monitor-rule-combobox" onblur={onComboBlur}>
+                    <input
+                      bind:this={comboInputEl}
+                      aria-label="Value"
+                      aria-autocomplete="list"
+                      aria-expanded={comboOpen}
+                      aria-haspopup="listbox"
+                      autocomplete="off"
+                      spellcheck="false"
+                      value={selectedValue}
+                      placeholder={dynamicOptions.length > 0 ? "Search or type a group name" : "Type a group name"}
+                      oninput={onComboInput}
+                      onfocus={openCombo}
+                      onkeydown={onComboKeydown}
+                    />
+                    {#if comboOpen && comboFilteredOptions.length > 0}
+                      <ul class="pf-monitor-rule-combobox-list" role="listbox" aria-label="Group names">
+                        {#each comboFilteredOptions as option, i (String(option.value))}
+                          <li
+                            role="option"
+                            aria-selected={selectedValue === String(option.value)}
+                            class:highlighted={i === comboHighlightIndex}
+                            onmousedown={(e) => { e.preventDefault(); pickComboOption(String(option.value)); }}
+                          >
+                            {option.label}
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
+                  </div>
+                {/if}
+              </label>
+              {#if dynamicOptionsError || (!dynamicOptionsLoading && dynamicOptions.length === 0)}
+                <p class="pf-monitor-rule-builder-hint">Connector not ready — type a group name</p>
               {/if}
-            </label>
+            {:else}
+              <label>
+                <span>Value</span>
+                {#if selectedValueOptions.length > 0}
+                  <select aria-label="Value" value={selectedValue} onchange={onValueInput}>
+                    {#each selectedValueOptions as option (String(option.value))}
+                      <option value={String(option.value)}>{option.label}</option>
+                    {/each}
+                  </select>
+                {:else}
+                  <input
+                    aria-label="Value"
+                    value={selectedValue}
+                    placeholder="Value"
+                    oninput={onValueInput}
+                  />
+                {/if}
+              </label>
+            {/if}
           {/if}
           <div class="pf-monitor-rule-builder-actions">
             <button type="button" class="pf-secondary-button" onclick={closeBuilder}>Cancel</button>
@@ -288,23 +487,66 @@
             </select>
           </label>
           {#if selectedNeedsValue}
-            <label>
-              <span>Value</span>
-              {#if selectedValueOptions.length > 0}
-                <select aria-label="Value" value={selectedValue} onchange={onValueInput}>
-                  {#each selectedValueOptions as option (String(option.value))}
-                    <option value={String(option.value)}>{option.label}</option>
-                  {/each}
-                </select>
-              {:else}
-                <input
-                  aria-label="Value"
-                  value={selectedValue}
-                  placeholder="Value"
-                  oninput={onValueInput}
-                />
+            {#if selectedDetail?.optionsSource === "connector_chats"}
+              <label>
+                <span>Value</span>
+                {#if dynamicOptionsLoading}
+                  <input aria-label="Value" value="" placeholder="Loading groups…" disabled />
+                {:else}
+                  <div class="pf-monitor-rule-combobox" onblur={onComboBlur}>
+                    <input
+                      bind:this={comboInputEl}
+                      aria-label="Value"
+                      aria-autocomplete="list"
+                      aria-expanded={comboOpen}
+                      aria-haspopup="listbox"
+                      autocomplete="off"
+                      spellcheck="false"
+                      value={selectedValue}
+                      placeholder={dynamicOptions.length > 0 ? "Search or type a group name" : "Type a group name"}
+                      oninput={onComboInput}
+                      onfocus={openCombo}
+                      onkeydown={onComboKeydown}
+                    />
+                    {#if comboOpen && comboFilteredOptions.length > 0}
+                      <ul class="pf-monitor-rule-combobox-list" role="listbox" aria-label="Group names">
+                        {#each comboFilteredOptions as option, i (String(option.value))}
+                          <li
+                            role="option"
+                            aria-selected={selectedValue === String(option.value)}
+                            class:highlighted={i === comboHighlightIndex}
+                            onmousedown={(e) => { e.preventDefault(); pickComboOption(String(option.value)); }}
+                          >
+                            {option.label}
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
+                  </div>
+                {/if}
+              </label>
+              {#if dynamicOptionsError || (!dynamicOptionsLoading && dynamicOptions.length === 0)}
+                <p class="pf-monitor-rule-builder-hint">Connector not ready — type a group name</p>
               {/if}
-            </label>
+            {:else}
+              <label>
+                <span>Value</span>
+                {#if selectedValueOptions.length > 0}
+                  <select aria-label="Value" value={selectedValue} onchange={onValueInput}>
+                    {#each selectedValueOptions as option (String(option.value))}
+                      <option value={String(option.value)}>{option.label}</option>
+                    {/each}
+                  </select>
+                {:else}
+                  <input
+                    aria-label="Value"
+                    value={selectedValue}
+                    placeholder="Value"
+                    oninput={onValueInput}
+                  />
+                {/if}
+              </label>
+            {/if}
           {/if}
           <div class="pf-monitor-rule-builder-actions">
             <button type="button" class="pf-secondary-button" onclick={closeBuilder}>Cancel</button>

@@ -1,7 +1,7 @@
 use crate::browser_args::BrowserArgs;
 use crate::media_internal_tools::{ImageGenerationArgs, MediaCapabilitiesArgs, VideoGenerationArgs};
 use crate::non_interactive::NonInteractiveArgs;
-use crate::subscriber_tool_args::{EmailArgs, SlackArgs, TelegramArgs};
+use crate::subscriber_tool_args::{EmailArgs, RequestSecretArgs, SlackArgs, TelegramArgs};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -283,6 +283,11 @@ pub(crate) enum InternalToolCommand {
     /// List connected image/video generation providers and models.
     #[command(name = "media-capabilities", alias = "mediacaps")]
     MediaCapabilities(#[command(flatten)] MediaCapabilitiesArgs),
+    /// Search, request, collect, or create an encrypted user secret through the
+    /// parent runtime. Returns only `PUFFER_SECRET_...` placeholders, never raw
+    /// secret values.
+    #[command(name = "request-secret", alias = "request_secret")]
+    RequestSecret(#[command(flatten)] RequestSecretArgs),
     /// Log in to Slack or look up Slack conversations through the parent runtime.
     Slack(#[command(flatten)] SlackArgs),
     /// Log in to Telegram or look up Telegram peers through the parent runtime.

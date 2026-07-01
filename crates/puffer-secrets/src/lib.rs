@@ -308,6 +308,19 @@ impl SecretVault {
 
     /// Creates or updates one encrypted secret and returns its public summary.
     pub fn put(&self, input: SecretUpsert) -> Result<SecretSummary> {
+        self.put_inner(input, true)
+    }
+
+    /// Like [`SecretVault::put`], but refuses to overwrite: if a record with the
+    /// same id, or the same (label, username, origin, source), already exists, it
+    /// returns an error instead of replacing it. Used for writes from
+    /// less-trusted callers (e.g. connector subprocesses over the internal-tool
+    /// broker) so they cannot silently clobber a stored secret.
+    pub fn put_insert_only(&self, input: SecretUpsert) -> Result<SecretSummary> {
+        self.put_inner(input, false)
+    }
+
+    fn put_inner(&self, input: SecretUpsert, allow_overwrite: bool) -> Result<SecretSummary> {
         let label = normalized_required("secret label", &input.label)?;
         let value = input.value;
         if value.is_empty() {
@@ -332,6 +345,9 @@ impl SecretVault {
                         && record.source == source
                 })
             });
+        if existing_index.is_some() && !allow_overwrite {
+            bail!("a secret named `{label}` already exists; refusing to overwrite it");
+        }
         let index = if let Some(index) = existing_index {
             store.secrets[index].label = label;
             store.secrets[index].description = description;

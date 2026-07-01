@@ -20,6 +20,7 @@
   import AgentDetail from "./lib/screens/agent/AgentDetail.svelte";
   import { isAlreadyPersistedTool, persistedToolIdSet } from "./lib/screens/agent/timelineToolDedup";
   import Workflows from "./lib/screens/Workflows.svelte";
+  import Automation from "./lib/screens/Automation.svelte";
   import Tasks from "./lib/screens/Tasks.svelte";
   import Contacts from "./lib/screens/Contacts.svelte";
   import BuildBadge from "./lib/components/BuildBadge.svelte";
@@ -4761,6 +4762,8 @@
             {/if}
           {:else if tweaks.screen === "workflows"}
             <Workflows onRunWorkflowCommand={runWorkflowCommand} />
+          {:else if tweaks.screen === "automation"}
+            <Automation />
           {:else if tweaks.screen === "tasks"}
             <Tasks onRunTaskCommand={runWorkflowCommand} />
           {:else if tweaks.screen === "contacts"}

@@ -57,6 +57,7 @@
   const screens: { id: ScreenId; label: string; icon: IconName }[] = [
     { id: "workspace", label: "Project", icon: "sparkles" },
     { id: "workflows", label: "Workflows", icon: "git" },
+    { id: "automation", label: "Automation", icon: "bolt" },
     { id: "tasks", label: "Tasks", icon: "listTodo" },
     { id: "contacts", label: "Contacts", icon: "plug" },
     { id: "settings", label: "Settings", icon: "settings" }

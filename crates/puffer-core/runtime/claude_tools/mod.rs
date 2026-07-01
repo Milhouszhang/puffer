@@ -1,30 +1,41 @@
+use crate::permissions::FilesystemPermissionPolicy;
+use crate::runner_adapter;
 use crate::runtime::structured_output_support::StructuredOutputConfig;
 use crate::state::ClaudeReadState;
-use crate::workspace_paths;
 use crate::AppState;
 use anyhow::{bail, Context, Result};
+use puffer_config::ProxyConfig;
 use puffer_provider_openai::OpenAIRequestConfig;
+use puffer_provider_registry::{AuthStore, ProviderRegistry};
 use puffer_resources::LoadedResources;
+use puffer_runner_api::{
+    check_read_freshness, NullChunkSink, ReadStateSnapshot, ReadStateUpdate, StalenessRejection,
+    ToolRequest as RunnerToolRequest, ToolResult as RunnerToolResult, ToolRunner,
+};
+use puffer_runner_grpc::RemoteToolRunner;
 use puffer_tools::{ToolDefinition, ToolExecutionResult, ToolOutput, ToolRegistry};
 use puffer_transport_anthropic::AnthropicRequestConfig;
 use serde_json::Value;
-use uuid::Uuid;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
+use uuid::Uuid;
 
-mod bash;
-mod edit;
-mod glob;
-mod grep;
+pub mod bash;
+pub(crate) mod bash_internal_permissions;
+pub mod edit;
+pub mod glob;
+pub mod grep;
 pub(super) mod mcp_resources;
-mod notebook_edit;
-mod read;
+pub mod notebook_edit;
+pub mod read;
 pub(crate) mod skill;
 pub(crate) mod tool_search;
-mod web_fetch;
-mod web_search;
+pub mod web_fetch;
+pub mod web_search;
+pub mod write_stdin;
 
 /// Retries a blocking HTTP send operation up to `max_attempts` times with 1s delay
 /// on transient connection/timeout errors.
@@ -56,7 +67,7 @@ fn is_retryable_send_error(error: &anyhow::Error) -> bool {
     })
 }
 pub(crate) mod workflow;
-mod write;
+pub mod write;
 
 /// Carries provider-specific execution context for runtime-backed tools.
 pub(crate) enum ProviderToolContext<'a> {
@@ -64,11 +75,13 @@ pub(crate) enum ProviderToolContext<'a> {
     OpenAI {
         request_config: &'a OpenAIRequestConfig,
         model_id: &'a str,
+        proxy: &'a ProxyConfig,
         structured_output: Option<&'a StructuredOutputConfig>,
     },
     Anthropic {
         request_config: &'a AnthropicRequestConfig,
         model_id: &'a str,
+        proxy: &'a ProxyConfig,
         structured_output: Option<&'a StructuredOutputConfig>,
     },
 }
@@ -82,19 +95,68 @@ pub(crate) fn is_claude_runtime_handler(handler: &str) -> bool {
 pub(crate) fn execute_tool(
     state: &mut AppState,
     resources: &LoadedResources,
+    providers: &ProviderRegistry,
+    auth_store: &AuthStore,
     registry: &ToolRegistry,
     definition: &ToolDefinition,
     cwd: &Path,
+    filesystem_policy: &FilesystemPermissionPolicy,
     input: Value,
     provider_context: ProviderToolContext<'_>,
 ) -> Result<ToolExecutionResult> {
-    let allow_all_paths = workspace_paths::sandbox_allows_all_paths(&state.sandbox_mode);
+    let skip_runner = definition.id == "Bash" && state.active_remote_target.is_none();
+    if !skip_runner && runner_adapter::is_runner_supported(definition.id.as_str()) {
+        if let Some(result) =
+            try_runner_dispatch(state, definition, cwd, &input, filesystem_policy)?
+        {
+            return Ok(result);
+        }
+    }
     match definition.id.as_str() {
         "Bash" => {
-            let execution = bash::execute_from_value(cwd, &state.session.id, input)?;
+            let internal_media_discovery_cache = state
+                .exact_media_discovery_cache
+                .clone()
+                .unwrap_or_else(puffer_media::ExactMediaDiscoveryCache::empty);
+            let session_id = state.session.id;
+            let process_store = state.process_store.clone();
+            let mut internal_permission_handler = |request| match request {
+                bash_internal_permissions::InternalToolBrokerRequest::Permission(request) => {
+                    bash_internal_permissions::InternalToolBrokerResponse::Permission(
+                        super::internal_tool_permissions::resolve_internal_tool_permission(
+                            state, resources, registry, cwd, request,
+                        ),
+                    )
+                }
+                bash_internal_permissions::InternalToolBrokerRequest::Execution(request) => {
+                    bash_internal_permissions::InternalToolBrokerResponse::Execution(
+                        super::internal_tool_permissions::execute_internal_tool_request(
+                            state,
+                            resources,
+                            registry,
+                            providers,
+                            auth_store,
+                            &internal_media_discovery_cache,
+                            cwd,
+                            request,
+                        ),
+                    )
+                }
+            };
+            let execution = bash::execute_from_value_with_internal_permissions(
+                cwd,
+                &session_id,
+                input,
+                Some(&process_store),
+                Some(&mut internal_permission_handler),
+            )?;
             let output = serde_json::to_string_pretty(&execution.output)
                 .context("failed to serialize Bash output")?;
             Ok(tool_result(definition, execution.success, output))
+        }
+        "WriteStdin" => {
+            let (success, output) = write_stdin::execute(&state.process_store, input)?;
+            Ok(tool_result(definition, success, output))
         }
         "Read" => {
             if is_full_read_request(&input) {
@@ -112,8 +174,8 @@ pub(crate) fn execute_tool(
             }
             let output = read::execute_claude_read_tool(
                 cwd,
-                &state.working_dirs,
-                allow_all_paths,
+                &filesystem_policy.workspace_roots,
+                &filesystem_policy.runner_policy(),
                 input.clone(),
             )?;
             record_read_from_input(state, &input)?;
@@ -123,8 +185,8 @@ pub(crate) fn execute_tool(
             let mut read_state = clone_read_state(state);
             let output = write::execute_claude_write_tool(
                 cwd,
-                &state.working_dirs,
-                allow_all_paths,
+                &filesystem_policy.workspace_roots,
+                &filesystem_policy.runner_policy(),
                 input.clone(),
                 &mut read_state,
             )?;
@@ -140,8 +202,8 @@ pub(crate) fn execute_tool(
             }
             let output = edit::execute_claude_edit(
                 cwd,
-                &state.working_dirs,
-                allow_all_paths,
+                &filesystem_policy.workspace_roots,
+                &filesystem_policy.runner_policy(),
                 input.clone(),
             )?;
             if let Some(path) = input_file_path(&input, "file_path")? {
@@ -152,12 +214,22 @@ pub(crate) fn execute_tool(
         "Glob" => Ok(tool_result(
             definition,
             true,
-            glob::execute_claude_glob(cwd, &state.working_dirs, allow_all_paths, input)?,
+            glob::execute_claude_glob(
+                cwd,
+                &filesystem_policy.workspace_roots,
+                &filesystem_policy.runner_policy(),
+                input,
+            )?,
         )),
         "Grep" => Ok(tool_result(
             definition,
             true,
-            grep::execute_claude_grep(cwd, &state.working_dirs, allow_all_paths, input)?,
+            grep::execute_claude_grep(
+                cwd,
+                &filesystem_policy.workspace_roots,
+                &filesystem_policy.runner_policy(),
+                input,
+            )?,
         )),
         "NotebookEdit" => {
             if let Err(error) = enforce_read_precondition(
@@ -168,8 +240,8 @@ pub(crate) fn execute_tool(
             }
             let output = notebook_edit::execute_notebook_edit_tool(
                 cwd,
-                &state.working_dirs,
-                allow_all_paths,
+                &filesystem_policy.workspace_roots,
+                &filesystem_policy.runner_policy(),
                 input.clone(),
             )?;
             if let Some(path) = input_file_path(&input, "notebook_path")? {
@@ -180,7 +252,7 @@ pub(crate) fn execute_tool(
         "Skill" => Ok(tool_result(
             definition,
             true,
-            skill::execute_claude_skill_tool(resources, input)?,
+            skill::execute_claude_skill_tool(state, resources, input)?,
         )),
         "ToolSearch" => Ok(tool_result(
             definition,
@@ -191,7 +263,13 @@ pub(crate) fn execute_tool(
             definition,
             true,
             super::local_tools::execute_runtime_local_tool(
-                state, resources, registry, definition, cwd, input,
+                state,
+                resources,
+                registry,
+                definition,
+                cwd,
+                filesystem_policy,
+                input,
             )?,
         )),
         "WebFetch" => {
@@ -204,16 +282,24 @@ pub(crate) fn execute_tool(
                 ProviderToolContext::OpenAI {
                     request_config,
                     model_id,
+                    proxy,
                     ..
-                } => web_search::execute_claude_openai_web_search(request_config, model_id, input)?,
+                } => web_search::execute_claude_openai_web_search(
+                    request_config,
+                    model_id,
+                    input,
+                    proxy,
+                )?,
                 ProviderToolContext::Anthropic {
                     request_config,
                     model_id,
+                    proxy,
                     ..
                 } => web_search::execute_claude_anthropic_web_search(
                     request_config,
                     model_id,
                     input,
+                    proxy,
                 )?,
                 ProviderToolContext::None => {
                     bail!("WebSearch requires provider execution context")
@@ -221,27 +307,95 @@ pub(crate) fn execute_tool(
             };
             Ok(tool_result(definition, true, output))
         }
-        _ if definition.handler.starts_with("runtime:workflow:") => Ok(tool_result(
-            definition,
-            true,
-            execute_workflow_tool(
+        _ if definition.handler.starts_with("runtime:workflow:") => {
+            let workflow_media_discovery_cache = state
+                .exact_media_discovery_cache
+                .clone()
+                .unwrap_or_else(puffer_media::ExactMediaDiscoveryCache::empty);
+            let stdout = execute_workflow_tool_with_media_context(
                 state,
                 resources,
+                Some(workflow::image_generation::ImageGenerationMediaContext {
+                    providers,
+                    auth_store,
+                    discovery_cache: &workflow_media_discovery_cache,
+                }),
+                Some(workflow::video_generation::VideoGenerationMediaContext {
+                    providers,
+                    auth_store,
+                    discovery_cache: &workflow_media_discovery_cache,
+                }),
                 cwd,
                 definition.id.as_str(),
                 input,
                 provider_context.structured_output(),
-            )?,
+            )?;
+            // Some workflow tools want to set `metadata.terminate = true`
+            // so the agent loop ends the turn after their result is
+            // delivered to the model — pi-mono parity for
+            // `AgentToolResult.terminate`. The post-process is opt-in
+            // per tool id; default is `Value::Null` for everything else.
+            let metadata = workflow_terminate_metadata(definition.id.as_str(), &stdout);
+            Ok(tool_result_with_metadata(
+                definition, true, stdout, metadata,
+            ))
+        }
+        _ if definition.handler == "runtime:project_memory" => Ok(tool_result(
+            definition,
+            true,
+            crate::memory::execute_memory_tool(state, input)?,
         )),
         _ if super::local_tools::is_runtime_local_tool(definition) => Ok(tool_result(
             definition,
             true,
             super::local_tools::execute_runtime_local_tool(
-                state, resources, registry, definition, cwd, input,
+                state,
+                resources,
+                registry,
+                definition,
+                cwd,
+                filesystem_policy,
+                input,
             )?,
         )),
         _ => registry.execute_json(&definition.id, cwd, input),
     }
+}
+
+/// Runs a parallel-batch `Bash` in-process with its own internal-tool broker so
+/// that subprocess media tools (imagegen/videogen) can call back and execute
+/// concurrently. The broker handler is media-only and uses shared references.
+pub(crate) fn execute_parallel_bash_with_media_broker(
+    definition: &ToolDefinition,
+    cwd: &Path,
+    session_id: &Uuid,
+    args: Value,
+    media_ctx: &super::internal_tool_permissions::MediaCapabilityContext<'_>,
+) -> Result<ToolExecutionResult> {
+    let mut handler = |request: bash_internal_permissions::InternalToolBrokerRequest| match request {
+        bash_internal_permissions::InternalToolBrokerRequest::Execution(req) => {
+            bash_internal_permissions::InternalToolBrokerResponse::Execution(
+                super::internal_tool_permissions::execute_media_internal_tool(media_ctx, cwd, req),
+            )
+        }
+        bash_internal_permissions::InternalToolBrokerRequest::Permission(_) => {
+            bash_internal_permissions::InternalToolBrokerResponse::Permission(
+                puffer_tools::internal_permissions::InternalToolPermissionResponse::deny(
+                    "internal tool permission is not available in a parallel batch; run it as a single command",
+                ),
+            )
+        }
+    };
+    let execution = bash::execute_from_value_with_internal_permissions(
+        cwd,
+        session_id,
+        args,
+        media_ctx.process_store,
+        Some(&mut handler),
+    )?;
+    let output = serde_json::to_string_pretty(&execution.output)
+        .context("failed to serialize Bash output")?;
+    Ok(tool_result(definition, execution.success, output))
 }
 
 /// Executes a parallel-safe tool without `&mut AppState`.
@@ -250,54 +404,99 @@ pub(crate) fn execute_tool(
 /// replicates the corresponding match arms from `execute_tool`. All data
 /// needed is passed by value/reference; no mutable application state is
 /// touched, enabling concurrent execution via `std::thread::scope`.
+///
+/// `Bash` is special-cased: it runs in-process with its own media broker via
+/// [`execute_parallel_bash_with_media_broker`] (so subprocess imagegen/videogen
+/// can call back), never through the broker-less runner. `media_ctx` is the
+/// shared media-capability context the caller builds when the batch contains a
+/// permitted Bash; it is `None` for Bash-free batches.
+///
+/// For tools in `runner_adapter::is_runner_supported(...)` (currently
+/// `Glob | Grep | WebFetch` in the parallel path), execution is routed through the supplied
+/// `Arc<dyn ToolRunner>` so a `RemoteToolRunner` can intercept parallel
+/// batches the same way it intercepts serial calls. The remaining
+/// parallel-safe tools (`WebSearch | ToolSearch`) intentionally stay on the
+/// in-process path: WebSearch needs provider context that isn't on the runner
+/// trait, and ToolSearch is local-only.
 pub(crate) fn execute_parallel_tool(
     definition: &ToolDefinition,
     cwd: &Path,
     working_dirs: &[PathBuf],
-    allow_all_paths: bool,
+    filesystem_policy: &FilesystemPermissionPolicy,
     session_id: &Uuid,
     input: Value,
-    resources: &LoadedResources,
+    _resources: &LoadedResources,
     registry: &ToolRegistry,
     provider_context: &ProviderToolContext<'_>,
+    runner: &Arc<dyn ToolRunner>,
+    media_ctx: Option<&super::internal_tool_permissions::MediaCapabilityContext<'_>>,
 ) -> Result<ToolExecutionResult> {
+    if definition.id == "Bash" {
+        // The caller builds the media context whenever a permitted Bash is in the
+        // batch, so this is always present here; guard rather than panic.
+        let media_ctx = media_ctx.ok_or_else(|| {
+            anyhow::anyhow!("parallel Bash dispatched without a media-capability context")
+        })?;
+        return execute_parallel_bash_with_media_broker(
+            definition, cwd, session_id, input, media_ctx,
+        );
+    }
+    if runner_adapter::is_runner_supported(definition.id.as_str()) {
+        let request = RunnerToolRequest {
+            request_id: None,
+            tool_id: definition.id.clone(),
+            cwd: cwd.to_path_buf(),
+            working_dirs: working_dirs.to_vec(),
+            filesystem: filesystem_policy.runner_policy(),
+            input: input.clone(),
+            session_id: Some(session_id.to_string()),
+        };
+        let mut sink = NullChunkSink;
+        let outcome = runner
+            .execute_tool(request, &mut sink)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        // Parallel-safe tools never touch read-state (Read/Write/Edit/NotebookEdit
+        // are excluded by `is_parallel_safe_tool`), so any updates returned
+        // here would be a runner bug. Assert in debug, ignore in release.
+        debug_assert!(
+            outcome.read_state_updates.is_empty(),
+            "parallel-safe tool {} returned read_state_updates",
+            definition.id
+        );
+        return Ok(ToolExecutionResult {
+            tool_id: outcome.tool_id,
+            success: outcome.success,
+            output: ToolOutput {
+                stdout: outcome.stdout,
+                stderr: outcome.stderr,
+                metadata: outcome.metadata,
+            },
+        });
+    }
     match definition.id.as_str() {
-        "Bash" => {
-            let execution = bash::execute_from_value(cwd, session_id, input)?;
-            let output = serde_json::to_string_pretty(&execution.output)
-                .context("failed to serialize Bash output")?;
-            Ok(tool_result(definition, execution.success, output))
-        }
-        "Glob" => Ok(tool_result(
-            definition,
-            true,
-            glob::execute_claude_glob(cwd, working_dirs, allow_all_paths, input)?,
-        )),
-        "Grep" => Ok(tool_result(
-            definition,
-            true,
-            grep::execute_claude_grep(cwd, working_dirs, allow_all_paths, input)?,
-        )),
-        "WebFetch" => {
-            let output = serde_json::to_string_pretty(&web_fetch::execute_claude_web_fetch(input)?)
-                .context("failed to serialize WebFetch output")?;
-            Ok(tool_result(definition, true, output))
-        }
         "WebSearch" => {
             let output = match provider_context {
                 ProviderToolContext::OpenAI {
                     request_config,
                     model_id,
+                    proxy,
                     ..
-                } => web_search::execute_claude_openai_web_search(request_config, model_id, input)?,
+                } => web_search::execute_claude_openai_web_search(
+                    request_config,
+                    model_id,
+                    input,
+                    proxy,
+                )?,
                 ProviderToolContext::Anthropic {
                     request_config,
                     model_id,
+                    proxy,
                     ..
                 } => web_search::execute_claude_anthropic_web_search(
                     request_config,
                     model_id,
                     input,
+                    proxy,
                 )?,
                 ProviderToolContext::None => {
                     bail!("WebSearch requires provider execution context")
@@ -310,24 +509,238 @@ pub(crate) fn execute_parallel_tool(
             true,
             tool_search::execute_claude_tool_search_tool(registry, input)?,
         )),
-        "Skill" => Ok(tool_result(
-            definition,
-            true,
-            skill::execute_claude_skill_tool(resources, input)?,
-        )),
         other => bail!("tool {other} is not parallel-safe"),
     }
 }
 
+/// Tries dispatching the call through the active [`puffer_runner_api::ToolRunner`].
+///
+/// Returns `Ok(Some(result))` when the runner handled the call (success or
+/// pre-flight rejection), `Ok(None)` when the tool needs the legacy in-place
+/// path (e.g. WebSearch's provider context, or Read's "file unchanged"
+/// short-circuit), and `Err` when the underlying execution fails.
+fn try_runner_dispatch(
+    state: &mut AppState,
+    definition: &ToolDefinition,
+    cwd: &Path,
+    input: &Value,
+    filesystem_policy: &FilesystemPermissionPolicy,
+) -> Result<Option<ToolExecutionResult>> {
+    let tool_id = definition.id.as_str();
+
+    // Read keeps its "file_unchanged" short-circuit on the legacy path —
+    // the runner DTO doesn't model that bookkeeping yet.
+    if tool_id == "Read" && is_full_read_request(input) {
+        if let Some(path) = input_file_path(input, "file_path")? {
+            if let Some(snapshot) = state.claude_read_state.get(&path) {
+                let timestamp_ms = file_timestamp_ms(&path)?;
+                if !snapshot.is_partial_view && timestamp_ms == snapshot.timestamp_ms {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    // Pre-flight staleness gate, hoisted out of the per-tool implementations.
+    let needs_freshness_check = matches!(tool_id, "Write" | "NotebookEdit")
+        || (tool_id == "Edit" && edit::requires_prior_read(input));
+    if needs_freshness_check {
+        let path_field = if tool_id == "NotebookEdit" {
+            "notebook_path"
+        } else {
+            "file_path"
+        };
+        if let Some(path) = input_file_path(input, path_field)? {
+            let snapshot = state
+                .claude_read_state
+                .get(&path)
+                .map(|snap| ReadStateSnapshot {
+                    timestamp_ms: snap.timestamp_ms,
+                    is_partial_view: snap.is_partial_view,
+                });
+            // Only enforce when the file already exists; Write/Edit on a
+            // brand-new path are allowed without a prior Read.
+            if path.exists() {
+                let current_mtime = file_timestamp_ms(&path)?;
+                if let Err(rejection) = check_read_freshness(snapshot.as_ref(), current_mtime) {
+                    return Ok(Some(staleness_failure(definition, &rejection)));
+                }
+            }
+        }
+    }
+
+    ensure_active_remote_runner_connected(state)?;
+
+    let request = RunnerToolRequest {
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        tool_id: tool_id.to_string(),
+        cwd: runner_cwd(state, cwd),
+        working_dirs: filesystem_policy.workspace_roots.clone(),
+        filesystem: filesystem_policy.runner_policy(),
+        input: input.clone(),
+        session_id: Some(state.session.id.to_string()),
+    };
+    let outcome = execute_runner_request_with_reconnect(state, cwd, request)?;
+
+    apply_read_state_updates(state, &outcome.read_state_updates);
+
+    Ok(Some(ToolExecutionResult {
+        tool_id: outcome.tool_id,
+        success: outcome.success,
+        output: ToolOutput {
+            stdout: outcome.stdout,
+            stderr: outcome.stderr,
+            metadata: outcome.metadata,
+        },
+    }))
+}
+
+fn ensure_active_remote_runner_connected(state: &mut AppState) -> Result<()> {
+    if state.active_remote_target.is_none() || !tool_runner_is_local(state.tool_runner.as_ref()) {
+        return Ok(());
+    }
+    let endpoint = state.remote_session_url.clone().ok_or_else(|| {
+        anyhow::anyhow!("remote target is active but no runner endpoint is saved")
+    })?;
+    let runner =
+        RemoteToolRunner::connect(&endpoint, state.active_remote_runner_auth_token.as_deref())
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "remote target is active but remote runner is not connected: {error}"
+                )
+            })?;
+    if state.local_tool_runner.is_none() {
+        state.local_tool_runner = Some(state.tool_runner.clone());
+    }
+    state.tool_runner = Arc::new(runner);
+    Ok(())
+}
+
+pub(super) fn execute_runner_request_with_reconnect(
+    state: &mut AppState,
+    cwd: &Path,
+    request: RunnerToolRequest,
+) -> Result<RunnerToolResult> {
+    let runner = state.tool_runner.clone();
+    let mut sink = NullChunkSink;
+    match runner.execute_tool(request.clone(), &mut sink) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            let error = anyhow::anyhow!(error);
+            if state.active_remote_target.is_none()
+                || !workflow::remote_execution::remote_error_is_reconnectable(&error)
+            {
+                return Err(error);
+            }
+            state.remote_session_status = Some("reconnecting".to_string());
+            if !workflow::remote_execution::reconnect_active_remote_runner(state, cwd)? {
+                return Err(error);
+            }
+            let runner = state.tool_runner.clone();
+            let mut sink = NullChunkSink;
+            runner
+                .execute_tool(request, &mut sink)
+                .map_err(|retry_error| {
+                    anyhow::anyhow!("remote tool call failed after reconnect: {retry_error}")
+                })
+        }
+    }
+}
+
+fn tool_runner_is_local(runner: &dyn ToolRunner) -> bool {
+    runner
+        .as_any()
+        .and_then(|any| any.downcast_ref::<runner_adapter::LocalToolRunner>())
+        .is_some()
+}
+
+fn runner_cwd(state: &AppState, cwd: &Path) -> PathBuf {
+    state
+        .active_remote_cwd
+        .clone()
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
+fn apply_read_state_updates(state: &mut AppState, updates: &[ReadStateUpdate]) {
+    for update in updates {
+        state.claude_read_state.insert(
+            update.path.clone(),
+            ClaudeReadState {
+                timestamp_ms: update.timestamp_ms,
+                is_partial_view: update.is_partial_view,
+            },
+        );
+    }
+}
+
+fn staleness_failure(
+    definition: &ToolDefinition,
+    rejection: &StalenessRejection,
+) -> ToolExecutionResult {
+    ToolExecutionResult {
+        tool_id: definition.id.clone(),
+        success: false,
+        output: ToolOutput {
+            stdout: rejection.message().to_string(),
+            stderr: String::new(),
+            metadata: Value::Null,
+        },
+    }
+}
+
 fn tool_result(definition: &ToolDefinition, success: bool, stdout: String) -> ToolExecutionResult {
+    tool_result_with_metadata(definition, success, stdout, Value::Null)
+}
+
+/// Build a `ToolExecutionResult` with explicit metadata. The metadata
+/// is what the tool-batch dispatcher inspects for `"terminate": true`
+/// (see `runtime/tool_batch.rs::extract_terminate`) — used by tools
+/// that want to end the turn after their result is delivered.
+fn tool_result_with_metadata(
+    definition: &ToolDefinition,
+    success: bool,
+    stdout: String,
+    metadata: Value,
+) -> ToolExecutionResult {
     ToolExecutionResult {
         tool_id: definition.id.clone(),
         success,
         output: ToolOutput {
             stdout,
             stderr: String::new(),
-            metadata: Value::Null,
+            metadata,
         },
+    }
+}
+
+/// Decide whether a workflow tool's result should carry
+/// `metadata.terminate = true`. Today only `update_goal` opts in,
+/// and only when the model successfully marked the goal `complete`
+/// (we sniff the JSON response since the workflow handler returns
+/// pretty-printed JSON). Pi-mono pattern: tools that mark a unit of
+/// work done can short-circuit the next provider round-trip.
+///
+/// Returning `Value::Null` is a no-op and matches the historical
+/// behavior for every other workflow tool.
+fn workflow_terminate_metadata(tool_id: &str, stdout: &str) -> Value {
+    if tool_id != "update_goal" {
+        return Value::Null;
+    }
+    // Cheap parse — workflow handlers always emit pretty-printed
+    // JSON. If parsing fails (shouldn't, but defensive) treat it
+    // as no-terminate.
+    let Ok(parsed) = serde_json::from_str::<Value>(stdout) else {
+        return Value::Null;
+    };
+    if parsed
+        .pointer("/goal/status")
+        .and_then(Value::as_str)
+        .map(|s| s == "complete")
+        .unwrap_or(false)
+    {
+        serde_json::json!({ "terminate": true })
+    } else {
+        Value::Null
     }
 }
 
@@ -434,7 +847,8 @@ fn enforce_read_precondition(state: &AppState, path: Option<&Path>) -> Result<()
         bail!("File has not been read yet. Read it first before writing to it.");
     };
     if snapshot.is_partial_view {
-        bail!("File has not been read yet. Read it first before writing to it.");
+        // defense-in-depth: pre-flight gate at mod.rs:402 catches first; keep messages aligned with StalenessRejection
+        bail!(StalenessRejection::PARTIAL_READ_MESSAGE);
     }
     let timestamp_ms = file_timestamp_ms(path)?;
     if timestamp_ms > snapshot.timestamp_ms {
@@ -465,32 +879,169 @@ pub fn execute_workflow_tool(
     input: Value,
     structured_output: Option<&StructuredOutputConfig>,
 ) -> Result<String> {
+    execute_workflow_tool_with_media_context(
+        state,
+        resources,
+        None,
+        None,
+        cwd,
+        tool_id,
+        input,
+        structured_output,
+    )
+}
+
+fn execute_workflow_tool_with_media_context(
+    state: &mut AppState,
+    resources: &LoadedResources,
+    image_media_context: Option<workflow::image_generation::ImageGenerationMediaContext<'_>>,
+    video_media_context: Option<workflow::video_generation::VideoGenerationMediaContext<'_>>,
+    cwd: &Path,
+    tool_id: &str,
+    input: Value,
+    structured_output: Option<&StructuredOutputConfig>,
+) -> Result<String> {
     match tool_id {
         "Agent" => workflow::agent::execute_agent(state, cwd, input),
+        "AnthropicStream" => {
+            workflow::anthropic_stream::execute_anthropic_stream(state, cwd, input)
+        }
         "AskUserQuestion" => {
             workflow::ask_user_question::execute_ask_user_question(state, cwd, input)
         }
+        "requestuserbrowseraction" | "RequestUserBrowserAction" => {
+            workflow::request_user_browser_action::execute_request_user_browser_action(
+                state, cwd, input,
+            )
+        }
+        "Canvas" => workflow::canvas::execute_canvas(state, cwd, input),
+        "CanvasState" => workflow::canvas_state::execute_canvas_state(state, cwd, input),
+        "ComfyUiAction" => workflow::comfyui_action::execute_comfyui_action(state, cwd, input),
+        "ComputerUseAction" => {
+            workflow::computer_use_action::execute_computer_use_action(state, cwd, input)
+        }
         "Config" => workflow::config::execute_config(state, cwd, input),
+        "ConnectionCreate" => {
+            workflow::connector_tools::execute_connection_create(state, cwd, input)
+        }
+        "ConnectionDelete" => {
+            workflow::connector_tools::execute_connection_delete(state, cwd, input)
+        }
+        "ConnectionList" => workflow::connector_tools::execute_connection_list(state, cwd, input),
+        "ConnectorAct" => workflow::connector_tools::execute_connector_act(state, cwd, input),
+        "ConnectorActionDraft" => {
+            workflow::connector_tools::execute_connector_action_draft(state, cwd, input)
+        }
+        "ConnectorCreation" => {
+            workflow::connector_tools::execute_connector_creation(state, cwd, input)
+        }
+        "ConnectorDelete" => workflow::connector_tools::execute_connector_delete(state, cwd, input),
+        "ConnectorList" => workflow::connector_tools::execute_connector_list(state, cwd, input),
+        "ConnectorRegister" => {
+            workflow::connector_tools::execute_connector_register(state, cwd, input)
+        }
+        "ConnectorTemplate" => {
+            workflow::connector_tools::execute_connector_template(state, cwd, input)
+        }
+        "ConnectorUpdate" => workflow::connector_tools::execute_connector_update(state, cwd, input),
         "CronCreate" => workflow::cron_create::execute_cron_create(state, cwd, input),
         "CronDelete" => workflow::cron_delete::execute_cron_delete(state, cwd, input),
         "CronList" => workflow::cron_list::execute_cron_list(state, cwd, input),
+        "Email" => workflow::email_configure::execute_email(cwd, input),
+        "EmailConfigure" => workflow::email_configure::execute_email_configure(cwd, input),
         "EnterPlanMode" => workflow::enter_plan_mode::execute_enter_plan_mode(state, cwd, input),
         "EnterWorktree" => workflow::enter_worktree::execute_enter_worktree(state, cwd, input),
         "ExitPlanMode" => workflow::exit_plan_mode::execute_exit_plan_mode(state, cwd, input),
         "ExitWorktree" => workflow::exit_worktree::execute_exit_worktree(state, cwd, input),
+        "get_goal" => workflow::goal::execute_get_goal(state, cwd, input),
+        "create_goal" => workflow::goal::execute_create_goal(state, cwd, input),
+        "update_goal" => workflow::goal::execute_update_goal(state, cwd, input),
+        "HttpRequest" => workflow::http_request::execute_http_request(state, cwd, input),
+        "ImageGeneration" => workflow::image_generation::execute_image_generation(
+            state.config.media.image.as_ref(),
+            cwd,
+            input,
+            image_media_context,
+        ),
+        "VideoGeneration" => workflow::video_generation::execute_video_generation(
+            state.config.media.video.as_ref(),
+            cwd,
+            input,
+            video_media_context,
+        ),
+        "DebugpyAction" => workflow::debugpy_action::execute_debugpy_action(state, cwd, input),
+        "DiscordAction" => workflow::discord_action::execute_discord_action(state, cwd, input),
         "LSP" => workflow::lsp::execute_lsp(state, resources, cwd, input),
+        "McpToolCall" => workflow::mcp_tool_call::execute_mcp_tool_call(state, cwd, input),
+        "McpStatus" => workflow::mcp_status::execute_mcp_status(state, cwd, input),
+        "ModalAction" => workflow::modal_action::execute_modal_action(state, cwd, input),
+        "MonitorActionDraft" => {
+            workflow::monitor_action_draft::execute_monitor_action_draft(state, cwd, input)
+        }
+        "MonitorReplyDraft" => {
+            workflow::monitor_reply_draft::execute_monitor_reply_draft(state, cwd, input)
+        }
+        "MonitorReplySend" => {
+            workflow::monitor_reply_send::execute_monitor_reply_send(state, cwd, input)
+        }
+        "NativeMcpAction" => {
+            workflow::native_mcp_action::execute_native_mcp_action(state, cwd, input)
+        }
+        "ProcessControl" => workflow::process_control::execute_process_control(state, cwd, input),
         "PowerShell" => workflow::powershell::execute_powershell(state, cwd, input),
+        "Recall" => workflow::recall::execute_recall(state, cwd, input),
+        "Remember" => workflow::remember::execute_remember(state, cwd, input),
+        "RemoteExecution" => {
+            workflow::remote_execution::execute_remote_execution(state, cwd, input)
+        }
+        "RequestSecret" => workflow::request_secret::execute_request_secret(state, cwd, input),
+        "SecretValue" => workflow::secret_value::execute_secret_value(state, cwd, input),
         "SendMessage" => workflow::send_message::execute_send_message(state, cwd, input),
         "SendUserMessage" | "Brief" => {
             workflow::send_user_message::execute_send_user_message(state, cwd, input)
         }
+        "ShopifyAction" => workflow::shopify_action::execute_shopify_action(state, cwd, input),
+        "Slack" => workflow::slack::execute_slack(state, cwd, input),
+        "SlackAction" => workflow::slack_action::execute_slack_action(state, cwd, input),
+        "SpotifyAction" => workflow::spotify_action::execute_spotify_action(state, cwd, input),
         "StructuredOutput" => workflow::structured_output::execute_structured_output(
             state,
             cwd,
             input,
             structured_output,
         ),
+        "VisionAnalyze" => workflow::vision_analyze::execute_vision_analyze(state, cwd, input),
+        "SubscriberInstall" => {
+            workflow::subscriber_install::execute_subscriber_install(state, cwd, input)
+        }
+        "SubscriberList" => workflow::subscriber_list::execute_subscriber_list(state, cwd, input),
+        "SubscriberScaffold" => {
+            workflow::subscriber_scaffold::execute_subscriber_scaffold(state, cwd, input)
+        }
+        "SubscriptionCreate" => {
+            workflow::subscription_create::execute_subscription_create(state, cwd, input)
+        }
+        "SubscriptionDelete" => {
+            workflow::subscription_delete::execute_subscription_delete(state, cwd, input)
+        }
+        "SubscriptionList" => {
+            workflow::subscription_list::execute_subscription_list(state, cwd, input)
+        }
+        "SubscriptionPause" => {
+            workflow::subscription_pause::execute_subscription_pause(state, cwd, input)
+        }
+        "TouchDesignerAction" => {
+            workflow::touchdesigner_action::execute_touchdesigner_action(state, cwd, input)
+        }
+        "WorkflowInspect" => workflow::workflow_tools::execute_workflow_inspect(state, cwd, input),
+        "WorkflowList" => workflow::workflow_tools::execute_workflow_list(state, cwd, input),
+        "WorkflowToggle" => workflow::workflow_tools::execute_workflow_toggle(state, cwd, input),
+        "WorkflowCreate" => workflow::workflow_tools::execute_workflow_create(state, cwd, input),
+        "WorkflowValidate" => {
+            workflow::workflow_tools::execute_workflow_validate(state, cwd, input)
+        }
         "TaskCreate" => workflow::task_create::execute_task_create(state, cwd, input),
+        "TaskFlow" => workflow::task_flow::execute_task_flow(state, cwd, input),
         "TaskGet" => workflow::task_get::execute_task_get(state, cwd, input),
         "TaskList" => workflow::task_list::execute_task_list(state, cwd, input),
         "TaskOutput" => workflow::task_output::execute_task_output(state, cwd, input),
@@ -498,6 +1049,24 @@ pub fn execute_workflow_tool(
         "TaskUpdate" => workflow::task_update::execute_task_update(state, cwd, input),
         "TeamCreate" => workflow::team_create::execute_team_create(state, cwd, input),
         "TeamDelete" => workflow::team_delete::execute_team_delete(state, cwd, input),
+        "Telegram" => workflow::telegram_login::execute_telegram(cwd, input),
+        "TelegramImportDesktop" => {
+            workflow::telegram_login::execute_telegram_import_desktop(cwd, input)
+        }
+        "TelegramLoginQr" => workflow::telegram_login::execute_telegram_login_qr(cwd, input),
+        "TelegramLoginQrWait" => {
+            workflow::telegram_login::execute_telegram_login_qr_wait(cwd, input)
+        }
+        "TelegramLoginStart" => {
+            workflow::telegram_login::execute_telegram_login_start(cwd, input)
+        }
+        "TelegramLoginSubmitCode" => {
+            workflow::telegram_login::execute_telegram_login_submit_code(cwd, input)
+        }
+        "TelegramLoginSubmitPassword" => {
+            workflow::telegram_login::execute_telegram_login_submit_password(cwd, input)
+        }
+        "LambdaInternal" => workflow::lambda_internal::execute_lambda_internal(state, cwd, input),
         "TodoWrite" => workflow::todo_write::execute_todo_write(state, cwd, input),
         other => bail!("workflow tool `{other}` is not implemented"),
     }
@@ -518,32 +1087,4 @@ impl<'a> ProviderToolContext<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn blank_pages_do_not_make_read_partial() {
-        let input = json!({
-            "file_path": "/tmp/demo.txt",
-            "pages": "   ",
-        });
-
-        assert!(is_full_read_request(&input));
-        assert!(!read_pages_field_is_present(&input));
-    }
-
-    #[test]
-    fn null_optional_read_fields_are_treated_as_absent() {
-        let input = json!({
-            "file_path": "/tmp/demo.txt",
-            "offset": null,
-            "limit": null,
-            "pages": null,
-        });
-
-        assert!(is_full_read_request(&input));
-        assert!(!read_field_is_present(&input, "offset"));
-        assert!(!read_field_is_present(&input, "limit"));
-    }
-}
+mod tests;

@@ -2,18 +2,29 @@ mod actions;
 mod agents;
 pub(crate) mod artifacts;
 mod auth;
+mod autodream;
 mod branch;
 mod common;
 mod config;
+mod connect;
 mod doctor;
 mod ecosystem;
+mod genskill;
+mod goal;
+mod lambda_doctor;
+mod lambda_skill_status;
 mod model;
+mod monitor;
+mod pentest;
 mod plugins;
 pub(crate) mod prompt;
+mod recap;
+mod reflect;
 mod resume;
 mod session;
 mod tasks;
 mod terminal_setup;
+mod workflows;
 
 pub use actions::CommandActionEntry;
 pub(crate) use agents::handle_agents_command;
@@ -24,6 +35,7 @@ pub(crate) use auth::with_login_flow_handler;
 pub(crate) use auth::{
     remove_provider_credentials, render_login_guidance, run_provider_login_flow, supports_auth_mode,
 };
+pub(crate) use autodream::handle_autodream_command;
 pub(crate) use branch::handle_branch_command;
 pub(crate) use common::{
     describe_context, describe_files_in_context, describe_git_diff, emit_system,
@@ -36,23 +48,38 @@ pub(crate) use config::{
     persist_user_settings, reload_config_from_disk, render_config_summary,
     render_permissions_panel, render_sandbox_actions,
 };
+pub use connect::execute_connect_flow;
 pub(crate) use doctor::{render_doctor_report, run_doctor};
 pub use ecosystem::McpActionEntry;
 pub(crate) use ecosystem::{
     handle_ide_command, handle_mcp_command, reload_resources_from_disk, render_ide_actions,
     render_mcp_actions, render_mcp_summary,
 };
+pub(crate) use genskill::handle_genskill_command;
+pub(crate) use goal::handle_goal_command;
+pub(crate) use lambda_doctor::{lambda_skill_doctor_warnings, render_lambda_skill_doctor_status};
+pub use lambda_skill_status::{lambda_skill_statuses, LambdaSkillStatus};
 pub(crate) use model::{
     apply_model_preferences, handle_effort_command, handle_fast_command, handle_model_command,
 };
+pub use monitor::execute_monitor_flow;
+pub(crate) use monitor::handle_monitor_command;
+pub use pentest::{
+    prepare_pentest_command, PentestCommand, PentestStart, DEFAULT_PENTEST_MAX_DISPATCHES_PER_ITER,
+    DEFAULT_PENTEST_MAX_ITERATIONS, PENTEST_USAGE,
+};
+pub use session::{sanitize_tool_invocation_input, sanitized_tool_invocation_input};
 pub use plugins::PluginActionEntry;
 pub(crate) use plugins::{
     handle_plugin_command, reload_plugins_summary, render_plugin_actions, render_plugin_summary,
 };
 pub(crate) use prompt::handle_plan_command;
+pub(crate) use recap::handle_recap_command;
+pub(crate) use reflect::handle_reflect_command;
 pub(crate) use resume::handle_resume_command;
 pub(crate) use resume::resumable_sessions_for_picker;
 pub use resume::{resolve_resume_launch, ResumeLaunchResolution};
+pub use session::append_trace_events;
 pub use session::SessionOverlayView;
 pub(crate) use session::{
     append_tool_invocations, handle_memory_command, handle_remote_control_command,
@@ -65,6 +92,7 @@ pub(crate) use terminal_setup::{
     handle_terminal_setup_command, should_hide_terminal_setup_command,
     terminal_setup_command_description,
 };
+pub(crate) use workflows::handle_workflows_command;
 
 use crate::AppState;
 use anyhow::Result;

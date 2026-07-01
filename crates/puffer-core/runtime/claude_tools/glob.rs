@@ -1,6 +1,7 @@
 use crate::workspace_paths;
 use anyhow::{anyhow, bail, Context, Result};
 use glob::{MatchOptions, Pattern};
+use puffer_runner_api::FilesystemExecutionPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -8,6 +9,25 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_GLOB_LIMIT: usize = 100;
+
+/// Linux pseudo-filesystem roots that the Glob walker must skip even
+/// when an agent passes a broad `path` like `/`. Without these, a
+/// `Glob("**/*.c", "/")` request recurses into `/proc/<pid>/...`,
+/// `/sys/...`, etc. — millions of synthetic entries that produce no
+/// matches but burn wall-clock and pollute tool output. Observed in
+/// 2026-04-12 trajectories on `make-doom-for-mips` (the related grep
+/// invocation with `path: "/"` produced 1.8MB of stderr on
+/// `/proc/sys/kernel/...` — see `runtime/claude_tools/grep.rs` for
+/// the matching guard there).
+///
+/// Match is **whole-path equality** (not basename), so a normal
+/// project directory accidentally named `proc` is unaffected — only
+/// the OS-level pseudo-FS roots get skipped.
+const PSEUDO_FS_ROOTS: &[&str] = &["/proc", "/sys", "/dev", "/run"];
+
+fn is_pseudo_fs_root(path: &Path) -> bool {
+    PSEUDO_FS_ROOTS.iter().any(|root| path == Path::new(root))
+}
 
 /// Match options aligned with shell / gitignore glob semantics:
 /// `*` does NOT match the path separator `/`. This matches Claude Code's
@@ -49,7 +69,7 @@ struct ClaudeGlobOutput {
 pub fn execute_claude_glob(
     cwd: &Path,
     working_dirs: &[PathBuf],
-    allow_all_paths: bool,
+    filesystem: &FilesystemExecutionPolicy,
     input: Value,
 ) -> Result<String> {
     let started = Instant::now();
@@ -60,19 +80,14 @@ pub fn execute_claude_glob(
 
     let pattern = Pattern::new(&input.pattern)
         .map_err(|error| anyhow!("invalid glob pattern `{}`: {error}", input.pattern))?;
-    let sandbox_mode = if allow_all_paths {
-        "danger-full-access"
-    } else {
-        "workspace-write"
-    };
     let root = input
         .path
         .as_deref()
         .map(|path| {
-            workspace_paths::resolve_path_for_session(
+            workspace_paths::resolve_path_for_filesystem_policy(
                 cwd,
                 working_dirs,
-                sandbox_mode,
+                filesystem.sandbox_mode,
                 Path::new(path),
             )
         })
@@ -129,6 +144,12 @@ fn collect_glob_matches(
         }
         let path = entry.path();
         if file_type.is_dir() {
+            // Skip Linux pseudo-FS roots when traversing — see
+            // `PSEUDO_FS_ROOTS` doc comment for the trajectory
+            // anchor and the grep.rs counterpart.
+            if is_pseudo_fs_root(&path) {
+                continue;
+            }
             collect_glob_matches(workspace_root, &path, pattern, matches)?;
             continue;
         }
@@ -162,8 +183,30 @@ fn system_time_to_epoch_ms(time: SystemTime) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use puffer_runner_api::{FilesystemExecutionPolicy, FilesystemSandboxMode};
     use serde_json::json;
     use std::time::Duration;
+
+    fn workspace_write_policy() -> FilesystemExecutionPolicy {
+        FilesystemExecutionPolicy {
+            sandbox_mode: FilesystemSandboxMode::WorkspaceWrite,
+        }
+    }
+
+    #[test]
+    fn pseudo_fs_root_check_recognizes_each_root() {
+        for root in PSEUDO_FS_ROOTS {
+            assert!(
+                is_pseudo_fs_root(Path::new(root)),
+                "{root} should be flagged as pseudo-FS"
+            );
+        }
+        // Whole-path equality only: a project subdir named `proc`
+        // should NOT trigger the skip.
+        assert!(!is_pseudo_fs_root(Path::new("/home/user/project/proc")));
+        assert!(!is_pseudo_fs_root(Path::new("/proc/cmdline"))); // descendant
+        assert!(!is_pseudo_fs_root(Path::new("/app")));
+    }
 
     #[test]
     fn glob_returns_expected_shape() {
@@ -175,7 +218,7 @@ mod tests {
         let output = execute_claude_glob(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             json!({
                 "pattern": "src/*.rs"
             }),
@@ -198,7 +241,7 @@ mod tests {
         let output = execute_claude_glob(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             json!({
                 "pattern": "*.txt"
             }),
@@ -210,15 +253,19 @@ mod tests {
     }
 
     #[test]
-    fn glob_rejects_paths_outside_working_directories() {
+    fn glob_rejects_paths_outside_default_writable_roots() {
+        // Absolute path outside cwd, /tmp, $TMPDIR, /add-dir. ("../" no
+        // longer works as the "outside" probe because tempdir's cwd is
+        // already inside $TMPDIR — its parent is too. Codex-style default
+        // writable set covers /tmp + $TMPDIR.)
         let temp = tempfile::tempdir().unwrap();
         let error = execute_claude_glob(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             json!({
                 "pattern": "*.rs",
-                "path": "../"
+                "path": "/__puffer_test_outside_writable_set__/"
             }),
         )
         .unwrap_err()
@@ -238,7 +285,7 @@ mod tests {
         let output = execute_claude_glob(
             &cwd,
             &[extra.clone()],
-            false,
+            &workspace_write_policy(),
             json!({
                 "pattern": "src/*.rs",
                 "path": extra.display().to_string()
@@ -276,7 +323,7 @@ mod tests {
         let output = execute_claude_glob(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             json!({
                 "pattern": "*",
                 "path": temp.path().display().to_string(),
@@ -314,7 +361,7 @@ mod tests {
         let output = execute_claude_glob(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             json!({ "pattern": "**/*.o" }),
         )
         .unwrap();
@@ -345,7 +392,7 @@ mod tests {
         let output = execute_claude_glob(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             json!({ "pattern": "*.txt" }),
         )
         .unwrap();
@@ -367,7 +414,7 @@ mod tests {
         let output = execute_claude_glob(
             temp.path(),
             &[],
-            false,
+            &workspace_write_policy(),
             json!({ "pattern": "*.txt" }),
         )
         .unwrap();

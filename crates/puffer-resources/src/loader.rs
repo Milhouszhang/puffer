@@ -3,9 +3,11 @@ use crate::model::{
     McpServerSpec, PluginSpec, PromptTemplate, ProviderPack, SkillSpec, SourceInfo, SourceKind,
     ToolSpec,
 };
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use include_dir::{include_dir, Dir};
 use indexmap::IndexMap;
 use puffer_config::ConfigPaths;
+use puffer_runner_api::{RunnerError, ToolRunner};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
@@ -14,101 +16,317 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod lambda_skill;
+
+use self::lambda_skill::{load_lambda_skill_libraries, LambdaSkillLibrarySpec};
+
+/// Built-in `<repo>/resources/` baked into the binary at compile time.
+/// Same pattern as codex's `include_str!("../templates/foo.md")` (used at
+/// e.g. codex-rs/core/src/compact.rs:43), generalized to a directory tree
+/// because puffer ships ~95 yaml/md files. Without this, running `puffer`
+/// from a directory that has no sibling `resources/` would silently load
+/// 0 providers and the very first turn would fail with the misleading
+/// `no providers are registered`.
+static BUILTIN_RESOURCES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../resources");
+
 /// Loads bundled, user, and workspace resources into one in-memory registry.
-pub fn load_resources(paths: &ConfigPaths) -> Result<LoadedResources> {
+///
+/// Merge order (later wins on id collision):
+/// 1. **Embedded** — built-in `BUILTIN_RESOURCES` baked into the binary.
+///    Always present, no filesystem dependency.
+/// 2. **Filesystem builtin** — `paths.builtin_resources_dir`, set via
+///    `PUFFER_BUILTIN_RESOURCES_DIR` env var or defaulting to
+///    `<workspace>/resources`. Skipped if the directory does not exist
+///    (developer convenience: editing yaml in-place without rebuilding).
+/// 3. **User** — `~/.puffer/resources/`. Lets users override individual
+///    files (e.g. add a custom provider) without touching the install.
+/// 4. **Workspace** — `<cwd>/.puffer/resources/`. Project-level overrides.
+pub fn load_resources(paths: &ConfigPaths, runner: &dyn ToolRunner) -> Result<LoadedResources> {
     let mut loaded = LoadedResources::default();
+    apply_embedded_resources(&mut loaded)?;
+    merge_by_id(
+        &mut loaded.skills,
+        load_external_codex_claude_skills(paths)?,
+        |item| MergeKey::simple(item.value.name.clone()),
+        "skill",
+        &mut loaded.diagnostics,
+    );
     for (root, kind) in resource_roots(paths) {
-        let plugins = load_yaml_dir::<PluginSpec>(&root.join("plugins"), kind)?;
+        // Filesystem layers are optional. Without this guard the misleading
+        // "no providers are registered" error used to fire whenever the
+        // user ran puffer from a directory with no sibling `resources/`.
+        if !runner_path_exists(runner, &root) {
+            continue;
+        }
+        let plugins = load_yaml_dir::<PluginSpec>(runner, &root.join("plugins"), kind)?;
+        let lambda_skill_libraries = load_yaml_dir::<LambdaSkillLibrarySpec>(
+            runner,
+            &root.join("lambda_skill_libraries"),
+            kind,
+        )?;
         merge_by_id(
             &mut loaded.providers,
-            load_yaml_dir::<ProviderPack>(&root.join("providers"), kind)?,
-            |item| item.value.id.clone(),
+            load_yaml_dir::<ProviderPack>(runner, &root.join("providers"), kind)?,
+            |item| MergeKey::simple(item.value.id.clone()),
             "provider",
             &mut loaded.diagnostics,
         );
         merge_by_id(
             &mut loaded.tools,
-            load_yaml_dir::<ToolSpec>(&root.join("tools"), kind)?,
-            |item| item.value.id.clone(),
+            load_yaml_dir::<ToolSpec>(runner, &root.join("tools"), kind)?,
+            |item| MergeKey::simple(item.value.id.clone()),
             "tool",
             &mut loaded.diagnostics,
         );
         merge_by_id(
+            &mut loaded.internal_tools,
+            load_yaml_dir::<ToolSpec>(runner, &root.join("internal_tools"), kind)?,
+            |item| MergeKey::simple(item.value.id.clone()),
+            "internal_tool",
+            &mut loaded.diagnostics,
+        );
+        merge_by_id(
             &mut loaded.agents,
-            load_yaml_dir::<AgentSpec>(&root.join("agents"), kind)?,
-            |item| item.value.id.clone(),
+            load_yaml_dir::<AgentSpec>(runner, &root.join("agents"), kind)?,
+            |item| MergeKey::simple(item.value.id.clone()),
             "agent",
             &mut loaded.diagnostics,
         );
         merge_by_id(
             &mut loaded.prompts,
-            load_yaml_dir::<PromptTemplate>(&root.join("prompts"), kind)?,
-            |item| item.value.id.clone(),
+            load_yaml_dir::<PromptTemplate>(runner, &root.join("prompts"), kind)?,
+            |item| prompt_variant_key(&item.value),
             "prompt",
             &mut loaded.diagnostics,
         );
         merge_by_id(
             &mut loaded.hooks,
-            load_yaml_dir::<HookSpec>(&root.join("hooks"), kind)?,
-            |item| item.value.id.clone(),
+            load_yaml_dir::<HookSpec>(runner, &root.join("hooks"), kind)?,
+            |item| MergeKey::simple(item.value.id.clone()),
             "hook",
+            &mut loaded.diagnostics,
+        );
+        let lambda_skills =
+            load_lambda_skill_libraries(runner, &lambda_skill_libraries, &mut loaded.diagnostics)?;
+        merge_by_id(
+            &mut loaded.skills,
+            lambda_skills,
+            |item| MergeKey::simple(item.value.name.clone()),
+            "skill",
             &mut loaded.diagnostics,
         );
         merge_by_id(
             &mut loaded.skills,
-            load_skill_dir(&root.join("skills"), kind)?,
-            |item| item.value.name.clone(),
+            load_skill_dir(runner, &root.join("skills"), kind)?,
+            |item| MergeKey::simple(item.value.name.clone()),
             "skill",
             &mut loaded.diagnostics,
         );
         merge_by_id(
             &mut loaded.mascots,
-            load_yaml_dir::<MascotSpec>(&root.join("mascots"), kind)?,
-            |item| item.value.id.clone(),
+            load_yaml_dir::<MascotSpec>(runner, &root.join("mascots"), kind)?,
+            |item| MergeKey::simple(item.value.id.clone()),
             "mascot",
             &mut loaded.diagnostics,
         );
         merge_by_id(
             &mut loaded.plugins,
             plugins.clone(),
-            |item| item.value.id.clone(),
+            |item| MergeKey::simple(item.value.id.clone()),
             "plugin",
             &mut loaded.diagnostics,
         );
         merge_by_id(
             &mut loaded.agents,
             plugin_agent_specs(&plugins),
-            |item| item.value.id.clone(),
+            |item| MergeKey::simple(item.value.id.clone()),
             "agent",
             &mut loaded.diagnostics,
         );
         merge_by_id(
             &mut loaded.mcp_servers,
-            load_mcp_server_manifests(&root, kind)?,
-            |item| item.value.id.clone(),
+            load_mcp_server_manifests(runner, &root, kind)?,
+            |item| MergeKey::simple(item.value.id.clone()),
             "mcp_server",
             &mut loaded.diagnostics,
         );
         merge_by_id(
             &mut loaded.ides,
-            load_yaml_dir::<IdeSpec>(&root.join("ides"), kind)?,
-            |item| item.value.id.clone(),
+            load_yaml_dir::<IdeSpec>(runner, &root.join("ides"), kind)?,
+            |item| MergeKey::simple(item.value.id.clone()),
             "ide",
             &mut loaded.diagnostics,
         );
     }
+    validate_provider_media_descriptors(&loaded.providers)?;
+    apply_runtime_resource_filters(&mut loaded);
     Ok(loaded)
 }
 
-/// Looks up a prompt template by id.
+/// Loads only tool resources needed to construct the executable tool registry.
+pub fn load_tool_resources(
+    paths: &ConfigPaths,
+    runner: &dyn ToolRunner,
+) -> Result<LoadedResources> {
+    let mut loaded = LoadedResources::default();
+    apply_embedded_tool_resources(&mut loaded)?;
+    for (root, kind) in resource_roots(paths) {
+        if !runner_path_exists(runner, &root) {
+            continue;
+        }
+        merge_by_id(
+            &mut loaded.tools,
+            load_yaml_dir::<ToolSpec>(runner, &root.join("tools"), kind)?,
+            |item| MergeKey::simple(item.value.id.clone()),
+            "tool",
+            &mut loaded.diagnostics,
+        );
+        merge_by_id(
+            &mut loaded.internal_tools,
+            load_yaml_dir::<ToolSpec>(runner, &root.join("internal_tools"), kind)?,
+            |item| MergeKey::simple(item.value.id.clone()),
+            "internal_tool",
+            &mut loaded.diagnostics,
+        );
+    }
+    apply_runtime_resource_filters(&mut loaded);
+    Ok(loaded)
+}
+
+fn apply_runtime_resource_filters(resources: &mut LoadedResources) {
+    filter_browser_resources(resources, puffer_builtin_browser_disabled());
+}
+
+fn filter_browser_resources(resources: &mut LoadedResources, no_browser: bool) {
+    if !no_browser {
+        return;
+    }
+    resources
+        .internal_tools
+        .retain(|tool| tool.value.id.trim() != "Browser");
+    resources
+        .skills
+        .retain(|skill| skill.value.name.trim() != "browser");
+    for plugin in &mut resources.plugins {
+        plugin
+            .value
+            .skills
+            .retain(|skill| skill.trim() != "browser");
+    }
+}
+
+fn puffer_builtin_browser_disabled() -> bool {
+    std::env::var("PUFFER_NO_BROWSER")
+        .ok()
+        .is_some_and(|value| enabled_flag(&value))
+}
+
+fn enabled_flag(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    !matches!(normalized.as_str(), "" | "0" | "false" | "no" | "off")
+}
+
+/// Probe directory presence via the runner. Treats `NotFound` as absent and
+/// any other error (e.g. permission denied) as also absent — same as the
+/// previous `Path::exists` semantics, which silently swallowed io errors.
+fn runner_path_exists(runner: &dyn ToolRunner, path: &Path) -> bool {
+    match runner.list_dir(path) {
+        Ok(_) => true,
+        Err(RunnerError::NotFound(_)) => false,
+        Err(_) => false,
+    }
+}
+
+/// Looks up the base (no-variant) prompt template by id.
 pub fn prompt_by_id<'a>(
     resources: &'a LoadedResources,
     id: &str,
 ) -> Option<&'a LoadedItem<PromptTemplate>> {
-    resources
-        .prompts
-        .iter()
-        .find(|prompt| prompt.value.id == id)
+    resources.prompts.iter().find(|prompt| {
+        prompt.value.id == id
+            && prompt.value.for_provider.is_none()
+            && prompt.value.for_model.is_none()
+    })
+}
+
+/// Looks up a prompt template by id, preferring provider/model-specific variants.
+///
+/// Fallback order: (id + provider + model) → (id + model) → (id + provider) → (id, base).
+/// `provider` and `model` are normalized by lowercasing; `model` additionally has any
+/// `provider/` prefix stripped before matching.
+pub fn prompt_for<'a>(
+    resources: &'a LoadedResources,
+    id: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Option<&'a LoadedItem<PromptTemplate>> {
+    let provider_norm = provider.map(|value| value.trim().to_ascii_lowercase());
+    let model_norm = model.map(normalize_model_id);
+
+    let candidates: [(Option<&str>, Option<&str>); 4] = [
+        (provider_norm.as_deref(), model_norm.as_deref()),
+        (None, model_norm.as_deref()),
+        (provider_norm.as_deref(), None),
+        (None, None),
+    ];
+
+    for (want_provider, want_model) in candidates {
+        if let Some(found) = find_prompt_variant(resources, id, want_provider, want_model) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn find_prompt_variant<'a>(
+    resources: &'a LoadedResources,
+    id: &str,
+    want_provider: Option<&str>,
+    want_model: Option<&str>,
+) -> Option<&'a LoadedItem<PromptTemplate>> {
+    resources.prompts.iter().find(|prompt| {
+        prompt.value.id == id
+            && prompt_field_matches(prompt.value.for_provider.as_deref(), want_provider)
+            && prompt_field_matches(prompt.value.for_model.as_deref(), want_model)
+    })
+}
+
+fn prompt_field_matches(field: Option<&str>, want: Option<&str>) -> bool {
+    match (field, want) {
+        (None, None) => true,
+        (Some(lhs), Some(rhs)) => lhs.trim().eq_ignore_ascii_case(rhs),
+        _ => false,
+    }
+}
+
+fn normalize_model_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let without_provider = trimmed
+        .split_once('/')
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    without_provider.to_ascii_lowercase()
+}
+
+fn prompt_variant_key(template: &PromptTemplate) -> MergeKey {
+    let dedup = format!(
+        "{}|{}|{}",
+        template.id,
+        template.for_provider.as_deref().unwrap_or(""),
+        template.for_model.as_deref().unwrap_or(""),
+    );
+    let mut display = template.id.clone();
+    let qualifiers = [
+        ("provider", template.for_provider.as_deref()),
+        ("model", template.for_model.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(label, value)| value.map(|v| format!("{label}={v}")))
+    .collect::<Vec<_>>();
+    if !qualifiers.is_empty() {
+        display = format!("{} ({})", display, qualifiers.join(", "));
+    }
+    MergeKey::new(dedup, display)
 }
 
 /// Looks up an agent definition by id.
@@ -203,104 +421,167 @@ fn resource_roots(paths: &ConfigPaths) -> Vec<(PathBuf, SourceKind)> {
     ]
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct McpManifestFile {
-    #[serde(flatten)]
-    server: McpServerSpec,
-    #[serde(default = "default_mcp_enabled")]
-    enabled: bool,
-    #[serde(default, flatten)]
-    _extra: BTreeMap<String, Value>,
+/// Applies the compile-time-embedded resources as the base layer of the
+/// loader. Filesystem layers in `resource_roots` are merged on top.
+fn apply_embedded_resources(loaded: &mut LoadedResources) -> Result<()> {
+    let plugins = load_yaml_embedded::<PluginSpec>("plugins")?;
+    apply_embedded_tool_resources(loaded)?;
+    merge_by_id(
+        &mut loaded.providers,
+        load_yaml_embedded::<ProviderPack>("providers")?,
+        |item| MergeKey::simple(item.value.id.clone()),
+        "provider",
+        &mut loaded.diagnostics,
+    );
+    merge_by_id(
+        &mut loaded.agents,
+        load_yaml_embedded::<AgentSpec>("agents")?,
+        |item| MergeKey::simple(item.value.id.clone()),
+        "agent",
+        &mut loaded.diagnostics,
+    );
+    merge_by_id(
+        &mut loaded.prompts,
+        load_yaml_embedded::<PromptTemplate>("prompts")?,
+        |item| prompt_variant_key(&item.value),
+        "prompt",
+        &mut loaded.diagnostics,
+    );
+    merge_by_id(
+        &mut loaded.hooks,
+        load_yaml_embedded::<HookSpec>("hooks")?,
+        |item| MergeKey::simple(item.value.id.clone()),
+        "hook",
+        &mut loaded.diagnostics,
+    );
+    merge_by_id(
+        &mut loaded.skills,
+        load_skill_embedded()?,
+        |item| MergeKey::simple(item.value.name.clone()),
+        "skill",
+        &mut loaded.diagnostics,
+    );
+    merge_by_id(
+        &mut loaded.mascots,
+        load_yaml_embedded::<MascotSpec>("mascots")?,
+        |item| MergeKey::simple(item.value.id.clone()),
+        "mascot",
+        &mut loaded.diagnostics,
+    );
+    merge_by_id(
+        &mut loaded.plugins,
+        plugins.clone(),
+        |item| MergeKey::simple(item.value.id.clone()),
+        "plugin",
+        &mut loaded.diagnostics,
+    );
+    merge_by_id(
+        &mut loaded.agents,
+        plugin_agent_specs(&plugins),
+        |item| MergeKey::simple(item.value.id.clone()),
+        "agent",
+        &mut loaded.diagnostics,
+    );
+    merge_by_id(
+        &mut loaded.mcp_servers,
+        load_mcp_server_manifests_embedded()?,
+        |item| MergeKey::simple(item.value.id.clone()),
+        "mcp_server",
+        &mut loaded.diagnostics,
+    );
+    merge_by_id(
+        &mut loaded.ides,
+        load_yaml_embedded::<IdeSpec>("ides")?,
+        |item| MergeKey::simple(item.value.id.clone()),
+        "ide",
+        &mut loaded.diagnostics,
+    );
+    Ok(())
 }
 
-fn default_mcp_enabled() -> bool {
-    true
+fn apply_embedded_tool_resources(loaded: &mut LoadedResources) -> Result<()> {
+    merge_by_id(
+        &mut loaded.tools,
+        load_yaml_embedded::<ToolSpec>("tools")?,
+        |item| MergeKey::simple(item.value.id.clone()),
+        "tool",
+        &mut loaded.diagnostics,
+    );
+    merge_by_id(
+        &mut loaded.internal_tools,
+        load_yaml_embedded::<ToolSpec>("internal_tools")?,
+        |item| MergeKey::simple(item.value.id.clone()),
+        "internal_tool",
+        &mut loaded.diagnostics,
+    );
+    Ok(())
 }
 
-fn load_mcp_server_manifests(
-    root: &Path,
-    kind: SourceKind,
-) -> Result<Vec<LoadedItem<McpServerSpec>>> {
-    let canonical = load_mcp_manifest_dir(&root.join("mcp_servers"), kind)?;
-    let canonical_ids = canonical
-        .iter()
-        .map(|item| item.value.id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-
-    let legacy = load_mcp_manifest_dir(&root.join("mcp"), kind)?
-        .into_iter()
-        .filter(|item| !canonical_ids.contains(&item.value.id))
-        .collect::<Vec<_>>();
-
-    let mut merged = legacy;
-    merged.extend(canonical);
-    Ok(merged)
-}
-
-fn load_mcp_manifest_dir(dir: &Path, kind: SourceKind) -> Result<Vec<LoadedItem<McpServerSpec>>> {
-    Ok(load_yaml_dir::<McpManifestFile>(dir, kind)?
-        .into_iter()
-        .filter_map(|item| {
-            item.value.enabled.then_some(LoadedItem {
-                value: item.value.server,
-                source_info: item.source_info,
-            })
-        })
-        .collect())
-}
-
-fn load_yaml_dir<T>(dir: &Path, kind: SourceKind) -> Result<Vec<LoadedItem<T>>>
+/// Loads every `*.yaml` / `*.yml` file under `BUILTIN_RESOURCES/<subdir>`
+/// and parses each as `T`.
+fn load_yaml_embedded<T>(subdir: &str) -> Result<Vec<LoadedItem<T>>>
 where
     T: DeserializeOwned,
 {
-    if !dir.exists() {
+    let Some(dir) = BUILTIN_RESOURCES.get_dir(subdir) else {
         return Ok(Vec::new());
-    }
+    };
+    let mut files: Vec<_> = dir.files().collect();
+    files.sort_by_key(|file| file.path().to_path_buf());
 
     let mut items = Vec::new();
-    for entry in sorted_dir_entries(dir)? {
-        let path = entry.path();
-        if !matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("yaml" | "yml")
-        ) {
+    for file in files {
+        let path = file.path();
+        let ext = path.extension().and_then(|e| e.to_str());
+        if !matches!(ext, Some("yaml" | "yml")) {
             continue;
         }
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read resource file {}", path.display()))?;
-        let value = serde_yaml::from_str::<T>(&raw)
-            .with_context(|| format!("failed to parse resource file {}", path.display()))?;
+        let raw = file
+            .contents_utf8()
+            .ok_or_else(|| anyhow!("embedded resource {} is not UTF-8", path.display()))?;
+        let value: T = serde_yaml::from_str(raw)
+            .with_context(|| format!("failed to parse embedded resource {}", path.display()))?;
         items.push(LoadedItem {
             value,
-            source_info: SourceInfo { path, kind },
+            source_info: SourceInfo {
+                path: PathBuf::from("<embedded>").join(path),
+                kind: SourceKind::Builtin,
+            },
         });
     }
     Ok(items)
 }
 
-fn load_skill_dir(dir: &Path, kind: SourceKind) -> Result<Vec<LoadedItem<SkillSpec>>> {
-    if !dir.exists() {
+/// Embedded equivalent of `load_skill_dir` — walks `BUILTIN_RESOURCES/skills/`
+/// and reads each `<skill>/SKILL.md` with the same frontmatter parsing the
+/// filesystem path uses.
+fn load_skill_embedded() -> Result<Vec<LoadedItem<SkillSpec>>> {
+    let Some(skills_dir) = BUILTIN_RESOURCES.get_dir("skills") else {
         return Ok(Vec::new());
-    }
+    };
+    let mut subdirs: Vec<_> = skills_dir.dirs().collect();
+    subdirs.sort_by_key(|d| d.path().to_path_buf());
 
     let mut items = Vec::new();
-    for entry in sorted_dir_entries(dir)? {
-        let path = entry.path();
-        if !path.is_dir() {
+    for subdir in subdirs {
+        let skill_path = subdir.path().join("SKILL.md");
+        let Some(skill_file) = BUILTIN_RESOURCES.get_file(&skill_path) else {
             continue;
-        }
-
-        let skill_path = path.join("SKILL.md");
-        if !skill_path.exists() {
-            continue;
-        }
-        let raw = fs::read_to_string(&skill_path)
-            .with_context(|| format!("failed to read skill file {}", skill_path.display()))?;
+        };
+        let raw = skill_file
+            .contents_utf8()
+            .ok_or_else(|| anyhow!("embedded skill {} is not UTF-8", skill_path.display()))?
+            .to_string();
         let (frontmatter, body) = split_frontmatter(&raw).with_context(|| {
             format!("failed to parse skill frontmatter {}", skill_path.display())
         })?;
-        let raw_name = frontmatter_string(&frontmatter, &["name"])
-            .unwrap_or_else(|| path.file_name().unwrap().to_string_lossy().to_string());
+        let raw_name = frontmatter_string(&frontmatter, &["name"]).unwrap_or_else(|| {
+            subdir
+                .path()
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
         let name = normalize_skill_name(&raw_name);
         let description = frontmatter_string(&frontmatter, &["description"])
             .unwrap_or_else(|| first_descriptive_line(&body).to_string());
@@ -309,6 +590,8 @@ fn load_skill_dir(dir: &Path, kind: SourceKind) -> Result<Vec<LoadedItem<SkillSp
             &["disable-model-invocation", "disableModelInvocation"],
         )
         .unwrap_or(false);
+        let requires_action =
+            frontmatter_bool(&frontmatter, &["requires-action", "requiresAction"]).unwrap_or(false);
         let allowed_tools =
             frontmatter_string_list(&frontmatter, &["allowed-tools", "allowedTools"]);
         let argument_hint = frontmatter_string(&frontmatter, &["argument-hint", "argumentHint"]);
@@ -333,6 +616,215 @@ fn load_skill_dir(dir: &Path, kind: SourceKind) -> Result<Vec<LoadedItem<SkillSp
                 effort,
                 context,
                 disable_model_invocation,
+                requires_action,
+                verification: None,
+            },
+            source_info: SourceInfo {
+                path: PathBuf::from("<embedded>").join(&skill_path),
+                kind: SourceKind::Builtin,
+            },
+        });
+    }
+    Ok(items)
+}
+
+/// Embedded equivalent of `load_mcp_server_manifests` — reads canonical
+/// `mcp_servers/` plus the legacy `mcp/` directory if it exists.
+fn load_mcp_server_manifests_embedded() -> Result<Vec<LoadedItem<McpServerSpec>>> {
+    let canonical = load_mcp_manifest_dir_embedded("mcp_servers")?;
+    let canonical_ids = canonical
+        .iter()
+        .map(|item| item.value.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let legacy = load_mcp_manifest_dir_embedded("mcp")?
+        .into_iter()
+        .filter(|item| !canonical_ids.contains(&item.value.id))
+        .collect::<Vec<_>>();
+    let mut merged = legacy;
+    merged.extend(canonical);
+    Ok(merged)
+}
+
+fn load_mcp_manifest_dir_embedded(subdir: &str) -> Result<Vec<LoadedItem<McpServerSpec>>> {
+    Ok(load_yaml_embedded::<McpManifestFile>(subdir)?
+        .into_iter()
+        .filter_map(|item| {
+            item.value.enabled.then_some(LoadedItem {
+                value: item.value.server,
+                source_info: item.source_info,
+            })
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct McpManifestFile {
+    #[serde(flatten)]
+    server: McpServerSpec,
+    #[serde(default = "default_mcp_enabled")]
+    enabled: bool,
+    #[serde(default, flatten)]
+    _extra: BTreeMap<String, Value>,
+}
+
+fn default_mcp_enabled() -> bool {
+    true
+}
+
+fn load_mcp_server_manifests(
+    runner: &dyn ToolRunner,
+    root: &Path,
+    kind: SourceKind,
+) -> Result<Vec<LoadedItem<McpServerSpec>>> {
+    let canonical = load_mcp_manifest_dir(runner, &root.join("mcp_servers"), kind)?;
+    let canonical_ids = canonical
+        .iter()
+        .map(|item| item.value.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let legacy = load_mcp_manifest_dir(runner, &root.join("mcp"), kind)?
+        .into_iter()
+        .filter(|item| !canonical_ids.contains(&item.value.id))
+        .collect::<Vec<_>>();
+
+    let mut merged = legacy;
+    merged.extend(canonical);
+    Ok(merged)
+}
+
+fn load_mcp_manifest_dir(
+    runner: &dyn ToolRunner,
+    dir: &Path,
+    kind: SourceKind,
+) -> Result<Vec<LoadedItem<McpServerSpec>>> {
+    Ok(load_yaml_dir::<McpManifestFile>(runner, dir, kind)?
+        .into_iter()
+        .filter_map(|item| {
+            item.value.enabled.then_some(LoadedItem {
+                value: item.value.server,
+                source_info: item.source_info,
+            })
+        })
+        .collect())
+}
+
+fn load_yaml_dir<T>(
+    runner: &dyn ToolRunner,
+    dir: &Path,
+    kind: SourceKind,
+) -> Result<Vec<LoadedItem<T>>>
+where
+    T: DeserializeOwned,
+{
+    let entries = match sorted_dir_entries(runner, dir) {
+        Ok(entries) => entries,
+        Err(RunnerError::NotFound(_)) => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(anyhow!(err))
+                .with_context(|| format!("failed to list resource dir {}", dir.display()))
+        }
+    };
+
+    let mut items = Vec::new();
+    for path in entries {
+        if !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("yaml" | "yml")
+        ) {
+            continue;
+        }
+        let raw_bytes = runner
+            .read_file(&path)
+            .map_err(|err| anyhow!(err))
+            .with_context(|| format!("failed to read resource file {}", path.display()))?;
+        let raw = String::from_utf8(raw_bytes)
+            .with_context(|| format!("resource file {} is not UTF-8", path.display()))?;
+        let value = serde_yaml::from_str::<T>(&raw)
+            .with_context(|| format!("failed to parse resource file {}", path.display()))?;
+        items.push(LoadedItem {
+            value,
+            source_info: SourceInfo { path, kind },
+        });
+    }
+    Ok(items)
+}
+
+fn load_skill_dir(
+    runner: &dyn ToolRunner,
+    dir: &Path,
+    kind: SourceKind,
+) -> Result<Vec<LoadedItem<SkillSpec>>> {
+    let entries = match runner.list_dir(dir) {
+        Ok(mut entries) => {
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+            entries
+        }
+        Err(RunnerError::NotFound(_)) => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(anyhow!(err))
+                .with_context(|| format!("failed to list resource dir {}", dir.display()))
+        }
+    };
+
+    let mut items = Vec::new();
+    for entry in entries {
+        if !entry.is_dir {
+            continue;
+        }
+        let path = entry.path;
+
+        let skill_path = path.join("SKILL.md");
+        let raw_bytes = match runner.read_file(&skill_path) {
+            Ok(bytes) => bytes,
+            Err(RunnerError::NotFound(_)) => continue,
+            Err(err) => {
+                return Err(anyhow!(err))
+                    .with_context(|| format!("failed to read skill file {}", skill_path.display()))
+            }
+        };
+        let raw = String::from_utf8(raw_bytes)
+            .with_context(|| format!("skill file {} is not UTF-8", skill_path.display()))?;
+        let (frontmatter, body) = split_frontmatter(&raw).with_context(|| {
+            format!("failed to parse skill frontmatter {}", skill_path.display())
+        })?;
+        let raw_name = frontmatter_string(&frontmatter, &["name"])
+            .unwrap_or_else(|| path.file_name().unwrap().to_string_lossy().to_string());
+        let name = normalize_skill_name(&raw_name);
+        let description = frontmatter_string(&frontmatter, &["description"])
+            .unwrap_or_else(|| first_descriptive_line(&body).to_string());
+        let disable_model_invocation = frontmatter_bool(
+            &frontmatter,
+            &["disable-model-invocation", "disableModelInvocation"],
+        )
+        .unwrap_or(false);
+        let requires_action =
+            frontmatter_bool(&frontmatter, &["requires-action", "requiresAction"]).unwrap_or(false);
+        let allowed_tools =
+            frontmatter_string_list(&frontmatter, &["allowed-tools", "allowedTools"]);
+        let argument_hint = frontmatter_string(&frontmatter, &["argument-hint", "argumentHint"]);
+        let argument_names =
+            frontmatter_whitespace_list(&frontmatter, &["arguments", "argumentNames"]);
+        let user_invocable =
+            frontmatter_bool(&frontmatter, &["user-invocable", "userInvocable"]).unwrap_or(true);
+        let model = frontmatter_string(&frontmatter, &["model"]);
+        let effort = frontmatter_string(&frontmatter, &["effort"]);
+        let context = frontmatter_string(&frontmatter, &["context"]);
+
+        items.push(LoadedItem {
+            value: SkillSpec {
+                name,
+                description,
+                content: body,
+                allowed_tools,
+                argument_hint,
+                argument_names,
+                user_invocable,
+                model,
+                effort,
+                context,
+                disable_model_invocation,
+                requires_action,
+                verification: None,
             },
             source_info: SourceInfo {
                 path: skill_path,
@@ -341,6 +833,211 @@ fn load_skill_dir(dir: &Path, kind: SourceKind) -> Result<Vec<LoadedItem<SkillSp
         });
     }
     Ok(items)
+}
+
+fn load_external_codex_claude_skills(paths: &ConfigPaths) -> Result<Vec<LoadedItem<SkillSpec>>> {
+    let mut items = Vec::new();
+    for (root, kind) in external_codex_claude_roots(paths) {
+        if !root.is_dir() {
+            continue;
+        }
+        collect_external_codex_claude_skills(&root, kind, &mut items)
+            .with_context(|| format!("failed to load external commands from {}", root.display()))?;
+    }
+    Ok(items)
+}
+
+fn external_codex_claude_roots(paths: &ConfigPaths) -> Vec<(PathBuf, SourceKind)> {
+    let mut roots = Vec::new();
+    if let Some(home) = paths.user_config_dir.parent() {
+        roots.push((home.join(".claude"), SourceKind::User));
+        roots.push((home.join(".codex"), SourceKind::User));
+    }
+    roots.push((paths.workspace_root.join(".claude"), SourceKind::Workspace));
+    roots.push((paths.workspace_root.join(".codex"), SourceKind::Workspace));
+    roots
+}
+
+fn collect_external_codex_claude_skills(
+    dir: &Path,
+    kind: SourceKind,
+    items: &mut Vec<LoadedItem<SkillSpec>>,
+) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to list {}", dir.display()))
+        }
+    };
+    let mut entries = entries
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read entries from {}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+
+    let is_commands_dir = dir.file_name().and_then(|name| name.to_str()) == Some("commands");
+
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to stat {}", entry.path().display()))?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            if should_skip_external_resource_dir(&path) {
+                continue;
+            }
+            collect_external_codex_claude_skills(&path, kind, items)?;
+        } else if file_type.is_file() && is_commands_dir && is_external_command_file(&path) {
+            if let Some(item) = load_external_command_file(&path, kind)? {
+                items.push(item);
+            }
+        } else if file_type.is_file() && is_external_skill_file(&path) {
+            if let Some(item) = load_external_skill_file(&path, kind)? {
+                items.push(item);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_external_resource_dir(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    matches!(
+        name,
+        ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".svelte-kit"
+    )
+}
+
+fn is_external_command_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if file_name.starts_with('_') {
+        return false;
+    }
+    matches!(path.extension().and_then(|ext| ext.to_str()), Some("md"))
+}
+
+fn is_external_skill_file(path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("SKILL.md") {
+        return false;
+    }
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("skills")
+}
+
+fn load_external_command_file(
+    path: &Path,
+    kind: SourceKind,
+) -> Result<Option<LoadedItem<SkillSpec>>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read external command {}", path.display()))?;
+    let (frontmatter, body) = split_frontmatter(&raw)
+        .with_context(|| format!("failed to parse command frontmatter {}", path.display()))?;
+    let raw_name = frontmatter_string(&frontmatter, &["name"]).unwrap_or_else(|| {
+        command_name_from_heading(&body).unwrap_or_else(|| {
+            path.file_stem()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+    });
+    let mut skill = skill_spec_from_parts(&frontmatter, body, raw_name);
+    if skill.content.trim().is_empty() {
+        return Ok(None);
+    }
+    if skill.description == "Skill" {
+        skill.description = format!("Imported command from {}", path.display());
+    }
+    Ok(Some(LoadedItem {
+        value: skill,
+        source_info: SourceInfo {
+            path: path.to_path_buf(),
+            kind,
+        },
+    }))
+}
+
+fn load_external_skill_file(
+    path: &Path,
+    kind: SourceKind,
+) -> Result<Option<LoadedItem<SkillSpec>>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read external skill {}", path.display()))?;
+    let (frontmatter, body) = split_frontmatter(&raw)
+        .with_context(|| format!("failed to parse skill frontmatter {}", path.display()))?;
+    let raw_name = frontmatter_string(&frontmatter, &["name"]).unwrap_or_else(|| {
+        path.parent()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default()
+    });
+    let skill = skill_spec_from_parts(&frontmatter, body, raw_name);
+    if skill.content.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(LoadedItem {
+        value: skill,
+        source_info: SourceInfo {
+            path: path.to_path_buf(),
+            kind,
+        },
+    }))
+}
+
+fn skill_spec_from_parts(frontmatter: &Mapping, body: String, raw_name: String) -> SkillSpec {
+    let description = frontmatter_string(frontmatter, &["description"])
+        .or_else(|| command_description_from_heading(&body))
+        .unwrap_or_else(|| first_descriptive_line(&body).to_string());
+    SkillSpec {
+        name: normalize_skill_name(&raw_name),
+        description,
+        content: body,
+        allowed_tools: frontmatter_string_list(frontmatter, &["allowed-tools", "allowedTools"]),
+        argument_hint: frontmatter_string(
+            frontmatter,
+            &["argument-hint", "argumentHint", "argument_hint"],
+        ),
+        argument_names: frontmatter_whitespace_list(
+            frontmatter,
+            &["arguments", "argumentNames", "argument_names"],
+        ),
+        user_invocable: frontmatter_bool(frontmatter, &["user-invocable", "userInvocable"])
+            .unwrap_or(true),
+        model: frontmatter_string(frontmatter, &["model"]),
+        effort: frontmatter_string(frontmatter, &["effort"]),
+        context: frontmatter_string(frontmatter, &["context"]),
+        disable_model_invocation: frontmatter_bool(
+            frontmatter,
+            &["disable-model-invocation", "disableModelInvocation"],
+        )
+        .unwrap_or(false),
+        requires_action: frontmatter_bool(frontmatter, &["requires-action", "requiresAction"])
+            .unwrap_or(false),
+        verification: None,
+    }
+}
+
+fn command_name_from_heading(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let heading = line.trim().strip_prefix("# ")?;
+        let command = heading.trim().strip_prefix('/')?;
+        let name = command.split_whitespace().next()?.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    })
+}
+
+fn command_description_from_heading(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let heading = line.trim().strip_prefix("# ")?;
+        let description = heading.trim().trim_start_matches('/').trim();
+        (!description.is_empty()).then(|| description.to_string())
+    })
 }
 
 fn normalize_skill_name(raw: &str) -> String {
@@ -363,13 +1060,13 @@ fn normalize_skill_name(raw: &str) -> String {
     }
 }
 
-fn sorted_dir_entries(dir: &Path) -> Result<Vec<fs::DirEntry>> {
-    let mut entries = fs::read_dir(dir)
-        .with_context(|| format!("failed to read resource dir {}", dir.display()))?
-        .collect::<std::io::Result<Vec<_>>>()
-        .with_context(|| format!("failed to list resource dir {}", dir.display()))?;
-    entries.sort_by(|left, right| left.path().cmp(&right.path()));
-    Ok(entries)
+fn sorted_dir_entries(
+    runner: &dyn ToolRunner,
+    dir: &Path,
+) -> std::result::Result<Vec<PathBuf>, RunnerError> {
+    let mut entries = runner.list_dir(dir)?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries.into_iter().map(|entry| entry.path).collect())
 }
 
 fn split_frontmatter(raw: &str) -> Result<(Mapping, String)> {
@@ -519,25 +1216,67 @@ fn merge_by_id<T, F>(
     diagnostics: &mut Vec<String>,
 ) where
     T: Clone,
-    F: Fn(&LoadedItem<T>) -> String,
+    F: Fn(&LoadedItem<T>) -> MergeKey,
 {
-    let mut merged = IndexMap::new();
+    let mut merged: IndexMap<String, (LoadedItem<T>, String)> = IndexMap::new();
     for item in existing.iter().cloned() {
-        merged.insert(key(&item), item);
+        let MergeKey { dedup, display } = key(&item);
+        merged.insert(dedup, (item, display));
     }
     for item in incoming {
-        let id = key(&item);
-        if let Some(previous) = merged.get(&id) {
+        let MergeKey { dedup, display } = key(&item);
+        if let Some((previous, _)) = merged.get(&dedup) {
             diagnostics.push(describe_override(
                 label,
-                &id,
+                &display,
                 &previous.source_info,
                 &item.source_info,
             ));
         }
-        merged.insert(id, item);
+        merged.insert(dedup, (item, display));
     }
-    *existing = merged.into_values().collect();
+    *existing = merged.into_values().map(|(item, _)| item).collect();
+}
+
+fn validate_provider_media_descriptors(providers: &[LoadedItem<ProviderPack>]) -> Result<()> {
+    for provider in providers {
+        provider
+            .value
+            .clone()
+            .into_descriptor()
+            .validate_media_descriptors()
+            .with_context(|| {
+                format!(
+                    "invalid media descriptor for provider `{}` from {}",
+                    provider.value.id,
+                    provider.source_info.path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Pairs the dedup key used to merge resources with a user-friendly id for diagnostics.
+struct MergeKey {
+    dedup: String,
+    display: String,
+}
+
+impl MergeKey {
+    fn simple(id: impl Into<String>) -> Self {
+        let value = id.into();
+        Self {
+            display: value.clone(),
+            dedup: value,
+        }
+    }
+
+    fn new(dedup: impl Into<String>, display: impl Into<String>) -> Self {
+        Self {
+            dedup: dedup.into(),
+            display: display.into(),
+        }
+    }
 }
 
 fn describe_override(
@@ -576,8 +1315,113 @@ fn source_kind_label(kind: SourceKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::hooks_for_event;
+    use puffer_runner_api::{
+        ChunkSink, DirEntry, McpPrompt, McpPromptContent, McpResourceContent, McpResourceRecord,
+        McpResult, McpServerInfo, McpTool, RunnerCapabilities, ToolRequest, ToolResult,
+    };
     use std::fs;
     use tempfile::tempdir;
+
+    /// Minimal `ToolRunner` backed by `std::fs` for loader tests; mirrors
+    /// `puffer_runner_local::LocalToolRunner` so tests don't take a circular
+    /// dependency on the runner crate.
+    #[derive(Debug)]
+    struct FsTestRunner;
+
+    impl ToolRunner for FsTestRunner {
+        fn ping(&self) -> std::result::Result<puffer_runner_api::RunnerPing, RunnerError> {
+            Ok(puffer_runner_api::RunnerPing {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                uptime: std::time::Duration::from_secs(0),
+            })
+        }
+        fn capabilities(&self) -> RunnerCapabilities {
+            RunnerCapabilities::default()
+        }
+        fn execute_tool(
+            &self,
+            _req: ToolRequest,
+            _sink: &mut dyn ChunkSink,
+        ) -> std::result::Result<ToolResult, RunnerError> {
+            Err(RunnerError::Unsupported("test runner".into()))
+        }
+        fn read_file(&self, path: &Path) -> std::result::Result<Vec<u8>, RunnerError> {
+            std::fs::read(path).map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => RunnerError::NotFound(path.display().to_string()),
+                _ => RunnerError::Other(format!("read {path:?}: {e}")),
+            })
+        }
+        fn list_dir(&self, path: &Path) -> std::result::Result<Vec<DirEntry>, RunnerError> {
+            let read = std::fs::read_dir(path).map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => RunnerError::NotFound(path.display().to_string()),
+                _ => RunnerError::Other(format!("read_dir {path:?}: {e}")),
+            })?;
+            let mut entries = Vec::new();
+            for entry in read {
+                let entry =
+                    entry.map_err(|e| RunnerError::Other(format!("dir entry {path:?}: {e}")))?;
+                let file_type = entry
+                    .file_type()
+                    .map_err(|e| RunnerError::Other(format!("file_type for {entry:?}: {e}")))?;
+                entries.push(DirEntry {
+                    path: entry.path(),
+                    is_dir: file_type.is_dir(),
+                    is_file: file_type.is_file(),
+                    is_symlink: file_type.is_symlink(),
+                });
+            }
+            Ok(entries)
+        }
+        fn glob(
+            &self,
+            _root: &Path,
+            _pattern: &str,
+        ) -> std::result::Result<Vec<PathBuf>, RunnerError> {
+            Err(RunnerError::Unsupported("glob".into()))
+        }
+        fn list_mcp_servers(&self) -> std::result::Result<Vec<McpServerInfo>, RunnerError> {
+            Err(RunnerError::Unsupported("mcp".into()))
+        }
+        fn list_mcp_tools(&self, _server: &str) -> std::result::Result<Vec<McpTool>, RunnerError> {
+            Err(RunnerError::Unsupported("mcp".into()))
+        }
+        fn call_mcp_tool(
+            &self,
+            _server: &str,
+            _tool: &str,
+            _args: serde_json::Value,
+            _sink: &mut dyn ChunkSink,
+        ) -> std::result::Result<McpResult, RunnerError> {
+            Err(RunnerError::Unsupported("mcp".into()))
+        }
+        fn list_mcp_resources(
+            &self,
+            _server: Option<&str>,
+        ) -> std::result::Result<Vec<McpResourceRecord>, RunnerError> {
+            Err(RunnerError::Unsupported("mcp".into()))
+        }
+        fn read_mcp_resource(
+            &self,
+            _server: &str,
+            _uri: &str,
+        ) -> std::result::Result<McpResourceContent, RunnerError> {
+            Err(RunnerError::Unsupported("mcp".into()))
+        }
+        fn list_mcp_prompts(
+            &self,
+            _server: &str,
+        ) -> std::result::Result<Vec<McpPrompt>, RunnerError> {
+            Err(RunnerError::Unsupported("mcp".into()))
+        }
+        fn get_mcp_prompt(
+            &self,
+            _server: &str,
+            _name: &str,
+            _args: serde_json::Value,
+        ) -> std::result::Result<McpPromptContent, RunnerError> {
+            Err(RunnerError::Unsupported("mcp".into()))
+        }
+    }
 
     #[test]
     fn load_resources_reads_skill_markdown_and_plugin_yaml() {
@@ -616,15 +1460,196 @@ mod tests {
         .unwrap();
 
         let paths = ConfigPaths::discover(&root);
-        let loaded = load_resources(&paths).unwrap();
-        assert_eq!(loaded.agents.len(), 1);
-        assert_eq!(loaded.prompts.len(), 1);
-        assert_eq!(loaded.hooks.len(), 1);
-        assert_eq!(loaded.skills.len(), 1);
-        assert_eq!(loaded.plugins.len(), 1);
-        assert_eq!(loaded.agents[0].value.id, "default");
-        assert_eq!(loaded.skills[0].value.name, "reviewer");
-        assert_eq!(loaded.plugins[0].value.id, "example");
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        // `load_resources` always merges in the embedded builtin
+        // resources baked into the binary, so we can't assert strict
+        // counts — verify the workspace-layer entries we wrote are
+        // present instead.
+        assert!(loaded.agents.iter().any(|a| a.value.id == "default"));
+        assert!(loaded.prompts.iter().any(|p| p.value.id == "plan"));
+        assert!(loaded.hooks.iter().any(|h| h.value.id == "tool-end"));
+        assert!(loaded.skills.iter().any(|s| s.value.name == "reviewer"));
+        assert!(loaded.plugins.iter().any(|p| p.value.id == "example"));
+    }
+
+    #[test]
+    fn load_resources_rejects_invalid_provider_media_descriptor() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let resources_dir = root.join("resources/providers");
+        fs::create_dir_all(&resources_dir).unwrap();
+        fs::write(
+            resources_dir.join("bad-media.yaml"),
+            r#"
+id: bad-media
+display_name: Bad Media
+base_url: https://bad-media.example
+default_api: openai-responses
+auth_modes:
+  - api_key
+models: []
+media:
+  image:
+    execution:
+      adapter: images_json
+      path: /v1/images/generations
+    models:
+      - id: exact-image-model
+        operations:
+          - generate
+        axes:
+          - id: size
+            label: Size
+            role: param
+            control: !enum
+              values:
+                - 1024x1024
+              default: 1024x1024
+        variants:
+          model_id: exact-image-model
+"#,
+        )
+        .unwrap();
+
+        let paths = ConfigPaths::discover(&root);
+        let error = load_resources(&paths, &FsTestRunner).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("invalid media descriptor for provider `bad-media`"));
+        assert!(message.contains("param axis size needs a request_field"));
+    }
+
+    #[test]
+    fn load_tool_resources_reads_tools_without_scanning_skills() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let resources_dir = root.join("resources");
+        fs::create_dir_all(resources_dir.join("tools")).unwrap();
+        fs::create_dir_all(resources_dir.join("skills/reviewer")).unwrap();
+        fs::create_dir_all(resources_dir.join("plugins")).unwrap();
+        fs::write(
+            resources_dir.join("tools/custom.yaml"),
+            "id: CustomTool\nname: CustomTool\ndescription: Custom tool\nhandler: runtime:sleep\n",
+        )
+        .unwrap();
+        fs::write(
+            resources_dir.join("skills/reviewer/SKILL.md"),
+            "---\nname: reviewer\ndescription: Review changes\n---\nBody\n",
+        )
+        .unwrap();
+        fs::write(
+            resources_dir.join("plugins/example.yaml"),
+            "id: example\ndisplay_name: Example\ncommands: []\n",
+        )
+        .unwrap();
+
+        let paths = ConfigPaths::discover(&root);
+        let loaded = load_tool_resources(&paths, &FsTestRunner).unwrap();
+        assert!(loaded
+            .tools
+            .iter()
+            .any(|tool| tool.value.id == "CustomTool"));
+        assert!(loaded.skills.is_empty());
+        assert!(loaded.plugins.is_empty());
+    }
+
+    #[test]
+    fn bundled_image_generation_internal_tool_accepts_optional_count_and_describes_multi_image_use()
+    {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let paths = ConfigPaths::discover(&root);
+
+        let loaded = load_tool_resources(&paths, &FsTestRunner).unwrap();
+        let tool = loaded
+            .internal_tools
+            .iter()
+            .find(|tool| tool.value.id == "ImageGeneration")
+            .expect("ImageGeneration internal tool");
+        assert!(!loaded
+            .tools
+            .iter()
+            .any(|tool| tool.value.id == "ImageGeneration"));
+
+        assert!(tool
+            .value
+            .description
+            .contains("Generate one or more images"));
+        assert_eq!(
+            tool.value.aliases,
+            vec!["image-generation".to_string(), "imagegen".to_string()]
+        );
+        assert!(tool.value.description.contains("count"));
+        assert!(!tool.value.description.contains("Generate one image"));
+
+        let schema = tool.value.input_schema.as_ref().expect("input schema");
+        let required = schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("required array");
+        assert!(required.iter().any(|value| value == "prompt"));
+        assert!(!required.iter().any(|value| value == "count"));
+        assert_eq!(schema["properties"]["count"]["maximum"], 9);
+    }
+
+    #[test]
+    fn bundled_video_generation_internal_tool_accepts_prompt_and_remote_image_references() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let paths = ConfigPaths::discover(&root);
+
+        let loaded = load_tool_resources(&paths, &FsTestRunner).unwrap();
+        let tool = loaded
+            .internal_tools
+            .iter()
+            .find(|tool| tool.value.id == "VideoGeneration")
+            .expect("VideoGeneration internal tool");
+        assert!(!loaded
+            .tools
+            .iter()
+            .any(|tool| tool.value.id == "VideoGeneration"));
+
+        assert_eq!(tool.value.handler, "runtime:workflow:video_generation");
+        assert_eq!(
+            tool.value.aliases,
+            vec!["video-generation".to_string(), "videogen".to_string()]
+        );
+        assert!(tool.value.description.contains("Generate one video clip"));
+        assert!(tool
+            .value
+            .description
+            .contains("public https:// URLs or approved asset:// URLs"));
+        assert!(tool.value.description.contains("Local image"));
+        assert!(tool.value.description.contains("paths are not accepted"));
+
+        let schema = tool.value.input_schema.as_ref().expect("input schema");
+        let required = schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("required array");
+        assert!(required.iter().any(|value| value == "prompt"));
+        assert_eq!(
+            schema.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("properties object");
+        let image_references = properties
+            .get("imageReferences")
+            .expect("imageReferences property");
+        let image_references_description = image_references
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .expect("imageReferences description");
+        assert!(image_references_description.contains("base64/data URLs are not supported"));
+        assert!(!properties.contains_key("image"));
+        assert!(!properties.contains_key("referenceImage"));
+        assert!(!properties.contains_key("firstFrame"));
+        assert!(!properties.contains_key("lastFrame"));
     }
 
     #[test]
@@ -640,8 +1665,8 @@ mod tests {
         .unwrap();
 
         let paths = ConfigPaths::discover(&root);
-        let loaded = load_resources(&paths).unwrap();
-        assert_eq!(loaded.plugins.len(), 1);
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        assert!(loaded.plugins.iter().any(|p| p.value.id == "example"));
         assert!(loaded
             .agents
             .iter()
@@ -650,6 +1675,60 @@ mod tests {
             .agents
             .iter()
             .any(|agent| agent.source_info.path.ends_with("plugins/example.yaml")));
+    }
+
+    #[test]
+    fn no_browser_filter_removes_builtin_browser_skill_references() {
+        let mut resources = LoadedResources {
+            skills: vec![LoadedItem {
+                value: SkillSpec {
+                    name: "browser".to_string(),
+                    description: "Browser".to_string(),
+                    content: "Use Browser".to_string(),
+                    ..SkillSpec::default()
+                },
+                source_info: SourceInfo {
+                    path: PathBuf::from("skills/browser/SKILL.md"),
+                    kind: SourceKind::Builtin,
+                },
+            }],
+            plugins: vec![LoadedItem {
+                value: PluginSpec {
+                    id: "puffer-builtins".to_string(),
+                    display_name: "Puffer Builtins".to_string(),
+                    description: String::new(),
+                    commands: Vec::new(),
+                    skills: vec!["reviewer".to_string(), "browser".to_string()],
+                    agents: Vec::new(),
+                    mcp_servers: Vec::new(),
+                    lsp_servers: Vec::new(),
+                },
+                source_info: SourceInfo {
+                    path: PathBuf::from("plugins/puffer-builtins.yaml"),
+                    kind: SourceKind::Builtin,
+                },
+            }],
+            internal_tools: vec![LoadedItem {
+                value: ToolSpec {
+                    id: "Browser".to_string(),
+                    name: "Browser".to_string(),
+                    description: "Browser".to_string(),
+                    handler: "runtime:browser".to_string(),
+                    ..ToolSpec::default()
+                },
+                source_info: SourceInfo {
+                    path: PathBuf::from("internal_tools/browser.yaml"),
+                    kind: SourceKind::Builtin,
+                },
+            }],
+            ..LoadedResources::default()
+        };
+
+        filter_browser_resources(&mut resources, true);
+
+        assert!(skill_by_name(&resources, "browser").is_none());
+        assert_eq!(resources.plugins[0].value.skills, vec!["reviewer"]);
+        assert!(resources.internal_tools.is_empty());
     }
 
     #[test]
@@ -670,9 +1749,14 @@ mod tests {
             user_config_dir: root.join(".home/.puffer"),
             builtin_resources_dir: root.join("resources"),
         };
-        let loaded = load_resources(&paths).unwrap();
-        assert_eq!(loaded.skills.len(), 1);
-        assert_eq!(loaded.skills[0].value.name, "review-helper");
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        // Embedded builtin skills get merged in too; verify the
+        // workspace skill we wrote is present and addressable by
+        // normalized names.
+        assert!(loaded
+            .skills
+            .iter()
+            .any(|s| s.value.name == "review-helper"));
         assert!(skill_by_name(&loaded, "Review Helper ++").is_some());
         assert!(skill_by_name(&loaded, "review helper").is_some());
         assert!(skill_by_name(&loaded, "review-helper").is_some());
@@ -686,7 +1770,13 @@ mod tests {
         fs::create_dir_all(resources_dir.join("skills/review-helper")).unwrap();
         fs::write(
             resources_dir.join("skills/review-helper/SKILL.md"),
-            "---\nname: Review Helper ++\ndescription: Review changes\nallowed-tools:\n  - Read\n  - Grep, Glob\nargument-hint: <ticket>\narguments: ticket env\nmodel: openai/gpt-5\neffort: high\nuser-invocable: false\ndisable-model-invocation: true\ncontext: fork\n---\nBody\n",
+            "---\nname: Review Helper ++\ndescription: Review changes\nallowed-tools:\n  - Read\n  - Grep, Glob\nargument-hint: <ticket>\narguments: ticket env\nmodel: openai/gpt-5\neffort: high\nuser-invocable: false\ndisable-model-invocation: true\nrequires-action: true\ncontext: fork\n---\nBody\n",
+        )
+        .unwrap();
+        fs::create_dir_all(resources_dir.join("skills/plain-helper")).unwrap();
+        fs::write(
+            resources_dir.join("skills/plain-helper/SKILL.md"),
+            "---\nname: Plain Helper\ndescription: No action obligation\n---\nBody\n",
         )
         .unwrap();
 
@@ -696,8 +1786,10 @@ mod tests {
             user_config_dir: root.join(".home/.puffer"),
             builtin_resources_dir: root.join("resources"),
         };
-        let loaded = load_resources(&paths).unwrap();
-        let skill = &loaded.skills[0].value;
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        let skill = &skill_by_name(&loaded, "review-helper")
+            .expect("workspace skill should load")
+            .value;
         assert_eq!(skill.name, "review-helper");
         assert_eq!(skill.description, "Review changes");
         assert_eq!(skill.allowed_tools, vec!["Read", "Grep", "Glob"]);
@@ -708,6 +1800,263 @@ mod tests {
         assert_eq!(skill.context.as_deref(), Some("fork"));
         assert!(!skill.user_invocable);
         assert!(skill.disable_model_invocation);
+        assert!(skill.requires_action);
+
+        let default_skill = &skill_by_name(&loaded, "plain-helper")
+            .expect("workspace skill without action obligation should load")
+            .value;
+        assert!(!default_skill.requires_action);
+    }
+
+    #[test]
+    fn load_resources_imports_codex_and_claude_commands_as_skills() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let home = temp.path().join("home");
+
+        let claude_command_dir =
+            home.join(".claude/plugins/marketplaces/example/plugins/review/commands");
+        fs::create_dir_all(&claude_command_dir).unwrap();
+        fs::write(
+            claude_command_dir.join("code-review.md"),
+            "---\ndescription: Code review a pull request\nallowed-tools: Read, Grep\nargument-hint: <pr-url>\n---\nReview $ARGUMENTS.\n",
+        )
+        .unwrap();
+        fs::write(
+            claude_command_dir.join("_conventions.md"),
+            "# Internal conventions\nDo not show this as a command.\n",
+        )
+        .unwrap();
+
+        let codex_skill_dir =
+            home.join(".codex/.tmp/plugins/plugins/superpowers/skills/brainstorming");
+        fs::create_dir_all(&codex_skill_dir).unwrap();
+        fs::write(
+            codex_skill_dir.join("SKILL.md"),
+            "---\nname: brainstorming\ndescription: MUST use before creative work\n---\nThink broadly before editing.\n",
+        )
+        .unwrap();
+
+        let workspace_command_dir = root.join(".codex/plugins/example/commands");
+        fs::create_dir_all(&workspace_command_dir).unwrap();
+        fs::write(
+            workspace_command_dir.join("ship-it.md"),
+            "# /ship-it\nShip the current branch with $ARGUMENTS.\n",
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            workspace_root: root.clone(),
+            workspace_config_dir: root.join(".puffer"),
+            user_config_dir: home.join(".puffer"),
+            builtin_resources_dir: root.join("resources"),
+        };
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+
+        let code_review = skill_by_name(&loaded, "code-review").expect("Claude command imports");
+        assert_eq!(code_review.value.description, "Code review a pull request");
+        assert_eq!(code_review.value.allowed_tools, vec!["Read", "Grep"]);
+        assert_eq!(code_review.value.argument_hint.as_deref(), Some("<pr-url>"));
+        assert_eq!(code_review.source_info.kind, SourceKind::User);
+
+        let brainstorming = skill_by_name(&loaded, "brainstorming").expect("Codex skill imports");
+        assert_eq!(
+            brainstorming.value.description,
+            "MUST use before creative work"
+        );
+        assert!(brainstorming.value.content.contains("Think broadly"));
+
+        let ship_it = skill_by_name(&loaded, "ship-it").expect("workspace command imports");
+        assert_eq!(ship_it.value.description, "ship-it");
+        assert_eq!(ship_it.source_info.kind, SourceKind::Workspace);
+
+        assert!(skill_by_name(&loaded, "_conventions").is_none());
+    }
+
+    #[test]
+    fn lambda_skill_library_imports_generated_external_skills() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let external_root = temp.path().join("lambda-library");
+        let skill_dir = external_root.join("source-pack/gh-fix-ci");
+        fs::create_dir_all(skill_dir.join("out")).unwrap();
+        fs::write(
+            skill_dir.join("skill.lskill"),
+            "host {}\nskill gh_fix_ci {}\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("out/GENERATED.SKILL.md"),
+            "---\nname: gh-fix-ci\ndescription: Verified CI repair\nrequiresAction: true\n---\n# Runtime body\nUse generated prompt.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("out/stats.json"),
+            "{\n  \"slug\": \"gh_fix_ci\",\n  \"tools\": 10,\n  \"actions\": 2\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("out/host.json"),
+            r#"{"effects":[],"domains":[],"tools":[{"name":"gh_auth_status","effects":[],"concreteTools":["Bash"],"concreteInputContracts":{"Bash":{"command":"gh auth status"}}}]}"#,
+        )
+        .unwrap();
+
+        let manifest_dir = root.join(".puffer/resources/lambda_skill_libraries");
+        fs::create_dir_all(&manifest_dir).unwrap();
+        fs::write(
+            manifest_dir.join("verified.yaml"),
+            format!(
+                "id: verified\nroot: '{}'\nhost_catalogue_subpath: out/host.json\nallowed_tools:\n  - Bash\n  - Read\nrequire_approval: true\nhost_tool_bindings:\n  gh_auth_status:\n    - Bash\nskill_host_tool_bindings:\n  gh-fix-ci:\n    gh_pr_view:\n      - Bash\n",
+                external_root.display()
+            ),
+        )
+        .unwrap();
+
+        let paths = ConfigPaths::discover(&root);
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        let skill = skill_by_name(&loaded, "gh-fix-ci")
+            .expect("lambda skill should import")
+            .clone();
+
+        assert_eq!(skill.value.description, "Verified CI repair");
+        assert_eq!(skill.value.allowed_tools, vec!["Bash", "Read"]);
+        assert!(!skill.value.disable_model_invocation);
+        assert!(skill.value.requires_action);
+        assert_eq!(skill.source_info.path, skill_dir.join("skill.lskill"));
+        assert!(skill
+            .value
+            .content
+            .contains("Lambda Skill verification:\n- system: lambda-skill"));
+        assert!(skill.value.content.contains("Use generated prompt."));
+        assert!(!skill.value.content.contains("---\nname:"));
+
+        let verification = skill
+            .value
+            .verification
+            .expect("lambda skill should carry verification metadata");
+        assert_eq!(verification.system, "lambda-skill");
+        assert_eq!(verification.tools, Some(10));
+        assert_eq!(verification.actions, Some(2));
+        assert_eq!(
+            verification.source_path,
+            Some(skill_dir.join("skill.lskill").display().to_string())
+        );
+        assert_eq!(verification.compiler_path, None);
+        assert_eq!(
+            verification.host_catalogue_path,
+            Some(skill_dir.join("out/host.json").display().to_string())
+        );
+        assert_eq!(
+            verification.host_tool_bindings.get("gh_auth_status"),
+            Some(&vec!["Bash".to_string()])
+        );
+        assert_eq!(
+            verification.host_tool_bindings.get("gh_pr_view"),
+            Some(&vec!["Bash".to_string()])
+        );
+        assert!(verification.require_approval);
+    }
+
+    #[test]
+    fn lambda_skill_library_ignores_nested_duplicate_roots() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let external_root = temp.path().join("lambda-library");
+        let nested_root = external_root.join("source-pack");
+        let skill_dir = nested_root.join("gh-fix-ci");
+        fs::create_dir_all(skill_dir.join("out")).unwrap();
+        fs::write(
+            skill_dir.join("skill.lskill"),
+            "host {}\nskill gh_fix_ci {}\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("out/GENERATED.SKILL.md"),
+            "---\nname: gh-fix-ci\ndescription: Verified CI repair\n---\nUse generated prompt.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("out/host.json"),
+            r#"{"effects":[],"domains":[],"tools":[{"name":"gh_auth_status","effects":[],"concreteTools":["Bash"],"concreteInputContracts":{"Bash":{"command":"gh auth status"}}}]}"#,
+        )
+        .unwrap();
+
+        let manifest_dir = root.join(".puffer/resources/lambda_skill_libraries");
+        fs::create_dir_all(&manifest_dir).unwrap();
+        fs::write(
+            manifest_dir.join("parent.yaml"),
+            format!(
+                "id: parent\nroot: '{}'\nhost_catalogue_subpath: out/host.json\nallowed_tools:\n  - Bash\n",
+                external_root.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            manifest_dir.join("nested.yaml"),
+            format!(
+                "id: nested\nroot: '{}'\nhost_catalogue_subpath: out/host.json\nallowed_tools:\n  - Bash\n",
+                nested_root.display()
+            ),
+        )
+        .unwrap();
+
+        let paths = ConfigPaths::discover(&root);
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        let expected_source = skill_dir.join("skill.lskill").display().to_string();
+        let lambda_skill_count = loaded
+            .skills
+            .iter()
+            .filter(|skill| {
+                skill.value.name == "gh-fix-ci"
+                    && skill
+                        .value
+                        .verification
+                        .as_ref()
+                        .is_some_and(|verification| {
+                            verification.system == "lambda-skill"
+                                && verification.source_path.as_deref()
+                                    == Some(expected_source.as_str())
+                        })
+            })
+            .count();
+
+        assert_eq!(lambda_skill_count, 1);
+    }
+
+    #[test]
+    fn lambda_skill_library_disables_named_generated_skill() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let external_root = temp.path().join("lambda-library");
+        let skill_dir = external_root.join("source-pack/gh-fix-ci");
+        fs::create_dir_all(skill_dir.join("out")).unwrap();
+        fs::write(
+            skill_dir.join("skill.lskill"),
+            "host {}\nskill gh_fix_ci {}\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("out/GENERATED.SKILL.md"),
+            "---\nname: gh-fix-ci\ndescription: Verified CI repair\n---\n# Runtime body\nUse generated prompt.\n",
+        )
+        .unwrap();
+
+        let manifest_dir = root.join(".puffer/resources/lambda_skill_libraries");
+        fs::create_dir_all(&manifest_dir).unwrap();
+        fs::write(
+            manifest_dir.join("verified.yaml"),
+            format!(
+                "id: verified\nroot: '{}'\nallowed_tools:\n  - Bash\ndisabled_skills:\n  - gh-fix-ci\n",
+                external_root.display()
+            ),
+        )
+        .unwrap();
+
+        let paths = ConfigPaths::discover(&root);
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        let skill = skill_by_name(&loaded, "gh-fix-ci").expect("lambda skill should import");
+
+        assert!(skill.value.disable_model_invocation);
     }
 
     #[test]
@@ -742,10 +2091,12 @@ mod tests {
             user_config_dir: root.join(".home/.puffer"),
             builtin_resources_dir: root.join("resources"),
         };
-        let loaded = load_resources(&paths).unwrap();
-        assert_eq!(loaded.prompts.len(), 1);
-        assert_eq!(loaded.prompts[0].value.description, "Workspace");
-        assert!(loaded.prompts[0]
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        // Embedded prompts also load; verify the `review` prompt
+        // ultimately resolves to the workspace override.
+        let review = prompt_by_id(&loaded, "review").expect("review prompt should resolve");
+        assert_eq!(review.value.description, "Workspace");
+        assert!(review
             .source_info
             .path
             .to_string_lossy()
@@ -783,9 +2134,11 @@ mod tests {
             user_config_dir: root.join(".home/.puffer"),
             builtin_resources_dir: root.join("resources"),
         };
-        let loaded = load_resources(&paths).unwrap();
-        assert_eq!(loaded.prompts.len(), 1);
-        assert_eq!(loaded.prompts[0].value.description, "Second");
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        // The `z_review.yaml` override wins because it sorts after
+        // `a_review.yaml` and load_yaml_dir is sorted.
+        let review = prompt_by_id(&loaded, "review").expect("review");
+        assert_eq!(review.value.description, "Second");
         assert!(loaded.diagnostics.iter().any(|item| {
             item.contains("duplicate prompt `review` in builtin resources")
                 && item.contains("z_review.yaml")
@@ -823,20 +2176,130 @@ mod tests {
             user_config_dir: root.join(".home/.puffer"),
             builtin_resources_dir: root.join("resources"),
         };
-        let loaded = load_resources(&paths).unwrap();
-        assert_eq!(loaded.hooks.len(), 2);
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        // Embedded hooks may add more entries; verify our additions and
+        // that the workspace override wins for `tool-end`.
+        assert!(hook_by_id(&loaded, "tool-end").is_some());
+        assert!(hook_by_id(&loaded, "tool-start").is_some());
         assert_eq!(
             hook_by_id(&loaded, "tool-end").unwrap().value.command,
             "echo workspace"
         );
         let tool_end_hooks = hooks_for_event(&loaded, "tool_end");
-        assert_eq!(tool_end_hooks.len(), 1);
-        assert_eq!(tool_end_hooks[0].value.id, "tool-end");
-        assert_eq!(tool_end_hooks[0].value.command, "echo workspace");
+        assert!(tool_end_hooks
+            .iter()
+            .any(|h| h.value.id == "tool-end" && h.value.command == "echo workspace"));
         assert!(loaded
             .diagnostics
             .iter()
             .any(|item| item.contains("workspace hook `tool-end`")));
+    }
+
+    #[test]
+    fn per_model_prompt_variants_coexist_and_resolve_with_fallback() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let builtin = root.join("resources/prompts");
+        fs::create_dir_all(&builtin).unwrap();
+        fs::write(
+            builtin.join("system-base.yaml"),
+            "id: system-base\ndescription: Base\ntemplate: base body\n",
+        )
+        .unwrap();
+        fs::write(
+            builtin.join("system-base.opus.yaml"),
+            "id: system-base\ndescription: Opus override\ntemplate: opus body\nfor_model: claude-opus-4-6\n",
+        )
+        .unwrap();
+        fs::write(
+            builtin.join("system-base.openai.yaml"),
+            "id: system-base\ndescription: OpenAI override\ntemplate: openai body\nfor_provider: openai\n",
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            workspace_root: root.clone(),
+            workspace_config_dir: root.join(".puffer"),
+            user_config_dir: root.join(".home/.puffer"),
+            builtin_resources_dir: root.join("resources"),
+        };
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        // Embedded prompts are also loaded; verify the workspace
+        // overrides our `system-base` id by checking variant resolution.
+        assert_eq!(
+            prompt_for(&loaded, "system-base", None, Some("claude-opus-4-6"))
+                .unwrap()
+                .value
+                .template,
+            "opus body"
+        );
+        assert_eq!(
+            prompt_for(&loaded, "system-base", Some("openai"), Some("gpt-5"))
+                .unwrap()
+                .value
+                .template,
+            "openai body"
+        );
+        assert_eq!(
+            prompt_for(&loaded, "system-base", None, None)
+                .unwrap()
+                .value
+                .template,
+            "base body"
+        );
+        assert_eq!(
+            prompt_by_id(&loaded, "system-base").unwrap().value.template,
+            "base body"
+        );
+    }
+
+    #[test]
+    fn workspace_variant_overrides_builtin_variant_with_same_model() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let builtin = root.join("resources/prompts");
+        let workspace = root.join(".puffer/resources/prompts");
+        fs::create_dir_all(&builtin).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            builtin.join("system-base.yaml"),
+            "id: system-base\ndescription: Base\ntemplate: base body\n",
+        )
+        .unwrap();
+        fs::write(
+            builtin.join("system-base.opus.yaml"),
+            "id: system-base\ndescription: Builtin opus\ntemplate: builtin opus\nfor_model: claude-opus-4-6\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("system-base.opus.yaml"),
+            "id: system-base\ndescription: Workspace opus\ntemplate: workspace opus\nfor_model: claude-opus-4-6\n",
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            workspace_root: root.clone(),
+            workspace_config_dir: root.join(".puffer"),
+            user_config_dir: root.join(".home/.puffer"),
+            builtin_resources_dir: root.join("resources"),
+        };
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        // Embedded prompts also load; verify the workspace variant
+        // overrides the builtin opus variant for the same model.
+        assert_eq!(
+            prompt_for(&loaded, "system-base", None, Some("claude-opus-4-6"))
+                .unwrap()
+                .value
+                .template,
+            "workspace opus"
+        );
+        assert_eq!(
+            prompt_for(&loaded, "system-base", None, None)
+                .unwrap()
+                .value
+                .template,
+            "base body"
+        );
     }
 
     #[test]
@@ -857,10 +2320,15 @@ mod tests {
             user_config_dir: root.join(".home/.puffer"),
             builtin_resources_dir: root.join("resources"),
         };
-        let loaded = load_resources(&paths).unwrap();
-        assert_eq!(loaded.mcp_servers.len(), 1);
-        assert_eq!(loaded.mcp_servers[0].value.id, "legacy");
-        assert!(loaded.mcp_servers[0]
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        // Embedded MCP servers also load; verify the legacy entry is
+        // present and sourced from the legacy directory.
+        let legacy = loaded
+            .mcp_servers
+            .iter()
+            .find(|item| item.value.id == "legacy")
+            .expect("legacy MCP entry should be present");
+        assert!(legacy
             .source_info
             .path
             .to_string_lossy()
@@ -892,19 +2360,27 @@ mod tests {
             user_config_dir: root.join(".home/.puffer"),
             builtin_resources_dir: root.join("resources"),
         };
-        let loaded = load_resources(&paths).unwrap();
-        assert_eq!(loaded.mcp_servers.len(), 1);
-        assert_eq!(loaded.mcp_servers[0].value.id, "docs");
-        assert_eq!(loaded.mcp_servers[0].value.display_name, "Canonical Docs");
-        assert!(loaded.mcp_servers[0]
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        let docs = loaded
+            .mcp_servers
+            .iter()
+            .find(|item| item.value.id == "docs")
+            .expect("docs MCP entry should be present");
+        assert_eq!(docs.value.display_name, "Canonical Docs");
+        assert!(docs
             .source_info
             .path
             .to_string_lossy()
             .contains("resources/mcp_servers/docs.yaml"));
+        // The filesystem builtin layer overrides the embedded `docs`
+        // entry shipped under `resources/mcp_servers/docs.yaml`, so a
+        // diagnostic is expected — what we care about is that the
+        // *canonical* directory wins over the legacy `mcp/` directory
+        // (i.e. no `from .../resources/mcp/docs.yaml` provenance).
         assert!(!loaded
             .diagnostics
             .iter()
-            .any(|item| item.contains("mcp_server `docs`")));
+            .any(|item| item.contains("resources/mcp/docs.yaml")));
     }
 
     #[test]
@@ -930,8 +2406,58 @@ mod tests {
             user_config_dir: root.join(".home/.puffer"),
             builtin_resources_dir: root.join("resources"),
         };
-        let loaded = load_resources(&paths).unwrap();
-        assert_eq!(loaded.mcp_servers.len(), 1);
-        assert_eq!(loaded.mcp_servers[0].value.id, "enabled");
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+        // Embedded MCP servers are also loaded; verify the
+        // workspace-layer `enabled` survives but `disabled` is dropped.
+        assert!(loaded
+            .mcp_servers
+            .iter()
+            .any(|item| item.value.id == "enabled"));
+        assert!(!loaded
+            .mcp_servers
+            .iter()
+            .any(|item| item.value.id == "disabled"));
+    }
+
+    /// Smoke test: every embedded tool-like yaml must parse as a
+    /// `ToolSpec`. Regression guard for bugs like browser.yaml's unquoted
+    /// `actions: u` substring, which YAML silently parsed as a nested
+    /// mapping and broke 6 of 14 `tool_visibility::*` tests on master
+    /// before being fixed in this PR. A single broken file now fails this
+    /// fast, with the offending path in the panic message.
+    #[test]
+    fn all_embedded_tool_yamls_parse() {
+        let mut files = Vec::new();
+        for dir_name in ["tools", "internal_tools"] {
+            let dir = BUILTIN_RESOURCES
+                .get_dir(dir_name)
+                .unwrap_or_else(|| panic!("embedded resources/{dir_name} directory"));
+            files.extend(dir.files());
+        }
+        files.sort_by_key(|file| file.path().to_path_buf());
+
+        let mut yaml_count = 0usize;
+        for file in files {
+            let path = file.path();
+            let ext = path.extension().and_then(|e| e.to_str());
+            if !matches!(ext, Some("yaml" | "yml")) {
+                continue;
+            }
+            yaml_count += 1;
+            let raw = file
+                .contents_utf8()
+                .unwrap_or_else(|| panic!("embedded tool yaml {} is not UTF-8", path.display()));
+            if let Err(err) = serde_yaml::from_str::<ToolSpec>(raw) {
+                panic!(
+                    "embedded tool yaml {} failed to parse: {err}",
+                    path.display()
+                );
+            }
+        }
+
+        assert!(
+            yaml_count > 0,
+            "expected at least one embedded tool yaml, found none"
+        );
     }
 }

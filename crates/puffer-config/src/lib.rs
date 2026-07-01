@@ -1,3 +1,9 @@
+mod browser;
+mod browser_extension_stage;
+pub mod env_vars;
+mod home_override;
+mod project_memory;
+mod proxy;
 mod settings_catalog;
 
 use anyhow::Context;
@@ -11,6 +17,17 @@ use std::path::{Path, PathBuf};
 
 const BUILTIN_RESOURCES_DIR_ENV: &str = "PUFFER_BUILTIN_RESOURCES_DIR";
 
+pub use browser::{
+    builtin_captcha_solvers, is_builtin_solver, BrowserConfig, BrowserExtensionConfig,
+    BuiltinCaptchaSolver, CaptchaConfig, CaptchaSolverConfig,
+};
+pub use browser_extension_stage::{stage_builtin_captcha_extension, CaptchaExtensionSeed};
+pub use home_override::{set_puffer_home_override, PufferHomeOverride};
+pub use project_memory::{
+    ensure_project_memory, load_project_registry, resolve_project_memory, ProjectEntry,
+    ProjectRegistry, ResolvedProjectMemory,
+};
+pub use proxy::{NetworkConfig, ProxyConfig, ProxyEndpoint, ProxyScheme, SanitizedProxyEndpoint};
 pub use settings_catalog::{
     config_setting_persists_to_workspace_file, config_setting_scope, config_setting_spec,
     normalize_config_setting_key, parse_config_cli_value, supported_config_settings,
@@ -24,6 +41,8 @@ pub struct PufferConfig {
     pub default_provider: Option<String>,
     pub openai_base_url: Option<String>,
     #[serde(default)]
+    pub openai_display_name: Option<String>,
+    #[serde(default)]
     pub openai_headers: BTreeMap<String, String>,
     #[serde(default)]
     pub openai_query_params: BTreeMap<String, String>,
@@ -36,8 +55,162 @@ pub struct PufferConfig {
     pub effort_level: Option<String>,
     #[serde(default, alias = "copyFullResponse")]
     pub copy_full_response: bool,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+    #[serde(default)]
+    pub recap: RecapConfig,
+    #[serde(default)]
+    pub night: NightConfig,
+    #[serde(default)]
+    pub browser: BrowserConfig,
+    #[serde(default)]
+    pub network: NetworkConfig,
+    #[serde(default)]
+    pub media: MediaConfig,
+    #[serde(default)]
+    pub remote: RemoteConfig,
     pub mascot: MascotConfig,
     pub ui: UiConfig,
+    /// When set, the runtime constructs a remote `RemoteToolRunner` against
+    /// this endpoint instead of using the in-process `LocalToolRunner`. The
+    /// actual swap happens at `AppState` construction time in the binary;
+    /// this struct is only the on-disk representation.
+    #[serde(default)]
+    pub remote_runner: Option<RemoteRunnerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteRunnerConfig {
+    /// gRPC endpoint, e.g. `http://127.0.0.1:50051`.
+    pub endpoint: String,
+    /// Inline bearer token. Mutually exclusive with `auth_token_env`; if
+    /// both are set, `auth_token` wins.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// Environment variable to read the bearer token from. Lets the config
+    /// file stay free of secrets.
+    #[serde(default)]
+    pub auth_token_env: Option<String>,
+    /// Initial delay (ms) between startup `Ping` retries. Defaults to
+    /// 1000 ms when unset.
+    #[serde(default)]
+    pub initial_backoff_ms: Option<u64>,
+    /// Cap on the per-attempt backoff (ms). Defaults to 10_000 ms when
+    /// unset.
+    #[serde(default)]
+    pub max_backoff_ms: Option<u64>,
+    /// Whether runtime construction should block until the remote runner
+    /// answers Ping. Defaults to true for interactive safety; managed
+    /// daemon sessions can disable this so tool-runner startup does not
+    /// block first-token latency when no tool is needed.
+    #[serde(default = "default_remote_runner_wait_for_ready")]
+    pub wait_for_ready: bool,
+}
+
+/// User-managed remote execution targets. This is separate from
+/// `remote_runner`, which is the low-level gRPC endpoint selected after a
+/// concrete target has been entered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RemoteConfig {
+    #[serde(default)]
+    pub default_target: Option<String>,
+    #[serde(default)]
+    pub ssh_hosts: Vec<SshHostConfig>,
+    #[serde(default)]
+    pub agentenv: Option<AgentEnvAccountConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshHostConfig {
+    pub id: String,
+    pub label: String,
+    pub target: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentEnvAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_agentenv_api_url")]
+    pub api_url: String,
+    /// Public host or IP that AgentEnv exposes sandbox ports on when the API
+    /// returns only a host port.
+    #[serde(default)]
+    pub runner_host: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub credential_secret_id: Option<String>,
+    #[serde(default = "default_agentenv_auth_method")]
+    pub auth_method: String,
+    #[serde(default)]
+    pub defaults: AgentEnvSandboxDefaults,
+}
+
+impl Default for AgentEnvAccountConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: default_agentenv_api_url(),
+            runner_host: None,
+            workspace: None,
+            credential_secret_id: None,
+            auth_method: default_agentenv_auth_method(),
+            defaults: AgentEnvSandboxDefaults::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentEnvSandboxDefaults {
+    #[serde(default = "default_agentenv_sandbox_type")]
+    pub sandbox_type: String,
+    #[serde(default = "default_agentenv_image")]
+    pub image: String,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub cpu_millis: Option<u32>,
+    #[serde(default)]
+    pub memory_mb: Option<u32>,
+    #[serde(default)]
+    pub gpu_count: Option<u32>,
+    #[serde(default)]
+    pub gpu_type: Option<String>,
+    #[serde(default)]
+    pub max_lifetime_seconds: Option<u32>,
+}
+
+impl Default for AgentEnvSandboxDefaults {
+    fn default() -> Self {
+        Self {
+            sandbox_type: default_agentenv_sandbox_type(),
+            image: default_agentenv_image(),
+            region: None,
+            cpu_millis: None,
+            memory_mb: None,
+            gpu_count: Some(0),
+            gpu_type: None,
+            max_lifetime_seconds: None,
+        }
+    }
+}
+
+impl RemoteRunnerConfig {
+    /// Resolves the effective bearer token by consulting the env var when
+    /// `auth_token` is unset.
+    pub fn resolve_auth_token(&self) -> Option<String> {
+        if let Some(direct) = &self.auth_token {
+            return Some(direct.clone());
+        }
+        self.auth_token_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,6 +235,146 @@ pub struct StatusLineConfig {
     pub padding: u16,
 }
 
+/// Configures media generation defaults shared by UI and runtime tools.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct MediaConfig {
+    #[serde(default, deserialize_with = "lenient_media_selection")]
+    pub image: Option<MediaGenerationConfig>,
+    #[serde(default, deserialize_with = "lenient_media_selection")]
+    pub video: Option<MediaGenerationConfig>,
+}
+
+/// Deserializes a persisted media selection leniently: a previously persisted
+/// concrete selection (old `model_id`/`adapter`/`parameters` shape, no
+/// `logical_model_id`) is treated as absent and resets to provider defaults on
+/// first run, rather than failing the whole config load. No backward-compat
+/// shim — the old fields are simply ignored.
+fn lenient_media_selection<'de, D>(
+    deserializer: D,
+) -> Result<Option<MediaGenerationConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Raw {
+        #[serde(default, alias = "providerId")]
+        provider_id: String,
+        #[serde(default, alias = "logicalModelId")]
+        logical_model_id: String,
+        #[serde(default)]
+        selections: BTreeMap<String, String>,
+    }
+    let raw = Option::<Raw>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| {
+        if raw.provider_id.trim().is_empty() || raw.logical_model_id.trim().is_empty() {
+            None
+        } else {
+            Some(MediaGenerationConfig {
+                provider_id: raw.provider_id,
+                logical_model_id: raw.logical_model_id,
+                selections: raw.selections,
+            })
+        }
+    }))
+}
+
+/// Configures one default media generation selection as a logical model plus
+/// the user's per-axis selections. The concrete upstream model id, adapter, and
+/// request parameters are resolved at use time from the provider capability
+/// model (see `resolve_media_request`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaGenerationConfig {
+    #[serde(alias = "providerId")]
+    pub provider_id: String,
+    #[serde(alias = "logicalModelId")]
+    pub logical_model_id: String,
+    #[serde(default)]
+    pub selections: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryConfig {
+    #[serde(default = "default_memory_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_memory_char_limit")]
+    pub char_limit: usize,
+    #[serde(default = "default_review_nudge_interval")]
+    pub review_nudge_interval: usize,
+    #[serde(default = "default_flush_min_turns")]
+    pub flush_min_turns: usize,
+    #[serde(default = "default_background_review")]
+    pub background_review: bool,
+    #[serde(default = "default_flush_on_compact")]
+    pub flush_on_compact: bool,
+    #[serde(default = "default_autodream_enabled")]
+    pub autodream_enabled: bool,
+    #[serde(default = "default_autodream_interval")]
+    pub autodream_interval: usize,
+    #[serde(default = "default_autodream_min_hours")]
+    pub autodream_min_hours: u64,
+    #[serde(default = "default_autodream_min_sessions")]
+    pub autodream_min_sessions: usize,
+    #[serde(default = "default_autodream_genskill_suggestions")]
+    pub autodream_genskill_suggestions: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_memory_enabled(),
+            char_limit: default_memory_char_limit(),
+            review_nudge_interval: default_review_nudge_interval(),
+            flush_min_turns: default_flush_min_turns(),
+            background_review: default_background_review(),
+            flush_on_compact: default_flush_on_compact(),
+            autodream_enabled: default_autodream_enabled(),
+            autodream_interval: default_autodream_interval(),
+            autodream_min_hours: default_autodream_min_hours(),
+            autodream_min_sessions: default_autodream_min_sessions(),
+            autodream_genskill_suggestions: default_autodream_genskill_suggestions(),
+        }
+    }
+}
+
+/// Session recap (away-summary) configuration. Mirrors Anthropic's
+/// claude-code `/recap` semantics: a short, model-generated one-liner that
+/// surfaces in the UI when the user comes back after stepping away.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecapConfig {
+    /// Master switch. When false, both `/recap` slash command and auto
+    /// trigger are no-ops.
+    #[serde(default = "default_recap_enabled")]
+    pub enabled: bool,
+    /// Whether auto-trigger (TUI idle timer / GUI window blur) fires
+    /// recaps. The slash command is unaffected. Default true.
+    #[serde(default = "default_recap_auto")]
+    pub auto: bool,
+    /// Minimum idle seconds before the auto-trigger fires. Matches
+    /// claude-code's `on8 = 180_000` (3 min) default.
+    #[serde(default = "default_recap_idle_secs")]
+    pub idle_secs: u64,
+    /// Minimum number of real user messages before any recap can fire.
+    /// Matches claude-code's `Ls3 = 3`.
+    #[serde(default = "default_recap_min_user_messages")]
+    pub min_user_messages: usize,
+    /// Minimum number of new user messages required between successive
+    /// auto-recaps (cooldown). Matches claude-code's `ks3 = 2`.
+    #[serde(default = "default_recap_cooldown_messages")]
+    pub cooldown_messages: usize,
+}
+
+impl Default for RecapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_recap_enabled(),
+            auto: default_recap_auto(),
+            idle_secs: default_recap_idle_secs(),
+            min_user_messages: default_recap_min_user_messages(),
+            cooldown_messages: default_recap_cooldown_messages(),
+        }
+    }
+}
+
 impl Default for PufferConfig {
     fn default() -> Self {
         Self {
@@ -69,6 +382,7 @@ impl Default for PufferConfig {
             default_model: None,
             default_provider: Some("anthropic".to_string()),
             openai_base_url: None,
+            openai_display_name: None,
             openai_headers: BTreeMap::new(),
             openai_query_params: BTreeMap::new(),
             theme: "puffer".to_string(),
@@ -76,6 +390,13 @@ impl Default for PufferConfig {
             fast_mode: false,
             effort_level: None,
             copy_full_response: false,
+            memory: MemoryConfig::default(),
+            recap: RecapConfig::default(),
+            night: NightConfig::default(),
+            browser: BrowserConfig::default(),
+            network: NetworkConfig::default(),
+            media: MediaConfig::default(),
+            remote: RemoteConfig::default(),
             mascot: MascotConfig {
                 id: "clawd".to_string(),
                 display_name: "Clawd".to_string(),
@@ -86,12 +407,125 @@ impl Default for PufferConfig {
                 tmux_golden_mode: false,
                 status_line: None,
             },
+            remote_runner: None,
         }
     }
 }
 
+/// `/night` autonomous overnight work. Experimental: opening pull requests to
+/// the user's fork is OFF by default and must be deliberately enabled.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NightConfig {
+    /// When true, `/night` may open pull requests to the user's fork for the
+    /// tested work it produces. Default false (experimental).
+    #[serde(default, alias = "submitPr")]
+    pub submit_pr: bool,
+    /// Token budget for one `/night` run. `/night` sets a session goal with
+    /// this budget so the run is bounded (the goal flips to budget-limited and
+    /// the model is steered to stop) rather than running unbounded overnight.
+    #[serde(default = "default_night_token_budget", alias = "tokenBudget")]
+    pub token_budget: u32,
+}
+
+impl Default for NightConfig {
+    fn default() -> Self {
+        Self {
+            submit_pr: false,
+            token_budget: default_night_token_budget(),
+        }
+    }
+}
+
+fn default_night_token_budget() -> u32 {
+    1_000_000
+}
+
 fn default_editor_mode() -> String {
     "normal".to_string()
+}
+
+fn default_remote_runner_wait_for_ready() -> bool {
+    true
+}
+
+fn default_agentenv_api_url() -> String {
+    "https://api.agentenv.io".to_string()
+}
+
+fn default_agentenv_auth_method() -> String {
+    "api_key".to_string()
+}
+
+fn default_agentenv_sandbox_type() -> String {
+    "small".to_string()
+}
+
+fn default_agentenv_image() -> String {
+    "python:3.11-slim".to_string()
+}
+
+fn default_memory_enabled() -> bool {
+    true
+}
+
+fn default_memory_char_limit() -> usize {
+    6_000
+}
+
+fn default_review_nudge_interval() -> usize {
+    8
+}
+
+fn default_flush_min_turns() -> usize {
+    6
+}
+
+fn default_background_review() -> bool {
+    true
+}
+
+fn default_flush_on_compact() -> bool {
+    true
+}
+
+fn default_autodream_enabled() -> bool {
+    false
+}
+
+fn default_autodream_interval() -> usize {
+    16
+}
+
+fn default_autodream_min_hours() -> u64 {
+    24
+}
+
+fn default_autodream_min_sessions() -> usize {
+    5
+}
+
+fn default_autodream_genskill_suggestions() -> bool {
+    true
+}
+
+fn default_recap_enabled() -> bool {
+    true
+}
+
+fn default_recap_auto() -> bool {
+    true
+}
+
+fn default_recap_idle_secs() -> u64 {
+    180
+}
+
+fn default_recap_min_user_messages() -> usize {
+    3
+}
+
+fn default_recap_cooldown_messages() -> usize {
+    2
 }
 
 #[derive(Debug, Clone)]
@@ -107,8 +541,8 @@ impl ConfigPaths {
     pub fn discover(workspace_root: impl Into<PathBuf>) -> Self {
         let workspace_root = workspace_root.into();
         let workspace_config_dir = workspace_root.join(".puffer");
-        let user_config_dir = std::env::var_os("PUFFER_HOME")
-            .map(PathBuf::from)
+        let user_config_dir = home_override::puffer_home_override()
+            .or_else(|| std::env::var_os("PUFFER_HOME").map(PathBuf::from))
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("."))
@@ -143,47 +577,77 @@ impl ConfigPaths {
     pub fn has_workspace_config(&self) -> bool {
         self.workspace_config_file().exists()
     }
+
+    /// Returns the user-level project registry file path.
+    pub fn projects_file(&self) -> PathBuf {
+        self.user_config_dir.join("projects.toml")
+    }
+
+    /// Returns the directory that stores per-project memory files.
+    pub fn projects_memory_dir(&self) -> PathBuf {
+        self.user_config_dir.join("projects")
+    }
 }
 
 /// Loads layered Puffer configuration from the user and workspace config files.
 pub fn load_config(paths: &ConfigPaths) -> Result<PufferConfig> {
     let mut config = PufferConfig::default();
-    let mut user_selection = None;
+    let mut user_preferences = None;
     if paths.user_config_file().exists() {
         merge_config_file(&mut config, &paths.user_config_file())?;
-        user_selection = Some((
-            config.default_provider.clone(),
-            config.default_model.clone(),
-            config.theme.clone(),
-            config.editor_mode.clone(),
-            config.fast_mode,
-            config.effort_level.clone(),
-            config.copy_full_response,
-        ));
+        user_preferences = Some(UserPreferenceSnapshot::capture(&config));
     }
     if paths.workspace_config_file().exists() {
         merge_config_file(&mut config, &paths.workspace_config_file())?;
     }
     apply_claude_status_line_fallback(&mut config, paths);
-    if let Some((
-        provider,
-        model,
-        theme,
-        editor_mode,
-        fast_mode,
-        effort_level,
-        copy_full_response,
-    )) = user_selection
-    {
-        config.default_provider = provider;
-        config.default_model = model;
-        config.theme = theme;
-        config.editor_mode = editor_mode;
-        config.fast_mode = fast_mode;
-        config.effort_level = effort_level;
-        config.copy_full_response = copy_full_response;
+    if let Some(snapshot) = user_preferences {
+        snapshot.restore(&mut config);
     }
     Ok(config)
+}
+
+struct UserPreferenceSnapshot {
+    default_provider: Option<String>,
+    default_model: Option<String>,
+    theme: String,
+    editor_mode: String,
+    fast_mode: bool,
+    effort_level: Option<String>,
+    copy_full_response: bool,
+    browser: BrowserConfig,
+    network: NetworkConfig,
+    media: MediaConfig,
+}
+
+impl UserPreferenceSnapshot {
+    fn capture(config: &PufferConfig) -> Self {
+        Self {
+            default_provider: config.default_provider.clone(),
+            default_model: config.default_model.clone(),
+            theme: config.theme.clone(),
+            editor_mode: config.editor_mode.clone(),
+            fast_mode: config.fast_mode,
+            effort_level: config.effort_level.clone(),
+            copy_full_response: config.copy_full_response,
+            browser: config.browser.clone(),
+            network: config.network.clone(),
+            media: config.media.clone(),
+        }
+    }
+
+    fn restore(self, config: &mut PufferConfig) {
+        config.default_provider = self.default_provider;
+        config.default_model = self.default_model;
+        config.theme = self.theme;
+        config.editor_mode = self.editor_mode;
+        config.fast_mode = self.fast_mode;
+        config.effort_level = self.effort_level;
+        config.copy_full_response = self.copy_full_response;
+        config.browser = self.browser;
+        config.network = self.network;
+        config.media = self.media;
+    }
 }
 
 /// Saves the user-level Puffer configuration file.
@@ -337,6 +801,76 @@ mod tests {
     }
 
     #[test]
+    fn media_generation_config_stores_logical_selection() {
+        let toml = r#"
+app_name = "Puffer"
+theme = "system"
+mascot = { id = "none", display_name = "None", enabled = false }
+ui = { no_alt_screen = false, tmux_golden_mode = false }
+
+[media.image]
+provider_id = "openai"
+logical_model_id = "gpt-image-1"
+selections = { size = "1024x1024", quality = "auto" }
+
+[media.video]
+provider_id = "relaydance"
+logical_model_id = "seedance-1-5-pro"
+
+[media.video.selections]
+audio = "true"
+resolution = "1080p"
+duration = "5"
+"#;
+
+        let parsed: PufferConfig = toml::from_str(toml).expect("config parses");
+        let image = parsed.media.image.as_ref().unwrap();
+        assert_eq!(image.logical_model_id, "gpt-image-1");
+        assert_eq!(image.selections["size"], "1024x1024");
+        let video = parsed.media.video.as_ref().unwrap();
+        assert_eq!(video.logical_model_id, "seedance-1-5-pro");
+        assert_eq!(video.selections["audio"], "true");
+    }
+
+    #[test]
+    fn old_concrete_media_config_resets_to_absent() {
+        // A previously persisted concrete selection (old model_id/adapter/
+        // parameters shape, no logical_model_id) must load as absent rather
+        // than failing the whole config.
+        let toml = r#"
+app_name = "Puffer"
+theme = "system"
+mascot = { id = "none", display_name = "None", enabled = false }
+ui = { no_alt_screen = false, tmux_golden_mode = false }
+
+[media.image]
+provider_id = "openai"
+model_id = "gpt-image-1"
+operation = "generate"
+adapter = "images_json"
+parameters = { size = "1024x1024" }
+"#;
+        let parsed: PufferConfig = toml::from_str(toml).expect("config parses");
+        assert!(parsed.media.image.is_none());
+        assert!(parsed.media.video.is_none());
+    }
+
+    #[test]
+    fn media_generation_config_accepts_camel_case_aliases() {
+        let json = r#"{ "providerId": "openai", "logicalModelId": "gpt-image-1", "selections": { "size": "1024x1024" } }"#;
+        let parsed: MediaGenerationConfig = serde_json::from_str(json).expect("json parses");
+        assert_eq!(parsed.provider_id, "openai");
+        assert_eq!(parsed.logical_model_id, "gpt-image-1");
+    }
+
+    #[test]
+    fn media_config_defaults_to_unconfigured_selections() {
+        let config = MediaConfig::default();
+        assert!(config.image.is_none());
+        assert!(config.video.is_none());
+    }
+
+    #[test]
     fn load_config_preserves_user_provider_selection_over_workspace_defaults() {
         let _guard = lock_puffer_home();
         let tempdir = tempdir().expect("tempdir");
@@ -359,6 +893,11 @@ mod tests {
         user.editor_mode = "vim".to_string();
         user.fast_mode = true;
         user.effort_level = Some("high".to_string());
+        user.media.image = Some(MediaGenerationConfig {
+            provider_id: "user-image-provider".to_string(),
+            logical_model_id: "user-image-model".to_string(),
+            selections: BTreeMap::from([("size".to_string(), "1024x1024".to_string())]),
+        });
         save_user_config(&paths, &user).expect("user config");
 
         let mut workspace = PufferConfig::default();
@@ -369,6 +908,11 @@ mod tests {
         workspace.openai_query_params =
             BTreeMap::from([("workspace_param".to_string(), "2".to_string())]);
         workspace.theme = "harbor".to_string();
+        workspace.media.image = Some(MediaGenerationConfig {
+            provider_id: "workspace-image-provider".to_string(),
+            logical_model_id: "workspace-image-model".to_string(),
+            selections: BTreeMap::new(),
+        });
         save_workspace_config(&paths, &workspace).expect("workspace config");
 
         let loaded = load_config(&paths).expect("load");
@@ -393,6 +937,7 @@ mod tests {
         assert_eq!(loaded.editor_mode, "vim");
         assert!(loaded.fast_mode);
         assert_eq!(loaded.effort_level.as_deref(), Some("high"));
+        assert_eq!(loaded.media, user.media);
     }
 
     #[test]
@@ -558,6 +1103,11 @@ tmux_golden_mode = false
             command: "printf puffer-status".to_string(),
             padding: 2,
         });
+        workspace_config.media.image = Some(MediaGenerationConfig {
+            provider_id: "workspace-image-provider".to_string(),
+            logical_model_id: "workspace-image-model".to_string(),
+            selections: BTreeMap::new(),
+        });
         save_workspace_config(&paths, &workspace_config).expect("workspace config");
 
         let loaded = load_config(&paths).expect("load");
@@ -577,6 +1127,7 @@ tmux_golden_mode = false
                 .map(|status_line| status_line.padding),
             Some(2)
         );
+        assert_eq!(loaded.media, workspace_config.media);
     }
 
     #[test]
@@ -591,5 +1142,80 @@ tmux_golden_mode = false
 
         let paths = ConfigPaths::discover(&workspace);
         assert_eq!(paths.builtin_resources_dir, override_dir);
+    }
+
+    #[test]
+    fn remote_runner_wait_for_ready_defaults_to_true() {
+        let mut config = PufferConfig::default();
+        config.remote_runner = Some(RemoteRunnerConfig {
+            endpoint: "http://127.0.0.1:50051".to_string(),
+            auth_token: None,
+            auth_token_env: None,
+            initial_backoff_ms: None,
+            max_backoff_ms: None,
+            wait_for_ready: default_remote_runner_wait_for_ready(),
+        });
+        let raw = toml::to_string(&config).expect("serialize");
+        let config: PufferConfig = toml::from_str(&raw).expect("config");
+
+        assert!(config.remote_runner.expect("remote runner").wait_for_ready);
+    }
+
+    #[test]
+    fn remote_runner_wait_for_ready_can_be_disabled() {
+        let mut config = PufferConfig::default();
+        config.remote_runner = Some(RemoteRunnerConfig {
+            endpoint: "http://127.0.0.1:50051".to_string(),
+            auth_token: None,
+            auth_token_env: None,
+            initial_backoff_ms: None,
+            max_backoff_ms: None,
+            wait_for_ready: false,
+        });
+        let raw = toml::to_string(&config).expect("serialize");
+        let config: PufferConfig = toml::from_str(&raw).expect("config");
+
+        assert!(!config.remote_runner.expect("remote runner").wait_for_ready);
+    }
+
+    #[test]
+    fn remote_agentenv_account_config_round_trips_secret_reference() {
+        let mut config = PufferConfig::default();
+        config.remote.agentenv = Some(AgentEnvAccountConfig {
+            enabled: true,
+            api_url: "https://api.agentenv.io".to_string(),
+            runner_host: Some("runner.agentenv.example".to_string()),
+            workspace: Some("wk_demo".to_string()),
+            credential_secret_id: Some("secret-agentenv".to_string()),
+            auth_method: "api_key".to_string(),
+            defaults: AgentEnvSandboxDefaults {
+                sandbox_type: "small".to_string(),
+                image: "docker.io/acme/puffer-tool-runner:latest".to_string(),
+                region: Some("us-west-2".to_string()),
+                cpu_millis: Some(2000),
+                memory_mb: Some(4096),
+                gpu_count: Some(0),
+                gpu_type: None,
+                max_lifetime_seconds: Some(3600),
+            },
+        });
+
+        let raw = toml::to_string(&config).expect("serialize");
+        assert!(raw.contains("credential_secret_id = \"secret-agentenv\""));
+        assert!(!raw.contains("sk-live"));
+
+        let loaded: PufferConfig = toml::from_str(&raw).expect("deserialize");
+        let agentenv = loaded.remote.agentenv.expect("agentenv config");
+        assert!(agentenv.enabled);
+        assert_eq!(
+            agentenv.runner_host.as_deref(),
+            Some("runner.agentenv.example")
+        );
+        assert_eq!(agentenv.workspace.as_deref(), Some("wk_demo"));
+        assert_eq!(
+            agentenv.credential_secret_id.as_deref(),
+            Some("secret-agentenv")
+        );
+        assert_eq!(agentenv.defaults.region.as_deref(), Some("us-west-2"));
     }
 }

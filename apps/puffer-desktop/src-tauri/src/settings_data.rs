@@ -1,12 +1,15 @@
 use crate::dtos::{
-    AuthProviderStatusDto, ProviderSummaryDto, ResourceCountsDto, SettingsConfigDto,
-    SettingsSessionSummaryDto, SettingsSnapshotDto,
+    AuthProviderStatusDto, BrowserCaptchaSettingsDto, BrowserCaptchaSolverDto, BrowserExtensionDto,
+    BrowserSettingsDto, ProviderSummaryDto, ResourceCountsDto, SecretSummaryDto,
+    SecretSourceDto, SecretsSettingsDto, SettingsConfigDto, SettingsSessionSummaryDto,
+    SettingsSnapshotDto,
 };
 use anyhow::Result;
 use indexmap::IndexMap;
-use puffer_config::{ensure_workspace_dirs, load_config, ConfigPaths};
+use puffer_config::{builtin_captcha_solvers, ensure_workspace_dirs, load_config, ConfigPaths};
 use puffer_provider_registry::{AuthMode, AuthStore, ProviderRegistry, StoredCredential};
 use puffer_resources::load_resources;
+use puffer_secrets::{SecretSummary, SecretVault};
 use puffer_session_store::SessionStore;
 use std::path::PathBuf;
 
@@ -62,6 +65,8 @@ pub(crate) fn load_settings_snapshot() -> Result<SettingsSnapshotDto> {
         .collect::<std::collections::BTreeSet<PathBuf>>()
         .len();
 
+    let provider_summaries = desktop_provider_summaries(&providers);
+
     Ok(SettingsSnapshotDto {
         workspace_root: paths.workspace_root.display().to_string(),
         workspace_config_file: paths.workspace_config_file().display().to_string(),
@@ -97,8 +102,133 @@ pub(crate) fn load_settings_snapshot() -> Result<SettingsSnapshotDto> {
             folder_groups,
         },
         auth: auth_statuses(&auth_store),
-        providers: providers.provider_entries().map(provider_summary).collect(),
+        providers: provider_summaries,
+        browser: browser_settings(&paths, &config),
+        secrets: secrets_settings(&paths)?,
     })
+}
+
+fn desktop_provider_summaries(providers: &ProviderRegistry) -> Vec<ProviderSummaryDto> {
+    let mut summaries: Vec<_> = providers.provider_entries().map(provider_summary).collect();
+    if !summaries.iter().any(|provider| provider.id == "puffer") {
+        summaries.insert(0, native_puffer_provider_summary());
+    }
+    summaries
+}
+
+fn native_puffer_provider_summary() -> ProviderSummaryDto {
+    ProviderSummaryDto {
+        id: "puffer".to_string(),
+        display_name: "Puffer".to_string(),
+        base_url: "local-cli://puffer".to_string(),
+        default_api: "cli".to_string(),
+        model_count: 1,
+        auth_modes: vec!["native".to_string()],
+        source_kind: "builtin".to_string(),
+        source_path: None,
+    }
+}
+
+fn browser_settings(
+    paths: &ConfigPaths,
+    config: &puffer_config::PufferConfig,
+) -> BrowserSettingsDto {
+    let mut captcha = config.browser.captcha.clone();
+    captcha.normalize();
+    BrowserSettingsDto {
+        extensions_enabled: config.browser.extensions_enabled,
+        extensions: config
+            .browser
+            .extensions
+            .iter()
+            .map(|extension| BrowserExtensionDto {
+                id: extension.id.clone(),
+                display_name: extension.display_name.clone(),
+                path: extension.path.clone(),
+                enabled: extension.enabled,
+                manifest_present: std::path::Path::new(&extension.path)
+                    .join("manifest.json")
+                    .exists(),
+                source: "custom".to_string(),
+            })
+            .collect(),
+        captcha: BrowserCaptchaSettingsDto {
+            enabled: captcha.enabled,
+            selected_solver: captcha.selected_solver.clone(),
+            solvers: builtin_captcha_solvers()
+                .iter()
+                .map(|solver| {
+                    let configured = captcha.solvers.get(solver.id);
+                    let base_url = configured
+                        .and_then(|item| item.base_url.clone())
+                        .unwrap_or_else(|| solver.default_base_url.to_string());
+                    let api_key_secret_id =
+                        configured.and_then(|item| item.api_key_secret_id.clone());
+                    let extension_dir = paths.builtin_resources_dir.join(solver.extension_path);
+                    BrowserCaptchaSolverDto {
+                        id: solver.id.to_string(),
+                        display_name: solver.display_name.to_string(),
+                        description: solver.description.to_string(),
+                        enabled: solver.id == captcha.selected_solver.as_str(),
+                        base_url,
+                        api_key_secret_id: api_key_secret_id.clone(),
+                        has_api_key: api_key_secret_id.is_some(),
+                        version: solver.version.to_string(),
+                        bundled: extension_dir.join("manifest.json").exists(),
+                        extension_path: extension_dir.display().to_string(),
+                        release_url: solver.release_url.to_string(),
+                        download_url: solver.download_url.to_string(),
+                        sha256: solver.sha256.to_string(),
+                        license: solver.license.to_string(),
+                    }
+                })
+                .collect(),
+        },
+    }
+}
+
+fn secrets_settings(paths: &ConfigPaths) -> Result<SecretsSettingsDto> {
+    let store_file = SecretVault::default_path(&paths.user_config_dir);
+    Ok(SecretsSettingsDto {
+        store_file: store_file.display().to_string(),
+        key_source: secret_key_source().to_string(),
+        chrome_import_supported: cfg!(target_os = "macos"),
+        sources: puffer_secrets::available_browser_sources()
+            .into_iter()
+            .map(|source| SecretSourceDto {
+                id: source.id,
+                label: source.label,
+                available: source.available,
+            })
+            .collect(),
+        items: SecretVault::list_metadata(&store_file)?
+            .into_iter()
+            .map(secret_summary)
+            .collect(),
+    })
+}
+
+fn secret_key_source() -> &'static str {
+    if std::env::var_os("PUFFER_SECRET_STORE_KEY").is_some() {
+        "env"
+    } else if cfg!(target_os = "macos") {
+        "macos-keychain"
+    } else {
+        "local-key-file"
+    }
+}
+
+fn secret_summary(summary: SecretSummary) -> SecretSummaryDto {
+    SecretSummaryDto {
+        id: summary.id,
+        label: summary.label,
+        description: summary.description,
+        username: summary.username,
+        origin: summary.origin,
+        source: summary.source,
+        created_at_ms: summary.created_at_ms,
+        updated_at_ms: summary.updated_at_ms,
+    }
 }
 
 fn auth_statuses(auth_store: &AuthStore) -> Vec<AuthProviderStatusDto> {

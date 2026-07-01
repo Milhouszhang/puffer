@@ -1,0 +1,15 @@
+id: qwen35
+display_name: Qwen3.5 (Local)
+# Local, on-device model for macOS desktop users. Served by an OpenAI-compatible
+# mlx shim on 127.0.0.1:8088 (see scripts/qwen35-serve). No API key needed.
+base_url: http://127.0.0.1:8088/v1
+default_api: openai-completions
+auth_modes: []
+models:
+  - id: qwen3.5-0.8b
+    display_name: Qwen3.5-0.8B (local)
+    provider: qwen35
+    api: openai-completions
+    context_window: 32768
+    max_output_tokens: 8192
+    supports_reasoning: true

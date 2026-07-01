@@ -1,13 +1,16 @@
 use crate::approval_overlay::ApprovalOverlay;
 use crate::btw_overlay::BtwOverlay;
-use crate::popup::popup_rows;
+use crate::pentest::PentestState;
+use crate::popup::{popup_row_matches_input, popup_rows, PopupRow};
 use crate::session_overlay::SessionOverlay;
 use crate::status_overlay::StatusOverlay;
 use crate::text_overlay::TextOverlay;
 use crate::usage::UsageOverlay;
+use crate::user_question_overlay::UserQuestionOverlay;
 use puffer_core::{
-    CommandSpec, PermissionPromptAction, PermissionPromptRequest, ToolCallRequest, ToolInvocation,
-    TurnExecution, TurnUsageReport,
+    CommandSpec, PermissionPromptAction, PermissionPromptRequest, SessionPermissionState,
+    ToolCallRequest, ToolInvocation, TurnExecution, TurnUsageReport, UserQuestionPromptRequest,
+    UserQuestionPromptResponse,
 };
 use puffer_provider_registry::{AuthStore, ExternalImportCandidate};
 use puffer_session_store::SessionSummary;
@@ -62,24 +65,56 @@ pub(crate) struct TuiState {
     pub(crate) tool_details_expanded: bool,
     pub(crate) overlay: Option<OverlayState>,
     pub(crate) pending_permission_request: Option<PendingPermissionRequest>,
+    pub(crate) pending_user_question_request: Option<PendingUserQuestionRequest>,
     pub(crate) deferred_prompt: Option<String>,
     pub(crate) pending_submit: Option<PendingSubmit>,
     pub(crate) queued_prompts: VecDeque<String>,
     pub(crate) active_loop: Option<LoopState>,
+    pub(crate) active_pentest: Option<PentestState>,
     /// Timestamp of last Ctrl+C press. Second press within 2s exits.
     pub(crate) last_ctrl_c: Option<std::time::Instant>,
     /// Transient hint shown in the status bar (auto-clears after 2s).
     pub(crate) status_hint: Option<(String, std::time::Instant)>,
+    /// Pasted-text placeholders displayed in `input`, paired with their full
+    /// content. Expanded back into the prompt when the user submits.
+    pub(crate) pending_pastes: Vec<(String, String)>,
+    /// Counter used to generate `[Pasted text #N ...]` placeholder ids.
+    pub(crate) next_paste_id: usize,
+    /// Recently submitted or cleared prompts, oldest first. Recalled with
+    /// the Up/Down arrow keys when the input is empty or currently being
+    /// navigated.
+    pub(crate) history: VecDeque<String>,
+    /// Index into `history` while the user is navigating it. `None` means
+    /// the user is editing fresh input and not browsing history.
+    pub(crate) history_cursor: Option<usize>,
+    /// Snapshot of the user's in-progress input at the moment they started
+    /// navigating history, restored when they move past the newest entry.
+    pub(crate) history_draft: Option<String>,
+    /// Timestamp of the most recent user keystroke. Auto-recap fires when
+    /// `now - last_user_input_at > config.recap.idle_secs` and the rest of
+    /// `puffer_core::recap::should_auto_trigger` passes.
+    pub(crate) last_user_input_at: std::time::Instant,
+    /// Count of user messages observed at the time the last recap (manual or
+    /// auto) was triggered. Feeds the cooldown check.
+    pub(crate) last_recap_user_msg_count: Option<usize>,
 }
 
 /// Carries one completed background provider turn back to the UI thread.
 pub(crate) struct PendingSubmitResult {
     pub(crate) outcome: std::result::Result<TurnExecution, String>,
     pub(crate) auth_store: AuthStore,
-    /// Session-level tool permissions accumulated on the worker clone.
-    pub(crate) session_tool_permissions: std::collections::HashMap<String, String>,
+    /// Canonical session-level permission state accumulated on the worker
+    /// clone. The UI thread replaces its local state with this value directly
+    /// so category-scoped grants survive the round-trip.
+    pub(crate) session_permission_state: SessionPermissionState,
     /// Whether the user chose "allow all" during this turn.
     pub(crate) session_allow_all: bool,
+    /// Project-memory review turns accumulated on the worker clone.
+    pub(crate) project_memory_review_turns: usize,
+    /// AutoDream review turns accumulated on the worker clone.
+    pub(crate) autodream_review_turns: usize,
+    /// Whether this completed turn should ask the user about creating a skill.
+    pub(crate) autodream_suggest_skill: bool,
 }
 
 /// Carries one event emitted while a provider-backed turn is in flight.
@@ -88,6 +123,7 @@ pub(crate) enum PendingSubmitEvent {
     TextDelta(String),
     ToolCallsRequested(Vec<ToolCallRequest>),
     ToolInvocations(Vec<ToolInvocation>),
+    ReflectionCheckpoint(String),
     RetryAttempt {
         attempt: usize,
         max_attempts: usize,
@@ -95,6 +131,15 @@ pub(crate) enum PendingSubmitEvent {
     },
     Usage(TurnUsageReport),
     PermissionRequest(PermissionPromptRequest, Sender<PermissionPromptAction>),
+    UserQuestionRequest(
+        UserQuestionPromptRequest,
+        Sender<UserQuestionPromptResponse>,
+    ),
+    ShellShortcutFinished(ShellShortcutResult),
+    /// A phase update from a background /ultrareview run (shown as a status hint).
+    UltrareviewProgress(String),
+    /// Final /ultrareview output (rendered markdown) or an error string.
+    UltrareviewFinished(Result<String, String>),
     Finished(PendingSubmitResult),
 }
 
@@ -102,18 +147,50 @@ pub(crate) enum PendingSubmitEvent {
 pub(crate) struct PendingSubmit {
     pub(crate) prompt: String,
     pub(crate) receiver: Receiver<PendingSubmitEvent>,
+    /// Transcript index through which live turn rows are already persisted.
+    pub(crate) transcript_persisted_len: usize,
+    /// Transcript index at the start of the current provider stream attempt.
+    pub(crate) stream_attempt_transcript_len: usize,
     pub(crate) pending_tool_calls: Vec<ToolCallRequest>,
     pub(crate) rendered_tool_invocations: usize,
+    /// Tool invocation count committed before the current provider stream attempt.
+    pub(crate) stream_attempt_rendered_tool_invocations: usize,
     pub(crate) started_at: std::time::Instant,
     /// Set to true when the model is actively producing thinking/reasoning tokens.
     pub(crate) thinking_active: bool,
     /// Transient status message (e.g. "Retrying (2/3)...").
     pub(crate) status_hint: Option<String>,
+    /// Cancel handle wired into the agent loop. Tripping it makes the
+    /// worker thread exit at the next turn boundary instead of running
+    /// to completion. Without this, ESC just drops the receiver and the
+    /// worker keeps running (burning tokens) until the LLM and tool
+    /// calls finish on their own.
+    pub(crate) cancel: puffer_core::CancelToken,
+}
+
+/// Carries an asynchronously completed `!cmd` shell shortcut back to the UI.
+pub(crate) struct ShellShortcutResult {
+    pub(crate) command: String,
+    pub(crate) success: bool,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 /// Stores the response channel for the currently visible permission prompt.
 pub(crate) struct PendingPermissionRequest {
     pub(crate) response_tx: Sender<PermissionPromptAction>,
+}
+
+/// Stores the response channel for the currently visible user question prompt.
+pub(crate) struct PendingUserQuestionRequest {
+    pub(crate) response_tx: Sender<UserQuestionPromptResponse>,
+}
+
+/// Describes the review action selected from an AutoDream suggestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoDreamSuggestionAction {
+    CreateSkillDraft,
+    Dismiss,
 }
 
 impl Default for TuiState {
@@ -127,15 +204,32 @@ impl Default for TuiState {
             tool_details_expanded: false,
             overlay: None,
             pending_permission_request: None,
+            pending_user_question_request: None,
             deferred_prompt: None,
             pending_submit: None,
             queued_prompts: VecDeque::new(),
             active_loop: None,
+            active_pentest: None,
             last_ctrl_c: None,
             status_hint: None,
+            pending_pastes: Vec::new(),
+            next_paste_id: 1,
+            history: VecDeque::new(),
+            history_cursor: None,
+            history_draft: None,
+            last_user_input_at: std::time::Instant::now(),
+            last_recap_user_msg_count: None,
         }
     }
 }
+
+/// Threshold above which a paste is replaced with a `[Pasted text #N ...]`
+/// placeholder instead of being inserted directly. Multi-line pastes are
+/// always replaced regardless of length.
+pub(crate) const PASTE_PLACEHOLDER_CHAR_THRESHOLD: usize = 200;
+
+/// Maximum number of prompts retained for Up/Down recall.
+pub(crate) const MAX_INPUT_HISTORY: usize = 200;
 
 impl TuiState {
     /// Returns true if this Ctrl+C should exit (second press within 2s).
@@ -173,6 +267,8 @@ impl TuiState {
         self.input.clear();
         self.cursor = 0;
         self.slash_selection = 0;
+        self.pending_pastes.clear();
+        self.exit_history_navigation();
         self.sync(commands);
     }
 
@@ -198,14 +294,84 @@ impl TuiState {
 
     /// Inserts one character into the prompt and refreshes slash suggestions.
     pub(crate) fn insert_char(&mut self, ch: char, commands: &[CommandSpec]) {
+        self.exit_history_navigation();
         self.input.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
         self.sync(commands);
     }
 
-    /// Removes the character immediately before the cursor.
+    /// Inserts a literal newline at the cursor (Shift+Enter / Alt+Enter / Ctrl+J).
+    pub(crate) fn insert_newline(&mut self, commands: &[CommandSpec]) {
+        self.insert_char('\n', commands);
+    }
+
+    /// Inserts a verbatim string (typically from a non-placeholder paste).
+    pub(crate) fn insert_str(&mut self, text: &str, commands: &[CommandSpec]) {
+        self.exit_history_navigation();
+        self.input.insert_str(self.cursor, text);
+        self.cursor += text.len();
+        self.sync(commands);
+    }
+
+    /// Handles a bracketed paste: inserts a placeholder for multi-line or
+    /// long pastes and stashes the original for expansion at submit time.
+    /// Short single-line pastes are inserted verbatim.
+    pub(crate) fn handle_paste(&mut self, raw: &str, commands: &[CommandSpec]) {
+        // Many terminals deliver paste newlines as `\r` or `\r\n`; normalize.
+        let pasted = raw.replace("\r\n", "\n").replace('\r', "\n");
+        let multiline = pasted.contains('\n');
+        let char_count = pasted.chars().count();
+        if !multiline && char_count <= PASTE_PLACEHOLDER_CHAR_THRESHOLD {
+            self.insert_str(&pasted, commands);
+            return;
+        }
+        let line_count = pasted.matches('\n').count() + 1;
+        let placeholder = self.allocate_paste_placeholder(line_count);
+        self.pending_pastes
+            .push((placeholder.clone(), pasted.clone()));
+        self.insert_str(&placeholder, commands);
+    }
+
+    fn allocate_paste_placeholder(&mut self, line_count: usize) -> String {
+        let id = self.next_paste_id;
+        self.next_paste_id = self.next_paste_id.saturating_add(1);
+        if line_count > 1 {
+            format!("[Pasted text #{id} +{line_count} lines]")
+        } else {
+            format!("[Pasted text #{id}]")
+        }
+    }
+
+    /// Replaces every `[Pasted text #N ...]` placeholder in `text` with its
+    /// stored content, returning the expanded prompt.
+    pub(crate) fn expand_paste_placeholders(&self, text: &str) -> String {
+        if self.pending_pastes.is_empty() || text.is_empty() {
+            return text.to_string();
+        }
+        let mut expanded = text.to_string();
+        for (placeholder, content) in &self.pending_pastes {
+            if expanded.contains(placeholder) {
+                expanded = expanded.replace(placeholder, content);
+            }
+        }
+        expanded
+    }
+
+    /// Removes the character immediately before the cursor. If the cursor is
+    /// inside a `[Pasted text #N ...]` placeholder, removes the entire
+    /// placeholder and drops its stored content.
     pub(crate) fn backspace(&mut self, commands: &[CommandSpec]) {
         if self.cursor == 0 {
+            return;
+        }
+        self.exit_history_navigation();
+        if let Some((start, end, placeholder)) =
+            self.paste_placeholder_span_for_backspace(self.cursor)
+        {
+            self.input.drain(start..end);
+            self.cursor = start;
+            self.pending_pastes.retain(|(name, _)| *name != placeholder);
+            self.sync(commands);
             return;
         }
         let start = previous_boundary(&self.input, self.cursor);
@@ -214,9 +380,54 @@ impl TuiState {
         self.sync(commands);
     }
 
-    /// Removes the character immediately after the cursor.
+    /// Returns `(start_byte, end_byte, placeholder)` when `cursor` is inside
+    /// or at the closing boundary of a tracked paste placeholder.
+    fn paste_placeholder_span_for_backspace(
+        &self,
+        cursor: usize,
+    ) -> Option<(usize, usize, String)> {
+        self.paste_placeholder_span_at(cursor, false, true)
+    }
+
+    /// Returns `(start_byte, end_byte, placeholder)` when `cursor` is inside
+    /// or at the opening boundary of a tracked paste placeholder.
+    fn paste_placeholder_span_for_delete(&self, cursor: usize) -> Option<(usize, usize, String)> {
+        self.paste_placeholder_span_at(cursor, true, false)
+    }
+
+    fn paste_placeholder_span_at(
+        &self,
+        cursor: usize,
+        include_start: bool,
+        include_end: bool,
+    ) -> Option<(usize, usize, String)> {
+        for (placeholder, _) in &self.pending_pastes {
+            for (start, _) in self.input.match_indices(placeholder) {
+                let end = start + placeholder.len();
+                let after_start = cursor > start || (include_start && cursor == start);
+                let before_end = cursor < end || (include_end && cursor == end);
+                if after_start && before_end {
+                    return Some((start, end, placeholder.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Removes the character immediately after the cursor. If the cursor is
+    /// inside a `[Pasted text #N ...]` placeholder, removes the entire
+    /// placeholder and drops its stored content.
     pub(crate) fn delete(&mut self, commands: &[CommandSpec]) {
         if self.cursor >= self.input.len() {
+            return;
+        }
+        self.exit_history_navigation();
+        if let Some((start, end, placeholder)) = self.paste_placeholder_span_for_delete(self.cursor)
+        {
+            self.input.drain(start..end);
+            self.cursor = start;
+            self.pending_pastes.retain(|(name, _)| *name != placeholder);
+            self.sync(commands);
             return;
         }
         let end = next_boundary(&self.input, self.cursor);
@@ -244,12 +455,11 @@ impl TuiState {
 
     /// Applies the currently highlighted slash-command suggestion to the prompt.
     pub(crate) fn apply_selected_command(&mut self, commands: &[CommandSpec]) -> bool {
-        let rows = self.matching_rows(commands);
-        let Some(command) = rows.get(self.slash_selection).copied() else {
+        let Some(row) = self.selected_matching_row(commands) else {
             return false;
         };
-        self.input = format!("/{}", command.name);
-        if command.argument_hint.is_some() {
+        self.input = row.replacement;
+        if row.append_space && !self.input.ends_with(' ') {
             self.input.push(' ');
         }
         self.cursor = self.input.len();
@@ -259,28 +469,135 @@ impl TuiState {
 
     /// Completes a partial slash command when Enter should pick the highlighted result.
     pub(crate) fn complete_on_enter(&mut self, commands: &[CommandSpec]) -> bool {
-        if !self.input.starts_with('/') || self.input.contains(' ') {
+        if !self.input.starts_with('/') {
             return false;
         }
-        let trimmed = self.input.trim_start_matches('/');
+        let trimmed = self.input.trim_start_matches('/').trim().to_string();
         if trimmed.is_empty() {
             return false;
         }
-        let rows = self.matching_rows(commands);
-        let Some(command) = rows.get(self.slash_selection).copied() else {
+        let Some(row) = self.selected_matching_row(commands) else {
             return false;
         };
-        if command.name == trimmed || command.aliases.iter().any(|alias| alias == trimmed) {
+        if popup_row_matches_input(&row, &self.input, commands) {
             return false;
         }
         self.apply_selected_command(commands)
     }
 
-    /// Takes the current input and resets the prompt buffer.
+    fn selected_matching_row(&mut self, commands: &[CommandSpec]) -> Option<PopupRow> {
+        let rows = self.matching_rows(commands);
+        if rows.is_empty() {
+            self.slash_selection = 0;
+            return None;
+        }
+        self.slash_selection = self.slash_selection.min(rows.len() - 1);
+        rows.get(self.slash_selection).cloned()
+    }
+
+    /// Takes the current input, expanding any `[Pasted text #N]` placeholders
+    /// back to their full content, and resets the prompt buffer. The expanded
+    /// prompt is also recorded in the recall history so the user can press
+    /// Up to bring it back later.
     pub(crate) fn take_input(&mut self) -> String {
         self.cursor = 0;
         self.slash_selection = 0;
-        std::mem::take(&mut self.input)
+        self.exit_history_navigation();
+        let raw = std::mem::take(&mut self.input);
+        let expanded = self.expand_paste_placeholders(&raw);
+        self.pending_pastes.clear();
+        self.push_history(&expanded);
+        expanded
+    }
+
+    /// Clears the current input and stores it in history so the user can
+    /// press Up to recall it. Returns `true` when something was cleared, so
+    /// callers (e.g., the Ctrl+C handler) can suppress the secondary
+    /// "press again to exit" behavior on this keystroke.
+    pub(crate) fn clear_input_to_history(&mut self, commands: &[CommandSpec]) -> bool {
+        if self.input.is_empty() && self.pending_pastes.is_empty() {
+            return false;
+        }
+        let raw = std::mem::take(&mut self.input);
+        let expanded = self.expand_paste_placeholders(&raw);
+        self.pending_pastes.clear();
+        self.cursor = 0;
+        self.slash_selection = 0;
+        self.exit_history_navigation();
+        self.push_history(&expanded);
+        self.sync(commands);
+        true
+    }
+
+    /// Pushes one entry onto the recall history, deduplicating against the
+    /// most recent entry and trimming the queue to [`MAX_INPUT_HISTORY`].
+    pub(crate) fn push_history(&mut self, entry: &str) {
+        if entry.trim().is_empty() {
+            return;
+        }
+        if self.history.back().map(String::as_str) == Some(entry) {
+            return;
+        }
+        self.history.push_back(entry.to_string());
+        while self.history.len() > MAX_INPUT_HISTORY {
+            self.history.pop_front();
+        }
+    }
+
+    /// Returns true when the user is currently navigating recall history.
+    pub(crate) fn is_navigating_history(&self) -> bool {
+        self.history_cursor.is_some()
+    }
+
+    /// Loads the previous (older) history entry into the input. Returns
+    /// `false` when there is nothing to recall.
+    pub(crate) fn history_recall_prev(&mut self, commands: &[CommandSpec]) -> bool {
+        if self.history.is_empty() {
+            return false;
+        }
+        let next_index = match self.history_cursor {
+            None => {
+                self.history_draft = Some(self.input.clone());
+                self.history.len() - 1
+            }
+            Some(0) => return true,
+            Some(idx) => idx - 1,
+        };
+        self.history_cursor = Some(next_index);
+        self.input = self.history[next_index].clone();
+        self.cursor = self.input.len();
+        self.pending_pastes.clear();
+        self.sync(commands);
+        true
+    }
+
+    /// Loads the next (newer) history entry. Past the newest entry, the
+    /// pre-history draft is restored and history navigation ends. Returns
+    /// `false` when not currently navigating.
+    pub(crate) fn history_recall_next(&mut self, commands: &[CommandSpec]) -> bool {
+        let Some(idx) = self.history_cursor else {
+            return false;
+        };
+        if idx + 1 >= self.history.len() {
+            self.input = self.history_draft.take().unwrap_or_default();
+            self.cursor = self.input.len();
+            self.history_cursor = None;
+            self.pending_pastes.clear();
+            self.sync(commands);
+            return true;
+        }
+        let next = idx + 1;
+        self.history_cursor = Some(next);
+        self.input = self.history[next].clone();
+        self.cursor = self.input.len();
+        self.pending_pastes.clear();
+        self.sync(commands);
+        true
+    }
+
+    fn exit_history_navigation(&mut self) {
+        self.history_cursor = None;
+        self.history_draft = None;
     }
 
     /// Stores a prompt to submit after onboarding finishes.
@@ -316,12 +633,8 @@ impl TuiState {
         }
     }
 
-    fn matching_rows<'a>(&self, commands: &'a [CommandSpec]) -> Vec<&'a CommandSpec> {
-        if self.input.starts_with('/') {
-            popup_rows(&self.input, commands)
-        } else {
-            Vec::new()
-        }
+    fn matching_rows(&self, commands: &[CommandSpec]) -> Vec<PopupRow> {
+        popup_rows(&self.input, commands)
     }
 
     fn sync(&mut self, commands: &[CommandSpec]) {
@@ -437,6 +750,14 @@ pub(crate) enum OverlayState {
     Status(StatusOverlay),
     Text(TextOverlay),
     Usage(UsageOverlay),
+    UserQuestionPrompt {
+        overlay: UserQuestionOverlay,
+    },
+    AutoDreamSuggestion {
+        skill_name: String,
+        purpose: String,
+        selection: usize,
+    },
     OnboardingTheme {
         entries: Vec<ModelPickerEntry>,
         selection: usize,
@@ -483,7 +804,8 @@ impl OverlayState {
             | Self::OnboardingTheme { selection, .. }
             | Self::OnboardingProvider { selection, .. }
             | Self::OnboardingAuth { selection, .. }
-            | Self::OnboardingModel { selection, .. } => {
+            | Self::OnboardingModel { selection, .. }
+            | Self::AutoDreamSuggestion { selection, .. } => {
                 *selection = selection.saturating_sub(1);
             }
             Self::PermissionPrompt { overlay } => overlay.select_previous(),
@@ -491,10 +813,9 @@ impl OverlayState {
             Self::Session(overlay) => overlay.scroll_up(),
             Self::Status(overlay) => overlay.scroll_up(),
             Self::Text(overlay) => overlay.scroll_up(),
-            Self::Help
-            | Self::ApiKeyPrompt { .. }
-            | Self::Usage(..)
-            | Self::OnboardingApiKey { .. } => {}
+            Self::Usage(overlay) => overlay.scroll_up(),
+            Self::UserQuestionPrompt { overlay } => overlay.select_previous(),
+            Self::Help | Self::ApiKeyPrompt { .. } | Self::OnboardingApiKey { .. } => {}
         }
     }
 
@@ -541,15 +862,17 @@ impl OverlayState {
             } => {
                 *selection = (*selection + 1).min(entries.len().saturating_sub(1));
             }
+            Self::AutoDreamSuggestion { selection, .. } => {
+                *selection = (*selection + 1).min(1);
+            }
             Self::PermissionPrompt { overlay } => overlay.select_next(),
             Self::Btw(overlay) => overlay.scroll_down(),
             Self::Session(overlay) => overlay.scroll_down(),
             Self::Status(overlay) => overlay.scroll_down(),
             Self::Text(overlay) => overlay.scroll_down(),
-            Self::Help
-            | Self::ApiKeyPrompt { .. }
-            | Self::Usage(..)
-            | Self::OnboardingApiKey { .. } => {}
+            Self::Usage(overlay) => overlay.scroll_down(),
+            Self::UserQuestionPrompt { overlay } => overlay.select_next(),
+            Self::Help | Self::ApiKeyPrompt { .. } | Self::OnboardingApiKey { .. } => {}
         }
     }
 
@@ -561,6 +884,8 @@ impl OverlayState {
             Self::Session(overlay) => overlay.page_up(),
             Self::Status(overlay) => overlay.page_up(),
             Self::Text(overlay) => overlay.page_up(),
+            Self::Usage(overlay) => overlay.page_up(),
+            Self::UserQuestionPrompt { overlay } => overlay.page_up(),
             _ => {
                 for _ in 0..10 {
                     self.select_previous();
@@ -577,6 +902,8 @@ impl OverlayState {
             Self::Session(overlay) => overlay.page_down(),
             Self::Status(overlay) => overlay.page_down(),
             Self::Text(overlay) => overlay.page_down(),
+            Self::Usage(overlay) => overlay.page_down(),
+            Self::UserQuestionPrompt { overlay } => overlay.page_down(),
             _ => {
                 for _ in 0..10 {
                     self.select_next();
@@ -593,6 +920,7 @@ impl OverlayState {
                 | Self::Btw(..)
                 | Self::Session(..)
                 | Self::Status(..)
+                | Self::UserQuestionPrompt { .. }
                 | Self::PermissionPrompt { .. }
         )
     }
@@ -682,6 +1010,8 @@ impl OverlayState {
             | Self::Status(..)
             | Self::Text(..)
             | Self::Usage(..)
+            | Self::UserQuestionPrompt { .. }
+            | Self::AutoDreamSuggestion { .. }
             | Self::OnboardingTheme { .. }
             | Self::OnboardingProvider { .. }
             | Self::OnboardingAuth { .. }
@@ -719,6 +1049,8 @@ impl OverlayState {
             | Self::Session(..)
             | Self::Status(..)
             | Self::Text(..)
+            | Self::UserQuestionPrompt { .. }
+            | Self::AutoDreamSuggestion { .. }
             | Self::Usage(..)
             | Self::OnboardingTheme { .. } => None,
         }
@@ -753,9 +1085,70 @@ impl OverlayState {
         }
     }
 
+    /// Returns true when the selected entry still matches the typed query.
+    pub(crate) fn selection_matches_query(&self, query: &str) -> bool {
+        let query = normalize_picker_query(query);
+        if query.is_empty() || !self.accepts_filter_input() {
+            return true;
+        }
+        match self {
+            Self::SessionPicker {
+                sessions,
+                selection,
+            } => sessions
+                .get(*selection)
+                .is_some_and(|session| session_matches_query(session, &query)),
+            Self::AgentPicker { entries, selection }
+            | Self::ModelPicker {
+                entries, selection, ..
+            }
+            | Self::EffortPicker {
+                entries, selection, ..
+            }
+            | Self::FastModePicker {
+                entries, selection, ..
+            }
+            | Self::LoginPicker { entries, selection }
+            | Self::ProviderPicker {
+                entries, selection, ..
+            }
+            | Self::LogoutPicker { entries, selection }
+            | Self::ThemePicker { entries, selection }
+            | Self::CommandPicker {
+                entries, selection, ..
+            }
+            | Self::OnboardingTheme { entries, selection }
+            | Self::OnboardingProvider { entries, selection }
+            | Self::OnboardingAuth {
+                entries, selection, ..
+            }
+            | Self::OnboardingModel {
+                entries, selection, ..
+            } => entries
+                .get(*selection)
+                .is_some_and(|entry| model_entry_matches_query(entry, &query)),
+            Self::AuthPicker {
+                entries, selection, ..
+            } => entries
+                .get(*selection)
+                .is_some_and(|entry| auth_entry_matches_query(entry, &query)),
+            Self::PermissionPrompt { .. }
+            | Self::Help
+            | Self::Btw(..)
+            | Self::Session(..)
+            | Self::Status(..)
+            | Self::Text(..)
+            | Self::Usage(..)
+            | Self::UserQuestionPrompt { .. }
+            | Self::AutoDreamSuggestion { .. }
+            | Self::ApiKeyPrompt { .. }
+            | Self::OnboardingApiKey { .. } => true,
+        }
+    }
+
     /// Moves the selection to the first entry that matches the typed query.
     pub(crate) fn select_matching_query(&mut self, query: &str) {
-        let query = query.trim().to_ascii_lowercase();
+        let query = normalize_picker_query(query);
         if query.is_empty() {
             return;
         }
@@ -764,34 +1157,10 @@ impl OverlayState {
                 sessions,
                 selection,
             } => {
-                if let Some(index) = sessions.iter().position(|session| {
-                    session.id.to_string().to_ascii_lowercase().contains(&query)
-                        || session
-                            .display_name
-                            .as_deref()
-                            .map(|name| name.to_ascii_lowercase().contains(&query))
-                            .unwrap_or(false)
-                        || session
-                            .slug
-                            .as_deref()
-                            .map(|slug| slug.to_ascii_lowercase().contains(&query))
-                            .unwrap_or(false)
-                        || session
-                            .note
-                            .as_deref()
-                            .map(|note| note.to_ascii_lowercase().contains(&query))
-                            .unwrap_or(false)
-                        || session
-                            .tags
-                            .iter()
-                            .any(|tag| tag.to_ascii_lowercase().contains(&query))
-                        || session
-                            .cwd
-                            .display()
-                            .to_string()
-                            .to_ascii_lowercase()
-                            .contains(&query)
-                }) {
+                if let Some(index) = sessions
+                    .iter()
+                    .position(|session| session_matches_query(session, &query))
+                {
                     *selection = index;
                 }
             }
@@ -822,10 +1191,10 @@ impl OverlayState {
             | Self::OnboardingModel {
                 entries, selection, ..
             } => {
-                if let Some(index) = entries.iter().position(|entry| {
-                    entry.selector.to_ascii_lowercase().contains(&query)
-                        || entry.description.to_ascii_lowercase().contains(&query)
-                }) {
+                if let Some(index) = entries
+                    .iter()
+                    .position(|entry| model_entry_matches_query(entry, &query))
+                {
                     *selection = index;
                 }
             }
@@ -834,14 +1203,16 @@ impl OverlayState {
             | Self::Btw(..)
             | Self::Session(..)
             | Self::Status(..)
-            | Self::Text(..) => {}
+            | Self::Text(..)
+            | Self::AutoDreamSuggestion { .. } => {}
+            Self::UserQuestionPrompt { .. } => {}
             Self::AuthPicker {
                 entries, selection, ..
             } => {
-                if let Some(index) = entries.iter().position(|entry| {
-                    entry.label.to_ascii_lowercase().contains(&query)
-                        || entry.description.to_ascii_lowercase().contains(&query)
-                }) {
+                if let Some(index) = entries
+                    .iter()
+                    .position(|entry| auth_entry_matches_query(entry, &query))
+                {
                     *selection = index;
                 }
             }
@@ -897,6 +1268,40 @@ impl OverlayState {
             self,
             Self::ApiKeyPrompt { .. } | Self::OnboardingApiKey { .. }
         )
+    }
+
+    /// Returns true when printable typing should filter or jump selection.
+    pub(crate) fn accepts_filter_input(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionPicker { .. }
+                | Self::AgentPicker { .. }
+                | Self::ModelPicker { .. }
+                | Self::EffortPicker { .. }
+                | Self::FastModePicker { .. }
+                | Self::LoginPicker { .. }
+                | Self::ProviderPicker { .. }
+                | Self::AuthPicker { .. }
+                | Self::LogoutPicker { .. }
+                | Self::ThemePicker { .. }
+                | Self::CommandPicker { .. }
+                | Self::OnboardingTheme { .. }
+                | Self::OnboardingProvider { .. }
+                | Self::OnboardingAuth { .. }
+                | Self::OnboardingModel { .. }
+        )
+    }
+
+    /// Returns the selected AutoDream suggestion action, when present.
+    pub(crate) fn selected_autodream_suggestion_action(&self) -> Option<AutoDreamSuggestionAction> {
+        match self {
+            Self::AutoDreamSuggestion { selection, .. } => match selection {
+                0 => Some(AutoDreamSuggestionAction::CreateSkillDraft),
+                1 => Some(AutoDreamSuggestionAction::Dismiss),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Returns the selected permission action when the overlay is a permission prompt.
@@ -1038,6 +1443,54 @@ impl OverlayState {
     }
 }
 
+fn normalize_picker_query(query: &str) -> String {
+    query.trim().to_ascii_lowercase()
+}
+
+fn model_entry_matches_query(entry: &ModelPickerEntry, query: &str) -> bool {
+    entry.selector.to_ascii_lowercase().contains(query)
+        || entry.description.to_ascii_lowercase().contains(query)
+}
+
+fn auth_entry_matches_query(entry: &AuthPickerEntry, query: &str) -> bool {
+    entry.label.to_ascii_lowercase().contains(query)
+        || entry.description.to_ascii_lowercase().contains(query)
+}
+
+fn session_matches_query(session: &SessionSummary, query: &str) -> bool {
+    session.id.to_string().to_ascii_lowercase().contains(query)
+        || session
+            .display_name
+            .as_deref()
+            .map(|name| name.to_ascii_lowercase().contains(query))
+            .unwrap_or(false)
+        || session
+            .generated_title
+            .as_deref()
+            .map(|title| title.to_ascii_lowercase().contains(query))
+            .unwrap_or(false)
+        || session
+            .slug
+            .as_deref()
+            .map(|slug| slug.to_ascii_lowercase().contains(query))
+            .unwrap_or(false)
+        || session
+            .note
+            .as_deref()
+            .map(|note| note.to_ascii_lowercase().contains(query))
+            .unwrap_or(false)
+        || session
+            .tags
+            .iter()
+            .any(|tag| tag.to_ascii_lowercase().contains(query))
+        || session
+            .cwd
+            .display()
+            .to_string()
+            .to_ascii_lowercase()
+            .contains(query)
+}
+
 fn previous_boundary(input: &str, cursor: usize) -> usize {
     if cursor == 0 {
         return 0;
@@ -1066,7 +1519,29 @@ fn max_scroll_offset(line_count: u16, viewport_height: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::TuiState;
+    use super::{session_matches_query, TuiState};
+    use puffer_session_store::SessionSummary;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    #[test]
+    fn session_matches_query_uses_generated_title() {
+        let session = SessionSummary {
+            id: Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap(),
+            display_name: None,
+            generated_title: Some("Fix session naming".to_string()),
+            cwd: PathBuf::from("/workspace/puffer"),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            event_count: 3,
+            parent_session_id: None,
+            slug: None,
+            tags: Vec::new(),
+            note: None,
+        };
+
+        assert!(session_matches_query(&session, "session naming"));
+    }
 
     #[test]
     fn scroll_up_detaches_from_follow_output() {
@@ -1084,5 +1559,144 @@ mod tests {
         tui.scroll_down(1, 20, 5);
         assert!(tui.follow_output);
         assert_eq!(tui.scroll_offset, 15);
+    }
+
+    #[test]
+    fn handle_paste_replaces_multiline_with_placeholder() {
+        let mut tui = TuiState::default();
+        tui.handle_paste("line one\nline two\nline three", &[]);
+        assert_eq!(tui.input, "[Pasted text #1 +3 lines]");
+        assert_eq!(tui.pending_pastes.len(), 1);
+        let submitted = tui.take_input();
+        assert_eq!(submitted, "line one\nline two\nline three");
+        assert!(tui.input.is_empty());
+        assert!(tui.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn handle_paste_inserts_short_single_line_verbatim() {
+        let mut tui = TuiState::default();
+        tui.handle_paste("hello world", &[]);
+        assert_eq!(tui.input, "hello world");
+        assert!(tui.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn handle_paste_normalizes_carriage_returns() {
+        let mut tui = TuiState::default();
+        tui.handle_paste("a\r\nb\rc", &[]);
+        // \r\n -> \n, lone \r -> \n => "a\nb\nc" => 3 lines
+        let placeholder = tui.input.clone();
+        assert!(placeholder.starts_with("[Pasted text #1 +3 lines"));
+        assert_eq!(tui.expand_paste_placeholders(&placeholder), "a\nb\nc");
+    }
+
+    #[test]
+    fn backspace_at_end_of_placeholder_removes_whole_paste() {
+        let mut tui = TuiState::default();
+        tui.handle_paste("one\ntwo", &[]);
+        let len = tui.input.len();
+        tui.cursor = len;
+        tui.backspace(&[]);
+        assert!(tui.input.is_empty());
+        assert!(tui.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn backspace_inside_placeholder_removes_whole_paste() {
+        let mut tui = TuiState::default();
+        tui.insert_str("before ", &[]);
+        tui.handle_paste("one\ntwo", &[]);
+        tui.insert_str(" after", &[]);
+        let placeholder_start = "before ".len();
+        tui.cursor = placeholder_start + 4;
+
+        tui.backspace(&[]);
+
+        assert_eq!(tui.input, "before  after");
+        assert_eq!(tui.cursor, placeholder_start);
+        assert!(tui.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn delete_at_start_of_placeholder_removes_whole_paste() {
+        let mut tui = TuiState::default();
+        tui.insert_str("before ", &[]);
+        tui.handle_paste("one\ntwo", &[]);
+        tui.insert_str(" after", &[]);
+        let placeholder_start = "before ".len();
+        tui.cursor = placeholder_start;
+
+        tui.delete(&[]);
+
+        assert_eq!(tui.input, "before  after");
+        assert_eq!(tui.cursor, placeholder_start);
+        assert!(tui.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn insert_newline_grows_input() {
+        let mut tui = TuiState::default();
+        tui.insert_char('a', &[]);
+        tui.insert_newline(&[]);
+        tui.insert_char('b', &[]);
+        assert_eq!(tui.input, "a\nb");
+        assert_eq!(tui.cursor, 3);
+    }
+
+    #[test]
+    fn clear_input_to_history_records_and_recalls() {
+        let mut tui = TuiState::default();
+        tui.insert_char('h', &[]);
+        tui.insert_char('i', &[]);
+        assert!(tui.clear_input_to_history(&[]));
+        assert!(tui.input.is_empty());
+
+        // First Up press loads the most recent entry.
+        assert!(tui.history_recall_prev(&[]));
+        assert_eq!(tui.input, "hi");
+        assert_eq!(tui.cursor, 2);
+
+        // Down past the end restores the empty draft.
+        assert!(tui.history_recall_next(&[]));
+        assert!(tui.input.is_empty());
+        assert!(!tui.is_navigating_history());
+    }
+
+    #[test]
+    fn take_input_records_submission_in_history() {
+        let mut tui = TuiState::default();
+        tui.insert_char('y', &[]);
+        tui.insert_char('o', &[]);
+        let _ = tui.take_input();
+        assert_eq!(tui.history.back().map(String::as_str), Some("yo"));
+    }
+
+    #[test]
+    fn history_dedupes_consecutive_duplicates() {
+        let mut tui = TuiState::default();
+        tui.push_history("same");
+        tui.push_history("same");
+        tui.push_history("same");
+        assert_eq!(tui.history.len(), 1);
+    }
+
+    #[test]
+    fn editing_input_exits_history_navigation() {
+        let mut tui = TuiState::default();
+        tui.push_history("alpha");
+        tui.push_history("beta");
+        assert!(tui.history_recall_prev(&[]));
+        assert_eq!(tui.input, "beta");
+        tui.insert_char('!', &[]);
+        assert!(!tui.is_navigating_history());
+        assert_eq!(tui.input, "beta!");
+    }
+
+    #[test]
+    fn clear_input_skips_when_empty() {
+        let mut tui = TuiState::default();
+        assert!(!tui.clear_input_to_history(&[]));
+        assert!(tui.history.is_empty());
     }
 }

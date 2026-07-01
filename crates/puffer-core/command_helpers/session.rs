@@ -1,9 +1,11 @@
 use super::common::{open_text_file_in_editor, render_utf8_qr};
 use super::emit_system;
+use crate::runtime::ReflectionTraceEvent;
 use crate::{AppState, ToolInvocation};
 use anyhow::Result;
 use puffer_config::ConfigPaths;
-use puffer_session_store::SessionStore;
+use puffer_session_store::{SessionStore, TRACE_RUNTIME};
+use serde_json::Value;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
@@ -36,6 +38,25 @@ pub struct SessionOverlayView {
     pub notice: Option<String>,
 }
 
+/// Persists one turn's reflection trace events into the per-session sidecar
+/// JSONL. Used by every `TurnExecution` consumer (both the non-streaming
+/// command/skill/compact paths in `puffer-core` and the streaming TUI
+/// receiver in `puffer-tui`) so reflection traces do not silently vanish on
+/// paths the runtime already observed them on. Failures are surfaced via
+/// `eprintln!` rather than swallowed so a mis-provisioned sidecar (disk
+/// full, permission drop) shows up somewhere the operator can see.
+pub fn append_trace_events(
+    session_store: &SessionStore,
+    session_id: uuid::Uuid,
+    traces: &[ReflectionTraceEvent],
+) {
+    for trace in traces {
+        if let Err(error) = session_store.append_trace_event(session_id, TRACE_RUNTIME, trace) {
+            eprintln!("reflection trace persist failed: {error}");
+        }
+    }
+}
+
 /// Records tool invocations into task history and the visible transcript.
 pub(crate) fn append_tool_invocations(
     state: &mut AppState,
@@ -43,15 +64,16 @@ pub(crate) fn append_tool_invocations(
     invocations: &[ToolInvocation],
 ) -> Result<()> {
     for invocation in invocations {
+        let persisted_input = sanitized_tool_invocation_input(invocation);
         state.record_task(
             invocation.tool_id.clone(),
-            invocation.input.clone(),
+            persisted_input.clone(),
             invocation.success,
         );
         state.push_tool_invocation(
             &invocation.call_id,
             &invocation.tool_id,
-            &invocation.input,
+            &persisted_input,
             &invocation.output,
             invocation.success,
         );
@@ -60,13 +82,54 @@ pub(crate) fn append_tool_invocations(
             puffer_session_store::TranscriptEvent::ToolInvocation {
                 call_id: invocation.call_id.clone(),
                 tool_id: invocation.tool_id.clone(),
-                input: invocation.input.clone(),
+                input: persisted_input,
                 output: invocation.output.clone(),
                 success: invocation.success,
+                metadata: tool_invocation_metadata(invocation),
+                actor: Some(state.assistant_actor()),
+                subject: state.tool_subject_actor(&invocation.tool_id, &invocation.output),
             },
         )?;
     }
     Ok(())
+}
+
+pub fn sanitized_tool_invocation_input(invocation: &ToolInvocation) -> String {
+    sanitize_tool_invocation_input(&invocation.tool_id, &invocation.input)
+}
+
+pub fn sanitize_tool_invocation_input(tool_id: &str, input: &str) -> String {
+    if tool_id != "RemoteExecution" {
+        return input.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(input) else {
+        return input.to_string();
+    };
+    redact_remote_execution_secret_fields(&mut value);
+    serde_json::to_string(&value).unwrap_or_else(|_| input.to_string())
+}
+
+fn redact_remote_execution_secret_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map.contains_key("runnerAuthToken") {
+                map.insert("runnerAuthToken".to_string(), Value::String("[redacted]".to_string()));
+            }
+            for value in map.values_mut() {
+                redact_remote_execution_secret_fields(value);
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                redact_remote_execution_secret_fields(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tool_invocation_metadata(invocation: &ToolInvocation) -> Option<serde_json::Value> {
+    (!invocation.metadata.is_null()).then(|| invocation.metadata.clone())
 }
 
 /// Handles `/tag` by toggling one searchable session tag.
@@ -477,16 +540,18 @@ pub(crate) fn handle_remote_env_command(
     )
 }
 
-
 fn render_memory_summary(state: &AppState) -> String {
     let files = memory_file_entries(state);
+    let project_status = crate::memory::project_memory_status(state)
+        .unwrap_or_else(|| "project=<unresolved>\nmemory_file=<unavailable>".to_string());
     format!(
-        "Memory files:\n{}\n\nSession memory summary:\nslug={}\nnote={}\ntags={}",
+        "Memory files:\n{}\n\nProject memory:\n{}\n\nSession memory summary:\nslug={}\nnote={}\ntags={}",
         files
             .iter()
             .map(format_memory_file_entry)
             .collect::<Vec<_>>()
             .join("\n"),
+        project_status,
         state.session.slug.as_deref().unwrap_or("<none>"),
         state.session.note.as_deref().unwrap_or("<none>"),
         if state.session.tags.is_empty() {
@@ -526,14 +591,16 @@ fn emit_memory_path(
     scope: Option<MemoryScope>,
 ) -> Result<()> {
     if let Some(scope) = scope {
+        if scope == MemoryScope::Project {
+            let _ = crate::memory::activate_project_memory(state)?;
+        }
         return emit_system(
             state,
             session_store,
-            format!(
-                "{} memory path: {}",
-                scope.label(),
-                memory_file_path(state, scope).display()
-            ),
+            match memory_file_path(state, scope) {
+                Some(path) => format!("{} memory path: {}", scope.label(), path.display()),
+                None => "No configured project matches the current working directory, so project memory is unavailable.".to_string(),
+            },
         );
     }
     let entries = memory_file_entries(state)
@@ -554,7 +621,13 @@ fn emit_memory_contents(
     scope: Option<MemoryScope>,
 ) -> Result<()> {
     let scope = scope.unwrap_or(MemoryScope::Project);
-    let path = memory_file_path(state, scope);
+    let Some(path) = memory_file_path(state, scope) else {
+        return emit_system(
+            state,
+            session_store,
+            "No configured project matches the current working directory, so project memory is unavailable.".to_string(),
+        );
+    };
     if !path.exists() {
         return emit_system(
             state,
@@ -590,12 +663,24 @@ fn open_memory_file(
     scope: Option<MemoryScope>,
 ) -> Result<()> {
     let scope = scope.unwrap_or(MemoryScope::Project);
-    let path = memory_file_path(state, scope);
+    if scope == MemoryScope::Project {
+        let _ = crate::memory::activate_project_memory(state)?;
+    }
+    let Some(path) = memory_file_path(state, scope) else {
+        return emit_system(
+            state,
+            session_store,
+            "No configured project matches the current working directory, so project memory is unavailable.".to_string(),
+        );
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     match open_text_file_in_editor(&path) {
         Ok(status) => emit_system(
             state,
             session_store,
-            format!("{status}\nTarget: {} memory", scope.label()),
+            format!("{status}\nTarget: {} memory\nPath: {}", scope.label(), path.display()),
         ),
         Err(error) => emit_system(
             state,
@@ -747,9 +832,11 @@ impl MemoryScope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use puffer_config::PufferConfig;
+    use crate::test_locks::env_lock;
+    use puffer_config::{ensure_workspace_dirs, PufferConfig};
     use puffer_session_store::SessionMetadata;
     use std::path::PathBuf;
+    use tempfile::tempdir;
     use uuid::Uuid;
 
     fn sample_state() -> AppState {
@@ -759,6 +846,7 @@ mod tests {
             SessionMetadata {
                 id: Uuid::nil(),
                 display_name: Some("demo".to_string()),
+                generated_title: None,
                 cwd: PathBuf::from("/workspace/puffer"),
                 created_at_ms: 0,
                 updated_at_ms: 0,
@@ -768,6 +856,66 @@ mod tests {
                 note: None,
             },
         )
+    }
+
+    #[test]
+    fn sanitized_remote_execution_invocation_input_redacts_runner_token() {
+        let invocation = ToolInvocation {
+            call_id: "call-remote".to_string(),
+            tool_id: "RemoteExecution".to_string(),
+            input: serde_json::json!({
+                "action": "enter-remote",
+                "targetType": "agentenv",
+                "sandboxId": "manual-token-leak-test",
+                "runnerEndpoint": "http://127.0.0.1:50051",
+                "runnerAuthToken": "fake-test-token-123",
+                "runnerCwd": "/tmp"
+            })
+            .to_string(),
+            output: "{}".to_string(),
+            success: true,
+            metadata: Value::Null,
+            terminate: false,
+        };
+
+        let sanitized = sanitized_tool_invocation_input(&invocation);
+
+        assert!(!sanitized.contains("fake-test-token-123"));
+        assert!(sanitized.contains("\"runnerAuthToken\":\"[redacted]\""));
+    }
+
+    #[test]
+    fn append_trace_events_writes_each_event_to_sidecar() {
+        use puffer_config::{ensure_workspace_dirs, ConfigPaths};
+        use tempfile::tempdir;
+
+        let tmp = tempdir().unwrap();
+        let paths = ConfigPaths::discover(tmp.path());
+        ensure_workspace_dirs(&paths).unwrap();
+        let store = SessionStore::from_paths(&paths).unwrap();
+        let session = store.create_session(tmp.path().to_path_buf()).unwrap();
+
+        let traces = vec![
+            ReflectionTraceEvent::LlmJudgeSkipped {
+                mode: "disabled".to_string(),
+                reason: "llm judge disabled in reflection config".to_string(),
+            },
+            ReflectionTraceEvent::LlmJudgeSkipped {
+                mode: "confirm_code_judge".to_string(),
+                reason: "confirm_code_judge mode requires a code-judge trigger first".to_string(),
+            },
+        ];
+
+        append_trace_events(&store, session.id, &traces);
+
+        let sidecar = store
+            .root()
+            .join(format!("{}.session.runtime_trace.jsonl", session.id));
+        let body = std::fs::read_to_string(&sidecar).expect("sidecar file exists");
+        // Two events, one JSON object per line.
+        assert_eq!(body.lines().count(), 2, "full body:\n{body}");
+        assert!(body.contains("llm judge disabled"));
+        assert!(body.contains("confirm_code_judge mode requires"));
     }
 
     #[test]
@@ -799,7 +947,43 @@ mod tests {
             Some("puffer://remote/00000000-0000-0000-0000-000000000000?name=buildbox&env=linux")
         );
     }
+
+    #[test]
+    fn project_memory_path_uses_registered_project_memory_file() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        let project_root = workspace.join("apps/demo");
+        let cwd = project_root.join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let _home = puffer_config::set_puffer_home_override(&home);
+
+        let paths = ConfigPaths::discover(&workspace);
+        ensure_workspace_dirs(&paths).unwrap();
+        std::fs::write(
+            paths.projects_file(),
+            format!(
+                "[[projects]]\nname = \"demo\"\npath = \"{}\"\n",
+                project_root.display()
+            ),
+        )
+        .unwrap();
+
+        let mut state = sample_state();
+        state.cwd = cwd.clone();
+        state.session.cwd = cwd;
+        state.refresh_project_memory();
+        let path = memory_file_path(&state, MemoryScope::Project).expect("project memory path");
+        assert!(path.ends_with("MEMORY.md"));
+        assert!(path.starts_with(paths.projects_memory_dir()));
+    }
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod session_tests;
 
 fn parse_memory_scope_for_command(raw: &str) -> std::result::Result<Option<MemoryScope>, String> {
     let normalized = raw.trim();
@@ -819,7 +1003,7 @@ fn parse_memory_scope_for_command(raw: &str) -> std::result::Result<Option<Memor
 #[derive(Debug, Clone)]
 struct MemoryFileEntry {
     scope: MemoryScope,
-    path: PathBuf,
+    path: Option<PathBuf>,
     exists: bool,
     bytes: u64,
 }
@@ -834,9 +1018,9 @@ fn memory_file_entries(state: &AppState) -> Vec<MemoryFileEntry> {
     .copied()
     .map(|scope| {
         let path = memory_file_path(state, scope);
-        let (exists, bytes) = match fs::metadata(&path) {
-            Ok(metadata) => (true, metadata.len()),
-            Err(_) => (false, 0),
+        let (exists, bytes) = match path.as_ref().and_then(|path| fs::metadata(path).ok()) {
+            Some(metadata) => (true, metadata.len()),
+            None => (false, 0),
         };
         MemoryFileEntry {
             scope,
@@ -849,20 +1033,25 @@ fn memory_file_entries(state: &AppState) -> Vec<MemoryFileEntry> {
 }
 
 fn format_memory_file_entry(entry: &MemoryFileEntry) -> String {
+    let path = entry
+        .path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<unavailable>".to_string());
     format!(
         "- {}: {} ({}, {} bytes)",
         entry.scope.label(),
-        entry.path.display(),
+        path,
         if entry.exists { "present" } else { "missing" },
         entry.bytes
     )
 }
 
-fn memory_file_path(state: &AppState, scope: MemoryScope) -> PathBuf {
+fn memory_file_path(state: &AppState, scope: MemoryScope) -> Option<PathBuf> {
     let paths = ConfigPaths::discover(&state.cwd);
     match scope {
-        MemoryScope::Project => state.cwd.join("CLAUDE.md"),
-        MemoryScope::Workspace => paths.workspace_config_dir.join("memory.md"),
-        MemoryScope::User => paths.user_config_dir.join("memory.md"),
+        MemoryScope::Project => crate::memory::project_memory_path(state),
+        MemoryScope::Workspace => Some(paths.workspace_config_dir.join("memory.md")),
+        MemoryScope::User => Some(paths.user_config_dir.join("memory.md")),
     }
 }

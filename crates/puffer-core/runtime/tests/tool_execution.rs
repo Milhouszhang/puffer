@@ -2,16 +2,47 @@ use super::*;
 use puffer_config::PufferConfig;
 use puffer_session_store::SessionMetadata;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 
 #[path = "tool_execution/agent_team_e2e.rs"]
 mod agent_team_e2e;
+#[path = "tool_execution/anthropic_stream.rs"]
+mod anthropic_stream;
+#[path = "tool_execution/browser_permissions.rs"]
+mod browser_permissions;
+#[path = "tool_execution/computer_use_action.rs"]
+mod computer_use_action;
+#[path = "tool_execution/debugpy_action.rs"]
+mod debugpy_action;
+#[path = "tool_execution/lambda_arxiv_contract.rs"]
+mod lambda_arxiv_contract;
+#[path = "tool_execution/lambda_gate_scope.rs"]
+mod lambda_gate_scope;
+#[path = "tool_execution/lambda_host_input_contract.rs"]
+mod lambda_host_input_contract;
+#[path = "tool_execution/legacy_alias_permissions.rs"]
+mod legacy_alias_permissions;
+#[path = "tool_execution/modal_secret_action.rs"]
+mod modal_secret_action;
 #[path = "tool_execution/multi_agent_e2e.rs"]
 mod multi_agent_e2e;
+#[path = "tool_execution/native_mcp_action.rs"]
+mod native_mcp_action;
+#[path = "tool_execution/openai_lambda_batch.rs"]
+mod openai_lambda_batch;
+#[path = "tool_execution/request_scope_skill_and_filters.rs"]
+mod request_scope_skill_and_filters;
 #[path = "tool_execution/request_scope_tests.rs"]
 mod request_scope_tests;
+#[path = "tool_execution/shopify_action.rs"]
+mod shopify_action;
+#[path = "tool_execution/task_flow_run_task.rs"]
+mod task_flow_run_task;
+#[path = "tool_execution/touchdesigner_action.rs"]
+mod touchdesigner_action;
 
 fn temp_state() -> AppState {
     let tempdir = tempfile::tempdir().unwrap();
@@ -20,6 +51,7 @@ fn temp_state() -> AppState {
     let session = SessionMetadata {
         id: Uuid::new_v4(),
         display_name: None,
+        generated_title: None,
         cwd: cwd.clone(),
         created_at_ms: 0,
         updated_at_ms: 0,
@@ -29,6 +61,39 @@ fn temp_state() -> AppState {
         note: None,
     };
     AppState::new(PufferConfig::default(), cwd, session)
+}
+
+fn empty_providers() -> ProviderRegistry {
+    ProviderRegistry::default()
+}
+
+fn outside_workspace_tempdir(cwd: &Path) -> tempfile::TempDir {
+    let mut bases = vec![PathBuf::from("/var/tmp")];
+    if let Some(home) = std::env::var_os("HOME") {
+        bases.push(PathBuf::from(home));
+    }
+    if let Ok(current) = std::env::current_dir() {
+        bases.push(current.join("target"));
+    }
+    let workspace_roots = crate::workspace_paths::workspace_roots(cwd, &[]);
+    for base in bases {
+        if fs::create_dir_all(&base).is_err() {
+            continue;
+        }
+        let Ok(tempdir) = tempfile::Builder::new()
+            .prefix("puffer-external-path-")
+            .tempdir_in(&base)
+        else {
+            continue;
+        };
+        if !workspace_roots
+            .iter()
+            .any(|root| tempdir.path().starts_with(root))
+        {
+            return tempdir;
+        }
+    }
+    panic!("failed to create tempdir outside default workspace roots");
 }
 
 fn write_sample_notebook(path: &Path) {
@@ -75,6 +140,8 @@ fn mark_file_fully_read(state: &mut AppState, path: &Path) {
 
 #[path = "tool_execution/workflow.rs"]
 mod workflow;
+#[path = "tool_execution/workflow_ask_user_question.rs"]
+mod workflow_ask_user_question;
 
 #[test]
 fn execute_openai_tool_calls_serializes_outputs() {
@@ -113,6 +180,89 @@ fn execute_openai_tool_calls_serializes_outputs() {
     assert_eq!(result.outputs[0].call_id, "call_1");
     assert!(result.outputs[0].output.contains("hi"));
     assert_eq!(result.invocations[0].tool_id, "bash");
+}
+
+#[test]
+fn openai_shell_alias_uses_active_remote_runner_cwd() {
+    openai_shell_like_alias_uses_active_remote_runner_cwd("bash");
+}
+
+#[test]
+fn openai_shell_tool_id_uses_active_remote_runner_cwd() {
+    openai_shell_like_alias_uses_active_remote_runner_cwd("shell");
+}
+
+fn openai_shell_like_alias_uses_active_remote_runner_cwd(tool_id: &str) {
+    let local_dir = tempfile::tempdir().unwrap();
+    let remote_dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(
+        PufferConfig::default(),
+        local_dir.path().to_path_buf(),
+        SessionMetadata {
+            id: Uuid::new_v4(),
+            display_name: None,
+            generated_title: None,
+            cwd: local_dir.path().to_path_buf(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            parent_session_id: None,
+            slug: None,
+            tags: Vec::new(),
+            note: None,
+        },
+    );
+    state.active_remote_target = Some(crate::state::ActiveRemoteTarget {
+        kind: "agentenv".to_string(),
+        id: "manual-local-runner".to_string(),
+    });
+    state.active_remote_cwd = Some(remote_dir.path().to_path_buf());
+
+    let resources = LoadedResources {
+        tools: vec![loaded_tool(tool_id, "Run shell", "bash")],
+        ..LoadedResources::default()
+    };
+    let registry = ToolRegistry::from_resources(&resources);
+    let mut providers = ProviderRegistry::new();
+    providers.register(openai_provider("http://127.0.0.1".to_string()));
+    let tool_calls = vec![OpenAIResponseToolCall {
+        item_id: Some("fc_1".to_string()),
+        status: Some("completed".to_string()),
+        call_id: "call_1".to_string(),
+        name: tool_id.to_string(),
+        arguments: json!({ "command": "pwd" }),
+    }];
+    let request_config = test_openai_request_config();
+
+    let result = execute_openai_tool_calls(
+        &mut state,
+        &resources,
+        &providers,
+        &mut AuthStore::default(),
+        &tool_calls,
+        &registry,
+        local_dir.path(),
+        &request_config,
+        "gpt-5",
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(result.invocations[0].tool_id, tool_id);
+    assert!(
+        result.outputs[0]
+            .output
+            .contains(&remote_dir.path().display().to_string()),
+        "{}",
+        result.outputs[0].output
+    );
+    assert!(
+        !result.outputs[0]
+            .output
+            .contains(&local_dir.path().display().to_string()),
+        "{}",
+        result.outputs[0].output
+    );
 }
 
 #[test]
@@ -164,11 +314,9 @@ fn execute_openai_tool_calls_return_permission_denials_as_tool_results() {
 }
 
 #[test]
-fn execute_openai_tool_calls_enforce_working_directory_access_for_claude_file_tools() {
+fn execute_openai_tool_calls_prompt_before_external_file_access() {
     let mut state = temp_state();
-    let outside = tempfile::tempdir().unwrap();
-    let outside_file = outside.path().join("secret.txt");
-    fs::write(&outside_file, "secret\n").unwrap();
+    let outside_file = std::path::PathBuf::from("/__puffer_test_outside_writable_set__/secret.txt");
     let resources = LoadedResources {
         tools: vec![loaded_tool("Read", "Read file", "runtime:claude_read")],
         ..LoadedResources::default()
@@ -185,24 +333,293 @@ fn execute_openai_tool_calls_enforce_working_directory_access_for_claude_file_to
     }];
     let request_config = test_openai_request_config();
     let cwd = state.cwd.clone();
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let prompt_log = prompts.clone();
 
-    let result = execute_openai_tool_calls(
-        &mut state,
-        &resources,
-        &providers,
-        &mut AuthStore::default(),
-        &tool_calls,
-        &registry,
-        &cwd,
-        &request_config,
-        "gpt-5",
-        None,
-        None,
+    let result = with_permission_prompt_handler(
+        move |request| {
+            prompt_log.lock().unwrap().push(format!(
+                "{}\n{}",
+                request.summary,
+                request.reason.unwrap_or_default()
+            ));
+            PermissionPromptAction::Deny
+        },
+        || {
+            execute_openai_tool_calls(
+                &mut state,
+                &resources,
+                &providers,
+                &mut AuthStore::default(),
+                &tool_calls,
+                &registry,
+                &cwd,
+                &request_config,
+                "gpt-5",
+                None,
+                None,
+            )
+        },
     )
     .unwrap();
 
     assert!(!result.invocations[0].success);
-    assert!(result.outputs[0].output.contains("working director"));
+    assert!(result.outputs[0]
+        .output
+        .contains("permission denied by user"));
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("Allow Read to access"));
+    assert!(prompts[0].contains("outside the current working directories"));
+}
+
+#[test]
+fn allow_once_external_file_access_executes_without_session_grant() {
+    let mut state = temp_state();
+    let cwd = state.cwd.clone();
+    let outside = outside_workspace_tempdir(&cwd);
+    let outside_file = outside.path().join("secret.txt");
+    fs::write(&outside_file, "from outside workspace").unwrap();
+    let resources = LoadedResources {
+        tools: vec![loaded_tool("Read", "Read file", "runtime:claude_read")],
+        ..LoadedResources::default()
+    };
+    let registry = ToolRegistry::from_resources(&resources);
+    let providers = empty_providers();
+    let request_config = test_openai_request_config();
+    let prompts = Arc::new(Mutex::new(0_usize));
+    let prompt_count = prompts.clone();
+
+    let result = with_permission_prompt_handler(
+        move |_request| {
+            *prompt_count.lock().unwrap() += 1;
+            PermissionPromptAction::AllowOnce
+        },
+        || {
+            execute_tool_call(
+                &mut state,
+                &resources,
+                &providers,
+                &mut AuthStore::default(),
+                &registry,
+                "gpt-5",
+                &cwd,
+                ToolExecutionBackend::OpenAi {
+                    request_config: &request_config,
+                    structured_output: None,
+                },
+                None,
+                "Read",
+                json!({ "file_path": outside_file.display().to_string() }),
+            )
+        },
+    )
+    .unwrap();
+
+    assert!(result.success);
+    assert!(result.output.stdout.contains("from outside workspace"));
+    assert_eq!(*prompts.lock().unwrap(), 1);
+    assert!(state
+        .session_permission_state()
+        .grants()
+        .profile_view(false)
+        .path_prefix_grants
+        .is_empty());
+}
+
+#[test]
+fn allow_session_external_path_access_is_reused() {
+    let mut state = temp_state();
+    let cwd = state.cwd.clone();
+    let outside = outside_workspace_tempdir(&cwd);
+    fs::write(outside.path().join("note.txt"), "hello").unwrap();
+    let resources = LoadedResources {
+        tools: vec![loaded_tool("Glob", "Find files", "runtime:claude_glob")],
+        ..LoadedResources::default()
+    };
+    let registry = ToolRegistry::from_resources(&resources);
+    let providers = empty_providers();
+    let mut auth_store = AuthStore::default();
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let prompt_log = prompts.clone();
+    let outside_path = outside.path().display().to_string();
+    let outside_path_for_prompt = outside_path.clone();
+
+    with_permission_prompt_handler(
+        move |request| {
+            prompt_log.lock().unwrap().push(request.summary);
+            PermissionPromptAction::AllowSession
+        },
+        || {
+            let first = resolve_tool_permission(
+                &mut state,
+                &resources,
+                &providers,
+                &mut auth_store,
+                &registry,
+                &cwd,
+                "Glob",
+                &json!({
+                    "pattern": "*.txt",
+                    "path": outside_path_for_prompt.clone()
+                }),
+                None,
+            )
+            .unwrap();
+            assert!(matches!(first, PermissionOutcome::Allowed(_)));
+
+            let second = resolve_tool_permission(
+                &mut state,
+                &resources,
+                &providers,
+                &mut auth_store,
+                &registry,
+                &cwd,
+                "Glob",
+                &json!({
+                    "pattern": "*.txt",
+                    "path": outside_path_for_prompt.clone()
+                }),
+                None,
+            )
+            .unwrap();
+            assert!(matches!(second, PermissionOutcome::Allowed(_)));
+        },
+    );
+
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(
+        prompts.as_slice(),
+        &[format!("Allow Glob to access {outside_path}")]
+    );
+    assert_eq!(
+        state
+            .session_permission_state()
+            .grants()
+            .profile_view(false)
+            .path_prefix_grants,
+        vec![outside.path().to_path_buf()]
+    );
+}
+
+#[test]
+fn auto_reviewer_can_allow_external_path_without_human_prompt() {
+    use crate::runtime::auto_approval_review::{
+        with_auto_permission_review_test_handler, AutoPermissionReviewDecision,
+        AutoPermissionReviewResult,
+    };
+
+    let mut state = temp_state();
+    let cwd = state.cwd.clone();
+    let outside = outside_workspace_tempdir(&cwd);
+    fs::write(outside.path().join("note.txt"), "hello").unwrap();
+    let resources = LoadedResources {
+        tools: vec![loaded_tool("Glob", "Find files", "runtime:claude_glob")],
+        ..LoadedResources::default()
+    };
+    let registry = ToolRegistry::from_resources(&resources);
+    let providers = empty_providers();
+    let mut auth_store = AuthStore::default();
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let prompt_log = prompts.clone();
+    let reviews = Arc::new(Mutex::new(Vec::<String>::new()));
+    let review_log = reviews.clone();
+
+    with_auto_permission_review_test_handler(
+        move |request| {
+            review_log.lock().unwrap().push(request.summary.clone());
+            AutoPermissionReviewResult {
+                decision: AutoPermissionReviewDecision::AllowOnce,
+                risk: "low".to_string(),
+                rationale: "explicit path read".to_string(),
+            }
+        },
+        || {
+            with_permission_prompt_handler(
+                move |request| {
+                    prompt_log.lock().unwrap().push(request.summary);
+                    PermissionPromptAction::Deny
+                },
+                || {
+                    let outcome = resolve_tool_permission(
+                        &mut state,
+                        &resources,
+                        &providers,
+                        &mut auth_store,
+                        &registry,
+                        &cwd,
+                        "Glob",
+                        &json!({
+                            "pattern": "*.txt",
+                            "path": outside.path().display().to_string()
+                        }),
+                        None,
+                    )
+                    .unwrap();
+                    assert!(matches!(outcome, PermissionOutcome::Allowed(_)));
+                },
+            );
+        },
+    );
+
+    assert!(prompts.lock().unwrap().is_empty());
+    assert_eq!(reviews.lock().unwrap().len(), 1);
+    assert!(reviews.lock().unwrap()[0].starts_with("Allow Glob to access"));
+}
+
+#[test]
+fn agent_cwd_external_path_uses_manual_approval() {
+    let mut state = temp_state();
+    let cwd = state.cwd.clone();
+    let outside = outside_workspace_tempdir(&cwd);
+    let resources = LoadedResources {
+        tools: vec![loaded_tool("Agent", "Delegate work", "runtime:agent")],
+        ..LoadedResources::default()
+    };
+    let registry = ToolRegistry::from_resources(&resources);
+    let providers = empty_providers();
+    let mut auth_store = AuthStore::default();
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let prompt_log = prompts.clone();
+
+    let outcome = with_permission_prompt_handler(
+        move |request| {
+            prompt_log.lock().unwrap().push(format!(
+                "{}\n{}",
+                request.summary,
+                request.reason.unwrap_or_default()
+            ));
+            PermissionPromptAction::Deny
+        },
+        || {
+            resolve_tool_permission(
+                &mut state,
+                &resources,
+                &providers,
+                &mut auth_store,
+                &registry,
+                &cwd,
+                "Agent",
+                &json!({
+                    "description": "Inspect external project",
+                    "prompt": "List skills",
+                    "cwd": outside.path().display().to_string()
+                }),
+                None,
+            )
+        },
+    )
+    .unwrap();
+
+    let PermissionOutcome::Denied(result) = outcome else {
+        panic!("external Agent cwd should wait for manual approval");
+    };
+    assert!(!result.success);
+    assert!(result.output.stdout.contains("permission denied by user"));
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("Allow Agent to access"));
+    assert!(prompts[0].contains("outside the current working directories"));
 }
 
 #[test]
@@ -526,6 +943,186 @@ fn execute_tool_call_requires_prior_read_for_notebook_edit() {
         .output
         .stdout
         .contains("File has not been read yet. Read it first before writing to it."));
+}
+
+#[test]
+fn allow_session_persists_runtime_bash_approval_for_the_session() {
+    use crate::runtime::auto_approval_review::{
+        with_auto_permission_review_test_handler, AutoPermissionReviewDecision,
+        AutoPermissionReviewResult,
+    };
+
+    let mut tool = loaded_tool("Bash", "Run shell", "runtime:claude_bash");
+    tool.value.approval_policy = Some("ask".to_string());
+    tool.value.sandbox_policy = Some("workspace-write".to_string());
+    let resources = LoadedResources {
+        tools: vec![tool],
+        ..LoadedResources::default()
+    };
+    let registry = ToolRegistry::from_resources(&resources);
+    let mut providers = ProviderRegistry::new();
+    providers.register(openai_provider("http://127.0.0.1".to_string()));
+    let request_config = test_openai_request_config();
+    let mut state = temp_state();
+    let cwd = state.cwd.clone();
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let prompt_log = prompts.clone();
+
+    with_auto_permission_review_test_handler(
+        |_request| AutoPermissionReviewResult {
+            decision: AutoPermissionReviewDecision::Unavailable,
+            risk: "unknown".to_string(),
+            rationale: "test covers human prompt fallback".to_string(),
+        },
+        || {
+            with_permission_prompt_handler(
+                move |request| {
+                    prompt_log.lock().unwrap().push(request.tool_id);
+                    PermissionPromptAction::AllowSession
+                },
+                || {
+                    let first = execute_tool_call(
+                        &mut state,
+                        &resources,
+                        &providers,
+                        &mut AuthStore::default(),
+                        &registry,
+                        "gpt-5",
+                        &cwd,
+                        ToolExecutionBackend::OpenAi {
+                            request_config: &request_config,
+                            structured_output: None,
+                        },
+                        None,
+                        "Bash",
+                        json!({"command": "cargo --version"}),
+                    )
+                    .unwrap();
+                    assert!(first.success);
+                    let reloaded_permission_context =
+                        crate::permissions::load_runtime_permission_context_with_inputs(
+                            &cwd,
+                            &resources,
+                            &state,
+                            crate::permissions::RuntimePermissionInputs::default(),
+                        )
+                        .unwrap();
+                    let reloaded_decision = reloaded_permission_context.decision_for_tool_call(
+                        registry.definition("Bash").unwrap(),
+                        &json!({"command": "cargo --help"}),
+                    );
+                    assert_eq!(
+                        reloaded_decision.behavior,
+                        crate::permissions::ToolPermissionBehavior::Allow
+                    );
+
+                    let second = execute_tool_call(
+                        &mut state,
+                        &resources,
+                        &providers,
+                        &mut AuthStore::default(),
+                        &registry,
+                        "gpt-5",
+                        &cwd,
+                        ToolExecutionBackend::OpenAi {
+                            request_config: &request_config,
+                            structured_output: None,
+                        },
+                        None,
+                        "Bash",
+                        json!({"command": "cargo --help"}),
+                    )
+                    .unwrap();
+                    assert!(second.success);
+                },
+            );
+        },
+    );
+
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(prompts.as_slice(), &["Bash".to_string()]);
+    let permission_context = crate::permissions::load_runtime_permission_context_with_inputs(
+        &cwd,
+        &resources,
+        &state,
+        crate::permissions::RuntimePermissionInputs::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        permission_context
+            .decision_for_tool_call(
+                registry.definition("Bash").unwrap(),
+                &json!({"command":"cargo --help"})
+            )
+            .behavior,
+        crate::permissions::ToolPermissionBehavior::Allow
+    );
+}
+
+#[test]
+fn auto_reviewer_can_allow_tool_ask_without_human_prompt() {
+    use crate::runtime::auto_approval_review::{
+        with_auto_permission_review_test_handler, AutoPermissionReviewDecision,
+        AutoPermissionReviewResult,
+    };
+
+    let resources = LoadedResources {
+        tools: vec![loaded_tool(
+            "WebSearch",
+            "Search the web",
+            "runtime:claude_web_search",
+        )],
+        ..LoadedResources::default()
+    };
+    let registry = ToolRegistry::from_resources(&resources);
+    let providers = empty_providers();
+    let mut auth_store = AuthStore::default();
+    let mut state = temp_state();
+    let cwd = state.cwd.clone();
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let prompt_log = prompts.clone();
+    let reviews = Arc::new(Mutex::new(Vec::<String>::new()));
+    let review_log = reviews.clone();
+
+    with_auto_permission_review_test_handler(
+        move |request| {
+            review_log.lock().unwrap().push(request.tool_id.clone());
+            AutoPermissionReviewResult {
+                decision: AutoPermissionReviewDecision::AllowSession,
+                risk: "low".to_string(),
+                rationale: "explicit command".to_string(),
+            }
+        },
+        || {
+            with_permission_prompt_handler(
+                move |request| {
+                    prompt_log.lock().unwrap().push(request.tool_id);
+                    PermissionPromptAction::Deny
+                },
+                || {
+                    let outcome = resolve_tool_permission(
+                        &mut state,
+                        &resources,
+                        &providers,
+                        &mut auth_store,
+                        &registry,
+                        &cwd,
+                        "WebSearch",
+                        &json!({"query": "puffer"}),
+                        None,
+                    )
+                    .unwrap();
+                    assert!(matches!(outcome, PermissionOutcome::Allowed(_)));
+                },
+            );
+        },
+    );
+
+    assert!(prompts.lock().unwrap().is_empty());
+    assert_eq!(
+        reviews.lock().unwrap().as_slice(),
+        &["WebSearch".to_string()]
+    );
 }
 
 #[test]

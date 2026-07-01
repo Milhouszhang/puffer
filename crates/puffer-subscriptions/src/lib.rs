@@ -1,0 +1,110 @@
+//! Routes connector events through user-defined workflow trigger bindings
+//! (Puffer-side filter, optional LLM classify, one action) and persists
+//! binding specs to disk.
+//!
+//! The unit of configuration is [`WorkflowBindingSpec`]. Legacy names such as
+//! `SubscriptionSpec` remain as type aliases while the runtime migrates toward
+//! connection-driven workflow terminology.
+//!
+//! Bindings live as a JSON document at `~/.puffer/workflow_bindings.json`. The
+//! [`WorkflowBindingStore`] guards reads/writes with a mutex; mutations are
+//! atomic via temp-file rename.
+//!
+//! The router consumes events from a [`puffer_subscriber_runtime::EventBus`]
+//! and dispatches matched events to an [`ActionDispatcher`].
+
+mod action;
+mod catalog;
+mod catalog_store;
+#[cfg(test)]
+mod catalog_tests;
+mod classify;
+mod command_match;
+mod connection;
+mod connector_process;
+mod connector_stream;
+mod contact_history;
+mod contacts;
+mod event_schema;
+mod history;
+mod manager;
+mod monitor_trace;
+mod protocol;
+mod proxy;
+mod router;
+mod router_debounce;
+mod self_gate;
+mod spec;
+mod store;
+mod subscriber_manifest;
+
+#[cfg(test)]
+mod telegram_e2e_tests;
+
+pub use action::{
+    install_connector_action_executor, install_outbound, install_workflow_runner,
+    installed_connector_action_executor, installed_workflow_runner, ActionDispatcher, ActionResult,
+    ActionUsage, BuiltinActionDispatcher, ConnectorActionExecutor, Outbound, TriageDecision,
+    TriageDecisionOutcome, WorkflowActionOutput, WorkflowActionRunner,
+};
+pub use catalog::{
+    builtin_connector_template, builtin_connector_templates, suggested_connection_slug,
+    ConnectorActionDefinition, ConnectorPermissionDefinition, ConnectorSlug,
+    ConnectorSubscriberTemplate, ConnectorTemplate,
+};
+pub use catalog_store::{ConnectorCatalogStore, ConnectorCatalogStoreError};
+pub use classify::{Classifier, ClassifyDecision, NullClassifier, RemoteClassifier};
+pub use connection::{
+    ConnectionHealth, ConnectionHealthStatus, ConnectionRecord, ConnectionSlug, ConnectionState,
+    ConnectionStore, ConnectionStoreError,
+};
+pub use contacts::{
+    connector_contacts_for_connector, connector_slug_accepts_contact_id,
+    connector_slugs_for_contact_id, contact_display_name_from_payload, contact_filter_matches,
+    contact_id_prefix, contact_ids_for_connector, contact_ids_from_payload, normalize_contact_id,
+    normalize_contact_ids, ConnectorContact, ContactContext, ContactDisplay, ContactProposal,
+    SavedContact, DISCORD_CONTACT_PREFIX, GOOGLE_CONTACT_PREFIX, LARK_CONTACT_PREFIX,
+    MATRIX_CONTACT_PREFIX, SLACK_CONTACT_PREFIX, TELEGRAM_CONTACT_PREFIX,
+};
+pub use event_schema::{
+    compile_event_field_rule, load_event_schema_from_dir, validate_event_schema, EventField,
+    EventFieldRule, EventFieldType, EventFieldValue, EventOperator, EventSchema, EventTextField,
+};
+pub use history::{
+    now_ms, WorkflowActionLog, WorkflowBindingRun, WorkflowBindingRunStatus, WorkflowHistoryStore,
+    WorkflowHistoryStoreError,
+};
+pub use manager::{
+    ConnectionAuthChecker, ConnectionAuthStatus, SubscriptionManager, SubscriptionManagerBuilder,
+};
+pub use monitor_trace::{
+    MonitorTraceIdentity, MonitorTraceMessage, MonitorTraceStage, MonitorTraceStageStatus,
+    MonitorTraceStatus, MonitorTraceStore, MonitorTraceStoreError,
+};
+pub use protocol::{
+    ConnectorActionRequest, ConnectorActionResponse, ConnectorSubscribeCommand,
+    ConnectorSubscribeFrame,
+};
+pub use proxy::{
+    builtin_agent_proxy, handle_agent_proxy_event, AgentProxy, AgentProxyBinding,
+    AgentProxyDecision, AgentProxyStore, AgentProxyStoreError, TelegramBotAgentProxy,
+};
+pub use router::{
+    prefilter_passes, process_envelope, process_envelope_batch_result, process_envelope_result,
+    EnvelopeProcessResult, RouterStats, SubscriptionRouter,
+};
+pub use self_gate::{DropAllSelfGate, SelfMessageGate, SELF_MESSAGE_KIND};
+pub use spec::{
+    filter_matches, render_value_templates, validate_action_spec, validate_spec, ActionGraphNode,
+    ActionSpec, FilterSpec, PrefilterSpec, SubscriptionSpec, SubscriptionStatus, TaggedFilterSpec,
+    WorkflowBindingSpec, WorkflowBindingStatus,
+};
+pub use store::{
+    SubscriptionStore, SubscriptionStoreError, WorkflowBindingStore, WorkflowBindingStoreError,
+};
+pub use subscriber_manifest::{
+    connection_subscriber_manifest, connection_subscriber_manifest_dir,
+    connection_subscriber_manifest_exists, connection_workflow_trigger_supported,
+    connector_runtime_hints, connector_workflow_trigger_supported, direct_subscriber_manifest,
+    find_subscriber_manifest, SubscriberManifestRoots,
+};

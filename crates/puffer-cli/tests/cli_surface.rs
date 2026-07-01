@@ -1,8 +1,10 @@
 use puffer_config::{ensure_workspace_dirs, ConfigPaths};
 use puffer_provider_registry::{OAuthCredential, StoredCredential};
+use puffer_session_store::SessionMetadata;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use uuid::Uuid;
 
 #[test]
 fn top_level_help_shows_claude_style_public_surface() {
@@ -14,6 +16,7 @@ fn top_level_help_shows_claude_style_public_surface() {
         "agents",
         "auth",
         "auto-mode",
+        "browser",
         "doctor",
         "install",
         "mcp",
@@ -89,6 +92,36 @@ fn resume_help_mentions_the_tui() {
 }
 
 #[test]
+fn startup_resume_picker_does_not_create_blank_session() {
+    let (_tempdir, workspace, puffer_home) = configured_workspace();
+    write_session_fixture(
+        &puffer_home,
+        Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap(),
+        "dockyard alpha",
+        &workspace,
+        10,
+    );
+    write_session_fixture(
+        &puffer_home,
+        Uuid::parse_str("00000000-0000-0000-0000-000000000102").unwrap(),
+        "dockyard beta",
+        &workspace,
+        20,
+    );
+    let before = session_fixture_count(&puffer_home);
+
+    let output = run_puffer(&workspace, &puffer_home, &["--resume", "dockyard"]);
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("interactive TUI requires stdin and stdout to be terminals"),
+        "{stderr}"
+    );
+    assert_eq!(session_fixture_count(&puffer_home), before);
+}
+
+#[test]
 fn remote_help_mentions_ssh_launch() {
     let (_tempdir, workspace, puffer_home) = configured_workspace();
     let output = run_puffer(&workspace, &puffer_home, &["remote", "--help"]);
@@ -97,6 +130,69 @@ fn remote_help_mentions_ssh_launch() {
     assert!(stdout.contains("Launch Puffer on a remote host over SSH"));
     assert!(stdout.contains("<TARGET>"));
     assert!(stdout.contains("--cwd"));
+}
+
+#[test]
+fn non_interactive_startup_prompt_prints_command_output() {
+    let (_tempdir, workspace, puffer_home) = configured_workspace();
+    let output = run_puffer(&workspace, &puffer_home, &["--no-alt-screen", "/status"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Status"), "{stdout}");
+    assert!(stdout.contains("Provider:"), "{stdout}");
+}
+
+#[test]
+fn browser_help_lists_phase_two_surface_commands() {
+    let (_tempdir, workspace, puffer_home) = configured_workspace();
+    let output = run_puffer(&workspace, &puffer_home, &["browser", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for command in [
+        "list",
+        "open",
+        "navigate",
+        "back",
+        "forward",
+        "reload",
+        "close",
+        "quit",
+        "tab",
+        "snapshot",
+        "screenshot",
+        "click",
+        "select",
+        "upload",
+        "check",
+        "uncheck",
+        "fill",
+        "type",
+        "press",
+        "eval",
+    ] {
+        assert!(
+            stdout.contains(command),
+            "missing `{command}` in browser help:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("window"),
+        "unexpected `window` in browser help:\n{stdout}"
+    );
+}
+
+#[test]
+fn browser_tab_help_lists_new_subcommand() {
+    let (_tempdir, workspace, puffer_home) = configured_workspace();
+    let output = run_puffer(&workspace, &puffer_home, &["browser", "tab", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for command in ["list", "new", "close"] {
+        assert!(
+            stdout.contains(command),
+            "missing `{command}` in browser tab help:\n{stdout}"
+        );
+    }
 }
 
 #[test]
@@ -240,6 +336,62 @@ fn mcp_round_trip_add_get_list_remove() {
 }
 
 #[test]
+fn mcp_reset_project_choices_clears_workspace_entries_but_keeps_other_disables() {
+    let (_tempdir, workspace, puffer_home) = configured_workspace();
+    let paths = ConfigPaths::discover(&workspace);
+    let state_path = paths.workspace_config_dir.join("mcp_servers.toml");
+    let mcp_dir = paths.workspace_config_dir.join("resources/mcp_servers");
+    fs::create_dir_all(&mcp_dir).expect("workspace mcp dir");
+    fs::write(
+        mcp_dir.join("demo.yaml"),
+        r#"id: demo
+display_name: Demo
+transport: stdio
+target: demo
+"#,
+    )
+    .expect("workspace mcp manifest");
+    fs::write(&state_path, "disabled = [\"demo\", \"docs\"]\n").expect("mcp enablement");
+
+    let reset = run_puffer(&workspace, &puffer_home, &["mcp", "reset-project-choices"]);
+    assert!(reset.status.success(), "{reset:?}");
+    let reset_text = String::from_utf8_lossy(&reset.stdout);
+    assert!(
+        reset_text.contains("Reset project-scoped MCP enablement choices."),
+        "{reset_text}"
+    );
+    let updated = fs::read_to_string(&state_path).expect("updated mcp enablement");
+    assert!(!updated.contains("demo"), "{updated}");
+    assert!(updated.contains("docs"), "{updated}");
+}
+
+#[test]
+fn mcp_reset_project_choices_removes_enablement_file_when_no_entries_remain() {
+    let (_tempdir, workspace, puffer_home) = configured_workspace();
+    let paths = ConfigPaths::discover(&workspace);
+    let state_path = paths.workspace_config_dir.join("mcp_servers.toml");
+    let mcp_dir = paths.workspace_config_dir.join("resources/mcp_servers");
+    fs::create_dir_all(&mcp_dir).expect("workspace mcp dir");
+    fs::write(
+        mcp_dir.join("demo.yaml"),
+        r#"id: demo
+display_name: Demo
+transport: stdio
+target: demo
+"#,
+    )
+    .expect("workspace mcp manifest");
+    fs::write(&state_path, "disabled = [\"demo\"]\n").expect("mcp enablement");
+
+    let reset = run_puffer(&workspace, &puffer_home, &["mcp", "reset-project-choices"]);
+    assert!(reset.status.success(), "{reset:?}");
+    assert!(
+        !state_path.exists(),
+        "expected {state_path:?} to be removed"
+    );
+}
+
+#[test]
 fn plugin_round_trip_install_disable_enable_validate_uninstall() {
     let (tempdir, workspace, puffer_home) = configured_workspace();
     let manifest_path = tempdir.path().join("demo-plugin.yaml");
@@ -363,6 +515,51 @@ fn configured_workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
     std::os::unix::fs::symlink(repo_root.join("resources"), workspace.join("resources"))
         .expect("resource symlink");
     (tempdir, workspace, puffer_home)
+}
+
+fn write_session_fixture(
+    puffer_home: &Path,
+    id: Uuid,
+    display_name: &str,
+    cwd: &Path,
+    updated_at_ms: u64,
+) {
+    let root = puffer_home.join(".puffer").join("sessions");
+    fs::create_dir_all(&root).expect("sessions dir");
+    let metadata = SessionMetadata {
+        id,
+        display_name: Some(display_name.to_string()),
+        generated_title: None,
+        cwd: cwd.to_path_buf(),
+        created_at_ms: 1,
+        updated_at_ms,
+        parent_session_id: None,
+        slug: Some(display_name.replace(' ', "-")),
+        tags: Vec::new(),
+        note: None,
+    };
+    let body = serde_json::json!({ "metadata": metadata });
+    fs::write(
+        root.join(format!("{id}.session.json")),
+        serde_json::to_vec(&body).expect("session json"),
+    )
+    .expect("write session");
+    fs::write(root.join(format!("{id}.jsonl")), b"").expect("write jsonl");
+}
+
+fn session_fixture_count(puffer_home: &Path) -> usize {
+    let root = puffer_home.join(".puffer").join("sessions");
+    fs::read_dir(root)
+        .expect("session dir")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.ends_with(".session.json"))
+        })
+        .count()
 }
 
 fn run_puffer(workspace: &Path, puffer_home: &Path, args: &[&str]) -> Output {

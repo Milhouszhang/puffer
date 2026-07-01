@@ -17,46 +17,58 @@ const now = Date.now();
 const sessionA: SessionListItem = {
   id: "session-a",
   displayName: "Claude parity sweep",
+  generatedTitle: null,
   title: "Claude parity sweep",
   cwd: "/home/c/puffer",
   folderPath: "/home/c/puffer",
   createdAtMs: now - 6_800_000,
   updatedAtMs: now - 42_000,
   eventCount: 52,
+  activityStatus: "running",
   slug: "claude-parity-sweep",
   tags: ["parity", "tools"],
   note: "Tight parity work against Claude Code",
-  parentSessionId: null
+  parentSessionId: null,
+  providerId: "claude",
+  modelId: "sonnet"
 };
 
 const sessionB: SessionListItem = {
   id: "session-b",
   displayName: "Desktop shell",
+  generatedTitle: null,
   title: "Desktop shell",
   cwd: "/home/c/puffer/.worktree/tauri-desktop-ui",
   folderPath: "/home/c/puffer",
   createdAtMs: now - 12_500_000,
   updatedAtMs: now - 130_000,
   eventCount: 31,
+  activityStatus: "awaiting",
   slug: "desktop-shell",
   tags: ["desktop", "ui"],
   note: "Parallel Tauri 2 app exploration",
-  parentSessionId: null
+  parentSessionId: null,
+  providerId: "codex",
+  modelId: null
 };
 
 const sessionC: SessionListItem = {
   id: "session-c",
   displayName: "Python LSP validation",
+  generatedTitle: null,
   title: "Python LSP validation",
   cwd: "/home/c/sample-python",
   folderPath: "/home/c/sample-python",
   createdAtMs: now - 20_000_000,
   updatedAtMs: now - 600_000,
   eventCount: 18,
+  activityStatus: "idle",
   slug: "python-lsp-validation",
   tags: ["lsp", "python"],
   note: "Real pyright end-to-end check",
-  parentSessionId: null
+  parentSessionId: null,
+  providerId: "puffer",
+  modelId: "default"
 };
 
 const sessionADiff: DiffSnapshot = {
@@ -86,14 +98,16 @@ export const mockFolders: FolderGroup[] = [
     label: "puffer",
     path: "/home/c/puffer",
     sessionCount: 2,
-    sessions: [sessionA, sessionB]
+    sessions: [sessionA, sessionB],
+    tags: []
   },
   {
     id: "/home/c/sample-python",
     label: "sample-python",
     path: "/home/c/sample-python",
     sessionCount: 1,
-    sessions: [sessionC]
+    sessions: [sessionC],
+    tags: []
   }
 ];
 
@@ -329,10 +343,10 @@ const timeline: TimelineItem[] = [
       summary: "Setting: theme",
       inputText: "{\"setting\":\"theme\",\"value\":\"light\"}",
       toolName: "Config",
-      choices: ["Allow once", "Allow for session", "Deny"]
+      choices: ["Approve once", "Always allow", "Deny"]
     },
     scopeLabel: "workspace",
-    choices: ["Allow once", "Allow for session", "Deny"]
+    choices: ["Approve once", "Always allow", "Deny"]
   },
   {
     id: "diff-1",
@@ -376,12 +390,45 @@ const timeline: TimelineItem[] = [
   }
 ];
 
+// Mock agent-diff payloads — three example edits the design uses to
+// fill out the Agent / Divergence sub-tabs in screenshot reviews.
+const mockAgentDiffB = {
+  files: [
+    {
+      path: "apps/puffer-desktop/src/lib/shell/Sidebar.svelte",
+      latestKind: "replace",
+      editCount: 2,
+      latestSummary:
+        "-  let inspectorTab = \"latest-diff\";\n+  let inspectorTab: InspectorTab = \"latest-diff\";\n"
+    },
+    {
+      path: "apps/puffer-desktop/src/lib/components/InspectorPane.svelte",
+      latestKind: "write",
+      editCount: 1,
+      latestSummary:
+        "+<script lang=\"ts\">\n+  export let tab: InspectorTab;\n+</script>\n"
+    }
+  ],
+  entries: []
+};
+
+const mockDivergenceB = {
+  agentOnly: [],
+  // The repo formatter rewrote a file the agent never touched —
+  // exactly the kind of drift the divergence tab exists to surface.
+  gitOnly: ["apps/puffer-desktop/src/app.css"],
+  agentTotal: 2,
+  gitTotal: 3
+};
+
 export const mockSessionDetail: SessionDetail = {
   session: sessionB,
   timeline,
   latestDiff,
   diffHistory: [latestDiff, olderDiff],
-  repoStatus: mockRepoStatus
+  repoStatus: mockRepoStatus,
+  agentDiff: mockAgentDiffB,
+  divergence: mockDivergenceB
 };
 
 const mockSessionDetailA: SessionDetail = {
@@ -395,6 +442,24 @@ const mockSessionDetailA: SessionDetail = {
     cwd: sessionA.cwd,
     branch: "fix/permission-parity",
     pullRequest: null
+  },
+  agentDiff: {
+    files: [
+      {
+        path: "crates/puffer-core/runtime/permissions.rs",
+        latestKind: "replace",
+        editCount: 1,
+        latestSummary:
+          "-return PermissionDecision::Deny;\n+if context.plan_mode() {\n+  return PermissionDecision::Ask;\n+}\n+return PermissionDecision::Deny;\n"
+      }
+    ],
+    entries: []
+  },
+  divergence: {
+    agentOnly: [],
+    gitOnly: [],
+    agentTotal: 1,
+    gitTotal: 1
   }
 };
 
@@ -434,7 +499,9 @@ const mockSessionDetailC: SessionDetail = {
     hasUncommittedChanges: false,
     isClean: true,
     statusLines: []
-  }
+  },
+  agentDiff: { files: [], entries: [] },
+  divergence: { agentOnly: [], gitOnly: [], agentTotal: 0, gitTotal: 0 }
 };
 
 export function mockSessionDetailFor(sessionId: string): SessionDetail {
@@ -480,6 +547,7 @@ export const mockDesktopPreferences: DesktopPreferences = {
   launchInspectorOpen: true,
   defaultInspectorTab: "latest-diff",
   defaultInspectorWidth: 50,
+  browserRenderer: "cef",
   remoteEnabled: false,
   remoteTarget: "",
   remoteCwd: ""
@@ -529,6 +597,49 @@ const mockProviders: ProviderSummary[] = [
   }
 ];
 
+const mockBrowserSettings = {
+  extensionsEnabled: true,
+  extensions: [],
+  captcha: {
+    enabled: false,
+    selectedSolver: "nopecha",
+    solvers: [
+      {
+        id: "nopecha",
+        displayName: "NopeCHA",
+        description: "NopeCHA Chrome automation extension.",
+        enabled: true,
+        baseUrl: "https://api.nopecha.com",
+        apiKeySecretId: null,
+        hasApiKey: false,
+        version: "0.6.0",
+        bundled: false,
+        extensionPath: "/home/c/puffer/resources/browser_extensions/nopecha/chromium_automation",
+        releaseUrl: "https://github.com/NopeCHALLC/nopecha-extension/releases/tag/0.6.0",
+        downloadUrl: "https://github.com/NopeCHALLC/nopecha-extension/releases/download/0.6.0/chromium_automation.zip",
+        sha256: "4871e1c6ed200dde8e5e790c23458415cb3213312701d3ff757c8ee115b79c3b",
+        license: "MIT"
+      },
+      {
+        id: "2captcha",
+        displayName: "2Captcha",
+        description: "2Captcha solver Chrome extension.",
+        enabled: false,
+        baseUrl: "https://2captcha.com",
+        apiKeySecretId: null,
+        hasApiKey: false,
+        version: "3.7.2",
+        bundled: false,
+        extensionPath: "/home/c/puffer/resources/browser_extensions/2captcha/chromium",
+        releaseUrl: "https://github.com/rucaptcha/2captcha-solver/releases/tag/v3.7.2",
+        downloadUrl: "https://github.com/rucaptcha/2captcha-solver/releases/download/v3.7.2/2captcha-solver-chrome-3.7.2.zip",
+        sha256: "",
+        license: "MIT"
+      }
+    ]
+  }
+};
+
 export const mockSettingsSnapshot: SettingsSnapshot = {
   workspaceRoot: "/home/c/puffer",
   workspaceConfigFile: "/home/c/puffer/.puffer/config.toml",
@@ -540,7 +651,12 @@ export const mockSettingsSnapshot: SettingsSnapshot = {
     defaultProvider: "anthropic",
     defaultModel: "claude-sonnet-4-5",
     openaiBaseUrl: null,
+    openaiDisplayName: null,
     theme: "puffer",
+    media: {
+      image: null,
+      video: null
+    },
     mascotId: "clawd",
     mascotDisplayName: "Clawd",
     mascotEnabled: true,
@@ -564,5 +680,47 @@ export const mockSettingsSnapshot: SettingsSnapshot = {
     folderGroups: 2
   },
   auth: mockAuth,
-  providers: mockProviders
+  providers: mockProviders,
+  browser: mockBrowserSettings,
+  networkProxy: {
+    enabled: false,
+    selected: null,
+    bypass: ["localhost", "127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+    proxies: [],
+    lastTest: null
+  },
+  remote: {
+    defaultTarget: null,
+    sshHosts: [],
+    agentenv: {
+      enabled: false,
+      apiUrl: "https://api.agentenv.io",
+      runnerHost: null,
+      workspace: null,
+      credentialSecretId: null,
+      hasCredential: false,
+      authMethod: "api_key",
+      defaults: {
+        sandboxType: "small",
+        image: "python:3.11-slim",
+        region: null,
+        cpuMillis: null,
+        memoryMb: null,
+        gpuCount: 0,
+        gpuType: null,
+        maxLifetimeSeconds: null
+      }
+    }
+  },
+  secrets: {
+    storeFile: "/home/c/.puffer/secrets.json",
+    keySource: "local-key-file",
+    chromeImportSupported: false,
+    sources: [
+      { id: "chrome", label: "Chrome", available: true },
+      { id: "firefox", label: "Firefox", available: false },
+      { id: "1password", label: "1Password", available: false }
+    ],
+    items: []
+  }
 };

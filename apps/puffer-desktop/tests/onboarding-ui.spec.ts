@@ -1,0 +1,169 @@
+import { expect, type Page, test } from "@playwright/test";
+import { FakeDaemon } from "./support/fakeDaemon";
+
+async function openForcedOnboarding(page: Page): Promise<void> {
+  const daemon = new FakeDaemon();
+  await daemon.install(page);
+  await daemon.open(page, { forceOnboarding: true, skipOnboarding: false });
+}
+
+async function completeStubbedOnboarding(page: Page): Promise<void> {
+  await page.getByRole("button", { name: /Next/ }).click();
+  await expect(page.getByRole("heading", { name: "Pick your agent provider" })).toBeVisible();
+  await page.getByRole("button", { name: /Next/ }).click();
+  await expect(page.getByRole("heading", { name: "Connect your tools" })).toBeVisible();
+  await page.getByRole("button", { name: /Next/ }).click();
+  await expect(page.getByRole("heading", { name: "What may Puffer learn?" })).toBeVisible();
+  await page.getByRole("button", { name: /Build profile/ }).click();
+  await expect(page.getByRole("heading", { name: "Workspace is ready" })).toBeVisible();
+}
+
+test("onboarding Continue enters the workspace", async ({ page }) => {
+  await openForcedOnboarding(page);
+
+  await expect(page.getByRole("heading", { name: "How should Puffer run?" })).toBeVisible();
+  await completeStubbedOnboarding(page);
+  await expect(
+    page.getByRole("heading", { name: "Workspace is ready" })
+  ).toBeVisible();
+  await page.getByRole("button", { name: /Start using Puffer/ }).click();
+
+  await expect(page.getByRole("button", { name: "New agent in puffer" })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Workspace is ready" })
+  ).toHaveCount(0);
+});
+
+test("completed onboarding stays dismissed after settings refresh", async ({ page }) => {
+  const daemon = new FakeDaemon();
+  await daemon.install(page);
+  await daemon.open(page, { skipOnboarding: false });
+
+  await completeStubbedOnboarding(page);
+  await expect(page.getByRole("heading", { name: "Workspace is ready" })).toBeVisible();
+  await page.getByRole("button", { name: /Start using Puffer/ }).click();
+  await expect(page.getByRole("button", { name: "New agent in puffer" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page
+    .locator(".pf-settings-row")
+    .filter({ hasText: "Account" })
+    .getByRole("button", { name: "Refresh" })
+    .click();
+
+  await expect(page.getByRole("heading", { name: "Workspace is ready" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "General" })).toBeVisible();
+});
+
+test("onboarding does not show fake repository choices", async ({ page }) => {
+  await openForcedOnboarding(page);
+
+  await completeStubbedOnboarding(page);
+  await expect(page.getByText("puffer-web")).toHaveCount(0);
+  await expect(page.getByText("stripe-api")).toHaveCount(0);
+});
+
+test("skip flag does not bypass provider login when auth is empty", async ({ page }) => {
+  const daemon = new FakeDaemon({ auth: [] });
+  await daemon.install(page);
+  await page.addInitScript(() => {
+    window.localStorage.setItem("puffer-desktop:skip-onboarding", "1");
+  });
+  await daemon.open(page);
+
+  await expect(page.getByRole("heading", { name: "Popular providers" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "New agent in puffer" })).toHaveCount(0);
+});
+
+test("force onboarding does not bypass provider login when auth is empty", async ({ page }) => {
+  const daemon = new FakeDaemon({ auth: [] });
+  await daemon.install(page);
+  await daemon.open(page, { forceOnboarding: true, skipOnboarding: false });
+
+  await page.getByRole("button", { name: /Next/ }).click();
+  await expect(page.getByRole("heading", { name: "Popular providers" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Workspace is ready" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Start using Puffer/ })).toHaveCount(0);
+});
+
+test("auth-free local provider satisfies onboarding provider requirement", async ({ page }) => {
+  const daemon = new FakeDaemon({
+    auth: [],
+    providers: [
+      {
+        id: "ollama",
+        displayName: "Ollama",
+        baseUrl: "http://localhost:11434/v1",
+        defaultApi: "openai-completions",
+        modelCount: 1,
+        authModes: [],
+        sourceKind: "test",
+        sourcePath: null
+      }
+    ]
+  });
+  await daemon.install(page);
+  await daemon.open(page, { forceOnboarding: true, skipOnboarding: false });
+
+  await page.getByRole("button", { name: /Next/ }).click();
+  await expect(page.getByRole("heading", { name: "Pick your agent provider" })).toBeVisible();
+  await expect(page.getByText("1 agent provider ready")).toBeVisible();
+  await expect(page.getByLabel("API key for Anthropic")).toHaveCount(0);
+});
+
+test("ready onboarding includes remote execution setup", async ({ page }) => {
+  await openForcedOnboarding(page);
+
+  await completeStubbedOnboarding(page);
+  await expect(page.getByRole("heading", { name: "Workspace is ready" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Remote Execution" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "AgentEnv account" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Save remote settings" })).toBeVisible();
+});
+
+test("skip flag does not bypass provider login with only non-agent auth", async ({ page }) => {
+  const daemon = new FakeDaemon({
+    auth: [
+      {
+        providerId: "github",
+        kind: "oauth",
+        email: "tester@example.com",
+        expiresAtMs: null,
+        scopes: [],
+        planType: "test",
+        organizationName: null
+      }
+    ],
+    providers: [
+      {
+        id: "github",
+        displayName: "GitHub",
+        baseUrl: "",
+        defaultApi: "oauth",
+        modelCount: 0,
+        authModes: ["oauth"],
+        sourceKind: "test",
+        sourcePath: null
+      },
+      {
+        id: "anthropic",
+        displayName: "Anthropic",
+        baseUrl: "",
+        defaultApi: "anthropic-messages",
+        modelCount: 1,
+        authModes: ["api_key"],
+        sourceKind: "test",
+        sourcePath: null
+      }
+    ]
+  });
+  await daemon.install(page);
+  await page.addInitScript(() => {
+    window.localStorage.setItem("puffer-desktop:skip-onboarding", "1");
+  });
+  await daemon.open(page);
+
+  await expect(page.getByRole("heading", { name: "Popular providers" })).toBeVisible();
+  await expect(page.getByText("Workspace is ready")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "New agent in puffer" })).toHaveCount(0);
+});

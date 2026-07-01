@@ -1,0 +1,65 @@
+<!doctype html>
+<!--
+  E2E fixture for #675 — main-document keystroke-guarded input fill fallback.
+
+  Reproduces the Olive Young #cardNo failure class in a LOCAL main-document
+  (no cross-origin iframe involved). Three inputs:
+
+    #cardNo   — keystroke-guarded: any value not produced by genuine
+                per-character keystrokes is reverted to '' on the next tick.
+                The puffer native value-setter fill is rejected here; only the
+                #675 per-character trusted-keystroke fallback can fill it.
+
+    #expiry   — keystroke-guarded the SAME way BUT it also reverts genuine
+                per-character keystrokes (a field that simply cannot be filled).
+                Used to prove the fallback BAILS HONESTLY (#580 no-false-success)
+                rather than reporting a fill that did not stick.
+
+    #name     — UNGUARDED: a plain input that accepts the native value-setter.
+                Used to prove the fast path is unaffected (no fallback fires).
+
+  How the guard distinguishes keystrokes from programmatic sets:
+  a per-character trusted keystroke fires `beforeinput`/`keydown` with
+  `isTrusted === true`; the page's native value-setter + dispatched InputEvent
+  fires `input` with `isTrusted === false`. The guard accepts only trusted
+  single-character keydown-driven edits and reverts everything else.
+-->
+<html>
+  <head><meta charset="utf-8" /><title>#675 keystroke-guard fixture</title></head>
+  <body>
+    <form>
+      <label>Card number <input id="cardNo" name="cardNo" autocomplete="off" /></label>
+      <label>Expiry <input id="expiry" name="expiry" autocomplete="off" /></label>
+      <label>Name on card <input id="name" name="name" autocomplete="off" /></label>
+    </form>
+    <script>
+      // A guard that only trusts genuine per-character keystrokes. It records
+      // each trusted keydown character; on the `input` event it rebuilds the
+      // value from the trusted log and discards anything else (programmatic
+      // value-setter writes, bulk insertText, paste).
+      function guard(el, { allowKeystrokes }) {
+        let trusted = '';
+        el.addEventListener('keydown', (e) => {
+          if (e.isTrusted && allowKeystrokes && e.key && e.key.length === 1) {
+            trusted += e.key;
+          }
+        });
+        el.addEventListener('input', (e) => {
+          // Async revert (next microtask) so a synchronous in-page readback can
+          // briefly see the programmatic value before it's reverted — exercises
+          // the delayed post-fill readback path as well as the throw path.
+          queueMicrotask(() => {
+            if (el.value !== trusted) {
+              el.value = trusted; // revert anything not from trusted keystrokes
+            }
+          });
+        });
+      }
+      // #cardNo: revertible, but genuine keystrokes ARE allowed -> fallback fills it.
+      guard(document.getElementById('cardNo'), { allowKeystrokes: true });
+      // #expiry: reverts EVEN genuine keystrokes -> fallback must bail honestly.
+      guard(document.getElementById('expiry'), { allowKeystrokes: false });
+      // #name has no guard -> fast native-setter path fills it.
+    </script>
+  </body>
+</html>

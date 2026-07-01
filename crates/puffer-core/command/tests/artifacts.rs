@@ -68,6 +68,7 @@ fn copy_picker_actions_list_full_response_and_code_blocks() {
     let session = puffer_session_store::SessionMetadata {
         id: uuid::Uuid::nil(),
         display_name: None,
+        generated_title: None,
         cwd: tempdir.path().to_path_buf(),
         created_at_ms: 0,
         updated_at_ms: 0,

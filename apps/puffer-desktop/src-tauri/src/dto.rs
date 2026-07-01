@@ -1,5 +1,9 @@
+use puffer_session_store::{
+    AttachmentState, MessageActor, SessionStore, StoredAttachment, StoredAttachmentKind,
+};
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FolderGroupDto {
@@ -14,6 +18,7 @@ pub struct SessionListItemDto {
     pub id: String,
     pub title: String,
     pub display_name: Option<String>,
+    pub generated_title: Option<String>,
     pub cwd: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -38,19 +43,64 @@ pub struct SessionDiffsDto {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatAttachmentDto {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub extension: String,
+    pub kind: String,
+    pub state: String,
+}
+
+impl ChatAttachmentDto {
+    /// Builds a desktop attachment DTO from stored metadata and file availability.
+    pub(crate) fn from_stored(
+        store: &SessionStore,
+        session_id: Uuid,
+        attachment: &StoredAttachment,
+    ) -> Self {
+        let state = match store.attachment_state(session_id, attachment) {
+            AttachmentState::Available => "available",
+            AttachmentState::Missing => "missing",
+        };
+        Self {
+            id: attachment.id.clone(),
+            name: attachment.name.clone(),
+            mime_type: attachment.mime_type.clone(),
+            size: attachment.size,
+            extension: attachment.extension.clone(),
+            kind: match attachment.kind {
+                StoredAttachmentKind::Image => "image".to_string(),
+                StoredAttachmentKind::File => "file".to_string(),
+            },
+            state: state.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TimelineItemDto {
     UserMessage {
         id: String,
         text: String,
+        attachments: Vec<ChatAttachmentDto>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageActor>,
     },
     AssistantMessage {
         id: String,
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageActor>,
     },
     SystemMessage {
         id: String,
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageActor>,
     },
     ToolCall {
         id: String,
@@ -60,11 +110,17 @@ pub enum TimelineItemDto {
         input_json: Option<Value>,
         output_text: String,
         permission_dialog: Option<PermissionDialogDto>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageActor>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subject: Option<MessageActor>,
     },
     CommandInvoked {
         id: String,
         name: String,
         args: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageActor>,
     },
     SessionRenamed {
         id: String,

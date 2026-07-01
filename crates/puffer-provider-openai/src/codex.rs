@@ -2,6 +2,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 
 const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 const ORIGINATOR_OVERRIDE_ENV: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
+pub(crate) const OPENAI_CODEX_COMPAT_VERSION: &str = "0.125.0";
 
 pub(crate) fn default_originator() -> String {
     std::env::var(ORIGINATOR_OVERRIDE_ENV)
@@ -10,7 +11,9 @@ pub(crate) fn default_originator() -> String {
         .unwrap_or_else(|| DEFAULT_ORIGINATOR.to_string())
 }
 
-pub(crate) fn codex_user_agent(version: &str, originator: &str) -> String {
+/// Builds the `User-Agent` header value used for OpenAI/Codex API requests.
+/// Includes OS type, version, architecture, and terminal information.
+pub fn codex_user_agent(version: &str, originator: &str) -> String {
     let os_info = os_info::get();
     let fallback = format!("{originator}/{version}");
     let candidate = format!(
@@ -114,8 +117,17 @@ mod tests {
     use super::{codex_user_agent, default_headers, default_originator};
 
     #[test]
-    fn default_originator_matches_codex() {
-        assert_eq!(default_originator(), "codex_cli_rs");
+    fn default_originator_matches_codex_or_override() {
+        let expected = std::env::var(super::ORIGINATOR_OVERRIDE_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "codex_cli_rs".to_string());
+        assert_eq!(default_originator(), expected);
+    }
+
+    #[test]
+    fn codex_compat_version_tracks_latest_codex() {
+        assert_eq!(super::OPENAI_CODEX_COMPAT_VERSION, "0.125.0");
     }
 
     #[test]

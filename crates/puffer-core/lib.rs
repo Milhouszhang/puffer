@@ -1,58 +1,151 @@
 mod agent_catalog;
+mod autodream;
 mod command;
 mod command_helpers;
 mod command_summary;
 mod config_settings;
 mod hooks;
+mod memory;
 mod model_preferences;
+mod network;
 mod permissions;
 mod plan_mode;
 mod plans;
+pub mod recap;
+pub mod runner_adapter;
+pub mod runner_mcp;
 mod runtime;
 mod skill_support;
 mod state;
 #[cfg(test)]
 pub(crate) mod test_locks;
 mod tool_names;
+pub mod ultrareview;
+pub mod user_memory;
 mod workspace_paths;
 
 pub use agent_catalog::{load_agent_catalog, AgentCatalogEntry};
+pub use autodream::{
+    autodream_status, autodream_status_with_store, autodream_suggestions_with_store,
+    autodream_turn_completed, autodream_turn_completed_with_store,
+    ensure_manual_autodream_project_memory, render_manual_autodream_result, run_autodream_review,
+    should_show_manual_autodream_genskill_suggestion, spawn_autodream_review,
+    spawn_autodream_review_with_store, visible_autodream_assistant_text, AutoDreamOutcome,
+    ManualAutoDreamBootstrap,
+};
 pub use command::{
     command_surface, dispatch_command, find_command, supported_commands, CommandKind, CommandSpec,
 };
+pub use command_helpers::append_trace_events;
+pub use command_helpers::execute_connect_flow;
+pub use command_helpers::execute_monitor_flow;
+pub use command_helpers::sanitize_tool_invocation_input;
+pub use command_helpers::sanitized_tool_invocation_input;
 pub use command_helpers::CommandActionEntry;
 pub use command_helpers::CopyActionEntry;
+pub use command_helpers::LambdaSkillStatus;
 pub use command_helpers::McpActionEntry;
 pub use command_helpers::PluginActionEntry;
 pub use command_helpers::ResumeLaunchResolution;
 pub use command_helpers::SessionOverlayView;
 pub use command_helpers::TaskActionEntry;
-pub(crate) use command_summary::{render_buddy_summary, render_cost_summary, render_usage_summary};
+pub use command_helpers::{
+    prepare_pentest_command, PentestCommand, PentestStart, DEFAULT_PENTEST_MAX_DISPATCHES_PER_ITER,
+    DEFAULT_PENTEST_MAX_ITERATIONS, PENTEST_USAGE,
+};
+pub use command_summary::render_cost_summary;
+pub(crate) use command_summary::{render_buddy_summary, render_usage_summary};
 pub use hooks::run_resource_hooks;
+pub use memory::{
+    activate_project_memory, flush_project_memory, project_memory_turn_completed,
+    spawn_project_memory_review,
+};
 pub use model_preferences::{
     default_effort_level, effort_level_is_supported, normalized_effort_level,
     provider_preference_family, supported_effort_levels, ModelPreferenceFamily,
 };
+pub use network::{blocking_client_for_url, test_proxy_endpoint, HttpPurpose, ProxyTestOutcome};
+pub use permissions::browser_action_set_for_action;
+pub use permissions::is_browser_tool_selector;
+pub use permissions::BrowserActionSet;
+pub use permissions::SessionPermissionState;
+pub use plan_mode::enter_plan_mode;
 pub use runtime::background_tasks;
 pub use runtime::claude_tools::execute_workflow_tool;
+pub use runtime::execute_tool_action_once;
 pub use runtime::execute_user_prompt as execute_user_turn;
+pub use runtime::install_subscription_manager;
+pub use runtime::lambda_gate::LambdaHostConcreteToolBinding;
+pub use runtime::mcp_discovery;
+pub use runtime::quota::{QuotaError, QuotaErrorKind, QUOTA_EXIT_CODE};
+pub use runtime::resource_watcher;
+pub use runtime::resource_watcher::ResourceWatcher;
+
+pub mod monitor_contract {
+    pub use crate::runtime::claude_tools::workflow::monitor_contract::{
+        display_source_context, monitor_contract_hash, parse_monitor_contract, MonitorContract,
+        MonitorTaskKind, MONITOR_SCHEMA_VERSION,
+    };
+}
+pub use runtime::subscription_manager;
 pub use runtime::teammate_loop;
 pub use runtime::{
-    execute_side_question, execute_user_prompt_streaming as execute_user_turn_streaming,
+    browser_auto_review_runtime_result_from_json, execute_side_question,
+    execute_user_prompt_streaming as execute_user_turn_streaming,
+    execute_user_prompt_streaming_excluding_tools as execute_user_turn_streaming_excluding_tools,
+    execute_user_prompt_streaming_with_cancel as execute_user_turn_streaming_with_cancel,
     execute_user_prompt_streaming_with_permissions as execute_user_turn_streaming_with_permissions,
+    execute_user_prompt_streaming_with_permissions_and_cancel as execute_user_turn_streaming_with_permissions_and_cancel,
+    execute_user_prompt_streaming_with_prompt_tools_and_cancel as execute_user_turn_streaming_with_prompt_tools_and_cancel,
+    execute_user_prompt_streaming_with_reflection as execute_user_turn_streaming_with_reflection,
     execute_user_prompt_streaming_with_structured_output as execute_user_turn_streaming_with_structured_output,
+    execute_user_prompt_streaming_without_tools as execute_user_turn_streaming_without_tools,
     execute_user_prompt_with_structured_output as execute_user_turn_with_structured_output,
-    shutdown_runtime_services, with_permission_prompt_handler, PermissionPromptAction,
-    PermissionPromptRequest, StructuredOutputConfig, ToolCallRequest, ToolInvocation,
-    TurnExecution, TurnStreamEvent, TurnUsageReport,
+    execute_user_prompt_without_tools as execute_user_turn_without_tools, runtime_work_active,
+    shutdown_runtime_services, with_permission_prompt_handler, with_user_question_prompt_handler,
+    BrowserAutoReviewActionSet, BrowserAutoReviewRawAction, BrowserAutoReviewRequest,
+    BrowserAutoReviewRuntimeResult, BrowserAutoReviewSessionTargeting, BrowserAutoReviewSource,
+    BrowserAutoReviewSuggestedGrantScope, BrowserAutoReviewTargetClass, BrowserAutoReviewUrlSource,
+    BrowserPermissionPromptActionSet, BrowserPermissionPromptPayload,
+    BrowserPermissionPromptSource, BrowserPermissionPromptTargetClass, CancelToken,
+    CodeJudgeConfig, LlmJudgeConfig, LlmJudgeContextScope, LlmJudgeMode, LlmJudgePromptCacheMode,
+    PermissionPromptAction, PermissionPromptRequest, PermissionPromptReviewPayload,
+    ReflectionConfig, ReflectionLanguage, ReflectionTraceEvent, RetryAttemptKind,
+    StructuredOutputConfig, ToolCallRequest, ToolInvocation, TurnExecution, TurnStreamEvent,
+    TurnUsageReport, UserQuestionPromptRequest, UserQuestionPromptResponse,
 };
-pub use state::{AppState, MessageRole, RenderedMessage, TaskRecord, TaskStatus};
+pub use runtime::{install_observability, observability_handle};
+pub use state::{
+    AppState, MessageRole, MonitorSourceStampContext, MonitorTaskCreateGateContext,
+    RenderedAttachment, RenderedMessage, TaskRecord, TaskStatus,
+};
 
 use anyhow::Result;
 use puffer_provider_registry::{AuthStore, ProviderRegistry};
 use puffer_resources::LoadedResources;
 use puffer_session_store::{SessionStore, SessionSummary};
 use std::path::Path;
+
+/// Applies an interactive Canvas state patch for a live daemon bridge.
+pub fn apply_canvas_state_patch(
+    cwd: &Path,
+    session_id: &str,
+    canvas_id: &str,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    runtime::claude_tools::workflow::canvas::apply_canvas_state_patch(
+        cwd, session_id, canvas_id, patch,
+    )
+}
+
+/// Executes a standalone LSP query against the configured workspace language servers.
+pub fn execute_lsp_query(
+    resources: &LoadedResources,
+    cwd: &Path,
+    input: serde_json::Value,
+) -> Result<String> {
+    runtime::claude_tools::workflow::lsp::execute_lsp_query(resources, cwd, input)
+}
 
 /// Renders the current session/provider/tool status summary used by `/status`.
 pub fn render_status_summary(
@@ -77,6 +170,36 @@ pub fn render_doctor_report(
     auth_store: &AuthStore,
 ) -> Result<String> {
     command_helpers::render_doctor_report(state, resources, providers, auth_store)
+}
+
+/// Renders Lambda Skill harness status lines used by doctor surfaces.
+pub fn render_lambda_skill_doctor_status(resources: &LoadedResources) -> String {
+    command_helpers::render_lambda_skill_doctor_status(resources)
+}
+
+/// Returns Lambda Skill harness warning summaries used by doctor surfaces.
+pub fn lambda_skill_doctor_warning_lines(resources: &LoadedResources) -> Vec<String> {
+    command_helpers::lambda_skill_doctor_warnings(resources)
+        .into_iter()
+        .map(|warning| format!("{}; {}", warning.summary, warning.detail))
+        .collect()
+}
+
+/// Returns Lambda Skill readiness rows used by UI surfaces.
+pub fn lambda_skill_statuses(resources: &LoadedResources) -> Vec<LambdaSkillStatus> {
+    command_helpers::lambda_skill_statuses(resources)
+}
+
+/// Validates a precompiled Lambda Skill host catalogue for runtime use.
+pub fn validate_lambda_host_catalogue_runtime(raw: &str) -> Result<()> {
+    runtime::lambda_gate::validate_host_catalogue_runtime(raw)
+}
+
+/// Returns the concrete tool bindings declared by a Lambda Skill host catalogue.
+pub fn lambda_host_catalogue_concrete_tool_bindings(
+    raw: &str,
+) -> Result<Vec<LambdaHostConcreteToolBinding>> {
+    runtime::lambda_gate::host_catalogue_concrete_tool_bindings(raw)
 }
 
 /// Renders the current `/context` summary used by interactive overlays.
@@ -290,7 +413,16 @@ pub fn resolve_resume_launch(
     command_helpers::resolve_resume_launch(session_store, current_cwd, query)
 }
 
-/// Reloads declarative resources and rebuilds the provider registry for the active session.
+/// Reloads declarative resources, rebuilds the provider registry, and
+/// hot-swaps the MCP roster on the live tool runner for the active session.
+///
+/// Skills are picked up implicitly because the system prompt is rebuilt
+/// from `resources.skills` on every turn; replacing `*resources` is enough.
+/// MCP servers need an extra step: the in-memory `McpHost` cached inside
+/// `LocalToolRunner` keeps live subprocess handles indexed by the old
+/// roster, so we hot-swap it via [`runner_adapter::LocalToolRunner::replace_mcp_roster`]
+/// so newly added manifests can launch on the next call and removed ones
+/// stop being callable immediately.
 pub fn reload_runtime_resources(
     state: &AppState,
     resources: &mut LoadedResources,
@@ -307,5 +439,47 @@ pub fn reload_runtime_resources(
         );
     }
     let _ = providers.discover_and_merge_all(auth_store);
+    apply_mcp_roster_to_runner(state, resources);
     command_helpers::reload_plugins_summary(state, resources)
+}
+
+/// Pushes the freshly-loaded MCP server roster onto the live tool runner.
+///
+/// Walks `Arc<dyn ToolRunner>` through the `as_any()` seam exposed by
+/// `puffer_runner_api::ToolRunner` and, if the underlying type is a
+/// `LocalToolRunner`, rebuilds its `McpHost`. Non-local runners (e.g.
+/// `RemoteToolRunner`) ignore this: they manage MCP lifecycle out of
+/// band, and forcing a reload here would step on the remote's roster.
+fn apply_mcp_roster_to_runner(state: &AppState, resources: &LoadedResources) {
+    let Some(any) = state.tool_runner.as_any() else {
+        return;
+    };
+    let Some(local) = any.downcast_ref::<runner_adapter::LocalToolRunner>() else {
+        return;
+    };
+    let servers = collect_runner_mcp_roster(resources);
+    let workspace = Some(state.cwd.clone());
+    local.replace_mcp_roster(servers, workspace);
+}
+
+/// Merges `resources.mcp_servers` with plugin-embedded MCP servers,
+/// deduplicating by id (case-insensitive). Mirrors the merge done at
+/// startup in `puffer_runner_local::local_runner_from_resources` so a
+/// hot-reload yields the same effective roster as a fresh start.
+fn collect_runner_mcp_roster(resources: &LoadedResources) -> Vec<puffer_resources::McpServerSpec> {
+    let mut servers: Vec<puffer_resources::McpServerSpec> = resources
+        .mcp_servers
+        .iter()
+        .map(|item| item.value.clone())
+        .collect();
+    for (_plugin, spec) in puffer_resources::plugin_mcp_servers(resources) {
+        if servers
+            .iter()
+            .any(|existing| existing.id.eq_ignore_ascii_case(&spec.id))
+        {
+            continue;
+        }
+        servers.push(spec.clone());
+    }
+    servers
 }

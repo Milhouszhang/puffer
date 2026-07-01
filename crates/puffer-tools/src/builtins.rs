@@ -49,7 +49,6 @@ pub fn parse_builtin_input(kind: ToolKind, input: Value) -> Result<ToolInput> {
                 command: input.command,
                 timeout: input.timeout,
                 run_in_background: input.run_in_background,
-                dangerously_disable_sandbox: input.dangerously_disable_sandbox,
             })
         }
         ToolKind::ReadFile => {
@@ -156,7 +155,6 @@ pub fn execute_bash_tool(
                 "command": input.command,
                 "timeout_ms": input.timeout,
                 "run_in_background": input.run_in_background,
-                "dangerously_disable_sandbox": input.dangerously_disable_sandbox,
                 "timed_out": execution.timed_out,
             }),
         },
@@ -504,9 +502,7 @@ fn run_bash_command(
     command: &str,
     timeout_ms: Option<u64>,
 ) -> Result<TimedCommandOutput> {
-    let mut child = Command::new(detected_shell())
-        .arg("-lc")
-        .arg(command)
+    let mut child = shell_command(command)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -548,6 +544,20 @@ fn run_bash_command(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(windows)]
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new("cmd.exe");
+    cmd.arg("/C").arg(command);
+    cmd
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new(detected_shell());
+    cmd.arg("-lc").arg(command);
+    cmd
 }
 
 fn bash_stderr_message(stderr: &[u8], timed_out: bool, timeout_ms: Option<u64>) -> String {
@@ -774,7 +784,6 @@ mod tests {
                 command: "printf hi".to_string(),
                 timeout: None,
                 run_in_background: false,
-                dangerously_disable_sandbox: false,
             },
         )
         .unwrap_err();
@@ -809,7 +818,6 @@ mod tests {
                 command: "sleep 1".to_string(),
                 timeout: Some(10),
                 run_in_background: false,
-                dangerously_disable_sandbox: false,
             },
         )
         .unwrap();
@@ -818,16 +826,16 @@ mod tests {
     }
 
     #[test]
-    fn bash_tool_uses_bash_shell() {
+    fn bash_tool_uses_detected_shell() {
         let temp = tempfile::tempdir().unwrap();
         let result = execute_bash_tool(
             "bash",
             temp.path(),
             BashToolInput {
-                command: "printf '%s' ${BASH_VERSION%%.*}".to_string(),
+                command: "printf '%s' \"${BASH_VERSION:-${ZSH_VERSION:-${KSH_VERSION:-shell}}}\""
+                    .to_string(),
                 timeout: None,
                 run_in_background: false,
-                dangerously_disable_sandbox: false,
             },
         )
         .unwrap();
@@ -845,7 +853,6 @@ mod tests {
                 command: "printf hi".to_string(),
                 timeout: None,
                 run_in_background: true,
-                dangerously_disable_sandbox: false,
             },
         )
         .unwrap_err();

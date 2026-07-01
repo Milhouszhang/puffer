@@ -7,6 +7,7 @@ pub(super) fn sample_state() -> AppState {
         SessionMetadata {
             id: Uuid::nil(),
             display_name: Some("demo".to_string()),
+            generated_title: None,
             cwd: PathBuf::from("/workspace/puffer"),
             created_at_ms: 0,
             updated_at_ms: 0,
@@ -103,6 +104,8 @@ pub(super) fn sample_resources() -> LoadedResources {
                 model_override: None,
                 mode: None,
                 chained_from: Vec::new(),
+                for_provider: None,
+                for_model: None,
             },
         )],
         skills: vec![loaded_item(
@@ -142,6 +145,12 @@ pub(super) fn sample_resources() -> LoadedResources {
                     endpoint: String::new(),
                     target: "git".to_string(),
                     description: "Git bridge".to_string(),
+                    env: Default::default(),
+                    inherit_env: true,
+                    timeout: None,
+                    connect_timeout: None,
+                    headers: Default::default(),
+                    oauth: None,
                 }],
                 lsp_servers: Vec::new(),
             },
@@ -155,6 +164,12 @@ pub(super) fn sample_resources() -> LoadedResources {
                 endpoint: String::new(),
                 target: "local".to_string(),
                 description: "Local tool bridge".to_string(),
+                env: Default::default(),
+                inherit_env: true,
+                timeout: None,
+                connect_timeout: None,
+                headers: Default::default(),
+                oauth: None,
             },
         )],
         ides: vec![loaded_item(
@@ -182,6 +197,7 @@ pub(super) fn openai_provider_resources() -> LoadedResources {
                 headers: Default::default(),
                 query_params: Default::default(),
                 discovery: None,
+                media: None,
                 models: vec![ModelDescriptor {
                     id: "gpt-5".to_string(),
                     display_name: "GPT-5".to_string(),
@@ -190,7 +206,11 @@ pub(super) fn openai_provider_resources() -> LoadedResources {
                     context_window: 272_000,
                     max_output_tokens: 16_384,
                     supports_reasoning: true,
+                    compat: None,
+                    input: vec![puffer_provider_registry::Modality::Text],
+                    cost: None,
                 }],
+                chat_completions_path: None,
             },
         )],
         ..LoadedResources::default()
@@ -208,6 +228,7 @@ pub(super) fn sample_providers() -> ProviderRegistry {
         headers: Default::default(),
         query_params: Default::default(),
         discovery: None,
+        media: None,
         models: vec![
             ModelDescriptor {
                 id: "claude-sonnet-4-5".to_string(),
@@ -217,6 +238,9 @@ pub(super) fn sample_providers() -> ProviderRegistry {
                 context_window: 200_000,
                 max_output_tokens: 8_192,
                 supports_reasoning: true,
+                compat: None,
+                input: vec![puffer_provider_registry::Modality::Text],
+                cost: None,
             },
             ModelDescriptor {
                 id: "claude-opus-4-1".to_string(),
@@ -226,8 +250,12 @@ pub(super) fn sample_providers() -> ProviderRegistry {
                 context_window: 200_000,
                 max_output_tokens: 8_192,
                 supports_reasoning: true,
+                compat: None,
+                input: vec![puffer_provider_registry::Modality::Text],
+                cost: None,
             },
         ],
+        chat_completions_path: None,
     });
     providers.register(ProviderDescriptor {
         id: "openai".to_string(),
@@ -238,6 +266,7 @@ pub(super) fn sample_providers() -> ProviderRegistry {
         headers: Default::default(),
         query_params: Default::default(),
         discovery: None,
+        media: None,
         models: vec![ModelDescriptor {
             id: "gpt-5".to_string(),
             display_name: "GPT-5".to_string(),
@@ -246,7 +275,11 @@ pub(super) fn sample_providers() -> ProviderRegistry {
             context_window: 200_000,
             max_output_tokens: 8_192,
             supports_reasoning: true,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
         }],
+        chat_completions_path: None,
     });
     providers.register(ProviderDescriptor {
         id: "ollama".to_string(),
@@ -257,6 +290,7 @@ pub(super) fn sample_providers() -> ProviderRegistry {
         headers: Default::default(),
         query_params: Default::default(),
         discovery: None,
+        media: None,
         models: vec![ModelDescriptor {
             id: "qwen3:14b".to_string(),
             display_name: "qwen3:14b".to_string(),
@@ -265,7 +299,11 @@ pub(super) fn sample_providers() -> ProviderRegistry {
             context_window: 32_768,
             max_output_tokens: 8_192,
             supports_reasoning: false,
+            compat: None,
+            input: vec![puffer_provider_registry::Modality::Text],
+            cost: None,
         }],
+        chat_completions_path: None,
     });
     providers
 }

@@ -62,6 +62,7 @@ use puffer_provider_registry::{
     AuthStore, ModelDescriptor, ProviderDescriptor, ProviderRegistry, StoredCredential,
 };
 use puffer_resources::{load_resources, LoadedResources, McpServerSpec};
+use puffer_secrets::{SecretUpsert, SecretVault};
 use puffer_session_store::{
     MessageActor, SessionMetadata, SessionStore, StoredAttachment, StoredAttachmentKind,
     TranscriptEvent, TurnBoundaryState,
@@ -120,6 +121,8 @@ use crate::desktop_api_types::{
 };
 
 const PROTOCOL_VERSION: &str = "1";
+const AGENTENV_LOGIN_URL: &str = "https://agentenv.io/login";
+const AGENTENV_API_URL: &str = "https://agentenv.io";
 
 /// Handshake record written to the handshake file + stdout so parent
 /// processes (Tauri) can discover the URL and token.
@@ -1415,6 +1418,9 @@ async fn dispatch_request(
         "login_with_oauth" => {
             respond!(detached!(|s, p| handle_login_with_oauth(&s, &p)))
         }
+        "login_with_agentenv" => {
+            respond!(detached!(|s| handle_login_with_agentenv(&s)))
+        }
         "list_external_credentials" => {
             respond!(detached!(|s| handle_list_external_credentials(&s)))
         }
@@ -2568,6 +2574,187 @@ fn handle_login_with_oauth(state: &DaemonState, params: &Value) -> Result<Value>
         &fresh.session_store,
     )?;
     Ok(serde_json::to_value(snapshot)?)
+}
+
+/// Runs the AgentEnv browser login flow from the daemon host and stores the
+/// returned access token as a Puffer secret after validating it with AgentEnv.
+fn handle_login_with_agentenv(state: &DaemonState) -> Result<Value> {
+    let listener = crate::authflow::CallbackListener::bind_localhost("/agentenv-callback")?;
+    let login_state = Uuid::new_v4().to_string();
+    let mut login_url = url::Url::parse(AGENTENV_LOGIN_URL)?;
+    login_url
+        .query_pairs_mut()
+        .append_pair("cli_callback", listener.redirect_uri())
+        .append_pair("state", &login_state);
+
+    if !crate::authflow::open_browser(login_url.as_str()) {
+        anyhow::bail!("could not open the system browser for AgentEnv login");
+    }
+
+    let callback = listener
+        .wait_for_callback_url(Duration::from_secs(180))?
+        .ok_or_else(|| anyhow::anyhow!("timed out waiting for AgentEnv login callback"))?;
+    let (token, parsed_state) = parse_agentenv_callback(&callback)?;
+    if parsed_state.as_deref() != Some(login_state.as_str()) {
+        anyhow::bail!("AgentEnv login state mismatch");
+    }
+
+    let config = state.config.lock().unwrap().clone();
+    let client = proxy_oauth_client(&config, AGENTENV_API_URL)?;
+    let profile = fetch_agentenv_profile(&client, &token)?;
+    let workspaces = fetch_agentenv_workspaces(&client, &token).ok();
+    let workspace = extract_agentenv_workspace(&profile, workspaces.as_ref());
+    let username = extract_agentenv_username(&profile);
+
+    let vault = SecretVault::open(SecretVault::default_path(&state.paths.user_config_dir))?;
+    let secret = vault.put(SecretUpsert {
+        id: None,
+        label: "AgentEnv access token".to_string(),
+        description: Some("AgentEnv OAuth access token".to_string()),
+        value: token,
+        username,
+        origin: Some(AGENTENV_API_URL.to_string()),
+        source: "oauth".to_string(),
+    })?;
+
+    let mut config = state.config.lock().unwrap().clone();
+    let agentenv = config.remote.agentenv.get_or_insert_with(Default::default);
+    agentenv.enabled = true;
+    agentenv.api_url = AGENTENV_API_URL.to_string();
+    agentenv.credential_secret_id = Some(secret.id);
+    agentenv.auth_method = "access_token".to_string();
+    if let Some(workspace) = workspace {
+        agentenv.workspace = Some(workspace);
+    }
+    save_user_config(&state.paths, &config).context("save AgentEnv config")?;
+    reload_daemon_config(state)?;
+
+    let fresh = state.build_runtime_inputs()?;
+    let config = state.config.lock().unwrap().clone();
+    let snapshot: SettingsSnapshotDto = desktop_api::load_settings_snapshot(
+        &state.paths,
+        &config,
+        &fresh.resources,
+        &fresh.providers,
+        &fresh.auth_store,
+        &fresh.session_store,
+    )?;
+    Ok(serde_json::to_value(snapshot)?)
+}
+
+fn parse_agentenv_callback(callback: &str) -> Result<(String, Option<String>)> {
+    let url = url::Url::parse(callback).context("parse AgentEnv callback URL")?;
+    let token = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "token").then(|| value.into_owned()))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("AgentEnv callback did not include an access token"))?;
+    let state = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()));
+    Ok((token, state))
+}
+
+fn fetch_agentenv_profile(client: &reqwest::blocking::Client, token: &str) -> Result<Value> {
+    let response = client
+        .get(format!("{AGENTENV_API_URL}/v1/auth/profile"))
+        .bearer_auth(token)
+        .send()
+        .context("validate AgentEnv access token")?;
+    agentenv_success_json(response, "AgentEnv profile validation")
+}
+
+fn fetch_agentenv_workspaces(client: &reqwest::blocking::Client, token: &str) -> Result<Value> {
+    let response = client
+        .get(format!("{AGENTENV_API_URL}/v1/auth/workspaces"))
+        .bearer_auth(token)
+        .send()
+        .context("load AgentEnv workspaces")?;
+    agentenv_success_json(response, "AgentEnv workspace discovery")
+}
+
+fn agentenv_success_json(response: reqwest::blocking::Response, context: &str) -> Result<Value> {
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("{context} failed with HTTP {status}: {text}");
+    }
+    serde_json::from_str(&text).with_context(|| format!("parse {context} response"))
+}
+
+fn extract_agentenv_username(profile: &Value) -> Option<String> {
+    string_at_any(
+        profile,
+        &[
+            &["email"],
+            &["username"],
+            &["user", "email"],
+            &["user", "username"],
+            &["data", "email"],
+            &["data", "username"],
+        ],
+    )
+}
+
+fn extract_agentenv_workspace(profile: &Value, workspaces: Option<&Value>) -> Option<String> {
+    string_at_any(
+        profile,
+        &[
+            &["selectedWorkspaceId"],
+            &["selected_workspace_id"],
+            &["selectedWorkspace", "id"],
+            &["selected_workspace", "id"],
+            &["user", "selectedWorkspaceId"],
+            &["user", "selected_workspace_id"],
+            &["data", "selectedWorkspaceId"],
+            &["data", "selected_workspace_id"],
+        ],
+    )
+    .or_else(|| workspaces.and_then(first_agentenv_workspace_id))
+}
+
+fn first_agentenv_workspace_id(value: &Value) -> Option<String> {
+    if let Some(items) = value.as_array() {
+        return items.iter().find_map(agentenv_workspace_id);
+    }
+    for key in ["workspaces", "items", "data"] {
+        if let Some(items) = value.get(key).and_then(Value::as_array) {
+            if let Some(id) = items.iter().find_map(agentenv_workspace_id) {
+                return Some(id);
+            }
+        }
+    }
+    agentenv_workspace_id(value)
+}
+
+fn agentenv_workspace_id(value: &Value) -> Option<String> {
+    string_at_any(value, &[&["id"], &["workspaceId"], &["workspace", "id"]])
+}
+
+fn string_at_any(value: &Value, paths: &[&[&str]]) -> Option<String> {
+    for path in paths {
+        let mut current = value;
+        let mut found = true;
+        for segment in *path {
+            if let Some(next) = current.get(*segment) {
+                current = next;
+            } else {
+                found = false;
+                break;
+            }
+        }
+        if !found {
+            continue;
+        }
+        if let Some(value) = current
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 /// Lists importable credentials discovered under external tool config roots.
@@ -6788,25 +6975,24 @@ mod tests {
         append_ordered_turn_progress, apply_daemon_yolo_mode, apply_turn_model_override,
         apply_turn_request_options, browser_launch_settings_or_default,
         browser_permission_payload_json, browser_status_for_turn, cancel_all_active_turns,
-        connector_setup_connect_args, connector_setup_id, daemon_now_ms,
-        desktop_latency_ms, file_media_mime_type, generated_video_handler,
-        handle_create_file_media_access, handle_create_generated_video_access,
-        handle_create_openai_realtime_client_secret, handle_create_session, handle_generate_media,
-        handle_import_external_credential, handle_list_lambda_skill_libraries,
-        handle_list_media_capabilities, handle_list_permissions, handle_list_provider_models,
-        handle_load_session_detail, handle_local_model_status, handle_login_with_api_key,
-        handle_logout_provider, handle_read_generated_media_preview,
-        handle_remove_lambda_skill_library, handle_save_lambda_skill_library,
-        handle_save_permissions, handle_save_proxy_settings, handle_set_lambda_skill_approval,
-        handle_set_lambda_skill_enabled, handle_update_config, model_descriptor_dto,
-        parse_single_byte_range, permission_review_payload_json,
+        connector_setup_connect_args, connector_setup_id, daemon_now_ms, desktop_latency_ms,
+        file_media_mime_type, generated_video_handler, handle_create_file_media_access,
+        handle_create_generated_video_access, handle_create_openai_realtime_client_secret,
+        handle_create_session, handle_generate_media, handle_import_external_credential,
+        handle_list_lambda_skill_libraries, handle_list_media_capabilities,
+        handle_list_permissions, handle_list_provider_models, handle_load_session_detail,
+        handle_local_model_status, handle_login_with_api_key, handle_logout_provider,
+        handle_read_generated_media_preview, handle_remove_lambda_skill_library,
+        handle_save_lambda_skill_library, handle_save_permissions, handle_save_proxy_settings,
+        handle_set_lambda_skill_approval, handle_set_lambda_skill_enabled, handle_update_config,
+        model_descriptor_dto, parse_single_byte_range, permission_review_payload_json,
         realtime_session_config_from_params, report_cancelled_turn, requires_explicit_subscription,
         resolve_create_session_model_id, resolve_monitor_reply_turn_scope, run_off_runtime,
         session_used_browser_tool, start_connector_setup_turn, turn_browser_tab_context,
-        CancelToken, ConnectionGuard, MONITOR_REPLY_ACTION_PROMPT_SCOPE,
-        DaemonState, GenerateMediaArtifactResult, GenerateMediaResult, GeneratedVideoRangeError,
-        GeneratedVideoTicket, ServerEnvelope, TurnHandle, TurnProgress, TurnProgressItem,
-        TurnRequestOptions,
+        CancelToken, ConnectionGuard, DaemonState, GenerateMediaArtifactResult,
+        GenerateMediaResult, GeneratedVideoRangeError, GeneratedVideoTicket, ServerEnvelope,
+        TurnHandle, TurnProgress, TurnProgressItem, TurnRequestOptions,
+        MONITOR_REPLY_ACTION_PROMPT_SCOPE,
     };
     use axum::{
         extract::{Path as AxumPath, State},

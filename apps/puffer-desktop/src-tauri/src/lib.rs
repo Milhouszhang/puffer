@@ -1,3 +1,4 @@
+mod agentenv_auth;
 mod backend;
 mod browser;
 mod browser_debug;
@@ -42,6 +43,7 @@ const REGISTERED_TAURI_COMMANDS: &[&str] = &[
     "merge_pull_request",
     "load_settings_snapshot",
     "login_with_oauth",
+    "login_with_agentenv",
     "login_with_api_key",
     "logout_provider",
     "list_external_credentials",
@@ -198,6 +200,12 @@ fn login_with_oauth(
         "login_with_oauth",
         json!({ "providerId": provider_id }),
     )
+}
+
+#[tauri::command]
+fn login_with_agentenv(app: AppHandle, state: State<'_, SharedBackend>) -> Result<Value, String> {
+    agentenv_auth::login_with_agentenv().map_err(|error| error.to_string())?;
+    backend_call(app, state, "load_settings_snapshot", json!({}))
 }
 
 #[tauri::command]
@@ -465,7 +473,11 @@ fn video_dir_for_cwd(cwd: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(all(target_os = "macos", puffer_desktop_cef_native))]
-fn spawn_cef_native_warmup(app_handle: AppHandle, smoke_url: Option<String>, prewarm_targets: usize) {
+fn spawn_cef_native_warmup(
+    app_handle: AppHandle,
+    smoke_url: Option<String>,
+    prewarm_targets: usize,
+) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use tauri::Manager;
@@ -567,6 +579,7 @@ pub fn run() {
             merge_pull_request,
             load_settings_snapshot,
             login_with_oauth,
+            login_with_agentenv,
             login_with_api_key,
             logout_provider,
             list_external_credentials,

@@ -13,7 +13,8 @@ async function completeStubbedOnboarding(page: Page): Promise<void> {
   await page.getByRole("button", { name: /Next/ }).click();
   await expect(page.getByRole("heading", { name: "Connect AgentEnv" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "AgentEnv account" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Save AgentEnv" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Connect AgentEnv" })).toBeVisible();
+  await expect(page.getByText("API URL")).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "SSH hosts" })).toHaveCount(0);
   await page.getByRole("button", { name: /Next/ }).click();
   await expect(page.getByRole("heading", { name: "Connect your tools" })).toBeVisible();
@@ -124,9 +125,11 @@ test("onboarding includes AgentEnv remote execution setup", async ({ page }) => 
   await page.getByRole("button", { name: /Next/ }).click();
   await expect(page.getByRole("heading", { name: "Connect AgentEnv" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "AgentEnv account" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Save AgentEnv" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Connect AgentEnv" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Save AgentEnv" })).toHaveCount(0);
+  await expect(page.getByText("API URL")).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "SSH hosts" })).toHaveCount(0);
-  await expect(page.getByText("Advanced AgentEnv settings")).toBeVisible();
+  await expect(page.getByText("Advanced AgentEnv settings")).toHaveCount(0);
 });
 
 test("skip flag does not bypass provider login with only non-agent auth", async ({ page }) => {

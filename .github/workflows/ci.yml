@@ -1,9 +1,17 @@
 name: CI
 
 on:
+  # Gate PRs, and the mainline itself after merge. Feature-branch pushes are
+  # covered by their PR run, so this avoids the push+pull_request double-run.
   push:
+    branches: [master]
   pull_request:
   workflow_dispatch:
+
+# Least privilege: CI only needs to read the checkout. Overrides the repo
+# default token scope so a compromised action can't write to the repo.
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -33,7 +41,7 @@ jobs:
 
       # --- Hard gate: must pass. Catches compile regressions across the workspace. ---
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       # --- Hard gate: unit + integration test targets across the workspace.
       # The tmux TUI snapshot tests are skipped: they render inside tmux and
@@ -44,14 +52,14 @@ jobs:
       # ~/.claude|~/.puffer reads, a leaked PUFFER_OPENAI_WEBSOCKET env var, and
       # a subscriber test reaching the subscription-manager singleton) are fixed. ---
       - name: Test
-        run: cargo test --workspace --tests -- --skip tmux_
+        run: cargo test --workspace --tests --locked -- --skip tmux_
 
       - name: Rustfmt (informational)
         run: cargo fmt --all --check
         continue-on-error: true
 
       - name: Clippy (informational)
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --locked
         continue-on-error: true
 
   desktop:

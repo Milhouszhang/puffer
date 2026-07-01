@@ -1628,8 +1628,10 @@ async function workflowRequest<T>(
 }
 
 /** Load registered workflows from the daemon. */
-export async function loadWorkflowSnapshot(): Promise<WorkflowSnapshot> {
-  return workflowRequest<WorkflowSnapshot>("workflow_list");
+export async function loadWorkflowSnapshot(options?: { includeWorkflows?: boolean }): Promise<WorkflowSnapshot> {
+  return workflowRequest<WorkflowSnapshot>("workflow_list", {
+    includeWorkflows: options?.includeWorkflows
+  });
 }
 
 /** Open the configured workflow runtime UI through the daemon. */
@@ -1764,7 +1766,7 @@ export async function createMonitor(
 
 /** Delete one connector monitor and return the refreshed workflow snapshot. */
 export async function deleteMonitor(slug: string): Promise<WorkflowSnapshot> {
-  return deleteWorkflowBinding(slug);
+  return deleteWorkflowBinding(slug, { includeWorkflows: false });
 }
 
 /** Ignore one monitor-created task and return the refreshed workflow snapshot. */
@@ -1841,8 +1843,14 @@ export async function loadMonitorHistory(limit = 200): Promise<WorkflowMonitorHi
 }
 
 /** Delete one connection-triggered workflow binding. */
-export async function deleteWorkflowBinding(slug: string): Promise<WorkflowSnapshot> {
-  return workflowRequest<WorkflowSnapshot>("workflow_binding_delete", { slug });
+export async function deleteWorkflowBinding(
+  slug: string,
+  options?: { includeWorkflows?: boolean }
+): Promise<WorkflowSnapshot> {
+  return workflowRequest<WorkflowSnapshot>("workflow_binding_delete", {
+    slug,
+    includeWorkflows: options?.includeWorkflows
+  });
 }
 
 /** Delete one connector connection. */

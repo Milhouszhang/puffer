@@ -66,31 +66,33 @@ use std::fs;
 
 /// Returns the workflow runtime snapshot with connector catalog context.
 pub(crate) fn handle_workflow_list(paths: &ConfigPaths) -> Result<Value> {
-    let (workflows, workflow_error) = match runtime_workflows(paths) {
-        Ok(workflows) => (workflows, None),
-        Err(error) => (Vec::new(), Some(error.to_string())),
+    handle_workflow_list_with_runtime(paths, true)
+}
+
+pub(crate) fn handle_workflow_list_with_runtime(
+    paths: &ConfigPaths,
+    include_workflows: bool,
+) -> Result<Value> {
+    let (workflows, workflow_error) = if include_workflows {
+        match runtime_workflows(paths) {
+            Ok(workflows) => (workflows, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        }
+    } else {
+        (Vec::new(), None)
     };
     let mut snapshot = json!({
         "workflows": workflows,
         "runs": [],
         "workflow_error": workflow_error,
     });
-    let ignore_filter_sync_error =
-        monitor_task_ignore::sync_monitor_ignore_filters_from_tasks(paths)
-            .err()
-            .map(|error| error.to_string());
     add_connector_context(paths, &mut snapshot);
     add_workflow_binding_context(paths, &mut snapshot);
     add_monitor_task_context(paths, &mut snapshot);
     monitor_memory::add_monitor_memory_context(paths, &mut snapshot);
     task_snapshot::add_task_context(paths, &mut snapshot);
     if let Some(object) = snapshot.as_object_mut() {
-        object.insert(
-            "monitor_ignore_filter_error".to_string(),
-            ignore_filter_sync_error
-                .map(Value::String)
-                .unwrap_or(Value::Null),
-        );
+        object.insert("monitor_ignore_filter_error".to_string(), Value::Null);
     }
     Ok(snapshot)
 }

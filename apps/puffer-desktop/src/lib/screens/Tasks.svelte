@@ -287,7 +287,7 @@
     loading = true;
     error = null;
     try {
-      const next = await loadWorkflowSnapshot();
+      const next = await loadWorkflowSnapshot({ includeWorkflows: false });
       if (generation !== refreshGeneration) return;
       applySnapshot(next);
       notice = "Task snapshot refreshed.";

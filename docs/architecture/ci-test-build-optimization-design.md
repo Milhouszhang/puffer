@@ -2,7 +2,7 @@
 
 Date: 2026-07-01
 Branch: `chore/add-ci-and-git-hooks`
-Status: Approved (design)
+Status: Approved (design, re-reviewed)
 
 ## Problem
 
@@ -12,8 +12,8 @@ coverage gaps and one performance cost:
 
 1. **`--lib` misses `puffer-cli`.** `puffer-cli` is a bin-only crate (no
    `lib.rs`). `cargo test --workspace --lib` runs only library targets, so the
-   daemon, RPC handlers, and workflow tests — a large product surface — are
-   never run.
+   daemon, RPC handlers, and workflow tests — a large product surface — never
+   run.
 2. **Build does not cover all targets.** `cargo build --workspace` compiles only
    lib + bin production code. `#[cfg(test)]` modules, integration tests
    (`crates/*/tests/`), examples, and benches are not compiled by build; a
@@ -21,100 +21,119 @@ coverage gaps and one performance cost:
    clippy step, which swallows it.
 3. **The Tauri Rust backend is never compiled.** `apps/puffer-desktop/src-tauri`
    is a *separate* Cargo workspace, so root `cargo build --workspace` skips it.
-   The desktop job only builds the frontend (vite/svelte/node). A backend
-   compile break ships undetected.
+   The desktop job only builds the frontend. A backend compile break ships
+   undetected. (`backend.rs` alone is ~2400 lines — a real surface.)
 4. **Tests run single-threaded** (`--test-threads=1`) as a stability stopgap.
    ~150 call sites resolve config via `ConfigPaths::discover`, which without a
    per-test home override reads the real `~/.puffer`; run in parallel, tests
    race on that shared session/project state and fail intermittently.
    Serializing is deterministic but ~4x slower (≈6.5 min vs ≈1.5 min).
 
-Constraints for this work: no backward-compatibility obligation; optimize for
-long-term value, stability, and performance; avoid over-engineering.
+Constraints: no backward-compatibility obligation; optimize for long-term value,
+stability, and performance; avoid over-engineering.
 
 ## Design
 
 ### 1. Test isolation at the source (enables parallel)
 
 Change `ConfigPaths::discover(workspace_root)` so that when `workspace_root` is
-located under the OS temporary directory (`std::env::temp_dir()` — where
-`tempfile::tempdir()` creates its dirs), `user_config_dir` resolves to
+under the OS temporary directory, `user_config_dir` resolves to
 `workspace_root/.puffer-user` instead of the real `$HOME/.puffer`. Outside the
-temp dir (production), behavior is unchanged (real `~/.puffer`).
+temp dir (production), behavior is unchanged.
 
-Rationale:
-- **Single point of change.** No edits to the ~150 test call sites.
-- **Automatic everywhere.** Works for both CI and local `cargo test`, zero
-  configuration, no env var to remember.
-- **Correct semantics.** A tempdir workspace *is* an ephemeral/test context;
-  isolating its "user" config to that same tempdir is the right behavior and
-  each test's dir is unique, so parallel tests never share state.
-- **Bonus long-term value.** Tests stop polluting the developer's real
-  `~/.puffer`.
+Precedence (unchanged order, new rule added as a fallback): explicit
+`puffer_home_override()` thread-local → `$PUFFER_HOME` → **[new] temp-dir rule**
+→ `$HOME` / `dirs::home_dir()`.
 
-Edge case: a real workspace physically located under the OS temp dir would get
-an isolated user config. This is negligible and harmless.
+Detection must be robust:
+- Canonicalize both `workspace_root` and `std::env::temp_dir()` before the
+  `starts_with` check (macOS `/var` → `/private/var` symlink; trailing slashes).
+- If canonicalization fails (e.g. the path does not exist yet), fall back to the
+  existing production behavior. Never panic; never change production resolution.
 
-Implementation notes:
-- Compare canonicalized paths (macOS `/var/folders` vs `/private/var/folders`
-  symlink) so the temp-dir check is reliable.
-- The existing `puffer_home_override` thread-local and `$PUFFER_HOME` env var
-  continue to take precedence (checked first); the temp-dir rule is the new
-  fallback ahead of `$HOME`.
+What this covers and does not cover:
+- **Covers the write-race source.** The intermittent failures are concurrent
+  writes to the shared `user_config_dir` (session/project registry,
+  `project_metadata.json`). Isolating `user_config_dir` per tempdir removes
+  them. It also fixes `puffer-resources`'s loader tests, which read `~/.claude`
+  via `user_config_dir.parent()` — so local verification is no longer perturbed
+  by a developer's real `~/.claude`.
+- **Does not cover direct `$HOME` reads.** A few tests read `$HOME/.claude` /
+  `$HOME/.puffer` directly (e.g. `system_prompt::load_context_blocks`). These
+  are **read-only** (no write race) and the individual assertion-sensitive cases
+  are already fixed with `ScopedHome`. Not a parallelism blocker.
+
+Add unit tests for the new `discover` behavior:
+- Under a tempdir workspace root, `user_config_dir` is inside that tempdir.
+- Under a non-temp (production) root, `user_config_dir` is `$HOME/.puffer`
+  (existing behavior preserved).
+- An explicit `PUFFER_HOME` / `puffer_home_override` still wins over the
+  temp-dir rule.
 
 ### 2. Widen and parallelize the Rust gate
 
-- **Build:** `cargo build --workspace --all-targets --locked` — compiles every
-  target (lib, bin, integration tests, examples, benches) across the workspace,
-  closing the "test/example compile break is invisible" gap. (Integration tests
-  are compiled here but still not *run* — running them needs infra: tmux, the
-  workflow-runtime image.)
 - **Test:** `cargo test --workspace --lib --bins --locked` — runs lib **and**
-  bin unit tests (adds `puffer-cli`'s daemon/workflow suites). Run **in
-  parallel** (drop `--test-threads=1`), now safe because §1 makes the tests
-  hermetic.
+  bin unit tests (adds `puffer-cli`). Run **in parallel** (drop
+  `--test-threads=1`), safe once §1 makes tests hermetic.
+- **Build / compile coverage:** close the "integration-test compile break is
+  invisible" gap. Preferred: `cargo build --workspace --all-targets --locked`
+  (compiles lib, bin, integration tests, examples, benches). **Verify it
+  compiles cleanly first.** If pre-existing examples/benches are bit-rotted, do
+  **not** fix unrelated rot — narrow to `cargo test --workspace --tests --no-run
+  --locked` (compiles all test targets, skips examples/benches), which still
+  closes the real gap. Decide by the verification result.
 
 ### 3. Compile the desktop backend (new job)
 
-Add a dedicated job `Desktop backend` that runs
-`cargo check --manifest-path apps/puffer-desktop/src-tauri/Cargo.toml --locked`
-after installing the Linux system dependencies Tauri needs (webkit2gtk / gtk).
-`cargo check` (not `build`) is the minimal signal — it verifies the backend
-compiles without codegen/link cost. As its own job it runs in parallel with the
-Rust and Desktop-frontend jobs, so it adds no critical-path wall-clock.
+Add a job `Desktop backend`:
+- `apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
+  libayatana-appindicator3-dev librsvg2-dev` (plus the pkg-config/openssl deps
+  already used by the Rust job).
+- `cargo check --manifest-path apps/puffer-desktop/src-tauri/Cargo.toml
+  --locked` (verify src-tauri's `Cargo.lock` is in sync so `--locked` passes).
+- Runs in parallel with the other jobs → no critical-path wall-clock cost.
+- `check` only (no build/link, no bundle) — minimal signal for a real gap.
+- Heaviest addition (webkit deps); first thing to drop if the cost is judged not
+  worth it.
 
 ### Resulting CI shape (three parallel jobs)
 
 | Job | Hard-gate steps | Informational |
 |---|---|---|
-| Rust | `build --workspace --all-targets`; `test --workspace --lib --bins` (parallel) | rustfmt, clippy |
+| Rust | build `--all-targets` (or `test --tests --no-run`); `test --workspace --lib --bins` (parallel) | rustfmt, clippy |
 | Desktop (frontend) | `vite build`, `svelte-check`, node tests | — |
 | Desktop backend | `cargo check` src-tauri | — |
 
 Unchanged and already mature: least-privilege token, `push: [master]` +
-`pull_request` triggers, `concurrency` cancel, `timeout-minutes`, `--locked`,
-rust-cache, npm cache.
+`pull_request`, `concurrency` cancel, `timeout-minutes`, `--locked`, rust-cache,
+npm cache.
 
 ## Verification
 
-1. Locally, with a clean HOME (matching CI), run `cargo test --workspace --lib
-   --bins --locked` **in parallel**, several times, to confirm §1 removes the
+1. `cargo build --workspace --all-targets --locked` compiles cleanly (decides
+   `--all-targets` vs `--tests --no-run` for §2).
+2. `cargo check --manifest-path apps/puffer-desktop/src-tauri/Cargo.toml
+   --locked` compiles (locally if the host has the apt deps, otherwise accept
+   CI-only verification).
+3. With a clean HOME (matching CI), run `cargo test --workspace --lib --bins
+   --locked` **in parallel**, several times, to confirm §1 removes the
    contention and the suite is deterministically green.
-2. If a small number of residual non-`~/.puffer` races remain (the known
+4. If a small number of residual non-`~/.puffer` races remain (the known
    non-home races — an image-response socket test and an `op` process-group
-   kill — are already fixed), fix each directly; they should be few.
-3. Push and confirm the PR CI is green; the Rust job should drop back to ≈1.5 min.
+   kill — are already fixed), fix each directly.
+5. Push; confirm PR CI green; Rust job drops back to ≈1.5 min.
 
 ## Explicit non-goals (avoid over-engineering)
 
 - No per-test hermeticity edits across the ~150 call sites — §1 replaces that.
 - No integration/e2e infrastructure (tmux, workflow-runtime image, Playwright).
 - No full Tauri app bundle/e2e — backend `cargo check` only.
-- No doctest gating.
+- No doctest gating (doctests remain uncompiled/unrun).
+- No fixing unrelated example/bench rot — narrow the compile step instead.
 
 ## Fallback
 
 If parallel proves unexpectedly flaky beyond a handful of fixable tests, revert
 the Test step to `--test-threads=1` (still a mature, deterministic, all-crate
-gate) while keeping the coverage widenings (`--bins`, `--all-targets`) and the
-`discover` isolation (which stands on its own as a correctness/pollution fix).
+gate) while keeping the coverage widenings (`--bins`, all-targets compile) and
+the `discover` isolation (which stands alone as a correctness/pollution fix).

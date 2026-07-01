@@ -19,6 +19,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The `--tests` gate links 100+ integration-test binaries; with debug
+  # symbols (the bulk of a debug binary) that `target/` exhausts the runner's
+  # disk ("No space left on device"). Debug symbols are useless in CI, so drop
+  # them — much smaller target/, faster linking, identical test behavior.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   rust:

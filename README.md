@@ -24,6 +24,29 @@ bash scripts/report-large-files.sh
 `scripts/report-large-files.sh` is informational by default. Use it to make
 large-file risk visible when a change touches a known oversized module.
 
+## Git hooks & CI
+
+Local git hooks are managed by [lefthook](https://github.com/evilmartians/lefthook).
+There is no root `package.json` to auto-install from, so run this once after
+cloning:
+
+```bash
+brew install lefthook   # or: cargo install lefthook
+lefthook install        # writes .git/hooks/*
+```
+
+- **pre-commit** (fast, file-scoped): rustfmt-check on staged `*.rs`, plus
+  svelte-check when `apps/puffer-desktop` sources change.
+- **pre-push**: `cargo clippy --workspace --all-targets`. Ordinary warnings
+  do not block, but clippy's *correctness* lints are deny-by-default, so a
+  correctness error will fail the push.
+- Emergency bypass is `git commit/push --no-verify` — prefer fixing the finding.
+
+CI (`.github/workflows/ci.yml`) is the authoritative full-tree gate. Hard
+gates: `cargo build --workspace`, `cargo test --workspace --lib`, and the
+desktop `vite build` + svelte-check + node tests. Rustfmt and clippy run in
+CI as informational only.
+
 ## Repo Map
 
 `Cargo.toml` is the source of truth for workspace membership. Main areas:

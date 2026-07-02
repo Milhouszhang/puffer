@@ -203,18 +203,35 @@ constraints:
 
 ## Agent-driven UI testing
 
-Design doc: docs/superpowers/specs/2026-07-02-agent-ui-testing-design.md
+Route UI testing work by scenario:
 
-Scenario routing:
 | Scenario | Tool | Deliverable |
 |---|---|---|
-| New-feature acceptance / flow exploration | agent-browser + `npm run agent:app` (isolated environment; read AGENT_APP_URL from stdout) | Exploration report + hardened `tests/*-ui.spec.ts` |
+| New-feature acceptance / flow exploration | agent-browser against the isolated `agent:app` instance | Exploration report + hardened `tests/*-ui.spec.ts` |
 | UI/UX visual review | agent-browser screenshots reviewed state by state; component-level via Storybook (`npm run storybook`, :6006) | Issue list + `toHaveScreenshot()` baselines in `tests/visual/*.spec.ts` |
-| Bug deep-dive (network/console/daemon protocol) | playwright-mcp (configured in .mcp.json) | Root cause + minimal reproduction spec |
+| Bug deep-dive (network/console/daemon protocol) | playwright-mcp (configured in `.mcp.json`) | Root cause + minimal reproduction spec |
 | Regression protection | `npm run test:desktop-ui` (CI, no agent) | Pass/fail |
 
+To launch the isolated app (from `apps/puffer-desktop/`):
+
+1. Build the daemon once: `cargo build -p puffer-cli` (the script fails fast if
+   `target/debug/puffer` is missing).
+2. Run `npm run agent:app`. Append `-- --provider real` to hit a real gateway;
+   that mode requires `RELAYDANCE_BASE_URL` and `RELAYDANCE_API_KEY`. The
+   default mock provider answers every prompt with a canned reply.
+3. Parse stdout: `AGENT_APP_URL=` is the ready-to-open app URL (any browser
+   tool works); `AGENT_APP_ROOT=` is the instance's temp directory.
+4. Stop with Ctrl-C/SIGTERM. The daemon, temp directory, and any self-started
+   Vite are cleaned up automatically; a Vite already running on 1420 is reused
+   and left untouched.
+
 Conventions:
-- Hardened specs use role-based selectors (`getByRole` first), styled after the existing `tests/*-ui.spec.ts`
-- A finding only counts as hardened once `npm run test:desktop-ui` (functional) / `npm run test:desktop-visual` (visual, macOS local only) passes
-- Visual baselines are platform-dependent: `tests/visual/` stays out of GitHub CI (CI is ubuntu; baselines are generated on macOS)
-- Exploration always goes through the isolated `agent:app` instance and never touches the user's dev data (the Vite on 1420 can be shared)
+
+- Explore only through the isolated `agent:app` instance — it never touches
+  the user's dev data, and sharing the Vite on 1420 is safe.
+- Harden findings with role-based selectors (`getByRole` first), styled after
+  the existing `tests/*-ui.spec.ts`.
+- Count a finding as hardened only once `npm run test:desktop-ui` (functional)
+  or `npm run test:desktop-visual` (visual) passes.
+- Keep `tests/visual/` out of GitHub CI and run it on macOS only: screenshot
+  baselines are macOS-generated and diverge on the ubuntu CI runners.

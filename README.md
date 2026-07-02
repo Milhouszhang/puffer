@@ -42,19 +42,24 @@ lefthook install        # writes .git/hooks/*
   correctness error will fail the push.
 - Emergency bypass is `git commit/push --no-verify` — prefer fixing the finding.
 
-CI (`.github/workflows/ci.yml`) is the authoritative full-tree gate. Hard
-gates: `cargo build --workspace --all-targets` (compiles production, test,
-integration, example, and bench targets, so a compile break anywhere fails CI
-rather than only the informational clippy step), `cargo test --workspace --lib
---bins` (the whole workspace unit suite, including the bin-only `puffer-cli`),
-and the desktop `vite build` + svelte-check + node tests, plus a `cargo check`
-of the Tauri Rust backend (`apps/puffer-desktop/src-tauri`, a separate
-workspace). Rust tests run in parallel: `ConfigPaths::discover` isolates
-`user_config_dir` under the OS temp dir in tests, so the suite no longer races
-on the real `~/.puffer`.
-Integration targets (`--tests`) are not gated (some need a terminal/tmux or the
-local workflow-runtime image); run them locally. Rustfmt and clippy run in CI as
-informational only.
+CI (`.github/workflows/ci.yml`) is the authoritative full-tree gate. All steps
+are hard gates, in three parallel jobs:
+
+- **Rust**: `cargo build --workspace --all-targets` (compiles production, test,
+  integration, example, and bench targets, so a compile break anywhere fails
+  CI), `cargo nextest run --workspace --profile ci` (unit + integration tests;
+  the `ci` profile in `.config/nextest.toml` kills wedged tests), `cargo fmt
+  --check`, and clippy with the `correctness` + `suspicious` groups denied.
+- **Desktop**: `vite build` + svelte-check + node tests on the Node version
+  pinned in `apps/puffer-desktop/.nvmrc`.
+- **Desktop backend** (`apps/puffer-desktop/src-tauri`, a separate workspace):
+  the same nextest / rustfmt / clippy gates as the root workspace.
+
+Rust tests run in parallel: `ConfigPaths::discover` isolates `user_config_dir`
+under the OS temp dir in tests, so the suite does not race on the real
+`~/.puffer`. Tests needing infra CI lacks self-exclude: tmux TUI tests are
+skipped via `PUFFER_SKIP_TMUX_TESTS=1`, and the few needing the local
+workflow-runtime image or a real browser are `#[ignore]`d; run those locally.
 
 ## Repo Map
 

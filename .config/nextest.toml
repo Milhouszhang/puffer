@@ -1,0 +1,10 @@
+# nextest profiles. CI selects `--profile ci`; local runs keep defaults.
+[profile.ci]
+# A wedged test (e.g. a blocked global-singleton channel) gets killed after
+# 3 slow-timeout periods instead of stalling the job until its 25min timeout.
+# 360s ceiling: the slowest legitimate test (execute_user_prompt_accepts_
+# openai_family_aliases) already takes ~145s locally, so 180s would risk
+# false kills on slower CI runners.
+slow-timeout = { period = "120s", terminate-after = 3 }
+# Surface every failure in one run rather than stopping at the first.
+fail-fast = false

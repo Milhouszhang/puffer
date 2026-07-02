@@ -67,6 +67,30 @@ mod tests {
         }
     }
 
+    fn auto_reply_binding() -> WorkflowBindingSpec {
+        WorkflowBindingSpec {
+            slug: "tg-review-auto-reply".into(),
+            description: "Auto reply to reviewed telegram tasks".into(),
+            connection_slug: "telegram-user".into(),
+            connector_slug: Some("telegram-login".into()),
+            status: WorkflowBindingStatus::Enabled,
+            filter: None,
+            ignore_filters: Vec::new(),
+            contact_ids: Vec::new(),
+            classify_prompt: None,
+            classify_model: None,
+            action: ActionSpec::ConnectorAct {
+                connector_slug: "telegram-login".into(),
+                action: "send_message".into(),
+                input: serde_json::json!({
+                    "chat_id": "{{payload.chat_id}}",
+                    "text": "reply"
+                }),
+            },
+            created_at_ms: 0,
+        }
+    }
+
     fn outgoing_envelope() -> EventEnvelope {
         EventEnvelope {
             envelope_id: "env-outgoing".into(),
@@ -148,6 +172,69 @@ mod tests {
             calls.load(AtomicOrdering::SeqCst),
             1,
             "dispatcher runs exactly once"
+        );
+        // PanicClassifier never panicked => classify was bypassed for self event.
+    }
+
+    #[test]
+    fn outgoing_event_with_allowing_gate_skips_non_monitor_bindings() {
+        struct ActionKindCountingDispatcher {
+            triage_calls: Arc<AtomicUsize>,
+            connector_calls: Arc<AtomicUsize>,
+        }
+        impl ActionDispatcher for ActionKindCountingDispatcher {
+            fn dispatch(&self, action: &ActionSpec, _envelope: &EventEnvelope) -> ActionResult {
+                match action {
+                    ActionSpec::TriageAgent { .. } => {
+                        self.triage_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        ActionResult::success("triaged")
+                    }
+                    ActionSpec::ConnectorAct { .. } => {
+                        self.connector_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        ActionResult::failure("connector action should have been self-gated")
+                    }
+                    _ => ActionResult::success("other"),
+                }
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let store = WorkflowBindingStore::load(dir.path().join("bindings.json")).unwrap();
+        store
+            .create(monitor_binding_with_classify_prompt())
+            .unwrap();
+        store.create(auto_reply_binding()).unwrap();
+        let triage_calls = Arc::new(AtomicUsize::new(0));
+        let connector_calls = Arc::new(AtomicUsize::new(0));
+        let dispatcher: Arc<dyn ActionDispatcher> = Arc::new(ActionKindCountingDispatcher {
+            triage_calls: triage_calls.clone(),
+            connector_calls: connector_calls.clone(),
+        });
+        let classifier: Arc<dyn Classifier> = Arc::new(PanicClassifier);
+        let gate: Arc<dyn SelfMessageGate> = Arc::new(AllowAllSelfGate);
+
+        let result = process_envelope_result(
+            &outgoing_envelope(),
+            &store,
+            None,
+            &dispatcher,
+            &classifier,
+            None,
+            &gate,
+        );
+
+        assert!(result.matched, "monitor binding may handle the self message");
+        assert_eq!(result.acted, 1);
+        assert_eq!(result.failed, 0);
+        assert_eq!(
+            triage_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "self message should still reach monitor triage when gate allows"
+        );
+        assert_eq!(
+            connector_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "self message must not reach auto-reply connector send binding"
         );
         // PanicClassifier never panicked => classify was bypassed for self event.
     }

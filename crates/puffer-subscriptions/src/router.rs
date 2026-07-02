@@ -158,16 +158,8 @@ pub(crate) fn process_envelope_result_with_monitor_digest(
             // (dedup/contact/classify). classify can be an LLM call, so gating
             // before it is essential (#569). The gate is cheap and injected so
             // the router holds no monitor/task knowledge.
-            if !gate.should_dispatch_self_message(&envelope.event) {
-                log_router_skip(&spec, envelope, "self_no_open_task");
-                record_router_trace(
-                    trace_store,
-                    &spec,
-                    envelope,
-                    "router_self_gate_skipped",
-                    "subscription_router",
-                    "Outgoing/self message had no open task in this conversation.",
-                );
+            if !self_message_should_dispatch_to_spec(&spec, &envelope.event, gate) {
+                record_self_gate_skip(trace_store, &spec, envelope);
                 continue;
             }
             result.matched = true;
@@ -584,16 +576,8 @@ pub(crate) fn process_envelope_batch_result_with_monitor_digest(
                 if !topic_matches {
                     continue;
                 }
-                if !gate.should_dispatch_self_message(&envelope.event) {
-                    log_router_skip(&spec, envelope, "self_no_open_task");
-                    record_router_trace(
-                        trace_store,
-                        &spec,
-                        envelope,
-                        "router_self_gate_skipped",
-                        "subscription_router",
-                        "Outgoing/self message had no open task in this conversation.",
-                    );
+                if !self_message_should_dispatch_to_spec(&spec, &envelope.event, gate) {
+                    record_self_gate_skip(trace_store, &spec, envelope);
                     continue;
                 }
                 result.matched = true;
@@ -1198,6 +1182,30 @@ fn monitor_binding_should_skip_event(spec: &WorkflowBindingSpec, payload: &Value
         return false;
     }
     payload_bool(payload, "notification_muted") || payload_bool(payload, "notification_silent")
+}
+
+fn self_message_should_dispatch_to_spec(
+    spec: &WorkflowBindingSpec,
+    event: &puffer_subscriber_runtime::Event,
+    gate: &Arc<dyn SelfMessageGate>,
+) -> bool {
+    is_monitor_binding(spec) && gate.should_dispatch_self_message(event)
+}
+
+fn record_self_gate_skip(
+    trace_store: Option<&MonitorTraceStore>,
+    spec: &WorkflowBindingSpec,
+    envelope: &EventEnvelope,
+) {
+    log_router_skip(spec, envelope, "self_no_open_task");
+    record_router_trace(
+        trace_store,
+        spec,
+        envelope,
+        "router_self_gate_skipped",
+        "subscription_router",
+        "Outgoing/self message is not eligible for this workflow binding.",
+    );
 }
 
 fn record_monitor_router_outcome(

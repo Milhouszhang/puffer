@@ -164,6 +164,16 @@ async function installNativeCefStub(page: Page, options: NativeCefStubOptions = 
           return { ok: true };
         }
         if (cmd === "browser_cef_native_hide") return { ok: true };
+        if (cmd === "ensure_local_daemon") {
+          const params = new URLSearchParams(window.location.search);
+          return {
+            url: params.get("corbinaBackend") ?? params.get("pufferBackend") ?? "",
+            token: params.get("corbinaToken") ?? params.get("pufferToken") ?? "test",
+            protocolVersion: "1",
+            workspaceRoot: "/tmp/puffer"
+          };
+        }
+        if (!cmd.startsWith("browser_cef_native_")) return null;
         throw new Error(`unexpected native CEF invoke: ${cmd}`);
       }
     };
@@ -1898,12 +1908,33 @@ test("Browser fuzz click storm keeps daemon session ids valid", async ({ page })
   await daemon.waitForRequest("browser_open", (request) =>
     request.params.sessionId === "session-browser:browser:tab-1"
   );
+  daemon.emit("browser:session-browser:browser:tab-1:state", {
+    url: "https://fuzz.example",
+    title: "Fuzz fixture",
+    loading: false
+  });
+  await expect(page.getByLabel("URL")).toHaveValue("https://fuzz.example");
 
   const canvas = page.locator(".pf-browser-canvas");
   for (let step = 0; step < 24; step += 1) {
     const mode = step % 8;
     if (mode === 0) {
-      await canvas.click({ position: { x: 18 + step, y: 20 } });
+      await canvas.dispatchEvent("pointerdown", {
+        clientX: 18 + step,
+        clientY: 20,
+        pointerId: 7,
+        button: 0,
+        buttons: 1,
+        pointerType: "mouse"
+      });
+      await canvas.dispatchEvent("pointerup", {
+        clientX: 18 + step,
+        clientY: 20,
+        pointerId: 7,
+        button: 0,
+        buttons: 0,
+        pointerType: "mouse"
+      });
     } else if (mode === 1) {
       await canvas.dispatchEvent("pointermove", {
         clientX: 30 + step,
@@ -2541,30 +2572,23 @@ test("Browser navigation controls are disabled while reconnecting but address st
 
 test("late Browser open responses do not overwrite the active tab", async ({ page }) => {
   const daemon = new FakeDaemon();
-  await daemon.install(page);
-  await page.addInitScript(() => {
-    window.localStorage.setItem(
-      "puffer-browser-tabs:session-browser",
-      JSON.stringify({
-        tabs: [
-          {
-            id: "tab-1",
-            label: "Slow tab",
-            url: "https://slow.example",
-            title: "Slow tab",
-            favicon: ""
-          },
-          {
-            id: "tab-2",
-            label: "Fast tab",
-            url: "https://fast.example",
-            title: "Fast tab",
-            favicon: ""
-          }
-        ]
-      })
-    );
+  daemon.setBrowserTabs("session-browser", {
+    activeTabId: "tab-1",
+    tabs: [
+      {
+        ...browserTab("tab-1", "https://slow.example"),
+        label: "Slow tab",
+        title: "Slow tab",
+        active: true
+      },
+      {
+        ...browserTab("tab-2", "https://fast.example"),
+        label: "Fast tab",
+        title: "Fast tab"
+      }
+    ]
   });
+  await daemon.install(page);
   daemon.delayResponse(
     "browser_open",
     (request) => request.params.sessionId === "session-browser:browser:tab-1",

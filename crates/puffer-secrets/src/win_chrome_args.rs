@@ -31,7 +31,10 @@ pub(crate) fn validate_elevation_arg(kind: &str, value: &str) -> Result<()> {
     const QUOTE_CLASS: &[char] = &[
         '"', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}', '\u{201C}', '\u{201D}', '\u{201E}',
     ];
-    if value.chars().any(|c| QUOTE_CLASS.contains(&c) || c.is_control()) {
+    if value
+        .chars()
+        .any(|c| QUOTE_CLASS.contains(&c) || c.is_control())
+    {
         bail!("refusing to elevate: {kind} contains an unsupported character");
     }
     // A trailing backslash escapes the literal closing `\"` we wrap the value in,
@@ -79,7 +82,10 @@ pub(crate) fn validate_vault_dir(vault: &str) -> Result<()> {
     if is_unc || !is_drive_abs {
         bail!("refusing to elevate: vault directory must be a local drive-absolute path");
     }
-    if vault.split(|c| c == '\\' || c == '/').any(|seg| seg == "..") {
+    if vault
+        .split(|c| c == '\\' || c == '/')
+        .any(|seg| seg == "..")
+    {
         bail!("refusing to elevate: vault directory must not contain a `..` segment");
     }
     Ok(())
@@ -126,7 +132,10 @@ mod tests {
         // A trailing separator on a real dir is stripped (so it isn't rejected).
         assert_eq!(normalize_vault_dir("D:\\puffer\\"), "D:\\puffer");
         assert_eq!(normalize_vault_dir("D:\\puffer"), "D:\\puffer");
-        assert_eq!(normalize_vault_dir("C:/Users/me/.puffer//"), "C:/Users/me/.puffer");
+        assert_eq!(
+            normalize_vault_dir("C:/Users/me/.puffer//"),
+            "C:/Users/me/.puffer"
+        );
         // PR-review #1: a bare drive root keeps one separator (stays drive-absolute),
         // it must NOT collapse to the drive-relative `C:`.
         assert_eq!(normalize_vault_dir("C:\\"), "C:\\");
@@ -150,7 +159,7 @@ mod tests {
             "C:\\Users\\me\\.puffer",
             "D:\\puffer",
             "C:/Users/me/.puffer",
-            "C:\\Program Files (x86)\\x", // parens/spaces are fine
+            "C:\\Program Files (x86)\\x",  // parens/spaces are fine
             "C:\\Users\\O'Brien\\.puffer", // apostrophe is fine (PS-escaped later)
         ] {
             assert!(validate_vault_dir(ok).is_ok(), "should accept: {ok}");
@@ -160,13 +169,13 @@ mod tests {
     #[test]
     fn vault_dir_rejects_unc_traversal_and_relative() {
         for bad in [
-            "\\\\attacker\\share",      // UNC -> off-machine redirect
-            "//attacker/share",          // forward-slash UNC
+            "\\\\attacker\\share",        // UNC -> off-machine redirect
+            "//attacker/share",           // forward-slash UNC
             "C:\\Users\\..\\..\\Windows", // .. traversal
             "C:\\a\\..\\b",
-            "puffer",                    // relative
-            "C:puffer",                  // drive-relative (no separator)
-            "\\Users\\me",               // rooted-but-no-drive
+            "puffer",      // relative
+            "C:puffer",    // drive-relative (no separator)
+            "\\Users\\me", // rooted-but-no-drive
         ] {
             assert!(validate_vault_dir(bad).is_err(), "should reject: {bad}");
         }
@@ -179,7 +188,9 @@ mod tests {
         // ASCII double quote.
         assert!(validate_elevation_arg("v", "a\"b").is_err());
         // Round-2 finding: every Unicode "smart" quote PowerShell treats as a quote.
-        for q in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}', '\u{201C}', '\u{201D}', '\u{201E}'] {
+        for q in [
+            '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}', '\u{201C}', '\u{201D}', '\u{201E}',
+        ] {
             let payload = format!("x{q};calc;#");
             assert!(
                 validate_elevation_arg("v", &payload).is_err(),
@@ -200,8 +211,19 @@ mod tests {
     #[test]
     fn elevation_arg_keeps_benign_characters() {
         // These are inert inside our quoting and must NOT be over-rejected.
-        for ok in ["O'Brien", "a & b", "x (y)", "100% sure", "a`b", "a$b", "name.with.dots"] {
-            assert!(validate_elevation_arg("v", ok).is_ok(), "should accept: {ok}");
+        for ok in [
+            "O'Brien",
+            "a & b",
+            "x (y)",
+            "100% sure",
+            "a`b",
+            "a$b",
+            "name.with.dots",
+        ] {
+            assert!(
+                validate_elevation_arg("v", ok).is_ok(),
+                "should accept: {ok}"
+            );
         }
     }
 

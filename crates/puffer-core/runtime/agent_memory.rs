@@ -39,7 +39,10 @@ pub(super) fn build_agent_memory_section(cwd: &Path, agent: &AgentSpec) -> Resul
     if let Ok(content) = fs::read_to_string(&entrypoint) {
         let trimmed = content.trim();
         if !trimmed.is_empty() {
-            lines.push(format!("Current memory:\n{}", truncate_memory_content(trimmed)));
+            lines.push(format!(
+                "Current memory:\n{}",
+                truncate_memory_content(trimmed)
+            ));
         }
     }
 

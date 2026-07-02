@@ -5,9 +5,8 @@ use crate::dtos::{
     ChatAttachmentSourceDto, DiffSummaryDto, DivergenceReportDto, ExternalCredentialDto,
     FolderGroupDto, MediaCapabilityInfoDto, MediaGenerationSettingsDto, MediaSettingsDto,
     ProviderSummaryDto, ResourceCountsDto, SecretSourceDto, SecretSummaryDto, SecretsSettingsDto,
-    SessionDetailDto,
-    SessionListItemDto, SettingsConfigDto, SettingsSessionSummaryDto, SettingsSnapshotDto,
-    TimelineItemDto,
+    SessionDetailDto, SessionListItemDto, SettingsConfigDto, SettingsSessionSummaryDto,
+    SettingsSnapshotDto, TimelineItemDto,
 };
 use crate::events::EventEmitter;
 use crate::repo_actions;

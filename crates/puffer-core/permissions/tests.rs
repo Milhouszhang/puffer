@@ -302,7 +302,12 @@ fn telegram_reads_allow_but_auth_actions_ask() {
     // account in the Connectors UI, so reading their own chats/contacts must
     // not pop a per-call approval (#699). The tool's yaml policy is `ask`.
     let telegram = tool_definition("Telegram", "ask");
-    for action in ["list_peers", "search_peers", "list_messages", "search_messages"] {
+    for action in [
+        "list_peers",
+        "search_peers",
+        "list_messages",
+        "search_messages",
+    ] {
         let decision =
             context.decision_for_tool_call(&telegram, &serde_json::json!({ "action": action }));
         assert_eq!(

@@ -401,7 +401,10 @@ impl RuntimePermissionContext {
                 // (outbound Telegram actions go through the human-gated monitor
                 // pipeline, not here), so only account-setup (login/import)
                 // actions stay gated.
-                let action = input.get("action").and_then(Value::as_str).unwrap_or_default();
+                let action = input
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let read_only = matches!(
                     action,
                     "list_peers" | "search_peers" | "list_messages" | "search_messages"

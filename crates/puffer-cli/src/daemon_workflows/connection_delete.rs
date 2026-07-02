@@ -69,7 +69,10 @@ fn is_lark_connection(connection: &ConnectionRecord) -> bool {
     // Only the lark-cli OpenAPI connectors own lark-cli auth/config to clean up.
     // The browser-based connectors (lark-browser/feishu-browser) authenticate via
     // QR in the embedded CEF browser and have no lark-cli state.
-    matches!(connection.connector_slug.as_str(), "lark-login" | "lark-bot")
+    matches!(
+        connection.connector_slug.as_str(),
+        "lark-login" | "lark-bot"
+    )
 }
 
 /// Best-effort FULL teardown of a WeChat connection (container + data + state).

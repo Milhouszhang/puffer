@@ -113,7 +113,10 @@ fn redact_remote_execution_secret_fields(value: &mut Value) {
     match value {
         Value::Object(map) => {
             if map.contains_key("runnerAuthToken") {
-                map.insert("runnerAuthToken".to_string(), Value::String("[redacted]".to_string()));
+                map.insert(
+                    "runnerAuthToken".to_string(),
+                    Value::String("[redacted]".to_string()),
+                );
             }
             for value in map.values_mut() {
                 redact_remote_execution_secret_fields(value);

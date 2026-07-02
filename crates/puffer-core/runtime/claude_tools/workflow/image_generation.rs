@@ -293,7 +293,9 @@ fn apply_count_override(
 /// so the normal flow never trips this.
 fn ensure_image_set_supported(supports_image_set: bool) -> Result<()> {
     if !supports_image_set {
-        bail!("image set requested but the selected model does not support grouped image generation");
+        bail!(
+            "image set requested but the selected model does not support grouped image generation"
+        );
     }
     Ok(())
 }

@@ -40,7 +40,7 @@ jobs:
     # blocked global-singleton channel) must not burn the 6h GitHub default.
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
@@ -106,7 +106,7 @@ jobs:
       run:
         working-directory: apps/puffer-desktop
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v6
         with:
@@ -146,7 +146,7 @@ jobs:
     # jobs, so this full gate has no critical-path cost.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |

@@ -16,6 +16,7 @@
     "test:desktop-ui": "playwright test tests/*ui.spec.ts tests/plus-*.spec.ts",
     "test:desktop-ui:webkit": "playwright test tests/*ui.spec.ts tests/plus-*.spec.ts --browser=webkit",
     "test:desktop": "playwright test",
+    "test:desktop-visual": "playwright test tests/visual",
     "test:tauri-config": "node tests/tauri-drag-drop-config.test.mjs",
     "test:codex-playwright": "playwright test tests/codex-playwright-mcp.spec.ts",
     "test:sidebar-css": "node tests/sidebar-accent-css.test.mjs",

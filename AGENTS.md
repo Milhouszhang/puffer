@@ -200,3 +200,21 @@ constraints:
   change.
 - If there is a conflict between fidelity and maintainability, document the
   gap in code comments or commit messages rather than silently diverging.
+
+## Agent-driven UI testing
+
+设计文档：docs/superpowers/specs/2026-07-02-agent-ui-testing-design.md
+
+场景路由：
+| 场景 | 工具 | 产出物 |
+|---|---|---|
+| 新功能验收/流程探索 | agent-browser + `npm run agent:app`（隔离环境，读 stdout 的 AGENT_APP_URL） | 探索报告 + 固化 `tests/*-ui.spec.ts` |
+| UI/UX 视觉审查 | agent-browser 截图逐状态审查；组件级用 Storybook（`npm run storybook`，:6006） | 问题清单 + `tests/visual/*.spec.ts` 的 `toHaveScreenshot()` 基线 |
+| Bug 深挖（网络/console/daemon 协议） | playwright-mcp（.mcp.json 已配） | 根因 + 最小复现 spec |
+| 回归防护 | `npm run test:desktop-ui`（CI，无 agent） | 通过/失败 |
+
+约定：
+- 固化 spec 用 role-based selector（`getByRole` 优先），风格对齐现有 `tests/*-ui.spec.ts`
+- 必须 `npm run test:desktop-ui`（功能）/`npm run test:desktop-visual`（视觉，仅 macOS 本地）通过才算固化
+- 视觉基线平台相关：`tests/visual/` 不进 GitHub CI（CI 是 ubuntu，基线是 macOS 生成）
+- 探索一律走 `agent:app` 的隔离实例，不碰用户 dev 数据（1420 的 Vite 可共用）

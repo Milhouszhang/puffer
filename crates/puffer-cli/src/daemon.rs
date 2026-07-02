@@ -1613,8 +1613,16 @@ async fn dispatch_request(
         "install_local_model" => {
             respond!(detached!(|s, p| handle_install_local_model(&s, &p)))
         }
-        "workflow_list" => respond!(detached!(|s| {
-            crate::daemon_workflows::handle_workflow_list(s.config_paths())
+        "workflow_list" => respond!(detached!(|s, p| {
+            let include_workflows = p
+                .get("include_workflows")
+                .or_else(|| p.get("includeWorkflows"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            crate::daemon_workflows::handle_workflow_list_with_runtime(
+                s.config_paths(),
+                include_workflows,
+            )
         })),
         "workflow_create" => respond!(detached!(|s, p| {
             crate::daemon_workflows::handle_workflow_create(s.config_paths(), &p)

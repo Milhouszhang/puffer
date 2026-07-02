@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
 use puffer_core::subscription_manager;
 use serde_json::Value;
+use std::thread;
 
 /// Deletes one subscription workflow binding and returns the refreshed snapshot.
 pub(crate) fn handle_workflow_binding_delete(paths: &ConfigPaths, params: &Value) -> Result<Value> {
@@ -11,10 +12,34 @@ pub(crate) fn handle_workflow_binding_delete(paths: &ConfigPaths, params: &Value
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .context("missing slug")?;
+    let include_workflows = params
+        .get("include_workflows")
+        .or_else(|| params.get("includeWorkflows"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let manager = subscription_manager()?;
     manager.store().delete(slug)?;
-    manager.refresh_connection_consumers()?;
-    super::handle_workflow_list(paths)
+    let refresh_manager = manager.clone();
+    let refresh_slug = slug.to_string();
+    if let Err(error) = thread::Builder::new()
+        .name("puffer-binding-delete-refresh".to_string())
+        .spawn(move || {
+            if let Err(error) = refresh_manager.refresh_connection_consumers() {
+                tracing::warn!(
+                    binding = %refresh_slug,
+                    error = %error,
+                    "failed to refresh connection consumers after deleting workflow binding"
+                );
+            }
+        })
+    {
+        tracing::warn!(
+            binding = %slug,
+            error = %error,
+            "failed to spawn connection consumer refresh after deleting workflow binding"
+        );
+    }
+    super::handle_workflow_list_with_runtime(paths, include_workflows)
 }
 
 #[cfg(test)]

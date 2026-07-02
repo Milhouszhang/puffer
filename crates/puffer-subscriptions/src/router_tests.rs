@@ -67,6 +67,30 @@ mod tests {
         }
     }
 
+    fn auto_reply_binding() -> WorkflowBindingSpec {
+        WorkflowBindingSpec {
+            slug: "tg-review-auto-reply".into(),
+            description: "Auto reply to reviewed telegram tasks".into(),
+            connection_slug: "telegram-user".into(),
+            connector_slug: Some("telegram-login".into()),
+            status: WorkflowBindingStatus::Enabled,
+            filter: None,
+            ignore_filters: Vec::new(),
+            contact_ids: Vec::new(),
+            classify_prompt: None,
+            classify_model: None,
+            action: ActionSpec::ConnectorAct {
+                connector_slug: "telegram-login".into(),
+                action: "send_message".into(),
+                input: serde_json::json!({
+                    "chat_id": "{{payload.chat_id}}",
+                    "text": "reply"
+                }),
+            },
+            created_at_ms: 0,
+        }
+    }
+
     fn outgoing_envelope() -> EventEnvelope {
         EventEnvelope {
             envelope_id: "env-outgoing".into(),
@@ -148,6 +172,69 @@ mod tests {
             calls.load(AtomicOrdering::SeqCst),
             1,
             "dispatcher runs exactly once"
+        );
+        // PanicClassifier never panicked => classify was bypassed for self event.
+    }
+
+    #[test]
+    fn outgoing_event_with_allowing_gate_skips_non_monitor_bindings() {
+        struct ActionKindCountingDispatcher {
+            triage_calls: Arc<AtomicUsize>,
+            connector_calls: Arc<AtomicUsize>,
+        }
+        impl ActionDispatcher for ActionKindCountingDispatcher {
+            fn dispatch(&self, action: &ActionSpec, _envelope: &EventEnvelope) -> ActionResult {
+                match action {
+                    ActionSpec::TriageAgent { .. } => {
+                        self.triage_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        ActionResult::success("triaged")
+                    }
+                    ActionSpec::ConnectorAct { .. } => {
+                        self.connector_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        ActionResult::failure("connector action should have been self-gated")
+                    }
+                    _ => ActionResult::success("other"),
+                }
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let store = WorkflowBindingStore::load(dir.path().join("bindings.json")).unwrap();
+        store
+            .create(monitor_binding_with_classify_prompt())
+            .unwrap();
+        store.create(auto_reply_binding()).unwrap();
+        let triage_calls = Arc::new(AtomicUsize::new(0));
+        let connector_calls = Arc::new(AtomicUsize::new(0));
+        let dispatcher: Arc<dyn ActionDispatcher> = Arc::new(ActionKindCountingDispatcher {
+            triage_calls: triage_calls.clone(),
+            connector_calls: connector_calls.clone(),
+        });
+        let classifier: Arc<dyn Classifier> = Arc::new(PanicClassifier);
+        let gate: Arc<dyn SelfMessageGate> = Arc::new(AllowAllSelfGate);
+
+        let result = process_envelope_result(
+            &outgoing_envelope(),
+            &store,
+            None,
+            &dispatcher,
+            &classifier,
+            None,
+            &gate,
+        );
+
+        assert!(result.matched, "monitor binding may handle the self message");
+        assert_eq!(result.acted, 1);
+        assert_eq!(result.failed, 0);
+        assert_eq!(
+            triage_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "self message should still reach monitor triage when gate allows"
+        );
+        assert_eq!(
+            connector_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "self message must not reach auto-reply connector send binding"
         );
         // PanicClassifier never panicked => classify was bypassed for self event.
     }
@@ -576,7 +663,7 @@ mod tests {
                 classify_prompt: None,
                 classify_model: None,
                 action: ActionSpec::RunWorkflow {
-                    slug: "downstream".into(),
+                    workflow_id: "downstream".into(),
                 },
                 created_at_ms: 0,
             })
@@ -1373,7 +1460,7 @@ mod tests {
                 classify_prompt: None,
                 classify_model: None,
                 action: ActionSpec::RunWorkflow {
-                    slug: "downstream".into(),
+                    workflow_id: "downstream".into(),
                 },
                 created_at_ms: 0,
             })
@@ -1950,5 +2037,132 @@ mod tests {
 
         assert_eq!(router.stats().snapshot_tuple().0, 2);
         router.shutdown().await;
+    }
+
+    #[test]
+    fn lark_binding_without_positive_selector_is_denied_before_triage() {
+        let dir = tempdir().unwrap();
+        let store = WorkflowBindingStore::load(dir.path().join("bindings.json")).unwrap();
+        store
+            .create(WorkflowBindingSpec {
+                slug: "monitor-lark-browser".into(),
+                description: "Monitor lark-browser".into(),
+                connection_slug: "lark-browser".into(),
+                connector_slug: Some("lark-browser".into()),
+                status: WorkflowBindingStatus::Enabled,
+                filter: None,
+                ignore_filters: Vec::new(),
+                contact_ids: Vec::new(),
+                classify_prompt: None,
+                classify_model: None,
+                action: ActionSpec::TriageAgent { prompt: "triage".into(), model: None },
+                created_at_ms: 0,
+            })
+            .unwrap();
+        let dispatcher: Arc<dyn ActionDispatcher> = Arc::new(BuiltinActionDispatcher::new());
+        let classifier: Arc<dyn Classifier> = Arc::new(NullClassifier);
+        let history_store = WorkflowHistoryStore::load(dir.path().join("history.json")).unwrap();
+        let envelope = EventEnvelope {
+            envelope_id: "env-lark-deny".into(),
+            subscriber_id: "lark-browser".into(),
+            received_at_ms: 0,
+            event: Event {
+                topic: "lark-browser".into(),
+                kind: "message".into(),
+                control: false,
+                dedup_key: None,
+                text: "群消息".into(),
+                payload: serde_json::json!({"chat_id":"7649938091766976625","sender":"user616298"}),
+            },
+        };
+        let denied = process_envelope_result(
+            &envelope, &store, Some(&history_store), &dispatcher, &classifier, None, &drop_all_gate(),
+        );
+        assert!(!denied.matched, "no positive selector => denied before triage");
+        let hist = history_store.list();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].action_log[0].action, "monitor_lark_default_deny");
+    }
+
+    #[test]
+    fn lark_binding_with_chat_id_filter_passes_the_default_deny_guard() {
+        let dir = tempdir().unwrap();
+        let store = WorkflowBindingStore::load(dir.path().join("bindings.json")).unwrap();
+        store
+            .create(WorkflowBindingSpec {
+                slug: "monitor-lark-browser".into(),
+                description: "Monitor lark-browser".into(),
+                connection_slug: "lark-browser".into(),
+                connector_slug: Some("lark-browser".into()),
+                status: WorkflowBindingStatus::Enabled,
+                filter: Some(FilterSpec::Json(serde_json::json!({"chat_id":"7649938091766976625"}))),
+                ignore_filters: Vec::new(),
+                contact_ids: Vec::new(),
+                classify_prompt: None,
+                classify_model: None,
+                action: ActionSpec::TriageAgent { prompt: "triage".into(), model: None },
+                created_at_ms: 0,
+            })
+            .unwrap();
+        let dispatcher: Arc<dyn ActionDispatcher> = Arc::new(BuiltinActionDispatcher::new());
+        let classifier: Arc<dyn Classifier> = Arc::new(NullClassifier);
+        let envelope = EventEnvelope {
+            envelope_id: "env-lark-pass".into(),
+            subscriber_id: "lark-browser".into(),
+            received_at_ms: 0,
+            event: Event {
+                topic: "lark-browser".into(),
+                kind: "message".into(),
+                control: false,
+                dedup_key: None,
+                text: "群消息".into(),
+                payload: serde_json::json!({"chat_id":"7649938091766976625","sender":"user616298"}),
+            },
+        };
+        let passed = process_envelope_result(
+            &envelope, &store, None, &dispatcher, &classifier, None, &drop_all_gate(),
+        );
+        assert!(passed.matched, "positive selector => passes the guard (chat_id matches)");
+    }
+
+    #[test]
+    fn non_lark_binding_without_selector_is_unaffected_by_default_deny() {
+        let dir = tempdir().unwrap();
+        let store = WorkflowBindingStore::load(dir.path().join("bindings.json")).unwrap();
+        store
+            .create(WorkflowBindingSpec {
+                slug: "monitor-telegram-user".into(),
+                description: "Monitor telegram-user".into(),
+                connection_slug: "telegram-user".into(),
+                connector_slug: Some("telegram-login".into()),
+                status: WorkflowBindingStatus::Enabled,
+                filter: None,
+                ignore_filters: Vec::new(),
+                contact_ids: Vec::new(),
+                classify_prompt: None,
+                classify_model: None,
+                action: ActionSpec::TriageAgent { prompt: "triage".into(), model: None },
+                created_at_ms: 0,
+            })
+            .unwrap();
+        let dispatcher: Arc<dyn ActionDispatcher> = Arc::new(BuiltinActionDispatcher::new());
+        let classifier: Arc<dyn Classifier> = Arc::new(NullClassifier);
+        let envelope = EventEnvelope {
+            envelope_id: "env-tg".into(),
+            subscriber_id: "telegram-user".into(),
+            received_at_ms: 0,
+            event: Event {
+                topic: "telegram-user".into(),
+                kind: "message".into(),
+                control: false,
+                dedup_key: None,
+                text: "alert".into(),
+                payload: serde_json::json!({"sender_username":"Alice"}),
+            },
+        };
+        let passed = process_envelope_result(
+            &envelope, &store, None, &dispatcher, &classifier, None, &drop_all_gate(),
+        );
+        assert!(passed.matched, "non-lark topic must NOT be denied by the lark guard");
     }
 }

@@ -114,6 +114,7 @@ pub fn builtin_connector_templates() -> Vec<ConnectorTemplate> {
         gcal_browser_template(),
         lark_browser_template(),
         feishu_browser_template(),
+        slack_browser_template(),
         wechat_login_template(),
     ]
 }
@@ -602,6 +603,76 @@ fn feishu_browser_template() -> ConnectorTemplate {
         output_schema: message_output_schema(),
         actions: lark_browser_actions(),
     }
+}
+
+fn slack_browser_template() -> ConnectorTemplate {
+    ConnectorTemplate {
+        slug: "slack-browser".to_string(),
+        description: "Slack web connector via the Puffer browser".to_string(),
+        skill: "slack-browser".to_string(),
+        binary: "puffer __subscriber slack-browser".to_string(),
+        command: Vec::new(),
+        requires_auth: true,
+        can_subscribe: true,
+        can_proxy_agent: false,
+        subscriber: Some(ConnectorSubscriberTemplate {
+            manifest_slug: "slack-browser".to_string(),
+            state_root: Some("slack-browser-accounts".to_string()),
+            display_name: Some("Slack Browser".to_string()),
+        }),
+        output_schema: message_output_schema(),
+        actions: slack_browser_actions(),
+    }
+}
+
+/// Slack browser connector actions: `send_message`, `read_history`, and `react`.
+/// The input field aliases mirror `slack_browser_actions.rs` parsers.
+fn slack_browser_actions() -> BTreeMap<String, ConnectorActionDefinition> {
+    let mut actions = BTreeMap::new();
+    for action in [
+        ConnectorActionDefinition {
+            slug: "send_message".to_string(),
+            description: "Send a Slack message to a channel (fields `channel_id`/`channel`/`to` \
+                and `text`/`message`/`body`)"
+                .to_string(),
+            input_schema: slack_message_action_schema(),
+            output_schema: action_output_schema(),
+            permission: ConnectorPermissionDefinition {
+                category: "external_message_send".to_string(),
+                summary: "Send a message through this connector".to_string(),
+                external_side_effect: true,
+            },
+        },
+        ConnectorActionDefinition {
+            slug: "read_history".to_string(),
+            description: "Read recent Slack channel history (fields `channel_id`/`channel`/`to`, \
+                optional `limit`)"
+                .to_string(),
+            input_schema: slack_message_action_schema(),
+            output_schema: action_output_schema(),
+            permission: ConnectorPermissionDefinition {
+                category: "external_message_read".to_string(),
+                summary: "Read external Slack channel history".to_string(),
+                external_side_effect: false,
+            },
+        },
+        ConnectorActionDefinition {
+            slug: "react".to_string(),
+            description: "React to a Slack message (fields `channel_id`/`channel`/`to`, \
+                `message_id`/`ts`, optional `emoji`/`reaction`)"
+                .to_string(),
+            input_schema: slack_message_action_schema(),
+            output_schema: action_output_schema(),
+            permission: ConnectorPermissionDefinition {
+                category: "external_message_interaction".to_string(),
+                summary: "React to an external Slack message".to_string(),
+                external_side_effect: true,
+            },
+        },
+    ] {
+        actions.insert(action.slug.clone(), action);
+    }
+    actions
 }
 
 /// Lark/Feishu browser connector actions: `send_message`, `read_history`, and
@@ -1235,5 +1306,27 @@ fn telegram_action_definition(
             summary: summary.to_string(),
             external_side_effect: true,
         },
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[test]
+    fn slack_browser_template_registered_with_three_acts() {
+        let t = builtin_connector_templates();
+        let slack = t
+            .iter()
+            .find(|c| c.slug == "slack-browser")
+            .expect("slack-browser template present");
+        assert_eq!(slack.binary, "puffer __subscriber slack-browser");
+        let sub = slack.subscriber.as_ref().expect("subscriber template");
+        assert_eq!(sub.manifest_slug, "slack-browser");
+        assert_eq!(sub.state_root.as_deref(), Some("slack-browser-accounts"));
+        let acts = &slack.actions;
+        assert!(acts.contains_key("send_message"));
+        assert!(acts.contains_key("read_history"));
+        assert!(acts.contains_key("react"));
     }
 }

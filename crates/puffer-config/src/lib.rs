@@ -5,6 +5,10 @@ mod home_override;
 mod project_memory;
 mod proxy;
 mod settings_catalog;
+mod workflow_backend;
+
+#[cfg(test)]
+mod workflow_backend_tests;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -36,6 +40,7 @@ pub use settings_catalog::{
     normalize_config_setting_key, parse_config_cli_value, supported_config_settings,
     ConfigSettingScope, ConfigSettingSpec, ConfigSettingValueKind,
 };
+pub use workflow_backend::{WorkflowBackendConfig, WorkflowBackendMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PufferConfig {
@@ -70,6 +75,10 @@ pub struct PufferConfig {
     pub network: NetworkConfig,
     #[serde(default)]
     pub media: MediaConfig,
+    #[serde(default)]
+    pub workflow_backend: WorkflowBackendConfig,
+    #[serde(default)]
+    pub remote: RemoteConfig,
     pub mascot: MascotConfig,
     pub ui: UiConfig,
     /// When set, the runtime constructs a remote `RemoteToolRunner` against
@@ -106,6 +115,99 @@ pub struct RemoteRunnerConfig {
     /// block first-token latency when no tool is needed.
     #[serde(default = "default_remote_runner_wait_for_ready")]
     pub wait_for_ready: bool,
+}
+
+/// User-managed remote execution targets. This is separate from
+/// `remote_runner`, which is the low-level gRPC endpoint selected after a
+/// concrete target has been entered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RemoteConfig {
+    #[serde(default)]
+    pub default_target: Option<String>,
+    #[serde(default)]
+    pub ssh_hosts: Vec<SshHostConfig>,
+    #[serde(default)]
+    pub agentenv: Option<AgentEnvAccountConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshHostConfig {
+    pub id: String,
+    pub label: String,
+    pub target: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentEnvAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_agentenv_api_url")]
+    pub api_url: String,
+    /// Public host or IP that AgentEnv exposes sandbox ports on when the API
+    /// returns only a host port.
+    #[serde(default)]
+    pub runner_host: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub credential_secret_id: Option<String>,
+    #[serde(default = "default_agentenv_auth_method")]
+    pub auth_method: String,
+    #[serde(default)]
+    pub defaults: AgentEnvSandboxDefaults,
+}
+
+impl Default for AgentEnvAccountConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: default_agentenv_api_url(),
+            runner_host: None,
+            workspace: None,
+            credential_secret_id: None,
+            auth_method: default_agentenv_auth_method(),
+            defaults: AgentEnvSandboxDefaults::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentEnvSandboxDefaults {
+    #[serde(default = "default_agentenv_sandbox_type")]
+    pub sandbox_type: String,
+    #[serde(default = "default_agentenv_image")]
+    pub image: String,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub cpu_millis: Option<u32>,
+    #[serde(default)]
+    pub memory_mb: Option<u32>,
+    #[serde(default)]
+    pub gpu_count: Option<u32>,
+    #[serde(default)]
+    pub gpu_type: Option<String>,
+    #[serde(default)]
+    pub max_lifetime_seconds: Option<u32>,
+}
+
+impl Default for AgentEnvSandboxDefaults {
+    fn default() -> Self {
+        Self {
+            sandbox_type: default_agentenv_sandbox_type(),
+            image: default_agentenv_image(),
+            region: None,
+            cpu_millis: None,
+            memory_mb: None,
+            gpu_count: Some(0),
+            gpu_type: None,
+            max_lifetime_seconds: None,
+        }
+    }
 }
 
 impl RemoteRunnerConfig {
@@ -304,6 +406,8 @@ impl Default for PufferConfig {
             browser: BrowserConfig::default(),
             network: NetworkConfig::default(),
             media: MediaConfig::default(),
+            workflow_backend: WorkflowBackendConfig::default(),
+            remote: RemoteConfig::default(),
             mascot: MascotConfig {
                 id: "clawd".to_string(),
                 display_name: "Clawd".to_string(),
@@ -353,6 +457,22 @@ fn default_editor_mode() -> String {
 
 fn default_remote_runner_wait_for_ready() -> bool {
     true
+}
+
+fn default_agentenv_api_url() -> String {
+    "https://api.agentenv.io".to_string()
+}
+
+fn default_agentenv_auth_method() -> String {
+    "api_key".to_string()
+}
+
+fn default_agentenv_sandbox_type() -> String {
+    "small".to_string()
+}
+
+fn default_agentenv_image() -> String {
+    "python:3.11-slim".to_string()
 }
 
 fn default_memory_enabled() -> bool {
@@ -419,6 +539,21 @@ fn default_recap_cooldown_messages() -> usize {
     2
 }
 
+/// Returns true when `workspace_root` canonicalizes to a path under the
+/// canonicalized OS temporary directory. Used by `ConfigPaths::discover` to
+/// isolate `user_config_dir` for tests run under a tempdir workspace. Any
+/// canonicalization failure (e.g. a path that does not exist yet) returns
+/// false, preserving production resolution.
+fn under_temp_dir(workspace_root: &Path) -> bool {
+    let (Ok(root), Ok(tmp)) = (
+        workspace_root.canonicalize(),
+        std::env::temp_dir().canonicalize(),
+    ) else {
+        return false;
+    };
+    root.starts_with(tmp)
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfigPaths {
     pub workspace_root: PathBuf,
@@ -432,12 +567,23 @@ impl ConfigPaths {
     pub fn discover(workspace_root: impl Into<PathBuf>) -> Self {
         let workspace_root = workspace_root.into();
         let workspace_config_dir = workspace_root.join(".puffer");
-        let user_config_dir = home_override::puffer_home_override()
-            .or_else(|| std::env::var_os("PUFFER_HOME").map(PathBuf::from))
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".puffer");
+        // Precedence: explicit override → `$PUFFER_HOME` → temp-dir rule →
+        // `$HOME`/home_dir. The temp-dir rule isolates `user_config_dir` under
+        // a per-test workspace so parallel tests never race on the real
+        // `~/.puffer`; production roots (outside the temp dir) are unchanged.
+        let user_config_dir = if let Some(over) = home_override::puffer_home_override() {
+            over.join(".puffer")
+        } else if let Some(env_home) = std::env::var_os("PUFFER_HOME") {
+            PathBuf::from(env_home).join(".puffer")
+        } else if under_temp_dir(&workspace_root) {
+            workspace_root.join(".puffer-user")
+        } else {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".puffer")
+        };
         let builtin_resources_dir = env::var_os(BUILTIN_RESOURCES_DIR_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| workspace_root.join("resources"));
@@ -495,6 +641,7 @@ pub fn load_config(paths: &ConfigPaths) -> Result<PufferConfig> {
     if let Some(snapshot) = user_preferences {
         snapshot.restore(&mut config);
     }
+    config.workflow_backend.normalize();
     Ok(config)
 }
 
@@ -509,6 +656,7 @@ struct UserPreferenceSnapshot {
     browser: BrowserConfig,
     network: NetworkConfig,
     media: MediaConfig,
+    workflow_backend: WorkflowBackendConfig,
 }
 
 impl UserPreferenceSnapshot {
@@ -524,6 +672,7 @@ impl UserPreferenceSnapshot {
             browser: config.browser.clone(),
             network: config.network.clone(),
             media: config.media.clone(),
+            workflow_backend: config.workflow_backend.clone(),
         }
     }
 
@@ -538,19 +687,20 @@ impl UserPreferenceSnapshot {
         config.browser = self.browser;
         config.network = self.network;
         config.media = self.media;
+        config.workflow_backend = self.workflow_backend;
     }
 }
 
 /// Saves the user-level Puffer configuration file.
 pub fn save_user_config(paths: &ConfigPaths, config: &PufferConfig) -> Result<()> {
     ensure_workspace_dirs(paths)?;
-    write_config_file(&paths.user_config_file(), config)
+    write_normalized_config_file(&paths.user_config_file(), config)
 }
 
 /// Saves the workspace-level Puffer configuration file.
 pub fn save_workspace_config(paths: &ConfigPaths, config: &PufferConfig) -> Result<()> {
     ensure_workspace_dirs(paths)?;
-    write_config_file(&paths.workspace_config_file(), config)
+    write_normalized_config_file(&paths.workspace_config_file(), config)
 }
 
 /// Ensures the standard user and workspace configuration directories exist.
@@ -629,6 +779,12 @@ fn write_config_file(path: &Path, config: &PufferConfig) -> Result<()> {
     fs::write(path, raw).with_context(|| format!("failed to write config file {}", path.display()))
 }
 
+fn write_normalized_config_file(path: &Path, config: &PufferConfig) -> Result<()> {
+    let mut normalized = config.clone();
+    normalized.workflow_backend.normalize();
+    write_config_file(path, &normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +811,15 @@ mod tests {
         fn set(path: &Path) -> Self {
             let old_home = std::env::var_os("PUFFER_HOME");
             std::env::set_var("PUFFER_HOME", path);
+            Self { old_home }
+        }
+
+        /// Clears `PUFFER_HOME` for the guard's lifetime so `discover` falls
+        /// through to the temp-dir rule / `$HOME`. Restores the prior value on
+        /// drop.
+        fn unset() -> Self {
+            let old_home = std::env::var_os("PUFFER_HOME");
+            std::env::remove_var("PUFFER_HOME");
             Self { old_home }
         }
     }
@@ -689,6 +854,48 @@ mod tests {
                 std::env::remove_var(BUILTIN_RESOURCES_DIR_ENV);
             }
         }
+    }
+
+    #[test]
+    fn discover_isolates_user_config_dir_under_tempdir() {
+        let _guard = lock_puffer_home();
+        let _home = ScopedPufferHome::unset();
+        let temp = tempdir().expect("tempdir");
+
+        let paths = ConfigPaths::discover(temp.path());
+
+        assert_eq!(paths.user_config_dir, temp.path().join(".puffer-user"));
+    }
+
+    #[test]
+    fn discover_uses_home_for_non_temp_root() {
+        let _guard = lock_puffer_home();
+        let _home = ScopedPufferHome::unset();
+        // A fixed, non-existent path is neither under the temp dir nor
+        // canonicalizable, so `discover` must fall through to `$HOME/.puffer`.
+        let root = PathBuf::from("/some/non-temp/project");
+
+        let paths = ConfigPaths::discover(&root);
+
+        let expected = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)
+            .expect("home dir")
+            .join(".puffer");
+        assert_eq!(paths.user_config_dir, expected);
+    }
+
+    #[test]
+    fn discover_override_wins_over_tempdir_rule() {
+        let _guard = lock_puffer_home();
+        let _home = ScopedPufferHome::unset();
+        let override_home = tempdir().expect("override home");
+        let _override = set_puffer_home_override(override_home.path());
+        let workspace = tempdir().expect("workspace tempdir");
+
+        let paths = ConfigPaths::discover(workspace.path());
+
+        assert_eq!(paths.user_config_dir, override_home.path().join(".puffer"));
     }
 
     #[test]
@@ -1067,5 +1274,46 @@ tmux_golden_mode = false
         let config: PufferConfig = toml::from_str(&raw).expect("config");
 
         assert!(!config.remote_runner.expect("remote runner").wait_for_ready);
+    }
+
+    #[test]
+    fn remote_agentenv_account_config_round_trips_secret_reference() {
+        let mut config = PufferConfig::default();
+        config.remote.agentenv = Some(AgentEnvAccountConfig {
+            enabled: true,
+            api_url: "https://api.agentenv.io".to_string(),
+            runner_host: Some("runner.agentenv.example".to_string()),
+            workspace: Some("wk_demo".to_string()),
+            credential_secret_id: Some("secret-agentenv".to_string()),
+            auth_method: "api_key".to_string(),
+            defaults: AgentEnvSandboxDefaults {
+                sandbox_type: "small".to_string(),
+                image: "docker.io/acme/puffer-tool-runner:latest".to_string(),
+                region: Some("us-west-2".to_string()),
+                cpu_millis: Some(2000),
+                memory_mb: Some(4096),
+                gpu_count: Some(0),
+                gpu_type: None,
+                max_lifetime_seconds: Some(3600),
+            },
+        });
+
+        let raw = toml::to_string(&config).expect("serialize");
+        assert!(raw.contains("credential_secret_id = \"secret-agentenv\""));
+        assert!(!raw.contains("sk-live"));
+
+        let loaded: PufferConfig = toml::from_str(&raw).expect("deserialize");
+        let agentenv = loaded.remote.agentenv.expect("agentenv config");
+        assert!(agentenv.enabled);
+        assert_eq!(
+            agentenv.runner_host.as_deref(),
+            Some("runner.agentenv.example")
+        );
+        assert_eq!(agentenv.workspace.as_deref(), Some("wk_demo"));
+        assert_eq!(
+            agentenv.credential_secret_id.as_deref(),
+            Some("secret-agentenv")
+        );
+        assert_eq!(agentenv.defaults.region.as_deref(), Some("us-west-2"));
     }
 }

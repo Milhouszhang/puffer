@@ -682,12 +682,58 @@ export const mockSettingsSnapshot: SettingsSnapshot = {
   auth: mockAuth,
   providers: mockProviders,
   browser: mockBrowserSettings,
+  workflowBackend: {
+    mode: "local",
+    apiUrl: "http://127.0.0.1:3000",
+    uiUrl: "http://localhost:5173",
+    workspaceId: "",
+    hasToken: false,
+    options: [
+      {
+        mode: "local",
+        label: "Run locally",
+        description: "Connects to a workflow runtime running on this device.",
+        apiUrl: "http://127.0.0.1:3000",
+        uiUrl: "http://localhost:5173"
+      },
+      {
+        mode: "agent_env_cloud",
+        label: "Run on AgentEnv Cloud",
+        description: "Sends required workflow data to AgentEnv Cloud for execution.",
+        apiUrl: "https://api.agentenv.io",
+        uiUrl: "https://agentenv.io"
+      }
+    ]
+  },
   networkProxy: {
     enabled: false,
     selected: null,
     bypass: ["localhost", "127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
     proxies: [],
     lastTest: null
+  },
+  remote: {
+    defaultTarget: null,
+    sshHosts: [],
+    agentenv: {
+      enabled: false,
+      apiUrl: "https://api.agentenv.io",
+      runnerHost: null,
+      workspace: null,
+      credentialSecretId: null,
+      hasCredential: false,
+      authMethod: "api_key",
+      defaults: {
+        sandboxType: "small",
+        image: "python:3.11-slim",
+        region: null,
+        cpuMillis: null,
+        memoryMb: null,
+        gpuCount: 0,
+        gpuType: null,
+        maxLifetimeSeconds: null
+      }
+    }
   },
   secrets: {
     storeFile: "/home/c/.puffer/secrets.json",

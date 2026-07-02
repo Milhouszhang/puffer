@@ -183,6 +183,89 @@ fn execute_openai_tool_calls_serializes_outputs() {
 }
 
 #[test]
+fn openai_shell_alias_uses_active_remote_runner_cwd() {
+    openai_shell_like_alias_uses_active_remote_runner_cwd("bash");
+}
+
+#[test]
+fn openai_shell_tool_id_uses_active_remote_runner_cwd() {
+    openai_shell_like_alias_uses_active_remote_runner_cwd("shell");
+}
+
+fn openai_shell_like_alias_uses_active_remote_runner_cwd(tool_id: &str) {
+    let local_dir = tempfile::tempdir().unwrap();
+    let remote_dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(
+        PufferConfig::default(),
+        local_dir.path().to_path_buf(),
+        SessionMetadata {
+            id: Uuid::new_v4(),
+            display_name: None,
+            generated_title: None,
+            cwd: local_dir.path().to_path_buf(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            parent_session_id: None,
+            slug: None,
+            tags: Vec::new(),
+            note: None,
+        },
+    );
+    state.active_remote_target = Some(crate::state::ActiveRemoteTarget {
+        kind: "agentenv".to_string(),
+        id: "manual-local-runner".to_string(),
+    });
+    state.active_remote_cwd = Some(remote_dir.path().to_path_buf());
+
+    let resources = LoadedResources {
+        tools: vec![loaded_tool(tool_id, "Run shell", "bash")],
+        ..LoadedResources::default()
+    };
+    let registry = ToolRegistry::from_resources(&resources);
+    let mut providers = ProviderRegistry::new();
+    providers.register(openai_provider("http://127.0.0.1".to_string()));
+    let tool_calls = vec![OpenAIResponseToolCall {
+        item_id: Some("fc_1".to_string()),
+        status: Some("completed".to_string()),
+        call_id: "call_1".to_string(),
+        name: tool_id.to_string(),
+        arguments: json!({ "command": "pwd" }),
+    }];
+    let request_config = test_openai_request_config();
+
+    let result = execute_openai_tool_calls(
+        &mut state,
+        &resources,
+        &providers,
+        &mut AuthStore::default(),
+        &tool_calls,
+        &registry,
+        local_dir.path(),
+        &request_config,
+        "gpt-5",
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(result.invocations[0].tool_id, tool_id);
+    assert!(
+        result.outputs[0]
+            .output
+            .contains(&remote_dir.path().display().to_string()),
+        "{}",
+        result.outputs[0].output
+    );
+    assert!(
+        !result.outputs[0]
+            .output
+            .contains(&local_dir.path().display().to_string()),
+        "{}",
+        result.outputs[0].output
+    );
+}
+
+#[test]
 fn execute_openai_tool_calls_return_permission_denials_as_tool_results() {
     let mut state = temp_state();
     let permissions_dir = ConfigPaths::discover(&state.cwd).workspace_config_dir;

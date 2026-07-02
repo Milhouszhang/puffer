@@ -41,6 +41,7 @@ use anyhow::{anyhow, Result};
 use puffer_provider_openai::OpenAIRequestConfig;
 use puffer_provider_registry::{AuthStore, ProviderRegistry};
 use puffer_resources::LoadedResources;
+use puffer_runner_api::ToolRequest as RunnerToolRequest;
 use puffer_tools::{ToolExecutionResult, ToolOutput, ToolRegistry};
 use puffer_transport_anthropic::AnthropicRequestConfig;
 use serde_json::Value;
@@ -227,7 +228,13 @@ pub(super) fn execute_tool_call(
         );
         output.map(|output| successful_runtime_tool(tool_id, output))
     } else {
-        match execute_legacy_builtin_alias(&definition, cwd, &filesystem_policy, &execution_input) {
+        match execute_legacy_builtin_alias(
+            state,
+            &definition,
+            cwd,
+            &filesystem_policy,
+            &execution_input,
+        ) {
             Ok(Some(result)) => Ok(result),
             Ok(None) => claude_tools::execute_tool(
                 state,
@@ -825,12 +832,45 @@ fn remember_browser_target(
 }
 
 fn execute_legacy_builtin_alias(
+    state: &mut AppState,
     definition: &puffer_tools::ToolDefinition,
     cwd: &Path,
     filesystem_policy: &FilesystemPermissionPolicy,
     input: &Value,
 ) -> Result<Option<ToolExecutionResult>> {
     match definition.id.as_str() {
+        "bash" | "shell" if state.active_remote_target.is_some() => {
+            let Some(command) = input.get("command").and_then(Value::as_str) else {
+                return Err(anyhow!("bash requires command"));
+            };
+            let mut mapped = serde_json::Map::new();
+            mapped.insert("command".to_string(), Value::String(command.to_string()));
+            if let Some(timeout) = input.get("timeout") {
+                mapped.insert("timeout".to_string(), timeout.clone());
+            }
+            if let Some(run_in_background) = input.get("run_in_background") {
+                mapped.insert("run_in_background".to_string(), run_in_background.clone());
+            }
+            let request = RunnerToolRequest {
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
+                tool_id: "Bash".to_string(),
+                cwd: active_runner_cwd(state, cwd),
+                working_dirs: filesystem_policy.workspace_roots.clone(),
+                filesystem: filesystem_policy.runner_policy(),
+                input: Value::Object(mapped),
+                session_id: Some(state.session.id.to_string()),
+            };
+            let outcome = claude_tools::execute_runner_request_with_reconnect(state, cwd, request)?;
+            Ok(Some(ToolExecutionResult {
+                tool_id: definition.id.clone(),
+                success: outcome.success,
+                output: ToolOutput {
+                    stdout: outcome.stdout,
+                    stderr: outcome.stderr,
+                    metadata: outcome.metadata,
+                },
+            }))
+        }
         "read_file" => {
             let mut mapped = serde_json::Map::new();
             let Some(path) = input.get("path").and_then(Value::as_str) else {
@@ -915,6 +955,13 @@ fn execute_legacy_builtin_alias(
         }
         _ => Ok(None),
     }
+}
+
+fn active_runner_cwd(state: &AppState, cwd: &Path) -> PathBuf {
+    state
+        .active_remote_cwd
+        .clone()
+        .unwrap_or_else(|| cwd.to_path_buf())
 }
 
 /// Builds a failed tool result for a permission block.

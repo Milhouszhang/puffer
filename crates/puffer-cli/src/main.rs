@@ -11,6 +11,7 @@ mod browser_output;
 mod browser_profiles;
 mod cli_args;
 mod command_surface;
+mod command_surface_desktop;
 mod connect;
 mod connectors;
 mod daemon;
@@ -21,14 +22,15 @@ mod daemon_files;
 mod daemon_fs_watch;
 mod daemon_gcal_browser_setup;
 mod daemon_gmail_browser_setup;
+mod daemon_lambda_skills;
 #[path = "daemon_lark_browser_setup.rs"]
 mod daemon_lark_browser_setup;
-mod daemon_lambda_skills;
 mod daemon_local_model;
 mod daemon_lsp;
 mod daemon_pty;
 mod daemon_secrets;
 mod daemon_singleton;
+mod daemon_slack_browser_setup;
 mod daemon_telegram_ranking;
 mod daemon_title;
 mod daemon_turn_recovery;
@@ -36,6 +38,8 @@ mod daemon_turn_routing;
 mod daemon_ui_state;
 #[cfg(unix)]
 mod daemon_wechat_browser_setup;
+mod daemon_workflow_backend_settings;
+mod daemon_workflow_runtime;
 mod daemon_workflows;
 mod desktop_activity;
 mod desktop_api;
@@ -45,16 +49,19 @@ mod gmail_browser;
 mod gmail_browser_log;
 mod heartbeat;
 mod internal_tools;
-mod lark_connector;
 #[path = "lark_browser.rs"]
 mod lark_browser;
 #[path = "lark_browser_script.rs"]
 mod lark_browser_script;
+mod lark_connector;
 mod media_internal_tools;
 mod non_interactive;
 mod project_metadata;
 mod resource_fs;
 mod runner_selection;
+mod slack_browser;
+#[path = "slack_browser_script.rs"]
+mod slack_browser_script;
 mod subscriber_tool_args;
 mod subscriber_tools;
 mod subscriptions;
@@ -62,6 +69,7 @@ mod subscriptions;
 mod wechat_connector;
 mod workflow_run_events;
 mod workflow_runtime;
+mod workflow_runtime_helpers;
 mod workflows;
 
 use anyhow::{Context, Result};
@@ -1413,6 +1421,7 @@ fn run_subscriber(id: &str) -> Result<()> {
             "gcal-browser" => crate::gcal_browser::run_subscriber().await,
             "gmail-browser" => crate::gmail_browser::run_subscriber().await,
             "lark-browser" => crate::lark_browser::run_subscriber().await,
+            "slack-browser" => crate::slack_browser::run_subscriber().await,
             other => Err(anyhow::anyhow!(
                 "unknown subscriber id `{other}`; this puffer build does not bundle a driver for it"
             )),

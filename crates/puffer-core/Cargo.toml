@@ -73,6 +73,7 @@ puffer-provider-openai = { path = "../puffer-provider-openai" }
 puffer-provider-registry = { path = "../puffer-provider-registry" }
 puffer-resources = { path = "../puffer-resources" }
 puffer-runner-api = { path = "../puffer-runner-api" }
+puffer-runner-grpc = { path = "../puffer-runner-grpc" }
 puffer-session-store = { path = "../puffer-session-store" }
 puffer-secrets = { path = "../puffer-secrets" }
 puffer-skill-evolution = { path = "../puffer-skill-evolution" }
@@ -81,7 +82,6 @@ puffer-subscriber-runtime = { path = "../puffer-subscriber-runtime" }
 puffer-subscriptions = { path = "../puffer-subscriptions" }
 puffer-tools = { path = "../puffer-tools" }
 puffer-transport-anthropic = { path = "../puffer-transport-anthropic" }
-puffer-workflow = { path = "../puffer-workflow" }
 sha2.workspace = true
 
 [dev-dependencies]

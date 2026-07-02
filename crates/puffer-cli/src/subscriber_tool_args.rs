@@ -362,6 +362,79 @@ pub(crate) enum TelegramCommand {
     },
 }
 
+#[derive(Debug, Args)]
+pub(crate) struct RequestSecretArgs {
+    #[command(subcommand)]
+    pub(crate) command: RequestSecretCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RequestSecretCommand {
+    /// Search stored secrets and return non-secret metadata only.
+    Search {
+        /// Free-text search terms.
+        #[arg(long)]
+        query: Option<String>,
+        /// Site, URL, or origin hint to narrow the search.
+        #[arg(long)]
+        origin: Option<String>,
+        /// Username or email hint to narrow the search.
+        #[arg(long)]
+        username: Option<String>,
+        /// Maximum number of results to return.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Request an existing secret by id or unique name; returns a placeholder.
+    Request {
+        /// Exact secret id.
+        #[arg(long, conflicts_with = "name")]
+        id: Option<String>,
+        /// Unique secret name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Brief reason the secret is needed (shown in the approval prompt).
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Ask the user to type a new secret value into a masked prompt, then store it.
+    Collect {
+        /// Name to save the secret under.
+        #[arg(long)]
+        name: String,
+        /// Optional non-secret description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Optional non-secret username.
+        #[arg(long)]
+        username: Option<String>,
+        /// Optional non-secret site, URL, or origin.
+        #[arg(long)]
+        origin: Option<String>,
+        /// Optional user-facing prompt text.
+        #[arg(long)]
+        prompt: Option<String>,
+    },
+    /// Store a new secret whose value is an existing PUFFER_SECRET_ placeholder.
+    Create {
+        /// Name to save the secret under.
+        #[arg(long)]
+        name: String,
+        /// Optional non-secret description.
+        #[arg(long)]
+        description: Option<String>,
+        /// A single PUFFER_SECRET_ placeholder from a prior secret-marked result.
+        #[arg(long)]
+        value: String,
+        /// Optional non-secret username.
+        #[arg(long)]
+        username: Option<String>,
+        /// Optional non-secret site, URL, or origin.
+        #[arg(long)]
+        origin: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum TelegramPeerKindArg {
     User,

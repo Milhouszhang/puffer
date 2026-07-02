@@ -103,12 +103,25 @@ pub(crate) enum PermissionGrantCategory {
     Workflow(WorkflowGrantCategory),
 }
 
+/// Identifies one session-scoped encrypted-secret approval.
+///
+/// Mirrors the granularity the dedicated secret approval used to carry: a single
+/// secret id, or a blanket allow-all for every secret this session.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum SecretGrant {
+    /// Every encrypted secret is approved for this session.
+    AllSecrets,
+    /// One specific encrypted secret id is approved for this session.
+    Secret(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum SessionGrantTarget {
     Tool(String),
     Surface(PermissionSurface),
     Category(PermissionGrantCategory),
     PathPrefix(PathBuf),
+    Secret(SecretGrant),
 }
 
 /// Stores the normalized session-scoped grants accumulated from permission prompts.
@@ -197,6 +210,31 @@ impl SessionPermissionGrants {
         self.granted.insert(SessionGrantTarget::PathPrefix(path));
     }
 
+    /// Grants session access to one encrypted secret id.
+    pub(crate) fn grant_secret(&mut self, secret_id: impl Into<String>) {
+        self.granted
+            .insert(SessionGrantTarget::Secret(SecretGrant::Secret(
+                secret_id.into(),
+            )));
+    }
+
+    /// Grants session access to every encrypted secret.
+    pub(crate) fn grant_all_secrets(&mut self) {
+        self.granted
+            .insert(SessionGrantTarget::Secret(SecretGrant::AllSecrets));
+    }
+
+    /// Returns whether the session already approved access to this secret id.
+    pub(crate) fn secret_granted(&self, secret_id: &str) -> bool {
+        self.granted
+            .contains(&SessionGrantTarget::Secret(SecretGrant::AllSecrets))
+            || self
+                .granted
+                .contains(&SessionGrantTarget::Secret(SecretGrant::Secret(
+                    secret_id.to_string(),
+                )))
+    }
+
     /// Returns legacy whole-tool allow entries for compatibility snapshots.
     pub(crate) fn legacy_tool_permissions(&self) -> HashMap<String, String> {
         self.granted
@@ -233,6 +271,12 @@ impl SessionPermissionGrants {
                 SessionGrantTarget::PathPrefix(path) => {
                     profile.path_prefix_grants.push(path.clone());
                     profile.surface_grants.insert(PermissionSurface::Filesystem);
+                }
+                SessionGrantTarget::Secret(_) => {
+                    // Secret approvals are evaluated at execution time against the
+                    // raw session grants, not via the effective profile: the secret
+                    // id is only known after the vault resolves the requested
+                    // selector, so there is nothing useful to fold in here.
                 }
             }
         }
@@ -810,6 +854,8 @@ fn grant_target_matches_surface(grant: &SessionGrantTarget, surface: PermissionS
         SessionGrantTarget::Surface(candidate) => *candidate == surface,
         SessionGrantTarget::Category(category) => category_surface(category) == surface,
         SessionGrantTarget::PathPrefix(_) => surface == PermissionSurface::Filesystem,
+        // Secret approvals are not tied to a permission surface.
+        SessionGrantTarget::Secret(_) => false,
     }
 }
 

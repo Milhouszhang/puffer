@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_yaml::{Mapping, Value as YamlValue};
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 mod lambda_skill;
@@ -43,6 +44,13 @@ static BUILTIN_RESOURCES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../reso
 pub fn load_resources(paths: &ConfigPaths, runner: &dyn ToolRunner) -> Result<LoadedResources> {
     let mut loaded = LoadedResources::default();
     apply_embedded_resources(&mut loaded)?;
+    merge_by_id(
+        &mut loaded.skills,
+        load_external_codex_claude_skills(paths)?,
+        |item| MergeKey::simple(item.value.name.clone()),
+        "skill",
+        &mut loaded.diagnostics,
+    );
     for (root, kind) in resource_roots(paths) {
         // Filesystem layers are optional. Without this guard the misleading
         // "no providers are registered" error used to fire whenever the
@@ -827,6 +835,211 @@ fn load_skill_dir(
     Ok(items)
 }
 
+fn load_external_codex_claude_skills(paths: &ConfigPaths) -> Result<Vec<LoadedItem<SkillSpec>>> {
+    let mut items = Vec::new();
+    for (root, kind) in external_codex_claude_roots(paths) {
+        if !root.is_dir() {
+            continue;
+        }
+        collect_external_codex_claude_skills(&root, kind, &mut items)
+            .with_context(|| format!("failed to load external commands from {}", root.display()))?;
+    }
+    Ok(items)
+}
+
+fn external_codex_claude_roots(paths: &ConfigPaths) -> Vec<(PathBuf, SourceKind)> {
+    let mut roots = Vec::new();
+    if let Some(home) = paths.user_config_dir.parent() {
+        roots.push((home.join(".claude"), SourceKind::User));
+        roots.push((home.join(".codex"), SourceKind::User));
+    }
+    roots.push((paths.workspace_root.join(".claude"), SourceKind::Workspace));
+    roots.push((paths.workspace_root.join(".codex"), SourceKind::Workspace));
+    roots
+}
+
+fn collect_external_codex_claude_skills(
+    dir: &Path,
+    kind: SourceKind,
+    items: &mut Vec<LoadedItem<SkillSpec>>,
+) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to list {}", dir.display()))
+        }
+    };
+    let mut entries = entries
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read entries from {}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+
+    let is_commands_dir = dir.file_name().and_then(|name| name.to_str()) == Some("commands");
+
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to stat {}", entry.path().display()))?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            if should_skip_external_resource_dir(&path) {
+                continue;
+            }
+            collect_external_codex_claude_skills(&path, kind, items)?;
+        } else if file_type.is_file() && is_commands_dir && is_external_command_file(&path) {
+            if let Some(item) = load_external_command_file(&path, kind)? {
+                items.push(item);
+            }
+        } else if file_type.is_file() && is_external_skill_file(&path) {
+            if let Some(item) = load_external_skill_file(&path, kind)? {
+                items.push(item);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_external_resource_dir(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    matches!(
+        name,
+        ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".svelte-kit"
+    )
+}
+
+fn is_external_command_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if file_name.starts_with('_') {
+        return false;
+    }
+    matches!(path.extension().and_then(|ext| ext.to_str()), Some("md"))
+}
+
+fn is_external_skill_file(path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("SKILL.md") {
+        return false;
+    }
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("skills")
+}
+
+fn load_external_command_file(
+    path: &Path,
+    kind: SourceKind,
+) -> Result<Option<LoadedItem<SkillSpec>>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read external command {}", path.display()))?;
+    let (frontmatter, body) = split_frontmatter(&raw)
+        .with_context(|| format!("failed to parse command frontmatter {}", path.display()))?;
+    let raw_name = frontmatter_string(&frontmatter, &["name"]).unwrap_or_else(|| {
+        command_name_from_heading(&body).unwrap_or_else(|| {
+            path.file_stem()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+    });
+    let mut skill = skill_spec_from_parts(&frontmatter, body, raw_name);
+    if skill.content.trim().is_empty() {
+        return Ok(None);
+    }
+    if skill.description == "Skill" {
+        skill.description = format!("Imported command from {}", path.display());
+    }
+    Ok(Some(LoadedItem {
+        value: skill,
+        source_info: SourceInfo {
+            path: path.to_path_buf(),
+            kind,
+        },
+    }))
+}
+
+fn load_external_skill_file(
+    path: &Path,
+    kind: SourceKind,
+) -> Result<Option<LoadedItem<SkillSpec>>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read external skill {}", path.display()))?;
+    let (frontmatter, body) = split_frontmatter(&raw)
+        .with_context(|| format!("failed to parse skill frontmatter {}", path.display()))?;
+    let raw_name = frontmatter_string(&frontmatter, &["name"]).unwrap_or_else(|| {
+        path.parent()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default()
+    });
+    let skill = skill_spec_from_parts(&frontmatter, body, raw_name);
+    if skill.content.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(LoadedItem {
+        value: skill,
+        source_info: SourceInfo {
+            path: path.to_path_buf(),
+            kind,
+        },
+    }))
+}
+
+fn skill_spec_from_parts(frontmatter: &Mapping, body: String, raw_name: String) -> SkillSpec {
+    let description = frontmatter_string(frontmatter, &["description"])
+        .or_else(|| command_description_from_heading(&body))
+        .unwrap_or_else(|| first_descriptive_line(&body).to_string());
+    SkillSpec {
+        name: normalize_skill_name(&raw_name),
+        description,
+        content: body,
+        allowed_tools: frontmatter_string_list(frontmatter, &["allowed-tools", "allowedTools"]),
+        argument_hint: frontmatter_string(
+            frontmatter,
+            &["argument-hint", "argumentHint", "argument_hint"],
+        ),
+        argument_names: frontmatter_whitespace_list(
+            frontmatter,
+            &["arguments", "argumentNames", "argument_names"],
+        ),
+        user_invocable: frontmatter_bool(frontmatter, &["user-invocable", "userInvocable"])
+            .unwrap_or(true),
+        model: frontmatter_string(frontmatter, &["model"]),
+        effort: frontmatter_string(frontmatter, &["effort"]),
+        context: frontmatter_string(frontmatter, &["context"]),
+        disable_model_invocation: frontmatter_bool(
+            frontmatter,
+            &["disable-model-invocation", "disableModelInvocation"],
+        )
+        .unwrap_or(false),
+        requires_action: frontmatter_bool(frontmatter, &["requires-action", "requiresAction"])
+            .unwrap_or(false),
+        verification: None,
+    }
+}
+
+fn command_name_from_heading(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let heading = line.trim().strip_prefix("# ")?;
+        let command = heading.trim().strip_prefix('/')?;
+        let name = command.split_whitespace().next()?.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    })
+}
+
+fn command_description_from_heading(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let heading = line.trim().strip_prefix("# ")?;
+        let description = heading.trim().trim_start_matches('/').trim();
+        (!description.is_empty()).then(|| description.to_string())
+    })
+}
+
 fn normalize_skill_name(raw: &str) -> String {
     let mut normalized = String::new();
     let mut last_was_dash = false;
@@ -1593,6 +1806,71 @@ media:
             .expect("workspace skill without action obligation should load")
             .value;
         assert!(!default_skill.requires_action);
+    }
+
+    #[test]
+    fn load_resources_imports_codex_and_claude_commands_as_skills() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let home = temp.path().join("home");
+
+        let claude_command_dir =
+            home.join(".claude/plugins/marketplaces/example/plugins/review/commands");
+        fs::create_dir_all(&claude_command_dir).unwrap();
+        fs::write(
+            claude_command_dir.join("code-review.md"),
+            "---\ndescription: Code review a pull request\nallowed-tools: Read, Grep\nargument-hint: <pr-url>\n---\nReview $ARGUMENTS.\n",
+        )
+        .unwrap();
+        fs::write(
+            claude_command_dir.join("_conventions.md"),
+            "# Internal conventions\nDo not show this as a command.\n",
+        )
+        .unwrap();
+
+        let codex_skill_dir =
+            home.join(".codex/.tmp/plugins/plugins/superpowers/skills/brainstorming");
+        fs::create_dir_all(&codex_skill_dir).unwrap();
+        fs::write(
+            codex_skill_dir.join("SKILL.md"),
+            "---\nname: brainstorming\ndescription: MUST use before creative work\n---\nThink broadly before editing.\n",
+        )
+        .unwrap();
+
+        let workspace_command_dir = root.join(".codex/plugins/example/commands");
+        fs::create_dir_all(&workspace_command_dir).unwrap();
+        fs::write(
+            workspace_command_dir.join("ship-it.md"),
+            "# /ship-it\nShip the current branch with $ARGUMENTS.\n",
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            workspace_root: root.clone(),
+            workspace_config_dir: root.join(".puffer"),
+            user_config_dir: home.join(".puffer"),
+            builtin_resources_dir: root.join("resources"),
+        };
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+
+        let code_review = skill_by_name(&loaded, "code-review").expect("Claude command imports");
+        assert_eq!(code_review.value.description, "Code review a pull request");
+        assert_eq!(code_review.value.allowed_tools, vec!["Read", "Grep"]);
+        assert_eq!(code_review.value.argument_hint.as_deref(), Some("<pr-url>"));
+        assert_eq!(code_review.source_info.kind, SourceKind::User);
+
+        let brainstorming = skill_by_name(&loaded, "brainstorming").expect("Codex skill imports");
+        assert_eq!(
+            brainstorming.value.description,
+            "MUST use before creative work"
+        );
+        assert!(brainstorming.value.content.contains("Think broadly"));
+
+        let ship_it = skill_by_name(&loaded, "ship-it").expect("workspace command imports");
+        assert_eq!(ship_it.value.description, "ship-it");
+        assert_eq!(ship_it.source_info.kind, SourceKind::Workspace);
+
+        assert!(skill_by_name(&loaded, "_conventions").is_none());
     }
 
     #[test]

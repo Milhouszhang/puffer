@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn workflows_new_accepts_planned_connection_and_pattern() {
+fn workflows_new_reports_removed_native_drafts() {
     let tempdir = tempdir().unwrap();
     let paths = ConfigPaths::discover(tempdir.path());
     ensure_workspace_dirs(&paths).unwrap();
@@ -27,19 +27,6 @@ fn workflows_new_accepts_planned_connection_and_pattern() {
     .unwrap();
 
     let text = &state.transcript.last().unwrap().text;
-    assert!(text.contains("slug: hi-archive"));
-    assert!(text.contains("trigger: connection:telegram-user pattern=hi"));
-    assert!(text.contains("connect: /connect telegram-login telegram-user"));
-    let workflows = puffer_workflow::WorkflowStore::new(&paths.workspace_config_dir)
-        .list()
-        .unwrap();
-    assert_eq!(workflows.len(), 1);
-    assert!(matches!(
-        &workflows[0].trigger,
-        puffer_workflow::TriggerSpec::Connection {
-            connection_slug,
-            pattern: Some(pattern),
-            ..
-        } if connection_slug == "telegram-user" && pattern == "hi"
-    ));
+    assert!(text.contains("Native workflow drafts were removed."));
+    assert!(text.contains("configured workflow runtime"));
 }

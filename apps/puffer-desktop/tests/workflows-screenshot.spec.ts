@@ -7,7 +7,10 @@ async function openWorkflows(page: Page) {
 
 async function openWorkflowDetail(page: Page) {
   await openWorkflows(page);
-  await page.getByLabel("Workflow list").getByRole("button", { name: /agent-review-workflow/ }).click();
+  await page
+    .getByLabel("Runtime workflows")
+    .getByRole("button", { name: /Agent review workflow/ })
+    .click();
 }
 
 test("workflows overview screenshot", async ({ page }) => {
@@ -20,7 +23,7 @@ test("workflows overview screenshot", async ({ page }) => {
   await page.screenshot({ path: "test-results/workflows-overview.png", fullPage: true });
 });
 
-test("workflows detail screenshot (canvas + inspector open)", async ({ page }) => {
+test("workflows detail screenshot (visual editor open)", async ({ page }) => {
   const daemon = new FakeDaemon();
   await daemon.install(page);
   await daemon.open(page);
@@ -30,30 +33,26 @@ test("workflows detail screenshot (canvas + inspector open)", async ({ page }) =
   await page.screenshot({ path: "test-results/workflows-detail-open.png", fullPage: true });
 });
 
-test("workflows detail screenshot (inspector collapsed)", async ({ page }) => {
+test("workflows detail screenshot (json editor open)", async ({ page }) => {
   const daemon = new FakeDaemon();
   await daemon.install(page);
   await daemon.open(page);
 
   await openWorkflowDetail(page);
   await page.waitForTimeout(300);
-  await page.getByRole("button", { name: "Collapse inspector" }).click();
+  await page.getByRole("tab", { name: "JSON" }).click();
   await page.waitForTimeout(300);
-  await page.screenshot({ path: "test-results/workflows-detail-collapsed.png", fullPage: true });
+  await page.screenshot({ path: "test-results/workflows-detail-json.png", fullPage: true });
 });
 
-test("workflows detail screenshot (runs sheet expanded)", async ({ page }) => {
+test("workflows detail screenshot (executions refreshed)", async ({ page }) => {
   const daemon = new FakeDaemon();
   await daemon.install(page);
   await daemon.open(page);
 
-  await openWorkflowDetail(page);
+  await openWorkflows(page);
   await page.waitForTimeout(300);
-  const toggle = page.getByRole("button", { name: /Runs/ });
-  const expanded = await toggle.getAttribute("aria-expanded");
-  if (expanded !== "true") {
-    await toggle.click();
-    await page.waitForTimeout(300);
-  }
+  await page.getByLabel("Runtime workflows").getByRole("button", { name: "Executions" }).click();
+  await page.waitForTimeout(300);
   await page.screenshot({ path: "test-results/workflows-detail-runs-open.png", fullPage: true });
 });

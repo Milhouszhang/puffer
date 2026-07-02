@@ -1,7 +1,8 @@
 use super::store::{
-    load_store, now_ms, process_is_running, save_store, tasks_path, StoredTask, TaskStore,
-    TodoInputItem,
+    load_store, now_ms, process_is_running, save_store, tasks_path, StoredTask, StoredTodo,
+    TaskStore, TodoInputItem,
 };
+use crate::{AppState, MessageRole};
 use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
 use serde_json::Value;
@@ -13,6 +14,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const MAX_PROCESS_OUTPUT_CHARS: usize = 30_000;
+pub(super) const VERIFICATION_NUDGE: &str =
+    "NOTE: You just closed out 3+ tasks and none of them was a verification step. Before writing your final summary, spawn the verification agent (subagent_type=\"verification\"). You cannot self-assign PARTIAL by listing caveats in your summary — only the verifier issues a verdict.";
 
 /// Returns the persisted runtime-agent output path for a task id.
 pub(super) fn runtime_agent_output_path(session_cwd: &Path, task_id: &str) -> std::path::PathBuf {
@@ -83,6 +86,43 @@ pub(super) fn validate_todos(todos: &[TodoInputItem]) -> anyhow::Result<()> {
         anyhow::bail!("TodoWrite supports at most one in_progress item at a time");
     }
     Ok(())
+}
+
+/// Returns true when the completed todo list should surface the verification reminder.
+pub(super) fn should_emit_verification_nudge_for_todos(todos: &[StoredTodo]) -> bool {
+    todos.len() >= 3
+        && todos.iter().all(|todo| todo.status == "completed")
+        && !todos
+            .iter()
+            .any(|todo| contains_verification_marker(&todo.content))
+}
+
+/// Returns true when the completed visible task list should surface the verification reminder.
+pub(super) fn should_emit_verification_nudge_for_tasks(tasks: &[StoredTask]) -> bool {
+    let visible = tasks
+        .iter()
+        .filter(|task| {
+            !task
+                .metadata
+                .get("_internal")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    visible.len() >= 3
+        && visible.iter().all(|task| task.status == "completed")
+        && !visible
+            .iter()
+            .any(|task| contains_verification_marker(&task.subject))
+}
+
+/// Returns true when the current runtime context belongs to a nested subagent.
+pub(super) fn is_subagent_context(state: &AppState) -> bool {
+    state.transcript.first().is_some_and(|message| {
+        message.role == MessageRole::System
+            && (message.text.contains("You are a coding subagent")
+                || message.text.contains("You are a verification specialist"))
+    })
 }
 
 /// Captures child-process output together with timeout state.
@@ -218,9 +258,18 @@ fn truncate_process_output(output: String) -> String {
     output.chars().take(MAX_PROCESS_OUTPUT_CHARS).collect()
 }
 
+fn contains_verification_marker(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("verif")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{truncate_process_output, MAX_PROCESS_OUTPUT_CHARS};
+    use super::{
+        should_emit_verification_nudge_for_tasks, should_emit_verification_nudge_for_todos,
+        truncate_process_output, MAX_PROCESS_OUTPUT_CHARS,
+    };
+    use crate::runtime::claude_tools::workflow::store::{StoredTask, StoredTodo};
+    use serde_json::{Map, Value};
 
     #[test]
     fn truncate_process_output_leaves_short_text_unchanged() {
@@ -236,5 +285,134 @@ mod tests {
 
         assert_eq!(truncated.chars().count(), MAX_PROCESS_OUTPUT_CHARS);
         assert!(truncated.chars().all(|ch| ch == 'x'));
+    }
+
+    #[test]
+    fn verification_nudge_for_todos_requires_large_completed_non_verification_list() {
+        let todos = vec![
+            StoredTodo {
+                content: "Ship feature".to_string(),
+                status: "completed".to_string(),
+                active_form: "Shipping feature".to_string(),
+            },
+            StoredTodo {
+                content: "Run tests".to_string(),
+                status: "completed".to_string(),
+                active_form: "Running tests".to_string(),
+            },
+            StoredTodo {
+                content: "Write summary".to_string(),
+                status: "completed".to_string(),
+                active_form: "Writing summary".to_string(),
+            },
+        ];
+        assert!(should_emit_verification_nudge_for_todos(&todos));
+
+        let mut with_verification = todos.clone();
+        with_verification[2].content = "Verification sweep".to_string();
+        assert!(!should_emit_verification_nudge_for_todos(
+            &with_verification
+        ));
+    }
+
+    #[test]
+    fn verification_nudge_for_tasks_ignores_internal_entries() {
+        let mut internal_metadata = Map::new();
+        internal_metadata.insert("_internal".to_string(), Value::Bool(true));
+        let tasks = vec![
+            StoredTask {
+                task_id: "1".to_string(),
+                subject: "Ship feature".to_string(),
+                description: String::new(),
+                active_form: String::new(),
+                status: "completed".to_string(),
+                owner: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+                metadata: Map::new(),
+                output: None,
+                task_type: None,
+                command: None,
+                process_id: None,
+                output_file: None,
+                received_at: None,
+                expires_at: None,
+                started_at_ms: None,
+                created_at_ms: None,
+                updated_at_ms: None,
+                exit_code: None,
+                completed_via: None,
+            },
+            StoredTask {
+                task_id: "2".to_string(),
+                subject: "Run tests".to_string(),
+                description: String::new(),
+                active_form: String::new(),
+                status: "completed".to_string(),
+                owner: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+                metadata: Map::new(),
+                output: None,
+                task_type: None,
+                command: None,
+                process_id: None,
+                output_file: None,
+                received_at: None,
+                expires_at: None,
+                started_at_ms: None,
+                created_at_ms: None,
+                updated_at_ms: None,
+                exit_code: None,
+                completed_via: None,
+            },
+            StoredTask {
+                task_id: "3".to_string(),
+                subject: "Write summary".to_string(),
+                description: String::new(),
+                active_form: String::new(),
+                status: "completed".to_string(),
+                owner: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+                metadata: Map::new(),
+                output: None,
+                task_type: None,
+                command: None,
+                process_id: None,
+                output_file: None,
+                received_at: None,
+                expires_at: None,
+                started_at_ms: None,
+                created_at_ms: None,
+                updated_at_ms: None,
+                exit_code: None,
+                completed_via: None,
+            },
+            StoredTask {
+                task_id: "4".to_string(),
+                subject: "Internal bookkeeping".to_string(),
+                description: String::new(),
+                active_form: String::new(),
+                status: "pending".to_string(),
+                owner: None,
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+                metadata: internal_metadata,
+                output: None,
+                task_type: None,
+                command: None,
+                process_id: None,
+                output_file: None,
+                received_at: None,
+                expires_at: None,
+                started_at_ms: None,
+                created_at_ms: None,
+                updated_at_ms: None,
+                exit_code: None,
+                completed_via: None,
+            },
+        ];
+        assert!(should_emit_verification_nudge_for_tasks(&tasks));
     }
 }

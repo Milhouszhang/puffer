@@ -1,14 +1,16 @@
 use crate::cli_args::{McpCommand, McpTransport, PluginCommand, ResourceScope};
+use crate::command_surface_desktop::import_claude_desktop_mcp_servers;
 use crate::resource_fs::{
     disabled_variant, enabled_variant, find_yaml_file_by_id, is_disabled_yaml_path,
     plugin_manifest_path, remove_if_exists, sorted_dir_entries,
 };
 use anyhow::{Context, Result};
-use puffer_config::{ConfigPaths, PufferConfig};
+use puffer_config::{ensure_workspace_dirs, ConfigPaths, PufferConfig};
 use puffer_mcp_oauth::PersistedTokens;
 use puffer_resources::{LoadedResources, McpServerSpec, PluginSpec, SourceKind};
 use puffer_runner_api::{OAuthStatus, OAuthTokensPayload, ToolRunner};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,15 +46,12 @@ pub(crate) fn run_mcp_command(
         McpCommand::AddJson { name, json, scope } => {
             add_mcp_server_from_json(paths, scope, &name, &json)
         }
-        McpCommand::AddFromClaudeDesktop => {
-            println!("Import from Claude Desktop is not implemented in Puffer yet.");
+        McpCommand::AddFromClaudeDesktop { scope } => {
+            println!("{}", import_claude_desktop_mcp_servers(paths, scope)?);
             Ok(())
         }
         McpCommand::Remove { name, scope } => remove_mcp_server(paths, scope, &name),
-        McpCommand::ResetProjectChoices => {
-            println!("Puffer does not persist project MCP approval state yet.");
-            Ok(())
-        }
+        McpCommand::ResetProjectChoices => reset_project_mcp_choices(paths),
         McpCommand::Serve => {
             println!("Puffer does not expose an MCP server bridge yet.");
             Ok(())
@@ -73,6 +72,56 @@ pub(crate) fn run_mcp_command(
             run_mcp_logout(&name, runner)
         }
     }
+}
+
+fn reset_project_mcp_choices(paths: &ConfigPaths) -> Result<()> {
+    ensure_workspace_dirs(paths)?;
+    let state_path = paths.workspace_config_dir.join("mcp_servers.toml");
+    if state_path.exists() {
+        let mut enablement: CliMcpEnablement = toml::from_str(&fs::read_to_string(&state_path)?)?;
+        let workspace_selectors = workspace_mcp_selectors(paths)?;
+        enablement
+            .disabled
+            .retain(|selector| !workspace_selectors.contains(&normalize_selector(selector)));
+        if enablement.disabled.is_empty() {
+            remove_if_exists(&state_path)?;
+        } else {
+            fs::write(&state_path, toml::to_string_pretty(&enablement)?)?;
+        }
+    }
+    println!(
+        "Reset project-scoped MCP enablement choices.\nPuffer will use the default MCP state the next time resources load."
+    );
+    Ok(())
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct CliMcpEnablement {
+    #[serde(default)]
+    disabled: Vec<String>,
+}
+
+fn workspace_mcp_selectors(paths: &ConfigPaths) -> Result<BTreeSet<String>> {
+    let dir = resource_dir(paths, ResourceScope::Local, "mcp_servers");
+    if !dir.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let mut selectors = BTreeSet::new();
+    for entry in sorted_dir_entries(&dir)? {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("yaml")
+            && path.extension().and_then(|ext| ext.to_str()) != Some("yml")
+        {
+            continue;
+        }
+        let spec: McpServerSpec = serde_yaml::from_str(&fs::read_to_string(&path)?)?;
+        selectors.insert(normalize_selector(&spec.id));
+    }
+    Ok(selectors)
+}
+
+fn normalize_selector(selector: &str) -> String {
+    selector.trim().to_ascii_lowercase()
 }
 
 /// Drive the OAuth interactive login for `name`. Resolves the server

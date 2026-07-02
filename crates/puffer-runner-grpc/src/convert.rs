@@ -19,6 +19,7 @@ use crate::proto;
 
 pub(crate) fn to_proto_tool_request(req: &ToolRequest) -> proto::ToolRequest {
     proto::ToolRequest {
+        request_id: req.request_id.clone(),
         tool_id: req.tool_id.clone(),
         cwd: req.cwd.display().to_string(),
         working_dirs: req
@@ -40,6 +41,7 @@ pub(crate) fn from_proto_tool_request(req: proto::ToolRequest) -> Result<ToolReq
             .map_err(|e| RunnerError::InvalidArgument(format!("input_json: {e}")))?
     };
     Ok(ToolRequest {
+        request_id: req.request_id,
         tool_id: req.tool_id,
         cwd: PathBuf::from(req.cwd),
         working_dirs: req.working_dirs.into_iter().map(PathBuf::from).collect(),
@@ -563,6 +565,7 @@ mod tests {
     /// Builds a tool request with the provided filesystem mode for transport tests.
     fn request_with_mode(sandbox_mode: FilesystemSandboxMode) -> ToolRequest {
         ToolRequest {
+            request_id: Some("request-1".into()),
             tool_id: "Read".into(),
             cwd: PathBuf::from("/workspace"),
             working_dirs: vec![PathBuf::from("/workspace"), PathBuf::from("/tmp/extra")],
@@ -590,12 +593,14 @@ mod tests {
             assert_eq!(decoded.working_dirs, request.working_dirs);
             assert_eq!(decoded.input, request.input);
             assert_eq!(decoded.session_id, request.session_id);
+            assert_eq!(decoded.request_id, request.request_id);
         }
     }
 
     #[test]
     fn missing_filesystem_field_is_invalid_argument() {
         let request = proto::ToolRequest {
+            request_id: None,
             tool_id: "Read".into(),
             cwd: "/workspace".into(),
             working_dirs: Vec::new(),

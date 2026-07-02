@@ -17,9 +17,9 @@ use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use puffer_config::{ensure_workspace_dirs, load_config, ConfigPaths};
 use puffer_core::{
-    execute_user_turn_streaming_with_permissions, with_user_question_prompt_handler, AppState,
-    BrowserPermissionPromptActionSet, BrowserPermissionPromptSource,
-    BrowserPermissionPromptTargetClass, MessageRole, PermissionPromptAction,
+    execute_user_turn_streaming_with_permissions_and_cancel, with_user_question_prompt_handler,
+    AppState, BrowserPermissionPromptActionSet, BrowserPermissionPromptSource,
+    BrowserPermissionPromptTargetClass, CancelToken, MessageRole, PermissionPromptAction,
     PermissionPromptRequest, TurnStreamEvent, UserQuestionPromptRequest,
     UserQuestionPromptResponse,
 };
@@ -29,7 +29,7 @@ use puffer_session_store::{MessageActor, SessionStore, TranscriptEvent, TurnBoun
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -44,7 +44,7 @@ pub(crate) struct TurnRegistry {
 }
 
 struct TurnEntry {
-    cancel: Arc<AtomicBool>,
+    cancel: CancelToken,
     pending: Arc<Mutex<HashMap<String, mpsc::Sender<PermissionPromptAction>>>>,
     pending_questions: Arc<Mutex<HashMap<String, mpsc::Sender<UserQuestionPromptResponse>>>>,
     // Tracks the next permission-request id so the callback thread can
@@ -247,7 +247,7 @@ pub(crate) fn run_agent_turn(
     let (config, resources, providers, auth_store, session_store, state) =
         load_context(&session_id).map_err(|err| err.to_string())?;
 
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = CancelToken::new();
     let pending: Arc<Mutex<HashMap<String, mpsc::Sender<PermissionPromptAction>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let pending_questions: Arc<Mutex<HashMap<String, mpsc::Sender<UserQuestionPromptResponse>>>> =
@@ -275,6 +275,9 @@ pub(crate) fn run_agent_turn(
     let spawn_turn_id = turn_id.clone();
     let spawn_session_id = session_id.clone();
     let spawn_actor = state.assistant_actor();
+    // Kept on this side of the move so the result handler can tell a
+    // user-initiated cancel apart from a genuine agent error.
+    let result_cancel = cancel.clone();
     thread::spawn(move || {
         let result = drive_turn(
             app.clone(),
@@ -301,6 +304,20 @@ pub(crate) fn run_agent_turn(
                     EmittedEvent::TurnComplete {
                         turn_id: spawn_turn_id.clone(),
                         assistant_text,
+                        actor: spawn_actor.clone(),
+                    },
+                );
+            }
+            // A turn the user interrupted returns `Err("cancelled")` from the
+            // agent loop. Surface that as a clean completion (the UI already
+            // clears the canceled turn's live state) rather than a scary
+            // "Agent error" toast.
+            Err(_) if result_cancel.is_cancelled() => {
+                let _ = app.emit(
+                    &event_channel,
+                    EmittedEvent::TurnComplete {
+                        turn_id: spawn_turn_id.clone(),
+                        assistant_text: String::new(),
                         actor: spawn_actor.clone(),
                     },
                 );
@@ -374,13 +391,14 @@ pub(crate) fn resolve_user_question(
         .map_err(|_| "agent worker already released the user question channel".to_string())
 }
 
-/// Best-effort cancel: flips the cancel flag and denies any outstanding
-/// permission request. The running turn will finish its current provider
-/// stream then exit.
+/// Best-effort cancel: flips the cancel token and denies any outstanding
+/// permission or question prompt. The agent loop observes the token at its
+/// next boundary and returns `Err("cancelled")`, so the worker stops instead
+/// of running on in the background after the user interrupts.
 pub(crate) fn cancel_turn(registry: Arc<TurnRegistry>, turn_id: String) -> Result<(), String> {
     registry
         .with(&turn_id, |entry| {
-            entry.cancel.store(true, Ordering::SeqCst);
+            entry.cancel.cancel();
             let mut pending = entry.pending.lock().unwrap();
             for (_, tx) in pending.drain() {
                 let _ = tx.send(PermissionPromptAction::Deny);
@@ -413,7 +431,7 @@ fn drive_turn(
     auth_store: AuthStore,
     session_store: SessionStore,
     mut state: AppState,
-    _cancel: Arc<AtomicBool>,
+    cancel: CancelToken,
     pending: Arc<Mutex<HashMap<String, mpsc::Sender<PermissionPromptAction>>>>,
     pending_questions: Arc<Mutex<HashMap<String, mpsc::Sender<UserQuestionPromptResponse>>>>,
     next_request_id: Arc<AtomicU64>,
@@ -534,7 +552,12 @@ fn drive_turn(
     let on_perm_pending = pending.clone();
     let on_perm_next_id = next_request_id.clone();
     let on_perm_actor = stream_actor.clone();
+    let on_perm_cancel = cancel.clone();
     let on_permission = move |request: PermissionPromptRequest| -> PermissionPromptAction {
+        // Turn already interrupted: deny without surfacing a fresh prompt. (#671)
+        if on_perm_cancel.is_cancelled() {
+            return PermissionPromptAction::Deny;
+        }
         let request_id = on_perm_next_id.fetch_add(1, Ordering::SeqCst).to_string();
         let (tx, rx) = mpsc::channel::<PermissionPromptAction>();
         on_perm_pending
@@ -568,7 +591,17 @@ fn drive_turn(
     let on_question_pending = pending_questions.clone();
     let on_question_next_id = next_request_id.clone();
     let on_question_actor = stream_actor.clone();
+    let on_question_cancel = cancel.clone();
     let on_user_question = move |request: UserQuestionPromptRequest| -> UserQuestionPromptResponse {
+        // Don't re-surface a question after the user interrupted the turn;
+        // returning empty lets the loop bail at its next cancel boundary
+        // instead of popping the prompt back up. (#671)
+        if on_question_cancel.is_cancelled() {
+            return UserQuestionPromptResponse {
+                answers: serde_json::Map::new(),
+                annotations: serde_json::Map::new(),
+            };
+        }
         let request_id = on_question_next_id
             .fetch_add(1, Ordering::SeqCst)
             .to_string();
@@ -595,13 +628,14 @@ fn drive_turn(
     };
 
     let outcome = with_user_question_prompt_handler(on_user_question, || {
-        execute_user_turn_streaming_with_permissions(
+        execute_user_turn_streaming_with_permissions_and_cancel(
             &mut state,
             &resources,
             &providers,
             &mut auth_store,
             &message,
             None,
+            &cancel,
             on_event,
             on_permission,
         )

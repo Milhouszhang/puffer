@@ -66,3 +66,27 @@ fn empty_reasoning_content_returns_none() {
     let parsed = parse_chat_completions_response(payload).unwrap();
     assert_eq!(extract_chat_completions_reasoning(&parsed), None);
 }
+
+#[test]
+fn strips_nul_and_control_bytes_but_keeps_whitespace() {
+    // Kimi has been observed embedding a NUL plus a stray C0 control
+    // byte (BEL) and a DEL inside its reasoning_content, then rejecting
+    // the same string on replay. Tab and newline must survive. The \u
+    // escapes below are JSON string escapes, so serde materializes the
+    // real control chars at parse time.
+    let payload = r#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"answer","reasoning_content":"a\u0000b\u0007c\u007f\ttab\nline"},"finish_reason":"stop"}]}"#;
+    let parsed = parse_chat_completions_response(payload).unwrap();
+    assert_eq!(
+        extract_chat_completions_reasoning(&parsed),
+        Some("abc\ttab\nline".to_string())
+    );
+}
+
+#[test]
+fn all_control_reasoning_content_returns_none() {
+    // reasoning_content that is nothing but control bytes sanitizes to
+    // empty, which must collapse back to `None` rather than `Some("")`.
+    let payload = r#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"answer","reasoning_content":"\u0000\u0007\u007f"},"finish_reason":"stop"}]}"#;
+    let parsed = parse_chat_completions_response(payload).unwrap();
+    assert_eq!(extract_chat_completions_reasoning(&parsed), None);
+}

@@ -177,7 +177,9 @@ fn try_download_once(
         .bytes()
         .map(|bytes| bytes.to_vec())
         .map_err(|error| {
-            DownloadError::Transient(anyhow::Error::new(error).context(format!("read {label} bytes")))
+            DownloadError::Transient(
+                anyhow::Error::new(error).context(format!("read {label} bytes")),
+            )
         })
 }
 

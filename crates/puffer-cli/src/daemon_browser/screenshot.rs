@@ -142,7 +142,10 @@ fn derive_in_frame_name(attrs: &HashMap<String, String>, tag: &str) -> String {
 /// Classifies one DOM node into an in-frame field (role, fillable). Returns
 /// `None` for hidden inputs and non-fillable elements.
 fn classify_field_node(node: &Value) -> Option<InFrameFieldNode> {
-    let tag = node.get("nodeName").and_then(Value::as_str)?.to_ascii_lowercase();
+    let tag = node
+        .get("nodeName")
+        .and_then(Value::as_str)?
+        .to_ascii_lowercase();
     let backend_node_id = node.get("backendNodeId").and_then(Value::as_i64)?;
     let attrs = dom_attributes(node);
     let role = match tag.as_str() {
@@ -205,9 +208,12 @@ pub(crate) fn collect_in_frame_field_nodes(
 /// the deep pass must leave them alone to avoid duplicate refs.
 fn iframe_has_accessible_name(node: &Value) -> bool {
     let attrs = dom_attributes(node);
-    ["title", "aria-label", "alt"]
-        .iter()
-        .any(|key| attrs.get(*key).map(|v| !v.trim().is_empty()).unwrap_or(false))
+    ["title", "aria-label", "alt"].iter().any(|key| {
+        attrs
+            .get(*key)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    })
 }
 
 fn walk_dom_for_fields(
@@ -317,7 +323,10 @@ fn collect_payment_frames(tree_node: &Value, is_root: bool, out: &mut HashSet<St
     if let Some(frame) = tree_node.get("frame") {
         let id = frame.get("id").and_then(Value::as_str).unwrap_or_default();
         let url = frame.get("url").and_then(Value::as_str).unwrap_or_default();
-        let name = frame.get("name").and_then(Value::as_str).unwrap_or_default();
+        let name = frame
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if !is_root && !id.is_empty() && frame_is_payment(url, name) {
             out.insert(id.to_string());
         }

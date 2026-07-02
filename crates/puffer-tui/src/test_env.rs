@@ -27,6 +27,22 @@ impl ScopedPufferHome {
             _guard: guard,
         }
     }
+
+    /// Clears `PUFFER_HOME` while holding the shared lock. Use when a test
+    /// exercises a flow that resolves `ConfigPaths::discover` internally and
+    /// must rely on the tempdir isolation rule (not a stray `PUFFER_HOME` set
+    /// by a concurrent test). Restores the prior value on drop.
+    pub(crate) fn unset() -> Self {
+        let guard = puffer_home_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_home = std::env::var_os("PUFFER_HOME");
+        std::env::remove_var("PUFFER_HOME");
+        Self {
+            old_home,
+            _guard: guard,
+        }
+    }
 }
 
 impl Drop for ScopedPufferHome {

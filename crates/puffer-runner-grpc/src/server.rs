@@ -9,13 +9,17 @@
 //! it to `tonic::transport::Server`. Integration tests do the same in-process.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
+use prost::Message;
 use puffer_runner_api::{
     ChunkKind, ChunkSink, ElicitationHandler, ElicitationMode, ElicitationRequest,
-    ElicitationResponse, FnChunkSink, RunnerError, ToolRunner,
+    ElicitationResponse, FnChunkSink, RunnerError, ToolRequest, ToolRunner,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -30,6 +34,8 @@ use crate::proto;
 use crate::AUTH_METADATA_KEY;
 
 pub use proto::tool_runner_server::ToolRunnerServer;
+
+const MAX_IDEMPOTENT_EXECUTIONS: usize = 512;
 
 /// Adapter from a synchronous `Arc<dyn ToolRunner>` to the generated tonic
 /// service trait. All RPCs forward to the runner; blocking work runs on a
@@ -54,6 +60,8 @@ pub struct ToolRunnerService {
     auth_token: Option<Arc<String>>,
     started: Instant,
     elicitation_router: Arc<BidiElicitationRouter>,
+    idempotent_executions: Arc<Mutex<HashMap<String, Arc<IdempotentExecution>>>>,
+    idempotency_store: Option<Arc<IdempotencyStore>>,
 }
 
 impl ToolRunnerService {
@@ -80,6 +88,8 @@ impl ToolRunnerService {
             auth_token: None,
             started: Instant::now(),
             elicitation_router: router,
+            idempotent_executions: Arc::new(Mutex::new(HashMap::new())),
+            idempotency_store: None,
         }
     }
 
@@ -99,6 +109,13 @@ impl ToolRunnerService {
         self
     }
 
+    /// Persists completed idempotent tool executions so duplicate
+    /// `request_id` calls can be replayed after a runner process restart.
+    pub fn with_idempotency_dir(mut self, dir: impl Into<PathBuf>) -> Result<Self, std::io::Error> {
+        self.idempotency_store = Some(Arc::new(IdempotencyStore::open(dir.into())?));
+        Ok(self)
+    }
+
     fn check_auth<T>(&self, req: &Request<T>) -> Result<(), Status> {
         let Some(expected) = self.auth_token.as_deref() else {
             return Ok(());
@@ -115,6 +132,110 @@ impl ToolRunnerService {
         } else {
             Err(Status::unauthenticated("invalid bearer token"))
         }
+    }
+
+    fn execute_tool_uncached(
+        &self,
+        request: ToolRequest,
+        event_tx: mpsc::Sender<Result<proto::ToolEvent, Status>>,
+    ) {
+        let runner = self.runner.clone();
+        let event_tx_for_blocking = event_tx.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut sink = ChannelChunkSink::new(event_tx_for_blocking.clone());
+            send_tool_execution_result(&runner, request, &mut sink, &event_tx_for_blocking, None);
+        });
+        drop(event_tx);
+    }
+
+    fn execute_tool_idempotently(
+        &self,
+        request_id: String,
+        request: ToolRequest,
+        event_tx: mpsc::Sender<Result<proto::ToolEvent, Status>>,
+    ) -> Result<(), Status> {
+        let fingerprint = request_fingerprint(&request)?;
+        if let Some(store) = &self.idempotency_store {
+            if let Some(replay) = store.load(&request_id).map_err(idempotency_store_error)? {
+                if replay.fingerprint != fingerprint {
+                    return Err(Status::already_exists(
+                        "request_id was already used for a different tool request",
+                    ));
+                }
+                tokio::task::spawn_blocking(move || {
+                    for event in replay.events {
+                        let _ = event_tx.blocking_send(Ok(event));
+                    }
+                });
+                return Ok(());
+            }
+        }
+        let (execution, should_start) = {
+            let mut executions = self
+                .idempotent_executions
+                .lock()
+                .map_err(|_| Status::internal("idempotency cache lock poisoned"))?;
+            match executions.get(&request_id) {
+                Some(existing) => {
+                    if existing.fingerprint != fingerprint {
+                        return Err(Status::already_exists(
+                            "request_id was already used for a different tool request",
+                        ));
+                    }
+                    (existing.clone(), false)
+                }
+                None => {
+                    if executions.len() >= MAX_IDEMPOTENT_EXECUTIONS {
+                        if let Some(evict) = executions
+                            .iter()
+                            .find_map(|(id, execution)| execution.is_complete().then(|| id.clone()))
+                        {
+                            executions.remove(&evict);
+                        }
+                    }
+                    let execution = Arc::new(IdempotentExecution::new(fingerprint));
+                    executions.insert(request_id.clone(), execution.clone());
+                    (execution, true)
+                }
+            }
+        };
+
+        if should_start {
+            let runner = self.runner.clone();
+            let event_tx_for_blocking = event_tx.clone();
+            let store = self.idempotency_store.clone();
+            let persist_request_id = request_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut sink =
+                    RecordingChunkSink::new(event_tx_for_blocking.clone(), execution.clone());
+                send_tool_execution_result(
+                    &runner,
+                    request,
+                    &mut sink,
+                    &event_tx_for_blocking,
+                    Some(&execution),
+                );
+                execution.complete();
+                if let Some(store) = store {
+                    let events = execution.wait_for_replay();
+                    if let Err(error) =
+                        store.save(&persist_request_id, &execution.fingerprint, &events)
+                    {
+                        eprintln!("puffer-tool-runner: idempotency persist failed: {error}");
+                    }
+                }
+            });
+            drop(event_tx);
+        } else {
+            tokio::task::spawn_blocking(move || {
+                for event in execution.wait_for_replay() {
+                    let _ = event_tx.blocking_send(Ok(event));
+                }
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -155,30 +276,11 @@ impl proto::tool_runner_server::ToolRunner for ToolRunnerService {
         let request = from_proto_tool_request(proto_req).map_err(|e| runner_error_to_status(&e))?;
 
         let (event_tx, event_rx) = mpsc::channel::<Result<proto::ToolEvent, Status>>(32);
-        let runner = self.runner.clone();
-        let event_tx_for_blocking = event_tx.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let mut sink = ChannelChunkSink::new(event_tx_for_blocking.clone());
-            match runner.execute_tool(request, &mut sink) {
-                Ok(result) => {
-                    let _ = event_tx_for_blocking.blocking_send(Ok(proto::ToolEvent {
-                        payload: Some(proto::tool_event::Payload::Completed(
-                            to_proto_tool_completed(&result),
-                        )),
-                    }));
-                }
-                Err(err) => {
-                    let _ = event_tx_for_blocking.blocking_send(Ok(proto::ToolEvent {
-                        payload: Some(proto::tool_event::Payload::Failed(proto::ToolFailed {
-                            code: runner_error_code(&err).to_string(),
-                            message: err.to_string(),
-                        })),
-                    }));
-                }
-            }
-        });
-        drop(event_tx);
+        if let Some(request_id) = request.request_id.clone() {
+            self.execute_tool_idempotently(request_id, request, event_tx)?;
+        } else {
+            self.execute_tool_uncached(request, event_tx);
+        }
 
         Ok(Response::new(ReceiverStream::new(event_rx)))
     }
@@ -279,7 +381,7 @@ impl proto::tool_runner_server::ToolRunner for ToolRunnerService {
             other => {
                 return Err(Status::invalid_argument(format!(
                     "first CallMcpTool message must be Call, got {other:?}"
-                )))
+                )));
             }
         };
         let args: serde_json::Value = if call.args_json.is_empty() {
@@ -520,6 +622,219 @@ fn runner_error_code(err: &RunnerError) -> &'static str {
     }
 }
 
+fn send_tool_execution_result(
+    runner: &Arc<dyn ToolRunner>,
+    request: ToolRequest,
+    sink: &mut dyn ChunkSink,
+    event_tx: &mpsc::Sender<Result<proto::ToolEvent, Status>>,
+    record: Option<&IdempotentExecution>,
+) {
+    let event = match runner.execute_tool(request, sink) {
+        Ok(result) => proto::ToolEvent {
+            payload: Some(proto::tool_event::Payload::Completed(
+                to_proto_tool_completed(&result),
+            )),
+        },
+        Err(err) => proto::ToolEvent {
+            payload: Some(proto::tool_event::Payload::Failed(proto::ToolFailed {
+                code: runner_error_code(&err).to_string(),
+                message: err.to_string(),
+            })),
+        },
+    };
+    if let Some(record) = record {
+        record.record_event(event.clone());
+    }
+    let _ = event_tx.blocking_send(Ok(event));
+}
+
+fn request_fingerprint(request: &ToolRequest) -> Result<String, Status> {
+    let mut request = request.clone();
+    request.request_id = None;
+    serde_json::to_string(&request)
+        .map_err(|error| Status::internal(format!("request fingerprint: {error}")))
+}
+
+fn idempotency_store_error(error: std::io::Error) -> Status {
+    Status::internal(format!("idempotency store: {error}"))
+}
+
+#[derive(Debug)]
+struct IdempotencyStore {
+    dir: PathBuf,
+}
+
+#[derive(Debug)]
+struct PersistedReplay {
+    fingerprint: String,
+    events: Vec<proto::ToolEvent>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedIdempotentExecution {
+    fingerprint: String,
+    event_frames: Vec<Vec<u8>>,
+}
+
+impl IdempotencyStore {
+    fn open(dir: PathBuf) -> Result<Self, std::io::Error> {
+        fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
+    }
+
+    fn load(&self, request_id: &str) -> Result<Option<PersistedReplay>, std::io::Error> {
+        let path = self.path_for_request_id(request_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path)?;
+        let persisted: PersistedIdempotentExecution =
+            serde_json::from_slice(&bytes).map_err(invalid_data)?;
+        let mut events = Vec::with_capacity(persisted.event_frames.len());
+        for frame in persisted.event_frames {
+            events.push(proto::ToolEvent::decode(frame.as_slice()).map_err(invalid_data)?);
+        }
+        Ok(Some(PersistedReplay {
+            fingerprint: persisted.fingerprint,
+            events,
+        }))
+    }
+
+    fn save(
+        &self,
+        request_id: &str,
+        fingerprint: &str,
+        events: &[proto::ToolEvent],
+    ) -> Result<(), std::io::Error> {
+        fs::create_dir_all(&self.dir)?;
+        let event_frames = events.iter().map(Message::encode_to_vec).collect();
+        let persisted = PersistedIdempotentExecution {
+            fingerprint: fingerprint.to_string(),
+            event_frames,
+        };
+        let bytes = serde_json::to_vec(&persisted).map_err(invalid_data)?;
+        let path = self.path_for_request_id(request_id);
+        let tmp = self.tmp_path_for(&path);
+        fs::write(&tmp, bytes)?;
+        fs::rename(tmp, path)?;
+        self.prune_completed(MAX_IDEMPOTENT_EXECUTIONS)?;
+        Ok(())
+    }
+
+    fn path_for_request_id(&self, request_id: &str) -> PathBuf {
+        self.dir
+            .join(format!("{}.json", sanitize_request_id(request_id)))
+    }
+
+    fn tmp_path_for(&self, path: &Path) -> PathBuf {
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("request.json");
+        self.dir.join(format!(".{file_name}.tmp"))
+    }
+
+    fn prune_completed(&self, max_entries: usize) -> Result<(), std::io::Error> {
+        let mut entries = fs::read_dir(&self.dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .filter_map(|entry| {
+                let modified = entry.metadata().ok()?.modified().ok()?;
+                Some((entry.path(), modified))
+            })
+            .collect::<Vec<_>>();
+        if entries.len() <= max_entries {
+            return Ok(());
+        }
+        entries.sort_by_key(|(_, modified)| *modified);
+        let remove_count = entries.len().saturating_sub(max_entries);
+        for (path, _) in entries.into_iter().take(remove_count) {
+            let _ = fs::remove_file(path);
+        }
+        Ok(())
+    }
+}
+
+fn sanitize_request_id(request_id: &str) -> String {
+    let mut safe = request_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(160)
+        .collect::<String>();
+    if safe.is_empty() {
+        safe.push_str("request");
+    }
+    safe
+}
+
+fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+}
+
+#[derive(Debug)]
+struct IdempotentExecution {
+    fingerprint: String,
+    state: Mutex<IdempotentExecutionState>,
+    complete: Condvar,
+}
+
+#[derive(Debug)]
+struct IdempotentExecutionState {
+    events: Vec<proto::ToolEvent>,
+    completed: bool,
+}
+
+impl IdempotentExecution {
+    fn new(fingerprint: String) -> Self {
+        Self {
+            fingerprint,
+            state: Mutex::new(IdempotentExecutionState {
+                events: Vec::new(),
+                completed: false,
+            }),
+            complete: Condvar::new(),
+        }
+    }
+
+    fn record_event(&self, event: proto::ToolEvent) {
+        if let Ok(mut state) = self.state.lock() {
+            state.events.push(event);
+        }
+    }
+
+    fn complete(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.completed = true;
+            self.complete.notify_all();
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.completed)
+            .unwrap_or(false)
+    }
+
+    fn wait_for_replay(&self) -> Vec<proto::ToolEvent> {
+        let mut state = self.state.lock().expect("idempotency cache lock poisoned");
+        while !state.completed {
+            state = self
+                .complete
+                .wait(state)
+                .expect("idempotency cache lock poisoned");
+        }
+        state.events.clone()
+    }
+}
+
 /// Bridge from synchronous `ChunkSink` writes to an mpsc of `ToolEvent`.
 struct ChannelChunkSink {
     tx: mpsc::Sender<Result<proto::ToolEvent, Status>>,
@@ -546,6 +861,50 @@ impl ChannelChunkSink {
 }
 
 impl ChunkSink for ChannelChunkSink {
+    fn stdout(&mut self, chunk: &[u8]) {
+        self.send_chunk(ChunkKind::Stdout, chunk);
+    }
+    fn stderr(&mut self, chunk: &[u8]) {
+        self.send_chunk(ChunkKind::Stderr, chunk);
+    }
+}
+
+/// Streaming sink that forwards chunks and stores the exact event sequence for
+/// duplicate idempotency-key requests.
+struct RecordingChunkSink {
+    inner: ChannelChunkSink,
+    execution: Arc<IdempotentExecution>,
+}
+
+impl RecordingChunkSink {
+    fn new(
+        tx: mpsc::Sender<Result<proto::ToolEvent, Status>>,
+        execution: Arc<IdempotentExecution>,
+    ) -> Self {
+        Self {
+            inner: ChannelChunkSink::new(tx),
+            execution,
+        }
+    }
+
+    fn send_chunk(&self, kind: ChunkKind, bytes: &[u8]) {
+        let payload = match kind {
+            ChunkKind::Stdout => proto::tool_event::Payload::Stdout(proto::StreamChunk {
+                data: bytes.to_vec(),
+            }),
+            ChunkKind::Stderr => proto::tool_event::Payload::Stderr(proto::StreamChunk {
+                data: bytes.to_vec(),
+            }),
+        };
+        let event = proto::ToolEvent {
+            payload: Some(payload),
+        };
+        self.execution.record_event(event.clone());
+        let _ = self.inner.tx.blocking_send(Ok(event));
+    }
+}
+
+impl ChunkSink for RecordingChunkSink {
     fn stdout(&mut self, chunk: &[u8]) {
         self.send_chunk(ChunkKind::Stdout, chunk);
     }

@@ -39,15 +39,21 @@ pub(crate) struct EmailSendRequest {
 
 /// Builds an `AsyncSmtpTransport` configured for the given account.
 ///
-/// Uses `starttls_relay` (submission on port 587 by default) with basic
-/// credentials. Callers must still be connected to the tokio runtime.
+/// Picks the TLS mode by port: 465 is implicit TLS (SMTPS) — the server expects
+/// a TLS handshake immediately on connect — while 587 (and other submission
+/// ports) use STARTTLS, which connects in plaintext and upgrades. Using
+/// `starttls_relay` against a 465 endpoint deadlocks the handshake (the client
+/// waits for a plaintext greeting while the server waits for TLS), so select the
+/// constructor accordingly. Callers must still be connected to the tokio runtime.
 pub fn build_transport(config: &EmailConfig) -> anyhow::Result<AsyncSmtpTransport<Tokio1Executor>> {
     let creds = Credentials::new(config.username.clone(), config.password.clone());
-    let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)
-        .with_context(|| format!("invalid SMTP host {}", config.smtp_host))?
-        .port(config.smtp_port)
-        .credentials(creds)
-        .build();
+    let builder = if config.smtp_port == 465 {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host)
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)
+    }
+    .with_context(|| format!("invalid SMTP host {}", config.smtp_host))?;
+    let transport = builder.port(config.smtp_port).credentials(creds).build();
     Ok(transport)
 }
 

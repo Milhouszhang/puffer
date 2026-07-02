@@ -86,6 +86,32 @@ std::string CefToString(const CefString& value) {
   return value.ToString();
 }
 
+// Schemes the embedded browser can actually load. Everything else — native-app
+// deep links like slack://, msteams://, zoommtg://, plus mailto:/tel: — would
+// otherwise surface an ERR_UNKNOWN_URL_SCHEME error page in CEF, breaking the
+// page (e.g. Slack's post-workspace-select redirect). Desktop Chrome silently
+// drops such navigations when no app handler exists, so we do the same and stay
+// on the web client.
+bool IsBrowsableScheme(const std::string& url) {
+  std::string scheme;
+  for (char c : url) {
+    if (c == ':') break;
+    scheme += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+  }
+  if (scheme.empty()) {
+    return true;  // relative / same-document navigation — let CEF handle it
+  }
+  static const char* const kBrowsable[] = {
+      "http",   "https",           "file",         "data", "blob", "about",
+      "chrome", "chrome-extension", "chrome-error", "devtools", "ws", "wss"};
+  for (const char* allowed : kBrowsable) {
+    if (scheme == allowed) {
+      return true;
+    }
+  }
+  return false;
+}
+
 int64_t CurrentTimeMs() {
   const auto now = std::chrono::system_clock::now().time_since_epoch();
   return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
@@ -353,6 +379,26 @@ class PufferCefClient : public CefClient,
   }
 #endif
 
+  // Cancel navigations to schemes CEF cannot load (native-app deep links such
+  // as slack://). Without this, CEF renders an ERR_UNKNOWN_URL_SCHEME error
+  // page and the web app never recovers; cancelling lets the site fall back to
+  // its in-browser experience, exactly as desktop Chrome does with no handler.
+  bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser,
+                      CefRefPtr<CefFrame> frame,
+                      CefRefPtr<CefRequest> request,
+                      bool user_gesture,
+                      bool is_redirect) override {
+    if (request) {
+      const std::string url = CefToString(request->GetURL());
+      if (!IsBrowsableScheme(url)) {
+        CefDebugLog("blocked-external-scheme",
+                    "session_id=" + session_id_ + " url=" + url);
+        return true;  // cancel the navigation
+      }
+    }
+    return false;  // allow normal http(s)/internal navigations
+  }
+
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     LogCefHost("after-created", session_id_);
     if (auto* slot = FindSlot(session_id_)) {
@@ -530,7 +576,8 @@ class PufferCefClient : public CefClient,
   bool HandlePopupInCurrentBrowser(CefRefPtr<CefBrowser> browser,
                                    const CefString& target_url) {
     const std::string url = CefToString(target_url);
-    if (!url.empty() && browser && browser->GetMainFrame()) {
+    if (!url.empty() && IsBrowsableScheme(url) && browser &&
+        browser->GetMainFrame()) {
       browser->GetMainFrame()->LoadURL(url);
       if (auto* slot = FindSlot(session_id_)) {
         slot->url = url;

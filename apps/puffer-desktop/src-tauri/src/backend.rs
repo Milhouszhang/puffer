@@ -5,9 +5,8 @@ use crate::dtos::{
     ChatAttachmentSourceDto, DiffSummaryDto, DivergenceReportDto, ExternalCredentialDto,
     FolderGroupDto, MediaCapabilityInfoDto, MediaGenerationSettingsDto, MediaSettingsDto,
     ProviderSummaryDto, ResourceCountsDto, SecretSourceDto, SecretSummaryDto, SecretsSettingsDto,
-    SessionDetailDto,
-    SessionListItemDto, SettingsConfigDto, SettingsSessionSummaryDto, SettingsSnapshotDto,
-    TimelineItemDto,
+    SessionDetailDto, SessionListItemDto, SettingsConfigDto, SettingsSessionSummaryDto,
+    SettingsSnapshotDto, TimelineItemDto,
 };
 use crate::events::EventEmitter;
 use crate::repo_actions;
@@ -15,6 +14,7 @@ use crate::{browser, files, fs_watch, local_model, lsp, media_capabilities, pty}
 use anyhow::{anyhow, bail, Context, Result};
 use base64::prelude::*;
 use puffer_config::{builtin_captcha_solvers, ConfigPaths};
+use puffer_core::command_surface;
 use puffer_media::{
     discover_exact_media_capabilities, generate_exact_media_with_cache,
     generated_media_timeline_attachments, read_generated_media_preview_by_artifact,
@@ -185,6 +185,12 @@ impl BackendState {
                 ))
             }
             "load_settings_snapshot" => serde_value(self.load_settings_snapshot()?),
+            "list_command_surface" => serde_value(self.list_command_surface()?),
+            "list_workspace_mentions" => serde_value(files::list_workspace_mentions(
+                &params,
+                &self.allowed_roots()?,
+                &self.default_workspace()?,
+            )?),
             "login_with_oauth" => serde_value(self.load_settings_snapshot()?),
             "login_with_api_key" => {
                 let provider_id = string_param(&params, &["providerId", "provider_id"])?;
@@ -275,9 +281,18 @@ impl BackendState {
                 self.rename_session(&session_id, title)?;
                 serde_value(self.load_session_detail(&session_id)?)
             }
-            "workflow_list" => serde_value(json!({"workflows": [], "runs": []})),
-            "workflow_runs_list" => serde_value(Vec::<Value>::new()),
-            "workflow_run_show" => Ok(Value::Null),
+            "workflow_list"
+            | "workflow_backend_get_config"
+            | "workflow_backend_save_config"
+            | "workflow_backend_test_connection"
+            | "workflow_open_ui"
+            | "workflow_create"
+            | "workflow_deploy"
+            | "workflow_execute"
+            | "workflow_list_executions"
+            | "workflow_get_execution"
+            | "workflow_runs_list"
+            | "workflow_run_show" => workflow_runtime_unavailable(method),
             "run_agent_turn" => self.run_agent_turn(events.clone(), params),
             "resolve_permission" | "resolve_user_question" => Ok(json!({})),
             "cancel_turn" => {
@@ -750,6 +765,15 @@ impl BackendState {
             browser: legacy_browser_settings(&home),
             secrets: self.secret_settings(&home)?,
         })
+    }
+
+    fn list_command_surface(&self) -> Result<Vec<puffer_core::CommandSpec>> {
+        let paths = ConfigPaths::discover(self.default_workspace()?);
+        let resources = load_resources(&paths, &puffer_runner_local::LocalToolRunner::new())?;
+        Ok(command_surface(&resources)
+            .into_iter()
+            .filter(|command| !command.hidden)
+            .collect())
     }
 
     fn save_secret(&self, params: Value) -> Result<()> {
@@ -2388,6 +2412,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn workflow_fallback_methods_fail_without_daemon_runtime() {
+        let backend = BackendState::new();
+        for method in [
+            "workflow_list",
+            "workflow_backend_get_config",
+            "workflow_backend_save_config",
+            "workflow_backend_test_connection",
+            "workflow_open_ui",
+            "workflow_create",
+            "workflow_deploy",
+            "workflow_execute",
+            "workflow_list_executions",
+            "workflow_get_execution",
+            "workflow_runs_list",
+            "workflow_run_show",
+        ] {
+            let error = backend
+                .handle(EventEmitter::websocket_only(), method, json!({}))
+                .unwrap_err();
+            let message = error.to_string();
+
+            assert!(
+                message.contains("Puffer daemon"),
+                "{method} error should mention Puffer daemon: {message}"
+            );
+            assert!(
+                message.contains("configured AgentEnv workflow runtime"),
+                "{method} error should mention AgentEnv runtime: {message}"
+            );
+        }
+    }
+
     fn generated_media_images_dir(workspace_root: &Path) -> PathBuf {
         workspace_root.join(".puffer").join("media").join("images")
     }
@@ -3017,7 +3074,7 @@ mod tests {
             Some("gpt-5.4"),
             vec![
                 bash_media_tool_event(
-                    "puffer internal-tool image-generation --prompt draw --count 2",
+                    "imagegen --prompt draw --count 2",
                     serde_json::json!({
                         "jobId": "job-1",
                         "requestedCount": 2,
@@ -3818,6 +3875,13 @@ fn serde_value<T: Serialize>(value: T) -> Result<Value> {
     Ok(serde_json::to_value(value)?)
 }
 
+fn workflow_runtime_unavailable(method: &str) -> Result<Value> {
+    bail!(
+        "workflow method `{method}` is unavailable in the BackendState fallback; \
+         it requires the Puffer daemon and a configured AgentEnv workflow runtime"
+    )
+}
+
 fn stored_session_activity_status(events: &[StoredEvent]) -> &'static str {
     if latest_stored_action_requires_permission(events) {
         return "awaiting";
@@ -3829,28 +3893,15 @@ fn stored_session_activity_status(events: &[StoredEvent]) -> &'static str {
 }
 
 fn latest_stored_action_requires_permission(events: &[StoredEvent]) -> bool {
-    for event in events.iter().rev() {
-        match event {
-            StoredEvent::System { text, .. } => return text_requires_permission(text),
-            StoredEvent::Tool { output, .. } => return output_requires_permission(output),
-            StoredEvent::User { .. } | StoredEvent::Assistant { .. } => return false,
-        }
+    match events.last() {
+        Some(StoredEvent::System { text, .. }) => text_requires_permission(text),
+        Some(StoredEvent::Tool { output, .. }) => output_requires_permission(output),
+        Some(StoredEvent::User { .. } | StoredEvent::Assistant { .. }) | None => false,
     }
-    false
 }
 
 fn latest_stored_action_is_unanswered(events: &[StoredEvent]) -> bool {
-    for event in events.iter().rev() {
-        match event {
-            StoredEvent::User { .. } => return true,
-            StoredEvent::Assistant { .. }
-            | StoredEvent::System { .. }
-            | StoredEvent::Tool { .. } => {
-                return false;
-            }
-        }
-    }
-    false
+    matches!(events.last(), Some(StoredEvent::User { .. }))
 }
 
 fn text_requires_permission(text: &str) -> bool {

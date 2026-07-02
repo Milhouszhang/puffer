@@ -1,3 +1,4 @@
+use puffer_config::WorkflowBackendMode;
 use puffer_session_store::{
     AttachmentState, MessageActor, SessionStore, StoredAttachment, StoredAttachmentKind,
 };
@@ -353,8 +354,107 @@ pub(crate) struct SettingsSnapshotDto {
     pub(crate) auth: Vec<AuthProviderStatusDto>,
     pub(crate) providers: Vec<ProviderSummaryDto>,
     pub(crate) browser: BrowserSettingsDto,
+    pub(crate) workflow_backend: WorkflowBackendSettingsDto,
     pub(crate) network_proxy: NetworkProxySettingsDto,
+    pub(crate) remote: RemoteSettingsDto,
     pub(crate) secrets: SecretsSettingsDto,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkflowBackendSettingsDto {
+    pub(crate) mode: WorkflowBackendMode,
+    pub(crate) api_url: String,
+    pub(crate) ui_url: String,
+    pub(crate) workspace_id: String,
+    pub(crate) has_token: bool,
+    pub(crate) options: Vec<WorkflowBackendOptionDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteSettingsDto {
+    pub(crate) default_target: Option<String>,
+    pub(crate) ssh_hosts: Vec<SshHostSettingsDto>,
+    pub(crate) agentenv: Option<AgentEnvSettingsDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkflowBackendOptionDto {
+    pub(crate) mode: WorkflowBackendMode,
+    pub(crate) label: String,
+    pub(crate) description: String,
+    pub(crate) api_url: String,
+    pub(crate) ui_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SshHostSettingsDto {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) target: String,
+    pub(crate) port: Option<u16>,
+    pub(crate) cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentEnvSettingsDto {
+    pub(crate) enabled: bool,
+    pub(crate) api_url: String,
+    pub(crate) runner_host: Option<String>,
+    pub(crate) workspace: Option<String>,
+    pub(crate) credential_secret_id: Option<String>,
+    pub(crate) has_credential: bool,
+    pub(crate) auth_method: String,
+    pub(crate) defaults: AgentEnvSandboxDefaultsDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentEnvSandboxDefaultsDto {
+    pub(crate) sandbox_type: String,
+    pub(crate) image: String,
+    pub(crate) region: Option<String>,
+    pub(crate) cpu_millis: Option<u32>,
+    pub(crate) memory_mb: Option<u32>,
+    pub(crate) gpu_count: Option<u32>,
+    pub(crate) gpu_type: Option<String>,
+    pub(crate) max_lifetime_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SaveRemoteSettingsParams {
+    pub(crate) default_target: Option<String>,
+    #[serde(default)]
+    pub(crate) ssh_hosts: Vec<SaveSshHostParams>,
+    pub(crate) agentenv: Option<SaveAgentEnvSettingsParams>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SaveSshHostParams {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) target: String,
+    pub(crate) port: Option<u16>,
+    pub(crate) cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SaveAgentEnvSettingsParams {
+    pub(crate) enabled: bool,
+    pub(crate) api_url: String,
+    #[serde(default)]
+    pub(crate) runner_host: Option<String>,
+    pub(crate) workspace: Option<String>,
+    pub(crate) credential_secret_id: Option<String>,
+    pub(crate) auth_method: String,
+    pub(crate) defaults: AgentEnvSandboxDefaultsDto,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -515,6 +615,22 @@ pub(crate) struct SaveBrowserCaptchaSolverParams {
     pub(crate) base_url: Option<String>,
     #[serde(default)]
     pub(crate) api_key_secret_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SaveWorkflowBackendSettingsParams {
+    pub(crate) mode: WorkflowBackendMode,
+    #[serde(default)]
+    pub(crate) api_url: String,
+    #[serde(default)]
+    pub(crate) ui_url: String,
+    #[serde(default)]
+    pub(crate) workspace_id: String,
+    #[serde(default)]
+    pub(crate) api_token: Option<String>,
+    #[serde(default)]
+    pub(crate) keep_token: bool,
 }
 
 fn default_enabled() -> bool {

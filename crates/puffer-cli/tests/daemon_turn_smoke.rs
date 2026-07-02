@@ -10,6 +10,146 @@ use std::time::{Duration, Instant};
 use tungstenite::{connect, stream::MaybeTlsStream, Message, WebSocket};
 use url::Url;
 
+const TEST_SECRET_STORE_KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
+
+#[test]
+#[ignore = "workflow_backend_test_connection needs the local workflow-runtime Docker image, which CI does not build (docker_missing)"]
+fn daemon_workflow_backend_rpc_round_trip_uses_secret_and_runtime_headers() {
+    let runtime = MockWorkflowRuntimeServer::start();
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let workspace = tempdir.path().join("workspace");
+    let puffer_home = tempdir.path().join("home");
+    let puffer_config = puffer_home.join(".puffer");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(&puffer_config).expect("puffer config");
+    let discovery_cache = tempdir.path().join("discovery.json");
+    std::fs::write(&discovery_cache, discovery_cache_json()).expect("discovery cache");
+
+    let mut daemon = DaemonProcess::start_with_env(
+        &workspace,
+        &puffer_home,
+        &discovery_cache,
+        &[("PUFFER_SECRET_STORE_KEY", TEST_SECRET_STORE_KEY)],
+    );
+    let mut client = DaemonClient::connect(&daemon.handshake);
+
+    let saved = client.rpc(
+        "workflow_backend_save_config",
+        json!({
+            "mode": "local",
+            "apiUrl": format!("{}/v1/workflows", runtime.base_url),
+            "uiUrl": "http://localhost:5173/workflows?debug=1",
+            "workspaceId": " workspace-rpc ",
+            "apiToken": "runtime-token",
+            "keepToken": false,
+        }),
+    );
+    assert_eq!(saved["apiUrl"], runtime.base_url);
+    assert_eq!(saved["uiUrl"], "http://localhost:5173/workflows");
+    assert_eq!(saved["workspaceId"], "workspace-rpc");
+    assert_eq!(saved["hasToken"], true);
+    let saved_text = saved.to_string();
+    assert!(!saved_text.contains("runtime-token"));
+    assert!(!saved_text.contains("apiToken"));
+    assert!(!saved_text.contains("apiTokenSecretId"));
+
+    let raw_config =
+        std::fs::read_to_string(puffer_config.join("config.toml")).expect("read saved user config");
+    assert!(!raw_config.contains("runtime-token"));
+    assert!(raw_config.contains("api_token_secret_id"));
+
+    let snapshot = client.rpc("workflow_backend_get_config", json!({}));
+    assert_eq!(snapshot["apiUrl"], runtime.base_url);
+    assert_eq!(snapshot["workspaceId"], "workspace-rpc");
+    assert_eq!(snapshot["hasToken"], true);
+    let snapshot_text = snapshot.to_string();
+    assert!(!snapshot_text.contains("runtime-token"));
+    assert!(!snapshot_text.contains("apiToken"));
+    assert!(!snapshot_text.contains("apiTokenSecretId"));
+
+    let checked = client.rpc("workflow_backend_test_connection", json!({}));
+    assert_eq!(checked["success"], true);
+    assert_eq!(checked["runtime"]["state"], "passed");
+    assert_eq!(checked["auth"]["state"], "passed");
+    assert_eq!(checked["workspace"]["state"], "passed");
+
+    let created = client.rpc(
+        "workflow_create",
+        json!({
+            "workflow": {
+                "name": "RPC workflow",
+                "definition": {
+                    "nodes": [],
+                    "edges": []
+                }
+            }
+        }),
+    );
+    assert_eq!(created["id"], "wf-rpc");
+
+    let deployed = client.rpc("workflow_deploy", json!({ "workflowId": "wf-rpc" }));
+    assert_eq!(deployed["id"], "wf-rpc");
+    assert_eq!(deployed["status"], "active");
+
+    let executed = client.rpc(
+        "workflow_execute",
+        json!({
+            "workflowId": "wf-rpc",
+            "input": { "source": "daemon-rpc" },
+            "triggerNodeId": "smoke-webhook"
+        }),
+    );
+    assert_eq!(executed["executionId"], "exec-rpc");
+
+    let executions = client.rpc(
+        "workflow_list_executions",
+        json!({ "workflowId": "wf-rpc" }),
+    );
+    assert_eq!(executions.as_array().map(Vec::len), Some(1));
+    assert_eq!(executions[0]["id"], "exec-rpc");
+
+    let execution = client.rpc(
+        "workflow_get_execution",
+        json!({
+            "workflowId": "wf-rpc",
+            "executionId": "exec-rpc"
+        }),
+    );
+    assert_eq!(execution["id"], "exec-rpc");
+
+    let captured = runtime.join();
+    assert_eq!(captured.len(), 7);
+    assert!(captured[0].starts_with("GET /v1/workflows/node-definitions "));
+    assert_workflow_runtime_headers(&captured[0], false);
+    assert!(!captured[0].to_ascii_lowercase().contains("x-workspace-id"));
+    assert!(captured[1].starts_with("GET /v1/workflows "));
+    assert_workflow_runtime_headers(&captured[1], true);
+    assert!(captured[2].starts_with("POST /v1/workflows "));
+    assert_workflow_runtime_headers(&captured[2], true);
+    assert!(captured[2].contains(r#""name":"RPC workflow""#));
+    assert!(captured[3].starts_with("POST /v1/workflows/wf-rpc/deploy "));
+    assert_workflow_runtime_headers(&captured[3], true);
+    assert!(captured[4].starts_with("POST /v1/workflows/wf-rpc/execute "));
+    assert_workflow_runtime_headers(&captured[4], true);
+    assert!(captured[4].contains(r#""triggerNodeId":"smoke-webhook""#));
+    assert!(captured[5].starts_with("GET /v1/workflows/wf-rpc/executions "));
+    assert_workflow_runtime_headers(&captured[5], true);
+    assert!(captured[6].starts_with("GET /v1/workflows/wf-rpc/executions/exec-rpc "));
+    assert_workflow_runtime_headers(&captured[6], true);
+
+    daemon.stop();
+}
+
+fn assert_workflow_runtime_headers(request: &str, include_workspace: bool) {
+    let lower = request.to_ascii_lowercase();
+    assert!(lower.contains("x-api-key: runtime-token"));
+    if include_workspace {
+        assert!(lower.contains("x-workspace-id: workspace-rpc"));
+    } else {
+        assert!(!lower.contains("x-workspace-id"));
+    }
+}
+
 #[test]
 fn daemon_persists_staged_attachment_ids_on_user_turn() {
     let mock = MockOpenAiServer::start("Attachment reply");
@@ -844,12 +984,22 @@ struct DaemonProcess {
 
 impl DaemonProcess {
     fn start(workspace: &Path, puffer_home: &Path, discovery_cache: &Path) -> Self {
+        Self::start_with_env(workspace, puffer_home, discovery_cache, &[])
+    }
+
+    fn start_with_env(
+        workspace: &Path,
+        puffer_home: &Path,
+        discovery_cache: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("cli crate parent")
             .parent()
             .expect("repo root");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_puffer"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_puffer"));
+        command
             .args([
                 "daemon",
                 "--bind",
@@ -866,9 +1016,11 @@ impl DaemonProcess {
             .env("PUFFER_DISCOVERY_CACHE_PATH", discovery_cache)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn daemon");
+            .stderr(Stdio::piped());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("spawn daemon");
 
         let stderr = Arc::new(Mutex::new(String::new()));
         let stderr_thread = Arc::clone(&stderr);
@@ -1012,6 +1164,94 @@ struct MockOpenAiServer {
     last_chat_body: Arc<Mutex<String>>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+struct MockWorkflowRuntimeServer {
+    base_url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    handle: thread::JoinHandle<()>,
+}
+
+impl MockWorkflowRuntimeServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock workflow runtime");
+        let address = listener
+            .local_addr()
+            .expect("mock workflow runtime address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming().take(7) {
+                let mut stream = stream.expect("accept workflow runtime request");
+                let request = read_http_request(&mut stream);
+                let text = String::from_utf8_lossy(&request).to_string();
+                let path = request_path(&text);
+                captured.lock().expect("workflow requests lock").push(text);
+                match path.as_str() {
+                    "/v1/workflows/node-definitions" => {
+                        write_http_json(&mut stream, json!({ "data": [{ "type": "webhook" }] }));
+                    }
+                    "/v1/workflows" => {
+                        if request.starts_with(b"POST ") {
+                            write_http_json(
+                                &mut stream,
+                                json!({
+                                    "data": {
+                                        "id": "wf-rpc",
+                                        "name": "RPC workflow",
+                                        "status": "draft"
+                                    }
+                                }),
+                            );
+                        } else {
+                            write_http_json(&mut stream, json!({ "data": [{ "id": "wf-rpc" }] }));
+                        }
+                    }
+                    "/v1/workflows/wf-rpc/deploy" => {
+                        write_http_json(
+                            &mut stream,
+                            json!({
+                                "data": {
+                                    "id": "wf-rpc",
+                                    "status": "active"
+                                }
+                            }),
+                        );
+                    }
+                    "/v1/workflows/wf-rpc/execute" => {
+                        write_http_json(
+                            &mut stream,
+                            json!({ "data": { "executionId": "exec-rpc" } }),
+                        );
+                    }
+                    "/v1/workflows/wf-rpc/executions" => {
+                        write_http_json(
+                            &mut stream,
+                            json!({ "data": [{ "id": "exec-rpc", "status": "completed" }] }),
+                        );
+                    }
+                    "/v1/workflows/wf-rpc/executions/exec-rpc" => {
+                        write_http_json(
+                            &mut stream,
+                            json!({ "data": { "id": "exec-rpc", "status": "completed" } }),
+                        );
+                    }
+                    _ => write_http_response(&mut stream, 404, "text/plain", b"not found"),
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            requests,
+            handle,
+        }
+    }
+
+    fn join(self) -> Vec<String> {
+        self.handle.join().expect("mock workflow runtime joined");
+        let requests = self.requests.lock().expect("workflow requests lock");
+        requests.clone()
+    }
 }
 
 impl MockOpenAiServer {

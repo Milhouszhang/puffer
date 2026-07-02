@@ -425,7 +425,7 @@ fn auth_refresh_does_not_degrade_connections_without_checker() {
             classify_prompt: None,
             classify_model: None,
             action: ActionSpec::RunWorkflow {
-                slug: "demo".into(),
+                workflow_id: "demo".into(),
             },
             created_at_ms: 0,
         })
@@ -743,7 +743,7 @@ fn no_command_connector_contacts_fall_back_to_history() {
         classify_prompt: None,
         classify_model: None,
         action: ActionSpec::RunWorkflow {
-            slug: "demo".into(),
+            workflow_id: "demo".into(),
         },
         created_at_ms: 0,
     };
@@ -1031,7 +1031,7 @@ fn test_binding(
         classify_prompt: None,
         classify_model: None,
         action: ActionSpec::RunWorkflow {
-            slug: "demo".into(),
+            workflow_id: "demo".into(),
         },
         created_at_ms: 0,
     }

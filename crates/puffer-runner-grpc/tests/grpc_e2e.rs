@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -50,7 +50,12 @@ fn pick_free_port() -> u16 {
 
 fn spawn_server(runner: Arc<dyn ToolRunner>) -> ServerHandle {
     let (addr, listener) = bind_loopback_listener();
-    spawn_server_with_listener(runner, addr, listener, None)
+    spawn_server_with_listener(runner, addr, listener, None, None)
+}
+
+fn spawn_server_with_idempotency_dir(runner: Arc<dyn ToolRunner>, dir: PathBuf) -> ServerHandle {
+    let (addr, listener) = bind_loopback_listener();
+    spawn_server_with_listener(runner, addr, listener, None, Some(dir))
 }
 
 /// Like [`spawn_server`] but installs a custom `BidiElicitationRouter` on
@@ -61,12 +66,12 @@ fn spawn_server_with_router(
     router: Arc<BidiElicitationRouter>,
 ) -> ServerHandle {
     let (addr, listener) = bind_loopback_listener();
-    spawn_server_with_listener(runner, addr, listener, Some(router))
+    spawn_server_with_listener(runner, addr, listener, Some(router), None)
 }
 
 fn spawn_server_on_port(runner: Arc<dyn ToolRunner>, port: u16) -> ServerHandle {
     let (addr, listener) = bind_listener_on_port(port);
-    spawn_server_with_listener(runner, addr, listener, None)
+    spawn_server_with_listener(runner, addr, listener, None, None)
 }
 
 fn bind_loopback_listener() -> (SocketAddr, TcpListener) {
@@ -92,6 +97,7 @@ fn spawn_server_with_listener(
     addr: SocketAddr,
     listener: TcpListener,
     router: Option<Arc<BidiElicitationRouter>>,
+    idempotency_dir: Option<PathBuf>,
 ) -> ServerHandle {
     let endpoint = format!("http://{addr}");
 
@@ -107,6 +113,13 @@ fn spawn_server_with_listener(
         None => ToolRunnerService::new(runner),
     }
     .with_auth_token(Some(TEST_TOKEN.to_string()));
+    let service = if let Some(dir) = idempotency_dir {
+        service
+            .with_idempotency_dir(dir)
+            .expect("open idempotency dir")
+    } else {
+        service
+    };
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
 
@@ -164,6 +177,7 @@ fn capture(buffer: Arc<Mutex<CapturedOutput>>) -> impl ChunkSink {
 
 fn make_request(tool_id: &str, cwd: &Path, input: serde_json::Value) -> ToolRequest {
     ToolRequest {
+        request_id: None,
         tool_id: tool_id.to_string(),
         cwd: cwd.to_path_buf(),
         working_dirs: Vec::new(),
@@ -270,6 +284,80 @@ fn run_scenarios(runner: &dyn ToolRunner, workspace: &Path) -> HashMap<&'static 
     out.insert("Sleep", sleep);
 
     out
+}
+
+#[test]
+fn execute_tool_replays_duplicate_request_id_without_reexecution() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    let server = spawn_server(Arc::new(LocalToolRunner::new()));
+    let remote = RemoteToolRunner::connect(&server.endpoint, Some(TEST_TOKEN)).expect("connect");
+
+    let marker = workspace.join("once.txt");
+    let mut request = make_request(
+        "Bash",
+        workspace,
+        serde_json::json!({
+            "command": format!("printf x >> {}; cat {}", marker.display(), marker.display()),
+        }),
+    );
+    request.request_id = Some("duplicate-bash-request".into());
+
+    let first = remote
+        .execute_tool(request.clone(), &mut NullChunkSink)
+        .expect("first execution");
+    let second = remote
+        .execute_tool(request, &mut NullChunkSink)
+        .expect("duplicate execution");
+
+    assert_eq!(second.stdout, first.stdout);
+    assert!(first.stdout.contains("\"stdout\": \"x\""));
+    assert_eq!(
+        std::fs::read_to_string(marker).expect("marker contents"),
+        "x"
+    );
+}
+
+#[test]
+fn execute_tool_replays_duplicate_request_id_after_runner_restart() {
+    let temp = tempdir().expect("tempdir");
+    let workspace = temp.path();
+    let idempotency_dir = workspace.join("idempotency");
+    let marker = workspace.join("durable-once.txt");
+    let mut request = make_request(
+        "Bash",
+        workspace,
+        serde_json::json!({
+            "command": format!("printf x >> {}; cat {}", marker.display(), marker.display()),
+        }),
+    );
+    request.request_id = Some("durable-duplicate-bash-request".into());
+
+    {
+        let server = spawn_server_with_idempotency_dir(
+            Arc::new(LocalToolRunner::new()),
+            idempotency_dir.clone(),
+        );
+        let remote =
+            RemoteToolRunner::connect(&server.endpoint, Some(TEST_TOKEN)).expect("connect");
+        let first = remote
+            .execute_tool(request.clone(), &mut NullChunkSink)
+            .expect("first execution");
+        assert!(first.stdout.contains("\"stdout\": \"x\""));
+    }
+
+    let server =
+        spawn_server_with_idempotency_dir(Arc::new(LocalToolRunner::new()), idempotency_dir);
+    let remote = RemoteToolRunner::connect(&server.endpoint, Some(TEST_TOKEN)).expect("reconnect");
+    let second = remote
+        .execute_tool(request, &mut NullChunkSink)
+        .expect("duplicate execution after restart");
+
+    assert!(second.stdout.contains("\"stdout\": \"x\""));
+    assert_eq!(
+        std::fs::read_to_string(marker).expect("marker contents"),
+        "x"
+    );
 }
 
 /// Read-state-updates compare cleanly only when both runners observe the

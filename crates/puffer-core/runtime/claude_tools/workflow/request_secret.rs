@@ -40,8 +40,29 @@ struct RequestSecretInput {
     prompt: Option<String>,
 }
 
-/// Searches, creates, or requests one encrypted user secret.
+/// Controls whether a secret write (create/collect) may overwrite an existing
+/// record. The in-process agent path allows it; the cross-process broker path
+/// uses insert-only so a connector cannot silently clobber a stored secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretWritePolicy {
+    AllowOverwrite,
+    InsertOnly,
+}
+
+/// Searches, creates, or requests one encrypted user secret (in-process agent
+/// path: writes may overwrite an existing record).
 pub fn execute_request_secret(state: &mut AppState, cwd: &Path, input: Value) -> Result<String> {
+    execute_request_secret_with_policy(state, cwd, input, SecretWritePolicy::AllowOverwrite)
+}
+
+/// Same as [`execute_request_secret`] but with an explicit write policy, so the
+/// internal-tool broker path can require insert-only writes.
+pub fn execute_request_secret_with_policy(
+    state: &mut AppState,
+    cwd: &Path,
+    input: Value,
+    write_policy: SecretWritePolicy,
+) -> Result<String> {
     let parsed = parse_request_secret_input(input)?;
     let action = parsed
         .action
@@ -56,8 +77,8 @@ pub fn execute_request_secret(state: &mut AppState, cwd: &Path, input: Value) ->
     match action.as_str() {
         "request" | "get" | "reveal" => request_secret(state, vault, parsed),
         "search" | "list" => search_secrets(vault, parsed),
-        "create" => create_secret(state, vault, parsed),
-        "collect" => collect_secret(state, vault, parsed),
+        "create" => create_secret(state, vault, parsed, write_policy),
+        "collect" => collect_secret(state, vault, parsed, write_policy),
         other => bail!("unsupported RequestSecret action `{other}`"),
     }
 }
@@ -123,14 +144,14 @@ fn request_secret(
         .filter(|value| !value.is_empty())
         .context("RequestSecret requires `id` or `label`")?;
     let secret = vault.reveal(&selector)?;
-    if !state.secret_access_state.allows(&secret.id) {
+    if !state.secret_session_granted(&secret.id) {
         match prompt_for_secret(&secret.id, &secret.label, parsed.reason.as_deref()) {
             PermissionPromptAction::AllowOnce => {}
             PermissionPromptAction::AllowSession => {
-                state.secret_access_state.allow_secret(secret.id.clone());
+                state.grant_secret_for_session(secret.id.clone());
             }
             PermissionPromptAction::AllowAllSession => {
-                state.secret_access_state.allow_all();
+                state.grant_all_secrets_for_session();
             }
             PermissionPromptAction::Deny => bail!("permission denied by user"),
         }
@@ -187,10 +208,23 @@ fn push_search_hint(parts: &mut Vec<String>, value: Option<&str>) {
     }
 }
 
+/// Writes a secret honoring the caller's overwrite policy.
+fn put_secret(
+    vault: &SecretVault,
+    write_policy: SecretWritePolicy,
+    upsert: SecretUpsert,
+) -> Result<SecretSummary> {
+    match write_policy {
+        SecretWritePolicy::AllowOverwrite => vault.put(upsert),
+        SecretWritePolicy::InsertOnly => vault.put_insert_only(upsert),
+    }
+}
+
 fn create_secret(
     state: &AppState,
     vault: SecretVault,
     parsed: RequestSecretInput,
+    write_policy: SecretWritePolicy,
 ) -> Result<String> {
     let label = parsed
         .label
@@ -212,15 +246,19 @@ fn create_secret(
         | PermissionPromptAction::AllowAllSession => {}
         PermissionPromptAction::Deny => bail!("permission denied by user"),
     }
-    let summary = vault.put(SecretUpsert {
-        id: parsed.id,
-        label,
-        description: parsed.description,
-        value,
-        username: parsed.username,
-        origin: parsed.origin,
-        source: "agent".to_string(),
-    })?;
+    let summary = put_secret(
+        &vault,
+        write_policy,
+        SecretUpsert {
+            id: parsed.id,
+            label,
+            description: parsed.description,
+            value,
+            username: parsed.username,
+            origin: parsed.origin,
+            source: "agent".to_string(),
+        },
+    )?;
     Ok(serde_json::to_string_pretty(&json!({
         "secret": secret_summary_json(summary),
         "created": true,
@@ -231,6 +269,7 @@ fn collect_secret(
     state: &mut AppState,
     vault: SecretVault,
     parsed: RequestSecretInput,
+    write_policy: SecretWritePolicy,
 ) -> Result<String> {
     let label = parsed
         .label
@@ -249,15 +288,19 @@ fn collect_secret(
     })
     .context("RequestSecret collect requires an active user question prompt")?;
     let value = collect_secret_answer(&response, &question)?;
-    let summary = vault.put(SecretUpsert {
-        id: parsed.id,
-        label,
-        description: parsed.description,
-        value: value.clone(),
-        username: parsed.username,
-        origin: parsed.origin,
-        source: "agent".to_string(),
-    })?;
+    let summary = put_secret(
+        &vault,
+        write_policy,
+        SecretUpsert {
+            id: parsed.id,
+            label,
+            description: parsed.description,
+            value: value.clone(),
+            username: parsed.username,
+            origin: parsed.origin,
+            source: "agent".to_string(),
+        },
+    )?;
     let token = register_masked_secret(state, value)?;
     Ok(serde_json::to_string_pretty(&json!({
         "secret": token,
@@ -274,7 +317,9 @@ fn collect_secret_prompt(label: &str, prompt: Option<&str>) -> String {
         .unwrap_or_else(|| {
             format!("Enter the secret value to save as encrypted Puffer secret `{label}`.")
         });
-    format!("{prompt}\n\nPuffer will save this value as encrypted secret `{label}` and return only a placeholder to the agent.")
+    format!(
+        "{prompt}\n\nPuffer will save this value as encrypted secret `{label}` and return only a placeholder to the agent."
+    )
 }
 
 fn collect_secret_answer(response: &UserQuestionPromptResponse, question: &str) -> Result<String> {
@@ -742,5 +787,369 @@ mod tests {
             .unwrap();
         assert_eq!(summary.origin.as_deref(), Some("https://ridge.com"));
         assert_eq!(summary.username.as_deref(), Some("user@example.com"));
+    }
+
+    #[test]
+    fn request_secret_session_grant_is_per_secret_and_allow_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let _secret_env = secret_test_env(dir.path());
+        let mut state = temp_state(dir.path());
+        let paths = ConfigPaths::discover(dir.path());
+        ensure_workspace_dirs(&paths).unwrap();
+        let vault = SecretVault::open(SecretVault::default_path(&paths.user_config_dir)).unwrap();
+        for label in ["Alpha", "Beta"] {
+            vault
+                .put(SecretUpsert {
+                    id: None,
+                    label: label.to_string(),
+                    description: None,
+                    value: format!("raw-{label}"),
+                    username: None,
+                    origin: None,
+                    source: "manual".to_string(),
+                })
+                .unwrap();
+        }
+
+        // Approving Alpha for the session must not require re-approval for Alpha,
+        // but must NOT silently approve Beta.
+        with_permission_prompt_handler(
+            |_| PermissionPromptAction::AllowSession,
+            || execute_request_secret(&mut state, dir.path(), json!({"label": "Alpha"})),
+        )
+        .unwrap();
+        // Alpha again: a Deny handler proves no prompt fires (already granted).
+        with_permission_prompt_handler(
+            |_| PermissionPromptAction::Deny,
+            || execute_request_secret(&mut state, dir.path(), json!({"label": "Alpha"})),
+        )
+        .expect("granted secret should not re-prompt");
+        // Beta: not granted yet, so the Deny handler rejects it.
+        let beta_denied = with_permission_prompt_handler(
+            |_| PermissionPromptAction::Deny,
+            || execute_request_secret(&mut state, dir.path(), json!({"label": "Beta"})),
+        );
+        assert!(
+            beta_denied.is_err(),
+            "ungranted secret must require approval"
+        );
+
+        // Allow-all then covers Beta without a further prompt.
+        with_permission_prompt_handler(
+            |_| PermissionPromptAction::AllowAllSession,
+            || execute_request_secret(&mut state, dir.path(), json!({"label": "Beta"})),
+        )
+        .unwrap();
+        with_permission_prompt_handler(
+            |_| PermissionPromptAction::Deny,
+            || execute_request_secret(&mut state, dir.path(), json!({"label": "Beta"})),
+        )
+        .expect("allow-all should cover every secret for the session");
+    }
+
+    #[test]
+    fn request_secret_via_internal_path_returns_placeholder_without_raw_value() {
+        use crate::runtime::internal_tool_permissions::execute_internal_tool_request;
+        use puffer_provider_registry::{AuthStore, ProviderRegistry};
+        use puffer_resources::LoadedResources;
+        use puffer_tools::internal_permissions::InternalToolExecutionRequest;
+        use puffer_tools::ToolRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _secret_env = secret_test_env(dir.path());
+        let mut state = temp_state(dir.path());
+        let paths = ConfigPaths::discover(dir.path());
+        ensure_workspace_dirs(&paths).unwrap();
+        let vault = SecretVault::open(SecretVault::default_path(&paths.user_config_dir)).unwrap();
+        vault
+            .put(SecretUpsert {
+                id: None,
+                label: "Demo".to_string(),
+                description: None,
+                value: "raw-secret".to_string(),
+                username: Some("demo@example.com".to_string()),
+                origin: Some("https://example.com/login".to_string()),
+                source: "manual".to_string(),
+            })
+            .unwrap();
+
+        let resources = LoadedResources::default();
+        let registry = ToolRegistry::from_resources(&resources);
+        let providers = ProviderRegistry::new();
+        let auth_store = AuthStore::default();
+        let discovery = puffer_media::ExactMediaDiscoveryCache::empty();
+
+        let response = with_permission_prompt_handler(
+            |_| PermissionPromptAction::AllowOnce,
+            || {
+                execute_internal_tool_request(
+                    &mut state,
+                    &resources,
+                    &registry,
+                    &providers,
+                    &auth_store,
+                    &discovery,
+                    dir.path(),
+                    InternalToolExecutionRequest {
+                        tool_id: "request-secret".to_string(),
+                        input: json!({"action": "request", "label": "Demo"}),
+                    },
+                )
+            },
+        );
+
+        assert!(response.success, "reason: {:?}", response.reason);
+        let output = response.output.unwrap_or_default();
+        assert!(output.contains("PUFFER_SECRET_"));
+        assert!(output.contains("demo@example.com"));
+        assert!(output.contains("https://example.com/login"));
+        assert!(!output.contains("raw-secret"));
+    }
+
+    /// Drives one RequestSecret call through the cross-process internal-tool
+    /// entry point, returning the broker response.
+    fn call_internal_request_secret(
+        state: &mut AppState,
+        cwd: &Path,
+        input: Value,
+    ) -> puffer_tools::internal_permissions::InternalToolExecutionResponse {
+        use crate::runtime::internal_tool_permissions::execute_internal_tool_request;
+        use puffer_provider_registry::{AuthStore, ProviderRegistry};
+        use puffer_resources::LoadedResources;
+        use puffer_tools::internal_permissions::InternalToolExecutionRequest;
+        use puffer_tools::ToolRegistry;
+
+        let resources = LoadedResources::default();
+        let registry = ToolRegistry::from_resources(&resources);
+        let providers = ProviderRegistry::new();
+        let auth_store = AuthStore::default();
+        let discovery = puffer_media::ExactMediaDiscoveryCache::empty();
+        execute_internal_tool_request(
+            state,
+            &resources,
+            &registry,
+            &providers,
+            &auth_store,
+            &discovery,
+            cwd,
+            InternalToolExecutionRequest {
+                tool_id: "request-secret".to_string(),
+                input,
+            },
+        )
+    }
+
+    fn open_test_vault(cwd: &Path) -> SecretVault {
+        let paths = ConfigPaths::discover(cwd);
+        ensure_workspace_dirs(&paths).unwrap();
+        SecretVault::open(SecretVault::default_path(&paths.user_config_dir)).unwrap()
+    }
+
+    // Usability: `search` over the internal path returns non-secret metadata and
+    // never a placeholder or raw value, and needs no approval prompt.
+    #[test]
+    fn request_secret_internal_search_returns_metadata_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let _secret_env = secret_test_env(dir.path());
+        let mut state = temp_state(dir.path());
+        open_test_vault(dir.path())
+            .put(SecretUpsert {
+                id: None,
+                label: "Deploy token".to_string(),
+                description: Some("production deploy token".to_string()),
+                value: "raw-deploy".to_string(),
+                username: None,
+                origin: Some("https://deploy.example".to_string()),
+                source: "manual".to_string(),
+            })
+            .unwrap();
+
+        let response = call_internal_request_secret(
+            &mut state,
+            dir.path(),
+            json!({"action": "search", "query": "production"}),
+        );
+
+        assert!(response.success, "reason: {:?}", response.reason);
+        let output = response.output.unwrap_or_default();
+        assert!(output.contains("Deploy token"));
+        assert!(!output.contains("raw-deploy"));
+        assert!(!output.contains("PUFFER_SECRET_"));
+    }
+
+    // Usability: `collect` over the internal path prompts, stores the typed value,
+    // and returns only a placeholder (never the raw value).
+    #[test]
+    fn request_secret_internal_collect_stores_and_masks() {
+        use crate::runtime::UserQuestionPromptResponse;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _secret_env = secret_test_env(dir.path());
+        let mut state = temp_state(dir.path());
+
+        let response = with_user_question_prompt_handler(
+            |request| {
+                let question = request.questions[0]["question"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                UserQuestionPromptResponse {
+                    answers: serde_json::Map::from_iter([(question, json!("collected-raw-value"))]),
+                    annotations: serde_json::Map::new(),
+                }
+            },
+            || {
+                call_internal_request_secret(
+                    &mut state,
+                    dir.path(),
+                    json!({"action": "collect", "name": "Collected", "prompt": "Enter it"}),
+                )
+            },
+        );
+
+        assert!(response.success, "reason: {:?}", response.reason);
+        let output = response.output.unwrap_or_default();
+        assert!(output.contains("PUFFER_SECRET_"));
+        assert!(!output.contains("collected-raw-value"));
+        // The value is actually persisted and retrievable.
+        assert_eq!(
+            open_test_vault(dir.path())
+                .reveal("Collected")
+                .unwrap()
+                .value,
+            "collected-raw-value"
+        );
+    }
+
+    // Security: `collect` over the internal path is insert-only too (it shares the
+    // same write policy as `create`), so a connector cannot overwrite an existing
+    // secret by collecting under a colliding name.
+    #[test]
+    fn request_secret_internal_collect_is_insert_only() {
+        use crate::runtime::UserQuestionPromptResponse;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _secret_env = secret_test_env(dir.path());
+        let mut state = temp_state(dir.path());
+
+        let first = with_user_question_prompt_handler(
+            |req| {
+                let q = req.questions[0]["question"].as_str().unwrap().to_string();
+                UserQuestionPromptResponse {
+                    answers: serde_json::Map::from_iter([(q, json!("first-value"))]),
+                    annotations: serde_json::Map::new(),
+                }
+            },
+            || {
+                call_internal_request_secret(
+                    &mut state,
+                    dir.path(),
+                    json!({"action": "collect", "name": "Mailbox"}),
+                )
+            },
+        );
+        assert!(first.success, "reason: {:?}", first.reason);
+        assert_eq!(
+            open_test_vault(dir.path()).reveal("Mailbox").unwrap().value,
+            "first-value"
+        );
+
+        // A second collect under the same name is refused; the value is unchanged.
+        let second = with_user_question_prompt_handler(
+            |req| {
+                let q = req.questions[0]["question"].as_str().unwrap().to_string();
+                UserQuestionPromptResponse {
+                    answers: serde_json::Map::from_iter([(q, json!("second-value"))]),
+                    annotations: serde_json::Map::new(),
+                }
+            },
+            || {
+                call_internal_request_secret(
+                    &mut state,
+                    dir.path(),
+                    json!({"action": "collect", "name": "Mailbox"}),
+                )
+            },
+        );
+        assert!(!second.success, "collect overwrite by name must be refused");
+        assert_eq!(
+            open_test_vault(dir.path()).reveal("Mailbox").unwrap().value,
+            "first-value"
+        );
+    }
+
+    // Security (Fix A): writes over the internal path are insert-only. A child can
+    // create a new secret, but cannot overwrite an existing one — neither by an
+    // injected `id` nor by reusing the label of a prior agent-created secret.
+    #[test]
+    fn request_secret_internal_create_is_insert_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let _secret_env = secret_test_env(dir.path());
+        let mut state = temp_state(dir.path());
+
+        // First create inserts a new secret.
+        let token1 = register_masked_secret(&state, "value-1".to_string()).unwrap();
+        let first = with_permission_prompt_handler(
+            |_| PermissionPromptAction::AllowOnce,
+            || {
+                call_internal_request_secret(
+                    &mut state,
+                    dir.path(),
+                    json!({"action": "create", "name": "Token", "value": token1}),
+                )
+            },
+        );
+        assert!(first.success, "reason: {:?}", first.reason);
+        assert_eq!(
+            open_test_vault(dir.path()).reveal("Token").unwrap().value,
+            "value-1"
+        );
+
+        // A second create reusing the same label is refused, value unchanged.
+        let token2 = register_masked_secret(&state, "value-2".to_string()).unwrap();
+        let second = with_permission_prompt_handler(
+            |_| PermissionPromptAction::AllowOnce,
+            || {
+                call_internal_request_secret(
+                    &mut state,
+                    dir.path(),
+                    json!({"action": "create", "name": "Token", "value": token2}),
+                )
+            },
+        );
+        assert!(!second.success, "overwrite by label must be refused");
+        assert_eq!(
+            open_test_vault(dir.path()).reveal("Token").unwrap().value,
+            "value-1"
+        );
+
+        // An injected id targeting an existing secret is also refused.
+        let victim = open_test_vault(dir.path())
+            .put(SecretUpsert {
+                id: None,
+                label: "Victim".to_string(),
+                description: None,
+                value: "victim-value".to_string(),
+                username: None,
+                origin: None,
+                source: "manual".to_string(),
+            })
+            .unwrap();
+        let token3 = register_masked_secret(&state, "value-3".to_string()).unwrap();
+        let third = with_permission_prompt_handler(
+            |_| PermissionPromptAction::AllowOnce,
+            || {
+                call_internal_request_secret(
+                    &mut state,
+                    dir.path(),
+                    json!({"action": "create", "id": victim.id, "name": "Other", "value": token3}),
+                )
+            },
+        );
+        assert!(!third.success, "overwrite by injected id must be refused");
+        assert_eq!(
+            open_test_vault(dir.path()).reveal("Victim").unwrap().value,
+            "victim-value"
+        );
     }
 }

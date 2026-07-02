@@ -37,7 +37,11 @@ impl MediaPermissionSnapshot {
     /// Promotes each media kind the batch demands to `Allow` when `authorize`
     /// approves it. `authorize(tool_id)` is the injected permission check
     /// (`true` = approved). Pure aside from the injected closure.
-    fn authorize_media_batch(&mut self, commands: &[&str], mut authorize: impl FnMut(&str) -> bool) {
+    fn authorize_media_batch(
+        &mut self,
+        commands: &[&str],
+        mut authorize: impl FnMut(&str) -> bool,
+    ) {
         let demand = batch_media_demand(commands, self);
         if demand.is_empty() {
             return;
@@ -71,9 +75,8 @@ pub(crate) struct MediaCapabilityContext<'a> {
     pub providers: &'a ProviderRegistry,
     pub auth_store: &'a AuthStore,
     pub discovery_cache: &'a ExactMediaDiscoveryCache,
-    pub process_store: Option<
-        &'a std::sync::Arc<std::sync::Mutex<crate::runtime::process_store::ProcessStore>>,
-    >,
+    pub process_store:
+        Option<&'a std::sync::Arc<std::sync::Mutex<crate::runtime::process_store::ProcessStore>>>,
 }
 
 /// Owned media-capability data captured from `AppState` before a parallel batch
@@ -223,7 +226,9 @@ pub(crate) fn execute_media_internal_tool(
     cwd: &std::path::Path,
     request: InternalToolExecutionRequest,
 ) -> InternalToolExecutionResponse {
-    use crate::runtime::claude_tools::workflow::{image_generation, media_capabilities, video_generation};
+    use crate::runtime::claude_tools::workflow::{
+        image_generation, media_capabilities, video_generation,
+    };
     let canonical = canonical_tool_name(&request.tool_id);
     match canonical.as_str() {
         "imagegeneration" => run_media_tool(ctx.permissions.image, &canonical, || {
@@ -300,6 +305,18 @@ pub(crate) fn execute_subscriber_internal_tool(
     request: InternalToolExecutionRequest,
 ) -> InternalToolExecutionResponse {
     use crate::runtime::claude_tools::workflow::{email_configure, telegram_login};
+    // `PUFFER_SECRET_...` placeholders are only resolved on the serial path (which
+    // holds `&AppState`); a parallel worker has no secret store. Rather than
+    // forward a literal placeholder to the connector (a broken login, and a value
+    // the redaction-less parallel path could surface), route secret-bearing calls
+    // back to the serial path where the placeholder is expanded and the result
+    // redacted.
+    if crate::runtime::secrets::contains_secret_placeholder(&request.input) {
+        return InternalToolExecutionResponse::failure(
+            "internal tool input references a Puffer secret placeholder, which is only \
+             resolved when the tool runs as a single command; rerun it outside a parallel batch",
+        );
+    }
     match canonical_tool_name(&request.tool_id).as_str() {
         "telegram" => run_subscriber_tool(permissions.telegram, "Telegram", || {
             telegram_login::execute_telegram(cwd, request.input)
@@ -377,7 +394,7 @@ pub(crate) fn execute_internal_tool_request(
     cwd: &Path,
     request: InternalToolExecutionRequest,
 ) -> InternalToolExecutionResponse {
-    internal_tool_execution_response(execute_internal_tool_request_result(
+    let response = internal_tool_execution_response(execute_internal_tool_request_result(
         state,
         resources,
         registry,
@@ -386,7 +403,38 @@ pub(crate) fn execute_internal_tool_request(
         discovery_cache,
         cwd,
         request,
-    ))
+    ));
+    // Redact any raw secret value before the response crosses the broker back to
+    // the child: non-RequestSecret inputs are expanded to raw values, so a tool
+    // error (or output) that embeds offending input could otherwise leak
+    // plaintext. Mirrors the redaction the main tool executor applies.
+    redact_internal_execution_response(state, response)
+}
+
+/// Redacts known raw secret values from an internal-tool response (success
+/// output, error reason, and media diagnostic) using their registered
+/// placeholders, so plaintext never reaches the child process.
+fn redact_internal_execution_response(
+    state: &AppState,
+    mut response: InternalToolExecutionResponse,
+) -> InternalToolExecutionResponse {
+    if let Some(output) = response.output.take() {
+        response.output = Some(crate::runtime::secrets::redact_known_secrets(
+            state, &output,
+        ));
+    }
+    if let Some(reason) = response.reason.take() {
+        response.reason = Some(crate::runtime::secrets::redact_known_secrets(
+            state, &reason,
+        ));
+    }
+    if let Some(diagnostic) = response.diagnostic.take() {
+        response.diagnostic = Some(crate::runtime::secrets::redact_json_value(
+            state,
+            &diagnostic,
+        ));
+    }
+    response
 }
 
 /// Maps an internal media tool result into a wire response, preserving media
@@ -439,7 +487,27 @@ fn execute_internal_tool_request_result(
                 .unwrap_or_else(|| "permission denied".to_string())
         );
     }
-    let workflow_tool = match canonical_tool_name(&request.tool_id).as_str() {
+    let canonical = canonical_tool_name(&request.tool_id);
+    // RequestSecret manages `PUFFER_SECRET_...` placeholders itself (its `create`
+    // action requires the value to stay a single placeholder), so it is exempt
+    // from input expansion — mirroring `preserves_secret_placeholders` in the
+    // main tool executor. Writes are insert-only: a connector over the broker may
+    // create/collect new secrets but must never overwrite an existing one (the
+    // parent vault refuses an overwrite rather than replacing it behind a prompt
+    // that only shows the child-chosen label).
+    if canonical == "requestsecret" {
+        return crate::runtime::claude_tools::workflow::request_secret::execute_request_secret_with_policy(
+            state,
+            cwd,
+            request.input,
+            crate::runtime::claude_tools::workflow::request_secret::SecretWritePolicy::InsertOnly,
+        );
+    }
+    // Expand `PUFFER_SECRET_...` placeholders in the child's input so internal
+    // tools can consume a secret the agent already requested, without the raw
+    // value ever leaving the parent process.
+    let input = crate::runtime::secrets::expand_secret_placeholders(state, &request.input)?;
+    let workflow_tool = match canonical.as_str() {
         "email" => "Email",
         "requestuserbrowseraction" => "requestuserbrowseraction",
         "telegram" => "Telegram",
@@ -447,7 +515,7 @@ fn execute_internal_tool_request_result(
             return crate::runtime::claude_tools::workflow::image_generation::execute_image_generation(
                 state.config.media.image.as_ref(),
                 cwd,
-                request.input,
+                input,
                 Some(crate::runtime::claude_tools::workflow::image_generation::ImageGenerationMediaContext {
                     providers,
                     auth_store,
@@ -459,7 +527,7 @@ fn execute_internal_tool_request_result(
             return crate::runtime::claude_tools::workflow::video_generation::execute_video_generation(
                 state.config.media.video.as_ref(),
                 cwd,
-                request.input,
+                input,
                 Some(crate::runtime::claude_tools::workflow::video_generation::VideoGenerationMediaContext {
                     providers,
                     auth_store,
@@ -472,7 +540,7 @@ fn execute_internal_tool_request_result(
                 providers,
                 auth_store,
                 discovery_cache,
-                request.input,
+                input,
             );
         }
         other => anyhow::bail!("unknown internal executable tool `{other}`"),
@@ -482,7 +550,7 @@ fn execute_internal_tool_request_result(
         resources,
         cwd,
         workflow_tool,
-        request.input,
+        input,
         None,
     )
 }
@@ -538,6 +606,11 @@ fn resolve_internal_tool_permission_result(
     match canonical_tool_name(&request.tool_id).as_str() {
         "browser" => resolve_browser_permission(state, resources, registry, cwd, request.input),
         "mediacapabilities" => Ok(InternalToolPermissionResponse::allow()),
+        // RequestSecret runs its own per-secret approval prompt inside execution
+        // (it needs the vault-resolved secret id, which the preflight does not
+        // have), so the preflight allows it through to avoid a double prompt. No
+        // secret is revealed without a matching execution request.
+        "requestsecret" => Ok(InternalToolPermissionResponse::allow()),
         "email"
         | "imagegeneration"
         | "requestuserbrowseraction"
@@ -822,8 +895,18 @@ mod tests {
         // Regression for issue #723: the parallel-batch broker used to bail on every
         // non-media internal tool. An Allowed telegram call must now route to its
         // handler instead of returning the "not available in a parallel batch"
-        // guidance. With no subscription runtime in a unit test the handler then
-        // fails — but on the subscriber-manager path, proving it routed.
+        // guidance. Routing is proven by a *handler-side* failure — the telegram
+        // handler loads its subscriber manifest (and, if found, talks to the
+        // process-global subscription manager) — as opposed to the broker's
+        // parallel-batch refusal.
+        //
+        // We deliberately accept either handler error: with an empty tempdir the
+        // manifest lookup fails first ("subscriber manifest not found"); where a
+        // manifest is discoverable it reaches the manager and reports
+        // "subscription runtime is not running". Asserting only the latter is a
+        // trap: it forces the manifest to resolve, and the handler then blocks on
+        // the manager channel whenever an earlier test has installed a real
+        // manager into the `OnceLock` — hanging the whole suite.
         let dir = tempdir().unwrap();
         let response = execute_subscriber_internal_tool(
             SubscriberPermissionSnapshot {
@@ -843,8 +926,38 @@ mod tests {
             "allowed telegram should route to its handler, got: {reason}"
         );
         assert!(
-            reason.contains("subscription runtime is not running"),
-            "expected the subscriber-manager error (proves it routed), got: {reason}"
+            reason.contains("subscriber manifest not found")
+                || reason.contains("subscription runtime is not running"),
+            "expected a telegram subscriber-handler error (proves it routed), got: {reason}"
+        );
+    }
+
+    #[test]
+    fn subscriber_parallel_batch_refuses_secret_placeholder_input() {
+        // A `PUFFER_SECRET_` placeholder is only resolved on the serial path (which
+        // holds `&AppState`). In a parallel batch the worker has no secret store, so
+        // a secret-bearing call must be refused with guidance to rerun serially —
+        // never forwarded as a literal placeholder to the connector.
+        let dir = tempdir().unwrap();
+        let response = execute_subscriber_internal_tool(
+            SubscriberPermissionSnapshot {
+                telegram: ToolPermissionBehavior::Allow,
+                email: ToolPermissionBehavior::Allow,
+            },
+            dir.path(),
+            InternalToolExecutionRequest {
+                tool_id: "telegram".to_string(),
+                input: json!({
+                    "action": "import_desktop",
+                    "passcode": "PUFFER_SECRET_deadbeefdeadbeefdeadbeefdeadbeef"
+                }),
+            },
+        );
+        assert!(!response.success);
+        let reason = response.reason.unwrap_or_default();
+        assert!(
+            reason.contains("secret placeholder"),
+            "expected secret-placeholder guidance, got: {reason}"
         );
     }
 
@@ -1267,7 +1380,10 @@ mod tests {
             },
         );
         assert!(!resp.success);
-        assert!(resp.reason.unwrap().contains("not available in a parallel batch"));
+        assert!(resp
+            .reason
+            .unwrap()
+            .contains("not available in a parallel batch"));
     }
 
     fn snapshot_all_ask() -> MediaPermissionSnapshot {
@@ -1331,7 +1447,11 @@ mod tests {
         let mut perms = snapshot_all_ask();
         perms.authorize_media_batch(&["imagegen '{}'"], |_| true);
         assert_eq!(perms.image, ToolPermissionBehavior::Allow);
-        assert_eq!(perms.video, ToolPermissionBehavior::Ask, "video not demanded → unchanged");
+        assert_eq!(
+            perms.video,
+            ToolPermissionBehavior::Ask,
+            "video not demanded → unchanged"
+        );
     }
 
     #[test]

@@ -85,6 +85,7 @@ pub(crate) use session::{
     handle_remote_env_command, handle_session_command, handle_tag_command, render_memory_panel,
     render_session_overlay, render_session_panel,
 };
+pub use session::{sanitize_tool_invocation_input, sanitized_tool_invocation_input};
 pub use tasks::TaskActionEntry;
 pub(crate) use tasks::{handle_tasks_command, render_task_actions, render_tasks_panel_text};
 pub(crate) use terminal_setup::{

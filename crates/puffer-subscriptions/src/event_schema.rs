@@ -53,6 +53,10 @@ pub struct EventField {
     /// Optional enum/display values.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<EventFieldValue>,
+    /// Optional dynamic options source identifier (e.g. "connector_chats").
+    /// When set, the UI fetches options at runtime and static `values` may be empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options_source: Option<String>,
 }
 
 /// Supported event field value types.
@@ -193,7 +197,10 @@ fn validate_operator_set(field: &EventField) -> Result<()> {
             );
         }
     }
-    if field.field_type == EventFieldType::Enum && field.values.is_empty() {
+    if field.field_type == EventFieldType::Enum
+        && field.values.is_empty()
+        && field.options_source.is_none()
+    {
         anyhow::bail!("enum field `{}` must declare values", field.path);
     }
     Ok(())
@@ -293,6 +300,7 @@ mod tests {
                         EventOperator::Matches,
                     ],
                     values: Vec::new(),
+                    options_source: None,
                 },
                 EventField {
                     path: "message.has_attachment".to_string(),
@@ -309,6 +317,7 @@ mod tests {
                             label: "No".to_string(),
                         },
                     ],
+                    options_source: None,
                 },
                 EventField {
                     path: "media".to_string(),
@@ -316,6 +325,7 @@ mod tests {
                     field_type: EventFieldType::Exists,
                     operators: vec![EventOperator::Exists],
                     values: Vec::new(),
+                    options_source: None,
                 },
             ],
             source_path: None,

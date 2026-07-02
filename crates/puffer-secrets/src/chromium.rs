@@ -112,12 +112,17 @@ fn unwrap_abe_key_material(post_dpapi: &[u8]) -> anyhow::Result<[u8; 32]> {
 
     fn take_u32(data: &[u8]) -> anyhow::Result<(usize, &[u8])> {
         let bytes = data.get(..4).context("ABE: truncated length")?;
-        Ok((u32::from_le_bytes(bytes.try_into().unwrap()) as usize, &data[4..]))
+        Ok((
+            u32::from_le_bytes(bytes.try_into().unwrap()) as usize,
+            &data[4..],
+        ))
     }
     let (hdr_len, rest) = take_u32(post_dpapi)?;
     let rest = rest.get(hdr_len..).context("ABE: truncated header")?;
     let (content_len, content) = take_u32(rest)?;
-    let content = content.get(..content_len).context("ABE: truncated content")?;
+    let content = content
+        .get(..content_len)
+        .context("ABE: truncated content")?;
     // Edge stores the 32-byte key directly after the two DPAPI layers (no
     // flag/AEAD wrap) — verified live decrypting a real Edge v20 blob. Chrome
     // wraps it under a flag-selected hardcoded key.
@@ -380,7 +385,12 @@ mod macos {
         fn decrypts_macos_v10_password() {
             let keychain = "test-safe-storage";
             let mut key = [0u8; 16];
-            pbkdf2_hmac::<Sha1>(keychain.as_bytes(), CHROME_SALT, CHROME_ITERATIONS, &mut key);
+            pbkdf2_hmac::<Sha1>(
+                keychain.as_bytes(),
+                CHROME_SALT,
+                CHROME_ITERATIONS,
+                &mut key,
+            );
             let mut encrypted = b"v10".to_vec();
             encrypted.extend(
                 Aes128CbcEnc::new(&key.into(), &CHROME_IV.into())
@@ -514,8 +524,7 @@ mod windows {
             let mut output = CRYPT_INTEGER_BLOB::default();
             CryptUnprotectData(&input, None, None, None, None, 0, &mut output)
                 .map_err(|error| anyhow!("CryptUnprotectData failed: {error}"))?;
-            let bytes =
-                std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+            let bytes = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
             let _ = LocalFree(HLOCAL(output.pbData as *mut core::ffi::c_void));
             Ok(bytes)
         }
@@ -528,8 +537,9 @@ mod windows {
     pub(super) fn cng_decrypt_chrome_key(encrypted_aes_key: &[u8; 32]) -> Result<[u8; 32]> {
         use windows::core::w;
         use windows::Win32::Security::Cryptography::{
-            NCryptDecrypt, NCryptFreeObject, NCryptOpenKey, NCryptOpenStorageProvider, CERT_KEY_SPEC,
-            NCRYPT_FLAGS, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE, NCRYPT_PROV_HANDLE, NCRYPT_SILENT_FLAG,
+            NCryptDecrypt, NCryptFreeObject, NCryptOpenKey, NCryptOpenStorageProvider,
+            CERT_KEY_SPEC, NCRYPT_FLAGS, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE, NCRYPT_PROV_HANDLE,
+            NCRYPT_SILENT_FLAG,
         };
         unsafe {
             let mut prov = NCRYPT_PROV_HANDLE::default();

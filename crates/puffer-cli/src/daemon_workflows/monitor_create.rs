@@ -10,6 +10,8 @@ use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
 
 const RESEARCH_ACTION_PROMPT_GUIDANCE: &str = "\n\nResearch action prompt guidance:\n- For any Research action, actionPrompt must define the specific research question, include source chat/contact context, cap web research to at most 3 web searches and 8 total research/tool steps, avoid repeated equivalent queries, prefer official or primary sources, and tell the action agent to stop once it has enough evidence for a concise reply.";
 const TASK_UPDATE_SOURCE_ISOLATION_POLICY: &str = "\n\nTaskUpdate source isolation policy:\n- Same chat/contact is not enough to call something a duplicate. If the current source event asks a new question, changes topic, or creates a separate request, create a new monitor task even when another task from the same sender is still pending.\n- Task source provenance is server-owned. Do not include monitor_envelope_id, monitor_envelope_ids, source_context, source_text, source_message_id, delivery_target, or other source/delivery metadata in TaskUpdate. Use TaskUpdate for status changes or ordinary non-source content updates only.";
@@ -47,7 +49,7 @@ pub(crate) fn handle_monitor_create(paths: &ConfigPaths, params: &Value) -> Resu
     let model_update = normalized_model_update(params.model);
     let contact_update = normalized_contact_update(params.contact_ids);
     create_or_resume_monitor(paths, &connection_slug, model_update, contact_update)?;
-    super::handle_workflow_list(paths)
+    super::handle_workflow_list_with_runtime(paths, false)
 }
 
 fn create_or_resume_monitor(
@@ -62,13 +64,6 @@ fn create_or_resume_monitor(
         .connection_store()
         .get(connection_slug)
         .ok_or_else(|| anyhow::anyhow!("connection `{connection_slug}` not found"))?;
-    eprintln!(
-        "monitor-create: connection={connection_slug} connector={} state={:?} has_consumer={} auth_failure_notified={}",
-        connection.connector_slug,
-        connection.state,
-        connection.has_consumer,
-        connection.auth_failure_notified
-    );
     ensure_connection_auth_usable(&connection)?;
     let template = manager
         .connector_store()
@@ -119,23 +114,62 @@ fn create_or_resume_monitor(
         )?,
     };
     manager.store().upsert(binding)?;
-    eprintln!(
-        "monitor-create: binding={} connection={connection_slug} action=triage_agent previous_exists={}",
-        monitor_slug,
-        previous.is_some()
+    start_monitor_setup_background(
+        Arc::clone(&manager),
+        paths.clone(),
+        connection,
+        template,
+        monitor_slug.clone(),
+        previous,
     );
-    let setup_result = (|| -> Result<()> {
-        ensure_workflow_subscriber_started(manager.as_ref(), paths, &connection, &template)?;
-        manager.refresh_connection_consumers()?;
-        Ok(())
-    })();
-    if let Err(error) = setup_result {
-        rollback_monitor_binding(manager.as_ref(), &monitor_slug, previous)?;
-        manager.refresh_connection_consumers()?;
-        return Err(error).with_context(|| format!("monitor `{monitor_slug}` setup failed"));
-    }
-    eprintln!("monitor-create: monitor={monitor_slug} setup_complete=true");
     Ok(())
+}
+
+fn start_monitor_setup_background(
+    manager: Arc<puffer_subscriptions::SubscriptionManager>,
+    paths: ConfigPaths,
+    connection: ConnectionRecord,
+    template: puffer_subscriptions::ConnectorTemplate,
+    monitor_slug: String,
+    previous: Option<WorkflowBindingSpec>,
+) {
+    let task_monitor_slug = monitor_slug.clone();
+    if let Err(error) = thread::Builder::new()
+        .name("puffer-monitor-setup".to_string())
+        .spawn(move || {
+            let setup_result = (|| -> Result<()> {
+                ensure_workflow_subscriber_started(
+                    manager.as_ref(),
+                    &paths,
+                    &connection,
+                    &template,
+                )?;
+                manager.refresh_connection_consumers()?;
+                Ok(())
+            })();
+            if let Err(error) = setup_result {
+                if let Err(rollback_error) =
+                    rollback_monitor_binding(manager.as_ref(), &task_monitor_slug, previous)
+                        .and_then(|_| manager.refresh_connection_consumers())
+                {
+                    tracing::warn!(
+                        monitor = %task_monitor_slug,
+                        error = %rollback_error,
+                        "failed to rollback monitor after setup failure"
+                    );
+                }
+                tracing::warn!(
+                    monitor = %task_monitor_slug,
+                    error = %error,
+                    "monitor setup failed after binding was created"
+                );
+                return;
+            }
+            tracing::info!(monitor = %task_monitor_slug, "monitor setup completed");
+        })
+    {
+        tracing::warn!(monitor = %monitor_slug, error = %error, "failed to spawn monitor setup task");
+    }
 }
 
 fn ensure_connection_auth_usable(connection: &ConnectionRecord) -> Result<()> {

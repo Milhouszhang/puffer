@@ -385,6 +385,7 @@ fn ide_command_creates_workspace_ide_file() {
 #[test]
 fn agents_command_creates_workspace_file() {
     let tempdir = tempdir().unwrap();
+    let _home = ScopedPufferHome::set(tempdir.path());
     let paths = ConfigPaths::discover(tempdir.path());
     ensure_workspace_dirs(&paths).unwrap();
     let session_store = SessionStore::from_paths(&paths).unwrap();
@@ -419,6 +420,7 @@ fn agents_command_creates_workspace_file() {
 #[test]
 fn agents_command_can_list_and_use_agent_presets() {
     let tempdir = tempdir().unwrap();
+    let _home = ScopedPufferHome::set(tempdir.path());
     let paths = ConfigPaths::discover(tempdir.path());
     ensure_workspace_dirs(&paths).unwrap();
     let session_store = SessionStore::from_paths(&paths).unwrap();
@@ -455,6 +457,7 @@ fn agents_command_can_list_and_use_agent_presets() {
 #[test]
 fn agents_command_lists_builtin_resource_agents() {
     let tempdir = tempdir().unwrap();
+    let _home = ScopedPufferHome::set(tempdir.path());
     let paths = ConfigPaths::discover(tempdir.path());
     ensure_workspace_dirs(&paths).unwrap();
     std::fs::create_dir_all(tempdir.path().join("resources/agents")).unwrap();

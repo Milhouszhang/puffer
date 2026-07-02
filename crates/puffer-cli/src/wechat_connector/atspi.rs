@@ -53,7 +53,16 @@ pub(crate) async fn conversation_row(
 ) -> Result<Option<(i32, i32)>> {
     let v = run(
         instance,
-        &["center", "--role", "list-item", "--name", recipient, "--contains", "--max-x", "280"],
+        &[
+            "center",
+            "--role",
+            "list-item",
+            "--name",
+            recipient,
+            "--contains",
+            "--max-x",
+            "280",
+        ],
     )
     .await?;
     point(&v)
@@ -72,8 +81,16 @@ pub(crate) async fn open_chat_is(instance: &WechatInstance, recipient: &str) -> 
     let v = run(
         instance,
         &[
-            "find", "--role", "list-item", "--name", recipient, "--contains",
-            "--max-x", "280", "--state", "SELECTED",
+            "find",
+            "--role",
+            "list-item",
+            "--name",
+            recipient,
+            "--contains",
+            "--max-x",
+            "280",
+            "--state",
+            "SELECTED",
         ],
     )
     .await?;
@@ -89,7 +106,16 @@ pub(crate) async fn body_in_history(instance: &WechatInstance, body: &str) -> Re
     let needle: String = body.chars().take(16).collect();
     let v = run(
         instance,
-        &["find", "--role", "list-item", "--name", needle.trim(), "--contains", "--min-x", "270"],
+        &[
+            "find",
+            "--role",
+            "list-item",
+            "--name",
+            needle.trim(),
+            "--contains",
+            "--min-x",
+            "270",
+        ],
     )
     .await?;
     Ok(found(&v))
@@ -97,8 +123,15 @@ pub(crate) async fn body_in_history(instance: &WechatInstance, body: &str) -> Re
 
 /// Click-center of a right-click context-menu item by its label. WeChat exposes
 /// context menus as `menu-item` nodes with real bounds.
-pub(crate) async fn menu_item(instance: &WechatInstance, label: &str) -> Result<Option<(i32, i32)>> {
-    let v = run(instance, &["center", "--role", "menu-item", "--name", label]).await?;
+pub(crate) async fn menu_item(
+    instance: &WechatInstance,
+    label: &str,
+) -> Result<Option<(i32, i32)>> {
+    let v = run(
+        instance,
+        &["center", "--role", "menu-item", "--name", label],
+    )
+    .await?;
     point(&v)
 }
 
@@ -111,13 +144,24 @@ pub(crate) async fn message_bounds(
 ) -> Result<Option<(i32, i32, i32, i32)>> {
     let v = run(
         instance,
-        &["find", "--role", "list-item", "--name", snippet, "--contains", "--min-x", "270"],
+        &[
+            "find",
+            "--role",
+            "list-item",
+            "--name",
+            snippet,
+            "--contains",
+            "--min-x",
+            "270",
+        ],
     )
     .await?;
     if !found(&v) {
         return Ok(None);
     }
-    let Some(b) = v.get("bounds") else { return Ok(None) };
+    let Some(b) = v.get("bounds") else {
+        return Ok(None);
+    };
     let g = |k: &str| b.get(k).and_then(Value::as_i64).map(|n| n as i32);
     match (g("x"), g("y"), g("w"), g("h")) {
         (Some(x), Some(y), Some(w), Some(h)) => Ok(Some((x, y, w, h))),
@@ -134,7 +178,10 @@ fn point(v: &Value) -> Result<Option<(i32, i32)>> {
     if !found(v) {
         return Ok(None);
     }
-    match (v.get("x").and_then(Value::as_i64), v.get("y").and_then(Value::as_i64)) {
+    match (
+        v.get("x").and_then(Value::as_i64),
+        v.get("y").and_then(Value::as_i64),
+    ) {
         (Some(x), Some(y)) => Ok(Some((x as i32, y as i32))),
         _ => Ok(None),
     }
@@ -152,7 +199,11 @@ async fn ensure_locator(instance: &WechatInstance) -> Result<()> {
 /// Runs an `a11y_locate.py` subcommand and parses its JSON line. Points the call
 /// at the WeChat session's a11y bus (a fresh exec has no D-Bus env of its own).
 async fn run(instance: &WechatInstance, args: &[&str]) -> Result<Value> {
-    let argline = args.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ");
+    let argline = args
+        .iter()
+        .map(|a| sh_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
     // `|| true`: a11y_locate.py exits 3 when an element isn't found (a valid
     // result — the `{"found":false}` JSON is still on stdout). Without this the
     // non-zero exit makes exec_bash treat a normal "not found" as a hard failure.

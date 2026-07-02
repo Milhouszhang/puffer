@@ -29,6 +29,7 @@ type PendingRequest = {
 };
 
 export type DaemonRequestOptions = {
+  requireWebSocket?: boolean;
   timeoutMs?: number;
 };
 
@@ -143,6 +144,11 @@ export class DaemonClient {
     options: DaemonRequestOptions = {}
   ): Promise<T> {
     if (!this.useWebSocket) {
+      if (options.requireWebSocket) {
+        throw new Error(
+          `Puffer daemon method ${method} requires a WebSocket daemon connection.`
+        );
+      }
       return invoke<T>("backend_request", { method, params });
     }
 
@@ -500,6 +506,11 @@ export function canReachDaemon(): boolean {
 
 export async function ensureLocalDaemonClient(): Promise<DaemonClient> {
   if (sharedClient) return sharedClient;
+  if (canInvokeTauri()) {
+    sharedClient = new DaemonClient(await invoke<DaemonHandshake>("ensure_local_daemon"));
+    await sharedClient.connect();
+    return sharedClient;
+  }
   const { handshake, source } = configuredBrowserDaemonHandshakeWithSource();
   if (handshake) {
     try {
@@ -511,12 +522,7 @@ export async function ensureLocalDaemonClient(): Promise<DaemonClient> {
       return connectSharedDaemonClient(workspaceHandshake);
     }
   }
-  if (!canInvokeTauri()) {
-    throw new Error("Puffer's Rust daemon is only available through a configured WebSocket or inside the Tauri desktop app.");
-  }
-  sharedClient = new DaemonClient(await invoke<DaemonHandshake>("ensure_local_daemon"));
-  await sharedClient.connect();
-  return sharedClient;
+  throw new Error("Puffer's Rust daemon is only available through a configured WebSocket or inside the Tauri desktop app.");
 }
 
 export async function reacquireLocalDaemonClient(): Promise<DaemonClient> {

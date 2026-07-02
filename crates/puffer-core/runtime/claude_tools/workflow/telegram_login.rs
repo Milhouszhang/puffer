@@ -77,9 +77,7 @@ pub fn execute_telegram(cwd: &Path, input: Value) -> Result<String> {
         TelegramAction::LoginQrWait => execute_telegram_login_qr_wait(cwd, input),
         TelegramAction::LoginStart => execute_telegram_login_start(cwd, input),
         TelegramAction::LoginSubmitCode => execute_telegram_login_submit_code(cwd, input),
-        TelegramAction::LoginSubmitPassword => {
-            execute_telegram_login_submit_password(cwd, input)
-        }
+        TelegramAction::LoginSubmitPassword => execute_telegram_login_submit_password(cwd, input),
         TelegramAction::SearchMessages => execute_telegram_search_messages(cwd, input),
         TelegramAction::SearchPeers => execute_telegram_list_peers(cwd, input, true),
     }
@@ -102,10 +100,7 @@ struct ImportDesktopInput {
 }
 
 /// Imports Telegram Desktop `tdata` authentication into the subscriber.
-pub fn execute_telegram_import_desktop(
-    cwd: &Path,
-    input: Value,
-) -> Result<String> {
+pub fn execute_telegram_import_desktop(cwd: &Path, input: Value) -> Result<String> {
     let connection_slug = connection_slug_from_input(&input)?;
     let parsed: ImportDesktopInput =
         serde_json::from_value(input).context("invalid Telegram import_desktop input")?;
@@ -157,11 +152,7 @@ struct ListPeersInput {
     limit: Option<usize>,
 }
 
-fn execute_telegram_list_peers(
-    cwd: &Path,
-    input: Value,
-    require_query: bool,
-) -> Result<String> {
+fn execute_telegram_list_peers(cwd: &Path, input: Value, require_query: bool) -> Result<String> {
     let connection_slug = connection_slug_from_input(&input)?;
     let parsed: ListPeersInput =
         serde_json::from_value(input).context("invalid Telegram peer-list input")?;
@@ -219,10 +210,7 @@ struct SearchMessagesInput {
     succinct: bool,
 }
 
-fn execute_telegram_search_messages(
-    cwd: &Path,
-    input: Value,
-) -> Result<String> {
+fn execute_telegram_search_messages(cwd: &Path, input: Value) -> Result<String> {
     let connection_slug = connection_slug_from_input(&input)?;
     let parsed: SearchMessagesInput =
         serde_json::from_value(input).context("invalid Telegram message-search input")?;
@@ -291,10 +279,7 @@ struct ListMessagesInput {
     succinct: bool,
 }
 
-fn execute_telegram_list_messages(
-    cwd: &Path,
-    input: Value,
-) -> Result<String> {
+fn execute_telegram_list_messages(cwd: &Path, input: Value) -> Result<String> {
     let connection_slug = connection_slug_from_input(&input)?;
     let parsed: ListMessagesInput =
         serde_json::from_value(input).context("invalid Telegram message-list input")?;
@@ -356,10 +341,7 @@ struct LoginQrInput {
 }
 
 /// Starts Telegram QR login and returns a short-lived `tg://login` URL.
-pub fn execute_telegram_login_qr(
-    cwd: &Path,
-    input: Value,
-) -> Result<String> {
+pub fn execute_telegram_login_qr(cwd: &Path, input: Value) -> Result<String> {
     let connection_slug = connection_slug_from_input(&input)?;
     let parsed: LoginQrInput =
         serde_json::from_value(input).context("invalid Telegram login_qr input")?;
@@ -411,10 +393,7 @@ struct LoginQrWaitInput {
 }
 
 /// Waits for Telegram QR login approval and persists the authorized session.
-pub fn execute_telegram_login_qr_wait(
-    cwd: &Path,
-    input: Value,
-) -> Result<String> {
+pub fn execute_telegram_login_qr_wait(cwd: &Path, input: Value) -> Result<String> {
     let connection_slug = connection_slug_from_input(&input)?;
     let parsed: LoginQrWaitInput =
         serde_json::from_value(input).context("invalid Telegram login_qr_wait input")?;
@@ -474,10 +453,7 @@ pub fn execute_telegram_login_qr_wait(
 /// will emit a `login_awaiting_code` event and a code is texted to the
 /// user's Telegram apps; the agent should then collect the code and run
 /// `telegram login-submit-code`.
-pub fn execute_telegram_login_start(
-    cwd: &Path,
-    input: Value,
-) -> Result<String> {
+pub fn execute_telegram_login_start(cwd: &Path, input: Value) -> Result<String> {
     let connection_slug = connection_slug_from_input(&input)?;
     let parsed: LoginStartInput =
         serde_json::from_value(input).context("invalid TelegramLoginStart input")?;
@@ -538,10 +514,7 @@ struct SubmitCodeInput {
 /// Submits the login code. On success the subscriber emits
 /// `login_complete`; on `PASSWORD_REQUIRED` it emits `login_awaiting_password`
 /// and the agent should run `telegram login-submit-password`.
-pub fn execute_telegram_login_submit_code(
-    cwd: &Path,
-    input: Value,
-) -> Result<String> {
+pub fn execute_telegram_login_submit_code(cwd: &Path, input: Value) -> Result<String> {
     let connection_slug = connection_slug_from_input(&input)?;
     let parsed: SubmitCodeInput =
         serde_json::from_value(input).context("invalid TelegramLoginSubmitCode input")?;
@@ -590,10 +563,7 @@ struct SubmitPasswordInput {
 
 /// Submits the 2FA cloud password. On success the subscriber emits
 /// `login_complete`; on failure it emits `login_error`.
-pub fn execute_telegram_login_submit_password(
-    cwd: &Path,
-    input: Value,
-) -> Result<String> {
+pub fn execute_telegram_login_submit_password(cwd: &Path, input: Value) -> Result<String> {
     let connection_slug = connection_slug_from_input(&input)?;
     let parsed: SubmitPasswordInput =
         serde_json::from_value(input).context("invalid TelegramLoginSubmitPassword input")?;

@@ -51,6 +51,13 @@ pub struct RunnerCapabilities {
 /// Identifies one tool execution attempt for transport / logging.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolRequest {
+    /// Optional idempotency key for exactly-once remote execution semantics.
+    ///
+    /// When present, remote runner services should execute the request at
+    /// most once per runner process and replay the completed result for
+    /// duplicate requests with the same id.
+    #[serde(default)]
+    pub request_id: Option<String>,
     /// Tool id (e.g. `"Bash"`, `"Read"`, `"Edit"`).
     pub tool_id: String,
     /// Working directory for the call.

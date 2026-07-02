@@ -500,7 +500,7 @@ fn workflow_binding(
         classify_prompt: None,
         classify_model: None,
         action: ActionSpec::RunWorkflow {
-            slug: "demo".to_string(),
+            workflow_id: "demo".to_string(),
         },
         created_at_ms: 0,
     }

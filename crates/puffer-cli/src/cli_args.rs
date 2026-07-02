@@ -1,7 +1,9 @@
 use crate::browser_args::BrowserArgs;
-use crate::media_internal_tools::{ImageGenerationArgs, MediaCapabilitiesArgs, VideoGenerationArgs};
+use crate::media_internal_tools::{
+    ImageGenerationArgs, MediaCapabilitiesArgs, VideoGenerationArgs,
+};
 use crate::non_interactive::NonInteractiveArgs;
-use crate::subscriber_tool_args::{EmailArgs, SlackArgs, TelegramArgs};
+use crate::subscriber_tool_args::{EmailArgs, RequestSecretArgs, SlackArgs, TelegramArgs};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -71,7 +73,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: Option<PluginCommand>,
     },
-    /// Register and inspect native Puffer workflows.
+    /// Inspect and execute workflows through the configured runtime.
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
@@ -283,6 +285,11 @@ pub(crate) enum InternalToolCommand {
     /// List connected image/video generation providers and models.
     #[command(name = "media-capabilities", alias = "mediacaps")]
     MediaCapabilities(#[command(flatten)] MediaCapabilitiesArgs),
+    /// Search, request, collect, or create an encrypted user secret through the
+    /// parent runtime. Returns only `PUFFER_SECRET_...` placeholders, never raw
+    /// secret values.
+    #[command(name = "request-secret", alias = "request_secret")]
+    RequestSecret(#[command(flatten)] RequestSecretArgs),
     /// Log in to Slack or look up Slack conversations through the parent runtime.
     Slack(#[command(flatten)] SlackArgs),
     /// Log in to Telegram or look up Telegram peers through the parent runtime.
@@ -330,61 +337,37 @@ pub(crate) enum DesktopApiCommand {
     },
     SettingsSnapshot,
     WorkflowList,
-    WorkflowRunsList {
-        workflow_slug: String,
-    },
-    WorkflowRunsShow {
-        idx: u64,
-    },
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum WorkflowCommand {
-    /// Register a workflow envelope or raw AgentFlow pipeline JSON file.
-    Register {
-        /// JSON file path.
-        json_path: String,
-        /// Optional workflow slug override.
-        #[arg(long = "slug")]
-        slug: Option<String>,
-        /// Cron trigger for raw AgentFlow pipeline imports.
-        #[arg(long = "cron", conflicts_with = "subscription_topic")]
-        cron: Option<String>,
-        /// Connection slug for raw AgentFlow pipeline imports.
-        #[arg(
-            long = "connection-slug",
-            alias = "subscription-topic",
-            conflicts_with = "cron"
-        )]
-        connection_slug: Option<String>,
-        /// Optional connection regex filter.
-        #[arg(long = "connection-pattern", alias = "subscription-pattern")]
-        connection_pattern: Option<String>,
-        /// Optional subscription classifier prompt.
-        #[arg(long = "classify-prompt")]
-        classify_prompt: Option<String>,
-    },
-    /// List registered workflows.
+    /// List workflows from the configured workflow runtime.
     Ls {
         /// Output JSON.
         #[arg(long = "json", default_value_t = false)]
         json: bool,
     },
-    /// Inspect workflow run records.
+    /// Inspect workflow runtime execution records.
     Runs {
         #[command(subcommand)]
         command: WorkflowRunsCommand,
     },
-    /// Run one workflow once. Use --dry-run for deterministic local execution.
+    /// Run one deployed workflow once through the configured runtime.
     Run {
         /// Workflow slug.
         workflow_slug: String,
-        /// Trigger JSON payload used for prompt interpolation.
+        /// Input JSON object sent to the workflow runtime.
         #[arg(long = "trigger-json")]
         trigger_json: Option<String>,
-        /// Use a deterministic local executor instead of calling an LLM provider.
-        #[arg(long = "dry-run", default_value_t = false)]
-        dry_run: bool,
+        /// Output JSON.
+        #[arg(long = "json", default_value_t = false)]
+        json: bool,
+    },
+    /// Run a runtime-only AgentEnv API smoke test.
+    SmokeTest {
+        /// Existing workflow id or slug to use instead of creating one.
+        #[arg(long = "workflow-id")]
+        workflow_id: Option<String>,
         /// Output JSON.
         #[arg(long = "json", default_value_t = false)]
         json: bool,
@@ -393,18 +376,10 @@ pub(crate) enum WorkflowCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum WorkflowRunsCommand {
-    /// List runs for a workflow slug.
+    /// List executions for a workflow id or slug.
     Ls {
         /// Workflow slug.
         workflow_slug: String,
-        /// Output JSON.
-        #[arg(long = "json", default_value_t = false)]
-        json: bool,
-    },
-    /// Show one run by global index.
-    Show {
-        /// Global run index.
-        idx: u64,
         /// Output JSON.
         #[arg(long = "json", default_value_t = false)]
         json: bool,
@@ -634,7 +609,11 @@ pub(crate) enum McpCommand {
         scope: ResourceScope,
     },
     /// Import MCP servers from Claude Desktop.
-    AddFromClaudeDesktop,
+    AddFromClaudeDesktop {
+        /// Configuration scope.
+        #[arg(short = 's', long = "scope", value_enum, default_value_t = ResourceScope::Local)]
+        scope: ResourceScope,
+    },
     /// Get details about one MCP server.
     Get {
         /// Stable MCP server id.
@@ -753,6 +732,71 @@ pub(crate) enum McpTransport {
     Stdio,
     Sse,
     Http,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, McpCommand, ResourceScope};
+    use clap::Parser;
+
+    #[test]
+    fn resume_flag_without_value_uses_empty_sentinel() {
+        let cli = Cli::parse_from(["puffer", "--resume"]);
+        assert_eq!(cli.resume.as_deref(), Some(""));
+        assert!(cli.prompt.is_none());
+    }
+
+    #[test]
+    fn resume_flag_with_value_keeps_positional_prompt() {
+        let cli = Cli::parse_from(["puffer", "--resume", "dockyard", "follow up"]);
+        assert_eq!(cli.resume.as_deref(), Some("dockyard"));
+        assert_eq!(cli.prompt.as_deref(), Some("follow up"));
+    }
+
+    #[test]
+    fn remote_prompt_collects_trailing_words() {
+        let cli = Cli::parse_from([
+            "puffer",
+            "remote",
+            "c@localhost",
+            "--cwd",
+            "/tmp/demo",
+            "hello",
+            "from",
+            "remote",
+        ]);
+        let Some(Command::Remote {
+            target,
+            cwd,
+            no_alt_screen,
+            prompt,
+        }) = cli.subcommand
+        else {
+            panic!("expected remote command");
+        };
+        assert_eq!(target, "c@localhost");
+        assert_eq!(cwd.as_deref(), Some("/tmp/demo"));
+        assert!(!no_alt_screen);
+        assert_eq!(prompt, ["hello", "from", "remote"]);
+    }
+
+    #[test]
+    fn mcp_add_from_desktop_accepts_scope_override() {
+        let cli = Cli::parse_from([
+            "puffer",
+            "mcp",
+            "add-from-claude-desktop",
+            "--scope",
+            "user",
+        ]);
+        let Some(Command::Mcp {
+            command: Some(McpCommand::AddFromClaudeDesktop { scope }),
+        }) = cli.subcommand
+        else {
+            panic!("expected mcp add-from-claude-desktop command");
+        };
+        assert_eq!(scope, ResourceScope::User);
+    }
 }
 
 #[derive(Debug, Subcommand)]

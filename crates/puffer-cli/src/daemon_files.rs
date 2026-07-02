@@ -2,6 +2,7 @@
 //!
 //! Methods:
 //!   - `list_dir(path)` → directory listing, dirs first then files
+//!   - `list_workspace_mentions({cwd?, query?, limit?})` → workspace file/folder mention candidates
 //!   - `read_file(path, {maxBytes?})` → UTF-8 or base64 content
 //!   - `write_file(path, content)` → overwrite an existing text file
 //!
@@ -24,6 +25,9 @@ const DEFAULT_MAX_BYTES: usize = 262_144; // 256 KiB
 const READ_HARD_MAX_BYTES: u64 = 24 * 1024 * 1024; // 24 MiB preview refusal threshold
 const WRITE_HARD_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const TEXT_SNIFF_BYTES: usize = 8 * 1024;
+const MENTION_SCAN_MAX_ENTRIES: usize = 12_000;
+const MENTION_DEFAULT_LIMIT: usize = 40;
+const MENTION_MAX_LIMIT: usize = 100;
 
 pub(crate) fn handle_list_dir(state: &DaemonState, params: &Value) -> Result<Value> {
     let raw = params
@@ -114,6 +118,60 @@ pub(crate) fn handle_list_dir(state: &DaemonState, params: &Value) -> Result<Val
     Ok(json!({ "entries": entries }))
 }
 
+pub(crate) fn handle_list_workspace_mentions(state: &DaemonState, params: &Value) -> Result<Value> {
+    let root = if let Some(raw) = params
+        .get("cwd")
+        .or_else(|| params.get("root"))
+        .and_then(|value| value.as_str())
+    {
+        validate_path(state, raw)?
+    } else {
+        std::fs::canonicalize(state.cwd_path()).unwrap_or_else(|_| state.cwd_path().to_path_buf())
+    };
+    let meta = std::fs::metadata(&root)
+        .with_context(|| format!("path does not exist: {}", root.display()))?;
+    if !meta.is_dir() {
+        bail!("mention root is not a directory: {}", root.display());
+    }
+    let query = params
+        .get("query")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize)
+        .unwrap_or(MENTION_DEFAULT_LIMIT)
+        .clamp(1, MENTION_MAX_LIMIT);
+
+    let mut candidates = Vec::new();
+    collect_workspace_mentions(&root, &root, &query, &mut candidates)?;
+    candidates.sort_by(|left, right| {
+        mention_score(left, &query)
+            .cmp(&mention_score(right, &query))
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    let items = candidates
+        .into_iter()
+        .take(limit)
+        .map(|candidate| {
+            json!({
+                "kind": candidate.kind,
+                "path": candidate.relative_path,
+                "absolutePath": candidate.absolute_path.display().to_string(),
+                "name": candidate.name,
+                "parent": candidate.parent,
+                "size": candidate.size,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({ "items": items }))
+}
+
 pub(crate) fn handle_read_file(state: &DaemonState, params: &Value) -> Result<Value> {
     let raw = params
         .get("path")
@@ -179,6 +237,135 @@ pub(crate) fn handle_read_file(state: &DaemonState, params: &Value) -> Result<Va
         "size": size,
         "truncated": truncated,
     }))
+}
+
+#[derive(Debug)]
+struct WorkspaceMentionCandidate {
+    kind: &'static str,
+    relative_path: String,
+    absolute_path: PathBuf,
+    name: String,
+    parent: String,
+    size: u64,
+}
+
+fn collect_workspace_mentions(
+    root: &Path,
+    dir: &Path,
+    query: &str,
+    out: &mut Vec<WorkspaceMentionCandidate>,
+) -> Result<()> {
+    if out.len() >= MENTION_SCAN_MAX_ENTRIES {
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    let mut entries = entries
+        .filter_map(std::result::Result::ok)
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        if out.len() >= MENTION_SCAN_MAX_ENTRIES {
+            break;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if should_skip_mention_path(&name) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let is_dir = meta.is_dir();
+        let Some(relative) = relative_mention_path(root, &path) else {
+            continue;
+        };
+        let relative_lower = relative.to_ascii_lowercase();
+        if query.is_empty()
+            || relative_lower.contains(query)
+            || name.to_ascii_lowercase().contains(query)
+        {
+            let parent = path
+                .parent()
+                .and_then(|parent| parent.strip_prefix(root).ok())
+                .map(display_relative_path)
+                .unwrap_or_default();
+            out.push(WorkspaceMentionCandidate {
+                kind: if is_dir { "directory" } else { "file" },
+                relative_path: relative,
+                absolute_path: path.clone(),
+                name,
+                parent,
+                size: meta.len(),
+            });
+        }
+        if is_dir {
+            collect_workspace_mentions(root, &path, query, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_mention_path(name: &str) -> bool {
+    name == ".DS_Store"
+        || name.starts_with('~')
+        || matches!(
+            name,
+            ".git"
+                | ".puffer"
+                | ".next"
+                | ".svelte-kit"
+                | "node_modules"
+                | "target"
+                | "dist"
+                | "build"
+                | "coverage"
+        )
+}
+
+fn relative_mention_path(root: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(root).ok().map(display_relative_path)
+}
+
+fn display_relative_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn mention_score(candidate: &WorkspaceMentionCandidate, query: &str) -> (u8, usize, usize) {
+    if query.is_empty() {
+        return (
+            if candidate.kind == "directory" { 0 } else { 1 },
+            candidate.relative_path.matches('/').count(),
+            candidate.relative_path.len(),
+        );
+    }
+    let path = candidate.relative_path.to_ascii_lowercase();
+    let name = candidate.name.to_ascii_lowercase();
+    let bucket = if name == query {
+        0
+    } else if name.starts_with(query) {
+        1
+    } else if path.starts_with(query) {
+        2
+    } else if path.contains(query) {
+        3
+    } else {
+        4
+    };
+    (
+        bucket,
+        candidate.relative_path.matches('/').count(),
+        candidate.relative_path.len(),
+    )
 }
 
 /// Overwrite one existing text file and return the updated read-file result.

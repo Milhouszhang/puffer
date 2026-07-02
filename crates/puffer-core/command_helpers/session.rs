@@ -5,6 +5,7 @@ use crate::{AppState, ToolInvocation};
 use anyhow::Result;
 use puffer_config::ConfigPaths;
 use puffer_session_store::{SessionStore, TRACE_RUNTIME};
+use serde_json::Value;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
@@ -63,15 +64,16 @@ pub(crate) fn append_tool_invocations(
     invocations: &[ToolInvocation],
 ) -> Result<()> {
     for invocation in invocations {
+        let persisted_input = sanitized_tool_invocation_input(invocation);
         state.record_task(
             invocation.tool_id.clone(),
-            invocation.input.clone(),
+            persisted_input.clone(),
             invocation.success,
         );
         state.push_tool_invocation(
             &invocation.call_id,
             &invocation.tool_id,
-            &invocation.input,
+            &persisted_input,
             &invocation.output,
             invocation.success,
         );
@@ -80,7 +82,7 @@ pub(crate) fn append_tool_invocations(
             puffer_session_store::TranscriptEvent::ToolInvocation {
                 call_id: invocation.call_id.clone(),
                 tool_id: invocation.tool_id.clone(),
-                input: invocation.input.clone(),
+                input: persisted_input,
                 output: invocation.output.clone(),
                 success: invocation.success,
                 metadata: tool_invocation_metadata(invocation),
@@ -90,6 +92,43 @@ pub(crate) fn append_tool_invocations(
         )?;
     }
     Ok(())
+}
+
+pub fn sanitized_tool_invocation_input(invocation: &ToolInvocation) -> String {
+    sanitize_tool_invocation_input(&invocation.tool_id, &invocation.input)
+}
+
+pub fn sanitize_tool_invocation_input(tool_id: &str, input: &str) -> String {
+    if tool_id != "RemoteExecution" {
+        return input.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(input) else {
+        return input.to_string();
+    };
+    redact_remote_execution_secret_fields(&mut value);
+    serde_json::to_string(&value).unwrap_or_else(|_| input.to_string())
+}
+
+fn redact_remote_execution_secret_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map.contains_key("runnerAuthToken") {
+                map.insert(
+                    "runnerAuthToken".to_string(),
+                    Value::String("[redacted]".to_string()),
+                );
+            }
+            for value in map.values_mut() {
+                redact_remote_execution_secret_fields(value);
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                redact_remote_execution_secret_fields(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn tool_invocation_metadata(invocation: &ToolInvocation) -> Option<serde_json::Value> {
@@ -820,6 +859,32 @@ mod tests {
                 note: None,
             },
         )
+    }
+
+    #[test]
+    fn sanitized_remote_execution_invocation_input_redacts_runner_token() {
+        let invocation = ToolInvocation {
+            call_id: "call-remote".to_string(),
+            tool_id: "RemoteExecution".to_string(),
+            input: serde_json::json!({
+                "action": "enter-remote",
+                "targetType": "agentenv",
+                "sandboxId": "manual-token-leak-test",
+                "runnerEndpoint": "http://127.0.0.1:50051",
+                "runnerAuthToken": "fake-test-token-123",
+                "runnerCwd": "/tmp"
+            })
+            .to_string(),
+            output: "{}".to_string(),
+            success: true,
+            metadata: Value::Null,
+            terminate: false,
+        };
+
+        let sanitized = sanitized_tool_invocation_input(&invocation);
+
+        assert!(!sanitized.contains("fake-test-token-123"));
+        assert!(sanitized.contains("\"runnerAuthToken\":\"[redacted]\""));
     }
 
     #[test]

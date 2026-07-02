@@ -115,8 +115,8 @@ use crate::desktop_api;
 use crate::desktop_api_types::{
     ExternalCredentialDto, FolderGroupDto, McpServerDto, MediaCapabilityAxisDto,
     MediaCapabilityInfoDto, ModelDescriptorDto, ProxyEndpointInputDto, ProxyTestResultDto,
-    RepoActionResultDto, RepoStatusDto, SaveProxySettingsParams, SessionDetailDto,
-    SettingsSnapshotDto, ThinkingOptionDto,
+    RepoActionResultDto, RepoStatusDto, SaveProxySettingsParams, SaveRemoteSettingsParams,
+    SessionDetailDto, SettingsSnapshotDto, ThinkingOptionDto,
 };
 
 const PROTOCOL_VERSION: &str = "1";
@@ -1461,6 +1461,15 @@ async fn dispatch_request(
                 crate::daemon_browser_settings::handle_save_browser_settings(&s, &p)
             }))
         }
+        "workflow_backend_get_config" => respond!(detached!(|s| {
+            crate::daemon_workflow_runtime::handle_workflow_backend_get_config(&s)
+        })),
+        "workflow_backend_save_config" => respond!(detached!(|s, p| {
+            crate::daemon_workflow_runtime::handle_workflow_backend_save_config(&s, &p)
+        })),
+        "workflow_backend_test_connection" => respond!(detached!(|s| {
+            crate::daemon_workflow_runtime::handle_workflow_backend_test_connection(&s)
+        })),
         "list_mcp_servers" => respond!(detached!(|s| handle_list_mcp_servers(&s))),
         "add_mcp_server" => respond!(detached!(|s, p| handle_add_mcp_server(&s, &p))),
         "list_lambda_skill_libraries" => {
@@ -1478,6 +1487,7 @@ async fn dispatch_request(
         "set_lambda_skill_approval" => {
             respond!(detached!(|s, p| handle_set_lambda_skill_approval(&s, &p)))
         }
+        "list_command_surface" => respond!(detached!(|s| handle_list_command_surface(&s))),
         "list_provider_models" => {
             respond!(detached!(|s, p| handle_list_provider_models(&s, &p)))
         }
@@ -1499,6 +1509,7 @@ async fn dispatch_request(
             respond!(detached!(|s, p| handle_create_file_media_access(&s, &p)))
         }
         "save_proxy_settings" => respond!(detached!(|s, p| handle_save_proxy_settings(&s, &p))),
+        "save_remote_settings" => respond!(detached!(|s, p| handle_save_remote_settings(&s, &p))),
         "save_secret" => respond!(detached!(|s, p| handle_save_secret(&s, &p))),
         "delete_secret" => respond!(detached!(|s, p| handle_delete_secret(&s, &p))),
         "contacts_list" => {
@@ -1580,6 +1591,9 @@ async fn dispatch_request(
         "pty_resize" => respond!(handle_pty_resize(&state, &params)),
         "pty_close" => respond!(handle_pty_close(&state, &params)),
         "list_dir" => respond!(crate::daemon_files::handle_list_dir(&state, &params)),
+        "list_workspace_mentions" => respond!(crate::daemon_files::handle_list_workspace_mentions(
+            &state, &params
+        )),
         "read_file" => respond!(crate::daemon_files::handle_read_file(&state, &params)),
         "write_file" => respond!(crate::daemon_files::handle_write_file(&state, &params)),
         "lsp_inspect" => respond!(detached!(|s, p| crate::daemon_lsp::handle_lsp_inspect(
@@ -1633,11 +1647,50 @@ async fn dispatch_request(
         "install_local_model" => {
             respond!(detached!(|s, p| handle_install_local_model(&s, &p)))
         }
-        "workflow_list" => respond!(crate::daemon_workflows::handle_workflow_list(&state.paths)),
-        "workflow_save" => respond!(crate::daemon_workflows::handle_workflow_save(
-            &state.paths,
-            &params
-        )),
+        "workflow_list" => respond!(detached!(|s, p| {
+            let include_workflows = p
+                .get("include_workflows")
+                .or_else(|| p.get("includeWorkflows"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            crate::daemon_workflows::handle_workflow_list_with_runtime(
+                s.config_paths(),
+                include_workflows,
+            )
+        })),
+        "workflow_create" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_create(s.config_paths(), &p)
+        })),
+        "workflow_update" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_update(s.config_paths(), &p)
+        })),
+        "workflow_deploy" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_deploy(s.config_paths(), &p)
+        })),
+        "workflow_undeploy" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_undeploy(s.config_paths(), &p)
+        })),
+        "workflow_node_definitions" => respond!(detached!(|s| {
+            crate::daemon_workflows::handle_workflow_node_definitions(s.config_paths())
+        })),
+        "workflow_node_definition" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_node_definition(s.config_paths(), &p)
+        })),
+        "workflow_execute" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_execute(s.config_paths(), &p)
+        })),
+        "workflow_execute_in_memory" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_execute_in_memory(s.config_paths(), &p)
+        })),
+        "workflow_list_executions" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_list_executions(s.config_paths(), &p)
+        })),
+        "workflow_get_execution" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_get_execution(s.config_paths(), &p)
+        })),
+        "workflow_open_ui" => respond!(detached!(|s| {
+            crate::daemon_workflow_runtime::handle_workflow_open_ui(&s)
+        })),
         "workflow_binding_create" => respond!(
             crate::daemon_workflows::handle_workflow_binding_create(&state.paths, &params)
         ),
@@ -1665,6 +1718,9 @@ async fn dispatch_request(
         "connector_action_execute" => respond!(
             crate::daemon_workflows::handle_connector_action_execute(&state.paths, &params)
         ),
+        "connector_action_draft_status" => respond!(
+            crate::daemon_workflows::handle_connector_action_draft_status(&state.paths, &params)
+        ),
         "monitor_memory_save" | "task_monitor_memory_save" => respond!(
             crate::daemon_workflows::handle_monitor_memory_save(&state.paths, &params)
         ),
@@ -1687,15 +1743,6 @@ async fn dispatch_request(
             &state.paths,
             &params
         )),
-        "workflow_runs_list" => respond!(crate::daemon_workflows::handle_workflow_runs_list(
-            &state.paths,
-            &params
-        )),
-        "workflow_run_show" => respond!(crate::daemon_workflows::handle_workflow_run_show(
-            &state.paths,
-            &params
-        )),
-
         "run_agent_turn" => {
             let tx_clone = tx.clone();
             let state_clone = state.clone();
@@ -1799,6 +1846,9 @@ async fn dispatch_request(
         "resolve_permission" => respond!(handle_resolve_permission(&state, &params)),
         "resolve_user_question" => respond!(handle_resolve_user_question(&state, &params)),
         "cancel_turn" => respond!(handle_cancel_turn(&state, &params)),
+        "lark_browser_list_chats" => {
+            respond!(detached!(|s, p| handle_lark_browser_list_chats(&s, &p)))
+        }
 
         other => {
             let _ = send_envelope(
@@ -1820,6 +1870,19 @@ async fn dispatch_request(
 // ---------------------------------------------------------------------------
 // RPC handlers — blocking work runs in a tokio::task::spawn_blocking closure.
 // ---------------------------------------------------------------------------
+
+/// RPC handler for `lark_browser_list_chats`.
+///
+/// Params: `{ connection_slug: string }` (optional — defaults to "lark-browser")
+/// Returns: `{ chats: [{chat_id, name, conversation_type, unread}] }`
+fn handle_lark_browser_list_chats(state: &DaemonState, params: &Value) -> Result<Value> {
+    let connection_slug = params
+        .get("connection_slug")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let manager = puffer_core::subscription_manager()?;
+    crate::lark_browser::list_chats_via_subscriber(&manager, state.config_paths(), connection_slug)
+}
 
 fn handle_canvas_state_update(state: &DaemonState, params: &Value) -> Result<Value> {
     let session_id = params
@@ -2412,6 +2475,26 @@ fn handle_save_proxy_settings(state: &DaemonState, params: &Value) -> Result<Val
     Ok(serde_json::to_value(snapshot)?)
 }
 
+fn handle_save_remote_settings(state: &DaemonState, params: &Value) -> Result<Value> {
+    let input: SaveRemoteSettingsParams =
+        serde_json::from_value(params.clone()).context("invalid remote settings")?;
+    let mut config = state.config.lock().unwrap().clone();
+    config.remote = desktop_api::remote_config_from_settings(input);
+    save_user_config(&state.paths, &config).context("save user config")?;
+    reload_daemon_config(state)?;
+    let fresh = state.build_runtime_inputs()?;
+    let config = state.config.lock().unwrap().clone();
+    let snapshot: SettingsSnapshotDto = desktop_api::load_settings_snapshot(
+        &state.paths,
+        &config,
+        &fresh.resources,
+        &fresh.providers,
+        &fresh.auth_store,
+        &fresh.session_store,
+    )?;
+    Ok(serde_json::to_value(snapshot)?)
+}
+
 fn handle_test_proxy(state: &DaemonState, params: &Value) -> Result<Value> {
     let input: TestProxyParams =
         serde_json::from_value(params.clone()).context("invalid proxy test params")?;
@@ -2810,6 +2893,15 @@ fn mcp_server_dtos(resources: &LoadedResources) -> Vec<McpServerDto> {
         .collect()
 }
 
+fn handle_list_command_surface(state: &DaemonState) -> Result<Value> {
+    let inputs = state.build_runtime_inputs_without_discovery()?;
+    let commands = command_surface(&inputs.resources)
+        .into_iter()
+        .filter(|command| !command.hidden)
+        .collect::<Vec<_>>();
+    Ok(serde_json::to_value(commands)?)
+}
+
 /// Returns the full model list for one provider. The snapshot only carries
 /// a count; the Settings → Models pane calls this to populate the picker.
 fn handle_list_provider_models(state: &DaemonState, params: &Value) -> Result<Value> {
@@ -2819,6 +2911,12 @@ fn handle_list_provider_models(state: &DaemonState, params: &Value) -> Result<Va
         .and_then(|v| v.as_str())
         .context("missing providerId")?;
     let provider_id = canonical_desktop_provider_id(requested_provider_id);
+    if provider_id == "puffer" {
+        return Ok(json!({
+            "providerId": provider_id,
+            "models": [native_puffer_model_descriptor()],
+        }));
+    }
     let mut inputs = state.build_runtime_inputs_without_discovery()?;
     let config = state.config.lock().unwrap().clone();
     let needs_fresh_discovery = inputs
@@ -2862,6 +2960,20 @@ fn handle_list_provider_models(state: &DaemonState, params: &Value) -> Result<Va
         .map(|model| model_descriptor_dto(family, model))
         .collect();
     Ok(json!({ "providerId": provider_id, "models": models }))
+}
+
+fn native_puffer_model_descriptor() -> Value {
+    json!({
+        "id": "default",
+        "displayName": "Default",
+        "provider": "puffer",
+        "api": "cli",
+        "contextWindow": 200000,
+        "maxOutputTokens": 8192,
+        "supportsReasoning": false,
+        "supportsTools": true,
+        "isDefault": true,
+    })
 }
 
 fn handle_list_media_capabilities(state: &DaemonState, params: &Value) -> Result<Value> {
@@ -3634,6 +3746,12 @@ fn resolve_create_session_routing(
     let inputs = state.build_runtime_inputs_without_discovery()?;
     if let Some(provider_id) = provider_id {
         let provider_id = canonical_desktop_provider_id(&provider_id);
+        if is_native_puffer_provider_id(&provider_id) {
+            return Ok(DesktopSessionRouting {
+                provider_id: Some(provider_id),
+                model_id: Some("default".to_string()),
+            });
+        }
         let provider = inputs
             .providers
             .provider(&provider_id)
@@ -4504,12 +4622,13 @@ fn append_ordered_turn_progress(
             }
             TurnProgressItem::ToolInvocation(invocation) => {
                 let subject = subject_for_tool(&invocation);
+                let input = puffer_core::sanitized_tool_invocation_input(&invocation);
                 session_store.append_event(
                     session_uuid,
                     TranscriptEvent::ToolInvocation {
                         call_id: invocation.call_id,
                         tool_id: invocation.tool_id,
-                        input: invocation.input,
+                        input,
                         output: invocation.output,
                         success: invocation.success,
                         metadata: (!invocation.metadata.is_null()).then_some(invocation.metadata),
@@ -4522,12 +4641,14 @@ fn append_ordered_turn_progress(
                 if !fail_pending_tools {
                     continue;
                 }
+                let input =
+                    puffer_core::sanitize_tool_invocation_input(&request.tool_id, &request.input);
                 session_store.append_event(
                     session_uuid,
                     TranscriptEvent::ToolInvocation {
                         call_id: request.call_id,
                         tool_id: request.tool_id,
-                        input: request.input,
+                        input,
                         output: CANCELLED_TURN_MESSAGE.to_string(),
                         success: false,
                         metadata: Some(json!({
@@ -5601,7 +5722,14 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
         let perm_turn = turn_id_thread.clone();
         let perm_pending = pending.clone();
         let perm_actor = stream_actor.clone();
+        let perm_cancel = cancel.clone();
         let on_permission = move |req: PermissionPromptRequest| -> PermissionPromptAction {
+            // Turn already interrupted: deny immediately instead of surfacing a
+            // fresh prompt. Re-emitting after cancel is what made a canceled
+            // turn pop its prompt back up. (#671)
+            if perm_cancel.is_cancelled() {
+                return PermissionPromptAction::Deny;
+            }
             let request_id = next_req_id.fetch_add(1, Ordering::SeqCst).to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             perm_pending.lock().unwrap().insert(request_id.clone(), tx);
@@ -5632,7 +5760,18 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
         let question_pending = pending_questions.clone();
         let question_next_id = setup_state.next_request_id.clone();
         let question_actor = stream_actor.clone();
+        let question_cancel = cancel.clone();
         let on_user_question = move |req: UserQuestionPromptRequest| -> UserQuestionPromptResponse {
+            // Don't re-surface a question once the user interrupted the turn.
+            // Returning an empty answer lets the tool record "pending" and the
+            // agent loop bails at its next cancel boundary, instead of popping
+            // the prompt back up after it was dismissed. (#671)
+            if question_cancel.is_cancelled() {
+                return UserQuestionPromptResponse {
+                    answers: serde_json::Map::new(),
+                    annotations: serde_json::Map::new(),
+                };
+            }
             let request_id = question_next_id.fetch_add(1, Ordering::SeqCst).to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             question_pending
@@ -5919,7 +6058,18 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
         let question_pending = pending_questions.clone();
         let question_next_id = next_req_id.clone();
         let question_actor = stream_actor.clone();
+        let question_cancel = cancel.clone();
         let on_user_question = move |req: UserQuestionPromptRequest| -> UserQuestionPromptResponse {
+            // Don't re-surface a question once the user interrupted the turn.
+            // Returning an empty answer lets the tool record "pending" and the
+            // agent loop bails at its next cancel boundary, instead of popping
+            // the prompt back up after it was dismissed. (#671)
+            if question_cancel.is_cancelled() {
+                return UserQuestionPromptResponse {
+                    answers: serde_json::Map::new(),
+                    annotations: serde_json::Map::new(),
+                };
+            }
             let request_id = question_next_id.fetch_add(1, Ordering::SeqCst).to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             question_pending
@@ -6234,6 +6384,45 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
             return;
         }
 
+        if crate::daemon_slack_browser_setup::connect_args_are_slack_browser(&connect_args) {
+            let outcome = crate::daemon_slack_browser_setup::execute_slack_browser_setup(
+                setup_state.clone(),
+                channel_thread.clone(),
+                turn_id_thread.clone(),
+                connect_args.clone(),
+                next_req_id.clone(),
+                pending_questions.clone(),
+                cancel_thread.clone(),
+            );
+            match outcome {
+                Ok(assistant_text) => {
+                    setup_state.publish_event(ServerEnvelope::Event {
+                        event: channel_thread.clone(),
+                        payload: json!({
+                            "type": "turn-complete",
+                            "turnId": turn_id_thread.clone(),
+                            "assistantText": assistant_text,
+                        }),
+                    });
+                }
+                Err(error) => {
+                    if !(cancel_thread.is_cancelled()
+                        && cancel_reported_thread.load(Ordering::SeqCst))
+                    {
+                        publish_sessionless_turn_error_event(
+                            &setup_state,
+                            &channel_thread,
+                            &turn_id_thread,
+                            format!("{error:#}"),
+                            None,
+                        );
+                    }
+                }
+            }
+            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+            return;
+        }
+
         let inputs = match setup_state.build_runtime_inputs_without_discovery() {
             Ok(v) => v,
             Err(err) => {
@@ -6259,7 +6448,18 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
         let question_pending = pending_questions.clone();
         let question_next_id = next_req_id.clone();
         let question_actor = stream_actor.clone();
+        let question_cancel = cancel.clone();
         let on_user_question = move |req: UserQuestionPromptRequest| -> UserQuestionPromptResponse {
+            // Don't re-surface a question once the user interrupted the turn.
+            // Returning an empty answer lets the tool record "pending" and the
+            // agent loop bails at its next cancel boundary, instead of popping
+            // the prompt back up after it was dismissed. (#671)
+            if question_cancel.is_cancelled() {
+                return UserQuestionPromptResponse {
+                    answers: serde_json::Map::new(),
+                    annotations: serde_json::Map::new(),
+                };
+            }
             let request_id = question_next_id.fetch_add(1, Ordering::SeqCst).to_string();
             let (tx, rx) = std::sync::mpsc::channel();
             question_pending
@@ -6544,6 +6744,13 @@ impl TurnRequestOptions {
     }
 
     fn apply_session_routing(&mut self, routing: DesktopSessionRouting) {
+        if routing
+            .provider_id
+            .as_deref()
+            .is_some_and(is_native_puffer_provider_id)
+        {
+            return;
+        }
         if self.provider_id.is_none() {
             self.provider_id = routing
                 .provider_id
@@ -6620,6 +6827,9 @@ fn apply_turn_provider_selection(
     fast_mode: bool,
 ) -> Result<()> {
     let provider_id = canonical_desktop_provider_id(provider_id);
+    if is_native_puffer_provider_id(&provider_id) {
+        return Ok(());
+    }
     let provider = providers
         .provider(&provider_id)
         .with_context(|| format!("provider {provider_id} not found"))?;
@@ -6637,6 +6847,9 @@ fn apply_turn_model_selection(
     effort: &str,
     fast_mode: bool,
 ) -> Result<()> {
+    if provider_id.is_some_and(is_native_puffer_provider_id) {
+        return Ok(());
+    }
     let requested = if let Some(provider_id) = provider_id {
         let provider_id = canonical_desktop_provider_id(provider_id);
         let provider = providers
@@ -6658,6 +6871,13 @@ fn apply_turn_model_override_with_preferences(
     effort: &str,
     fast_mode: bool,
 ) -> Result<()> {
+    if requested
+        .split_once('/')
+        .is_some_and(|(provider_id, _)| is_native_puffer_provider_id(provider_id))
+        || is_native_puffer_provider_id(requested)
+    {
+        return Ok(());
+    }
     let (provider_id, model_id) = resolve_turn_model(providers, requested)?;
     apply_turn_model_preferences(app_state, &provider_id, &model_id, effort, fast_mode);
     Ok(())
@@ -6699,6 +6919,9 @@ fn resolve_turn_model(providers: &ProviderRegistry, requested: &str) -> Result<(
     let (provider_id, model_id) = if let Some((provider_id, model_id)) = requested.split_once('/') {
         let provider_id = canonical_desktop_provider_id(provider_id);
         let model_id = model_id.trim();
+        if is_native_puffer_provider_id(&provider_id) {
+            return Ok((provider_id, "default".to_string()));
+        }
         let provider = providers
             .provider(&provider_id)
             .with_context(|| format!("provider {provider_id} not found"))?;
@@ -6737,6 +6960,10 @@ fn canonical_desktop_provider_id(provider_id: &str) -> String {
     }
 }
 
+fn is_native_puffer_provider_id(provider_id: &str) -> bool {
+    provider_id.trim().eq_ignore_ascii_case("puffer")
+}
+
 fn desktop_provider_ids_match(left: &str, right: &str) -> bool {
     canonical_desktop_provider_id(left) == canonical_desktop_provider_id(right)
 }
@@ -6770,25 +6997,24 @@ mod tests {
         apply_turn_model_override,
         apply_turn_request_options, browser_launch_settings_or_default,
         browser_permission_payload_json, browser_status_for_turn, cancel_all_active_turns,
-        connector_setup_connect_args, connector_setup_id, daemon_now_ms,
-        desktop_latency_ms, file_media_mime_type, generated_video_handler,
-        handle_create_file_media_access, handle_create_generated_video_access,
-        handle_create_openai_realtime_client_secret, handle_create_session, handle_generate_media,
-        handle_import_external_credential, handle_list_lambda_skill_libraries,
-        handle_list_media_capabilities, handle_list_permissions, handle_list_provider_models,
-        handle_load_session_detail, handle_local_model_status, handle_login_with_api_key,
-        handle_logout_provider, handle_read_generated_media_preview,
-        handle_remove_lambda_skill_library, handle_save_lambda_skill_library,
-        handle_save_permissions, handle_save_proxy_settings, handle_set_lambda_skill_approval,
-        handle_set_lambda_skill_enabled, handle_update_config, model_descriptor_dto,
-        parse_single_byte_range, permission_review_payload_json,
+        connector_setup_connect_args, connector_setup_id, daemon_now_ms, desktop_latency_ms,
+        file_media_mime_type, generated_video_handler, handle_create_file_media_access,
+        handle_create_generated_video_access, handle_create_openai_realtime_client_secret,
+        handle_create_session, handle_generate_media, handle_import_external_credential,
+        handle_list_lambda_skill_libraries, handle_list_media_capabilities,
+        handle_list_permissions, handle_list_provider_models, handle_load_session_detail,
+        handle_local_model_status, handle_login_with_api_key, handle_logout_provider,
+        handle_read_generated_media_preview, handle_remove_lambda_skill_library,
+        handle_save_lambda_skill_library, handle_save_permissions, handle_save_proxy_settings,
+        handle_set_lambda_skill_approval, handle_set_lambda_skill_enabled, handle_update_config,
+        model_descriptor_dto, parse_single_byte_range, permission_review_payload_json,
         realtime_session_config_from_params, report_cancelled_turn, requires_explicit_subscription,
         resolve_create_session_model_id, resolve_monitor_reply_turn_scope, run_off_runtime,
         session_used_browser_tool, start_connector_setup_turn, turn_browser_tab_context,
-        CancelToken, ConnectionGuard, MONITOR_REPLY_ACTION_PROMPT_SCOPE,
-        DaemonState, GenerateMediaArtifactResult, GenerateMediaResult, GeneratedVideoRangeError,
-        GeneratedVideoTicket, ServerEnvelope, TurnHandle, TurnProgress, TurnProgressItem,
-        TurnRequestOptions,
+        CancelToken, ConnectionGuard, DaemonState, GenerateMediaArtifactResult,
+        GenerateMediaResult, GeneratedVideoRangeError, GeneratedVideoTicket, ServerEnvelope,
+        TurnHandle, TurnProgress, TurnProgressItem, TurnRequestOptions,
+        MONITOR_REPLY_ACTION_PROMPT_SCOPE,
     };
     use axum::{
         extract::{Path as AxumPath, State},
@@ -8491,6 +8717,10 @@ models: []
     #[test]
     fn read_generated_media_preview_resolves_session_cwd() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let session_store = SessionStore::from_paths(&paths).unwrap();
         let workspace = temp.path().join("other-workspace");
@@ -8515,6 +8745,10 @@ models: []
     #[test]
     fn read_generated_media_preview_returns_video_poster_bytes() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let session_store = SessionStore::from_paths(&paths).unwrap();
         let workspace = temp.path().join("other-workspace");
@@ -8575,6 +8809,10 @@ models: []
     #[test]
     fn create_file_media_access_returns_ticket_for_video() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let workspace_root = paths.workspace_root.clone();
         std::fs::create_dir_all(&workspace_root).unwrap();
@@ -8599,6 +8837,10 @@ models: []
     #[test]
     fn create_file_media_access_rejects_directory() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let dir = paths.workspace_root.join("clip.mp4");
         std::fs::create_dir_all(&dir).unwrap();
@@ -8615,6 +8857,10 @@ models: []
     #[test]
     fn create_file_media_access_rejects_non_video() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let workspace_root = paths.workspace_root.clone();
         std::fs::create_dir_all(&workspace_root).unwrap();
@@ -8633,6 +8879,10 @@ models: []
     #[test]
     fn create_file_media_access_rejects_missing_path() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let missing = paths.workspace_root.join("nope.mp4");
         let state = test_state_with_paths(paths);
@@ -8648,6 +8898,10 @@ models: []
     #[test]
     fn create_generated_video_access_returns_ticket_path() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let session_store = SessionStore::from_paths(&paths).unwrap();
         let workspace = temp.path().join("other-workspace");
@@ -8712,6 +8966,7 @@ models: []
     #[test]
     fn generated_video_ticket_lookup_prunes_expired_entries() {
         let temp = tempfile::tempdir().unwrap();
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let state = test_state_with_paths(ConfigPaths::discover(temp.path()));
         state.generated_video_tickets.lock().unwrap().insert(
             "expired".to_string(),
@@ -8730,6 +8985,7 @@ models: []
     #[tokio::test]
     async fn generated_video_handler_serves_full_body() {
         let temp = tempfile::tempdir().unwrap();
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let state = Arc::new(test_state_with_paths(ConfigPaths::discover(temp.path())));
         let video_path = temp.path().join("generated.mp4");
         std::fs::write(&video_path, b"0123456789").unwrap();
@@ -8765,6 +9021,7 @@ models: []
     #[tokio::test]
     async fn generated_video_handler_serves_single_range() {
         let temp = tempfile::tempdir().unwrap();
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let state = Arc::new(test_state_with_paths(ConfigPaths::discover(temp.path())));
         let video_path = temp.path().join("generated.mp4");
         std::fs::write(&video_path, b"0123456789").unwrap();

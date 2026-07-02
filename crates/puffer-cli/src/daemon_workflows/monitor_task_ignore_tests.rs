@@ -46,6 +46,10 @@ fn ignore_monitor_task_marks_task_and_appends_memory() {
     assert_eq!(tasks[0]["ignored"], Value::Bool(true));
     assert_eq!(tasks[0]["status"], "completed");
     assert_eq!(tasks[0]["task_id"], "monitor-1");
+    let monitor_tasks = snapshot["monitor_tasks"].as_array().unwrap();
+    assert_eq!(monitor_tasks[0]["ignored"], Value::Bool(true));
+    assert_eq!(monitor_tasks[0]["status"], "completed");
+    assert_eq!(monitor_tasks[0]["task_id"], "monitor-1");
 
     let stored: Value = serde_json::from_str(&fs::read_to_string(task_path).unwrap()).unwrap();
     assert_eq!(

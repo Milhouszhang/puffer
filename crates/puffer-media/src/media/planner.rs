@@ -163,9 +163,7 @@ mod tests {
         let error = plan_image_generation(10, &grouped_batch(15)).unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("grouped image generation count"),
+            error.to_string().contains("grouped image generation count"),
             "{error}"
         );
     }

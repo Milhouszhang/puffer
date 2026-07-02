@@ -87,6 +87,7 @@ type PtySet = {
 type WorkflowSnapshotFixture = {
   workflows: JsonRecord[];
   runs: JsonRecord[];
+  workflow_error?: string | null;
   connectors?: JsonRecord[];
   connections?: JsonRecord[];
   connector_error?: string | null;
@@ -97,6 +98,26 @@ type WorkflowSnapshotFixture = {
   monitor_memories?: JsonRecord[];
   monitor_memory_error?: string | null;
 };
+
+type WorkflowBackendModeFixture = "local" | "agent_env_cloud";
+
+type WorkflowBackendFixture = {
+  mode: WorkflowBackendModeFixture;
+  apiUrl: string;
+  uiUrl: string;
+  workspaceId: string;
+  hasToken: boolean;
+  options: JsonRecord[];
+};
+
+type WorkflowBackendConnectionFixture = {
+  success: boolean;
+  runtime: JsonRecord;
+  auth: JsonRecord;
+  workspace: JsonRecord;
+};
+
+type WorkflowNodeDefinitionFixture = JsonRecord;
 
 type MonitorHistoryFixture = {
   messages: JsonRecord[];
@@ -204,6 +225,13 @@ export const ONE_PIXEL_JPEG_BASE64 =
   "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAEFAqf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/ASP/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/ASP/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAY/Asf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/IV//2gAMAwEAAgADAAAAEP/EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQMBAT8QE//EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQIBAT8QE//EABQQAQAAAAAAAAAAAAAAAAAAABD/2gAIAQEAAT8QE//Z";
 
 const now = Date.now();
+const WORKFLOW_ID_KEYS = ["id", "workflowId", "workflow_id", "workflowSlug", "workflow_slug", "slug"];
+const EXECUTION_ID_KEYS = ["id", "executionId", "execution_id", "runId", "run_id"];
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 function overlapsContactIds(record: JsonRecord, contactIds: string[]): boolean {
   const saved = new Set(contactIds);
   return normalizeContactIds(record.contact_ids).some((id) => saved.has(id));
@@ -537,6 +565,45 @@ function defaultAuthStatuses(): JsonRecord[] {
   ];
 }
 
+function workflowBackendOptions(): JsonRecord[] {
+  return [
+    {
+      mode: "local",
+      label: "Run locally",
+      description: "Connects to a workflow runtime running on this device.",
+      apiUrl: "http://127.0.0.1:3000",
+      uiUrl: "http://localhost:5173"
+    },
+    {
+      mode: "agent_env_cloud",
+      label: "Run on AgentEnv Cloud",
+      description: "Sends required workflow data to AgentEnv Cloud for execution.",
+      apiUrl: "https://api.agentenv.io",
+      uiUrl: "https://agentenv.io"
+    }
+  ];
+}
+
+function defaultWorkflowBackend(): WorkflowBackendFixture {
+  return {
+    mode: "local",
+    apiUrl: "http://127.0.0.1:3000",
+    uiUrl: "http://localhost:5173",
+    workspaceId: "",
+    hasToken: false,
+    options: workflowBackendOptions()
+  };
+}
+
+function defaultWorkflowBackendConnection(): WorkflowBackendConnectionFixture {
+  return {
+    success: true,
+    runtime: { state: "passed", message: "Workflow runtime API is reachable." },
+    auth: { state: "passed", message: "Workflow runtime token is accepted." },
+    workspace: { state: "passed", message: "Workflow workspace is accessible." }
+  };
+}
+
 export class FakeDaemon {
   readonly requests: DaemonRequest[] = [];
   readonly socketUrls: string[] = [];
@@ -578,6 +645,9 @@ export class FakeDaemon {
     openaiDisplayName: null,
     media: defaultMediaSettings()
   };
+  private workflowBackend: WorkflowBackendFixture = defaultWorkflowBackend();
+  private workflowBackendConnection: WorkflowBackendConnectionFixture =
+    defaultWorkflowBackendConnection();
   private secrets: JsonRecord[] = [];
   private permissions: JsonRecord = {
     path: "/tmp/puffer/.puffer/permissions.json",
@@ -644,6 +714,54 @@ export class FakeDaemon {
     connectorSlug: string;
     connectionSlug: string;
   }>();
+  private readonly workflowExecutions = new Map<string, JsonRecord[]>();
+  private workflowNodeDefinitions: WorkflowNodeDefinitionFixture[] = [
+    {
+      type: "webhook",
+      category: "trigger",
+      name: "Webhook",
+      description: "Trigger a workflow from an HTTP request.",
+      icon: "webhook",
+      trusted: false,
+      isBuiltin: true,
+      schemas: {
+        config: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            methods: { type: "array", items: { type: "string" } },
+            authentication: { type: "string" }
+          }
+        }
+      },
+      handler: { type: "webhook" },
+      secrets: null
+    },
+    {
+      type: "noop",
+      category: "transformer",
+      name: "Noop",
+      description: "Pass input through unchanged.",
+      icon: "workflow",
+      trusted: true,
+      isBuiltin: true,
+      schemas: { config: { type: "object", properties: {} } },
+      handler: { type: "transform" },
+      secrets: null
+    },
+    {
+      type: "telegram_trigger",
+      category: "trigger",
+      name: "Telegram Trigger",
+      description: "Trigger on Telegram messages.",
+      icon: "send",
+      trusted: false,
+      isBuiltin: true,
+      schemas: { config: { type: "object", properties: { secretToken: { type: "string" } } } },
+      handler: { type: "trusted_service", service: "telegram" },
+      secrets: null
+    }
+  ];
   private connectorSetupCompletionDelayMs = 0;
   private connectorSetupQuestions: ConnectorSetupQuestionFixture[] = [
     {
@@ -665,46 +783,39 @@ export class FakeDaemon {
   private workflowSnapshot: WorkflowSnapshotFixture = {
     workflows: [
       {
-        schema: "puffer.workflow.v1",
-        slug: "agent-review-workflow",
-        enabled: true,
-        trigger: { type: "subscription", source_topic: "workspace.task.created", pattern: "review" },
-        pipeline: {
-          name: "Agent review workflow",
-          working_dir: "/tmp/puffer",
-          concurrency: 1,
-          nodes: [
-            {
-              id: "codex-implement",
-              type: "codex",
-              agent: "Codex implementer",
-              model: "gpt-5.4-codex",
-              tools: ["read", "edit"],
-              prompt: "Implement the requested change."
-            },
-            {
-              id: "claude-review",
-              type: "claude",
-              agent: "Claude reviewer",
-              model: "claude-sonnet-4-5",
-              tools: ["read", "diff"],
-              depends_on: ["codex-implement"],
-              prompt: "Review the implementation."
-            },
-            {
-              id: "puffer-ship",
-              type: "puffer",
-              agent: "Puffer shipper",
-              model: "puffer-default",
-              tools: ["git", "test"],
-              depends_on: ["claude-review"],
-              prompt: "Prepare the handoff."
-            }
-          ]
-        }
+        id: "wf-agent-review",
+        name: "Agent review workflow",
+        description: "Review, implement, and ship workspace tasks through the configured AgentEnv runtime.",
+        status: "active",
+        deploymentStatus: "deployed",
+        deployment_status: "deployed",
+        version: 3,
+        source: "agentenv-runtime",
+        workspaceId: "local-dev",
+        createdAt: new Date(now - 240_000).toISOString(),
+        updatedAt: new Date(now - 30_000).toISOString(),
+        publishedAt: new Date(now - 30_000).toISOString()
       }
     ],
-    runs: [],
+    runs: [
+      {
+        id: "exec-agent-review-1",
+        executionId: "exec-agent-review-1",
+        workflowId: "wf-agent-review",
+        workflow_id: "wf-agent-review",
+        status: "completed",
+        input: { topic: "workspace.task.created", text: "review release plan" },
+        output: { summary: "Reviewed the release plan and prepared handoff notes." },
+        nodeOutputs: {},
+        nodeErrors: {},
+        startedAt: new Date(now - 70_000).toISOString(),
+        completedAt: new Date(now - 58_000).toISOString(),
+        createdAt: new Date(now - 70_000).toISOString(),
+        source: "agentenv-runtime",
+        error: null
+      }
+    ],
+    workflow_error: null,
     connectors: [
       {
         connector_slug: "telegram-login",
@@ -863,6 +974,19 @@ export class FakeDaemon {
     ],
     connector_error: null,
     workflow_bindings: [
+      {
+        slug: "agent-review-runtime",
+        description: "Run the AgentEnv review workflow from Telegram support events",
+        connection_slug: "telegram-user",
+        connector_slug: "telegram-login",
+        status: "enabled",
+        enabled: true,
+        action_type: "run_workflow",
+        action_path: "wf-agent-review",
+        filter_pattern: "review|release|ship",
+        contact_ids: [],
+        created_at_ms: now - 75_000
+      },
       {
         slug: "monitor-telegram-user",
         description: "Monitor telegram-user for actionable tasks",
@@ -1106,6 +1230,23 @@ export class FakeDaemon {
     };
   }
 
+  setWorkflowBackend(config: Partial<WorkflowBackendFixture>): void {
+    this.workflowBackend = {
+      ...this.workflowBackend,
+      ...config,
+      options: config.options ? config.options.map((option) => ({ ...option })) : this.workflowBackend.options
+    };
+  }
+
+  setWorkflowBackendConnection(result: WorkflowBackendConnectionFixture): void {
+    this.workflowBackendConnection = {
+      success: result.success,
+      runtime: { ...result.runtime },
+      auth: { ...result.auth },
+      workspace: { ...result.workspace }
+    };
+  }
+
   setProviderModels(providerId: string, models: JsonRecord[]): void {
     this.providerModels[providerId] = models;
   }
@@ -1202,6 +1343,7 @@ export class FakeDaemon {
     this.workflowSnapshot = {
       workflows: snapshot.workflows.map((workflow) => ({ ...workflow })),
       runs: snapshot.runs.map((run) => ({ ...run })),
+      workflow_error: snapshot.workflow_error ?? null,
       connectors: snapshot.connectors?.map((connector) => ({ ...connector })),
       connections: snapshot.connections?.map((connection) => ({ ...connection })),
       connector_error: snapshot.connector_error ?? null,
@@ -1212,6 +1354,23 @@ export class FakeDaemon {
       monitor_memories: snapshot.monitor_memories?.map((memory) => ({ ...memory })),
       monitor_memory_error: snapshot.monitor_memory_error ?? null
     };
+    this.workflowExecutions.clear();
+    for (const run of this.workflowSnapshot.runs) {
+      const workflowId = this.recordString(run, [
+        "workflowId",
+        "workflow_id",
+        "workflowSlug",
+        "workflow_slug"
+      ]);
+      if (!workflowId) continue;
+      const executions = this.workflowExecutions.get(workflowId) ?? [];
+      executions.push({ ...run });
+      this.workflowExecutions.set(workflowId, executions);
+    }
+  }
+
+  setWorkflowNodeDefinitions(definitions: WorkflowNodeDefinitionFixture[]): void {
+    this.workflowNodeDefinitions = definitions.map((definition) => ({ ...definition }));
   }
 
   setMonitorHistory(history: MonitorHistoryFixture): void {
@@ -1560,6 +1719,54 @@ export class FakeDaemon {
         return this.runAgentTurn(request.params);
       case "dispatch_slash_command":
         return this.runAgentTurn(request.params);
+      case "list_command_surface":
+        return [
+          {
+            name: "compact",
+            aliases: [],
+            description: "Summarize the conversation to preserve context budget",
+            argumentHint: "<instructions>",
+            kind: "Prompt",
+            hidden: false
+          },
+          {
+            name: "review",
+            aliases: [],
+            description: "Review the current worktree or pull request",
+            argumentHint: null,
+            kind: "Prompt",
+            hidden: false
+          },
+          {
+            name: "plan",
+            aliases: [],
+            description: "Enable plan mode or view the current session plan",
+            argumentHint: "[open|description]",
+            kind: "Local",
+            hidden: false
+          }
+        ];
+      case "list_workspace_mentions":
+        return {
+          items: [
+            {
+              kind: "directory",
+              path: "src/lib",
+              absolutePath: "/tmp/puffer/src/lib",
+              name: "lib",
+              parent: "src",
+              size: 0
+            },
+            {
+              kind: "file",
+              path: "src/lib/main.ts",
+              absolutePath: "/tmp/puffer/src/lib/main.ts",
+              name: "main.ts",
+              parent: "src/lib",
+              size: 1200
+            }
+          ]
+        };
       case "read_chat_attachment_preview":
         return this.readChatAttachmentPreview(request.params);
       case "read_generated_media_preview":
@@ -1598,6 +1805,37 @@ export class FakeDaemon {
         return this.saveProxySettings(request.params);
       case "save_secret":
         return this.saveSecret(request.params);
+      case "workflow_backend_get_config":
+        return this.workflowBackendConfig();
+      case "workflow_backend_save_config":
+        return this.saveWorkflowBackendConfig(request.params);
+      case "workflow_backend_test_connection":
+        return this.workflowBackendConnectionResult();
+      case "workflow_open_ui":
+        return {
+          url: this.workflowUiUrl(),
+          opened: true
+        };
+      case "workflow_create":
+        return this.createRuntimeWorkflow(request.params);
+      case "workflow_update":
+        return this.updateRuntimeWorkflow(request.params);
+      case "workflow_deploy":
+        return this.deployRuntimeWorkflow(request.params);
+      case "workflow_undeploy":
+        return this.undeployRuntimeWorkflow(request.params);
+      case "workflow_node_definitions":
+        return this.listWorkflowNodeDefinitions();
+      case "workflow_node_definition":
+        return this.getWorkflowNodeDefinition(request.params);
+      case "workflow_execute":
+        return this.executeRuntimeWorkflow(request.params);
+      case "workflow_execute_in_memory":
+        return this.executeRuntimeWorkflowInMemory(request.params);
+      case "workflow_list_executions":
+        return this.listRuntimeWorkflowExecutions(request.params);
+      case "workflow_get_execution":
+        return this.getRuntimeWorkflowExecution(request.params);
       case "delete_secret":
         return this.deleteSecret(request.params);
       case "import_chrome_secrets":
@@ -1677,8 +1915,6 @@ export class FakeDaemon {
       case "task_monitor_history_list":
       case "monitor_history_list":
         return this.monitorHistory;
-      case "workflow_save":
-        return this.saveWorkflow(request.params);
       case "workflow_binding_create":
         return this.createWorkflowBinding(request.params);
       case "workflow_binding_delete":
@@ -1816,10 +2052,257 @@ export class FakeDaemon {
     ];
   }
 
+  private createRuntimeWorkflow(params: JsonRecord): JsonRecord {
+    const input = isJsonRecord(params.workflow) ? params.workflow : params;
+    const id =
+      this.recordString(input, WORKFLOW_ID_KEYS) ??
+      `wf-fixture-${this.workflowSnapshot.workflows.length + 1}`;
+    const existing = this.findRuntimeWorkflow(id);
+    const timestamp = new Date(Date.now()).toISOString();
+    const record = {
+      ...input,
+      id,
+      name: this.recordString(input, ["name", "displayName", "display_name", "title"]) ??
+        `Runtime workflow ${id}`,
+      status: this.recordString(input, ["status", "state"]) ?? "draft",
+      version: typeof input.version === "number"
+        ? input.version
+        : typeof existing?.version === "number"
+          ? existing.version
+          : 1,
+      createdAt: this.recordString(existing ?? {}, ["createdAt", "created_at"]) ?? timestamp,
+      updatedAt: timestamp,
+      source: this.recordString(input, ["source"]) ?? "fake-daemon"
+    };
+    this.workflowSnapshot = {
+      ...this.workflowSnapshot,
+      workflows: [
+        ...this.workflowSnapshot.workflows.filter((workflow) => this.workflowRecordId(workflow) !== id),
+        record
+      ].sort((a, b) => String(this.workflowRecordId(a) ?? "").localeCompare(this.workflowRecordId(b) ?? ""))
+    };
+    return { ...record };
+  }
+
+  private updateRuntimeWorkflow(params: JsonRecord): JsonRecord {
+    const workflowId = this.requiredRuntimeWorkflowId(params);
+    const existing = this.findRuntimeWorkflow(workflowId);
+    if (!existing) throw new Error(`workflow ${workflowId} not found`);
+    const input = isJsonRecord(params.workflow) ? params.workflow : params;
+    const timestamp = new Date(Date.now()).toISOString();
+    const record = {
+      ...existing,
+      ...input,
+      id: this.workflowRecordId(existing) ?? workflowId,
+      version: typeof existing.version === "number" ? existing.version : 1,
+      updatedAt: timestamp,
+      source: this.recordString(existing, ["source"]) ?? "fake-daemon"
+    };
+    this.workflowSnapshot = {
+      ...this.workflowSnapshot,
+      workflows: this.workflowSnapshot.workflows.map((workflow) =>
+        this.workflowRecordId(workflow) === workflowId ? record : workflow
+      )
+    };
+    return { ...record };
+  }
+
+  private deployRuntimeWorkflow(params: JsonRecord): JsonRecord {
+    const workflowId = this.requiredRuntimeWorkflowId(params);
+    const existing = this.findRuntimeWorkflow(workflowId);
+    if (!existing) throw new Error(`workflow ${workflowId} not found`);
+    const timestamp = new Date(Date.now()).toISOString();
+    const version = typeof existing.version === "number" ? existing.version + 1 : 2;
+    const deployed = {
+      ...existing,
+      id: this.workflowRecordId(existing) ?? workflowId,
+      status: "active",
+      deploymentStatus: "deployed",
+      deployment_status: "deployed",
+      version,
+      publishedAt: timestamp,
+      updatedAt: timestamp,
+      source: this.recordString(existing, ["source"]) ?? "fake-daemon"
+    };
+    this.workflowSnapshot = {
+      ...this.workflowSnapshot,
+      workflows: this.workflowSnapshot.workflows.map((workflow) =>
+        this.workflowRecordId(workflow) === workflowId ? deployed : workflow
+      )
+    };
+    return { ...deployed };
+  }
+
+  private undeployRuntimeWorkflow(params: JsonRecord): JsonRecord {
+    const workflowId = this.requiredRuntimeWorkflowId(params);
+    const existing = this.findRuntimeWorkflow(workflowId);
+    if (!existing) throw new Error(`workflow ${workflowId} not found`);
+    const timestamp = new Date(Date.now()).toISOString();
+    const undeployed = {
+      ...existing,
+      id: this.workflowRecordId(existing) ?? workflowId,
+      status: "draft",
+      deploymentStatus: "draft",
+      deployment_status: "draft",
+      publishedAt: null,
+      updatedAt: timestamp,
+      source: this.recordString(existing, ["source"]) ?? "fake-daemon"
+    };
+    this.workflowSnapshot = {
+      ...this.workflowSnapshot,
+      workflows: this.workflowSnapshot.workflows.map((workflow) =>
+        this.workflowRecordId(workflow) === workflowId ? undeployed : workflow
+      )
+    };
+    return { ...undeployed };
+  }
+
+  private listWorkflowNodeDefinitions(): JsonRecord[] {
+    return this.workflowNodeDefinitions.map(
+      ({ type, category, name, description, icon, trusted, isBuiltin }) => ({
+        type,
+        category,
+        name,
+        description,
+        icon,
+        trusted,
+        isBuiltin
+      })
+    );
+  }
+
+  private getWorkflowNodeDefinition(params: JsonRecord): JsonRecord {
+    const type = this.recordString(params, ["type", "nodeType", "node_type"]);
+    if (!type) throw new Error("missing workflow node type");
+    const definition = this.workflowNodeDefinitions.find((candidate) => candidate.type === type);
+    if (!definition) throw new Error(`workflow node definition ${type} not found`);
+    return { ...definition };
+  }
+
+  private executeRuntimeWorkflow(params: JsonRecord): JsonRecord {
+    const workflowId = this.requiredRuntimeWorkflowId(params);
+    const request = this.runtimeExecutionRequest(params);
+    const executions = this.workflowExecutionsFor(workflowId);
+    const timestamp = new Date(Date.now()).toISOString();
+    const id = this.recordString(request, EXECUTION_ID_KEYS) ?? `exec-${workflowId}-${executions.length + 1}`;
+    const execution = {
+      ...request,
+      id,
+      workflowId,
+      workflow_id: workflowId,
+      status: this.recordString(request, ["status", "state"]) ?? "completed",
+      input: request.input ?? request,
+      output: request.output ?? null,
+      nodeOutputs: request.nodeOutputs ?? {},
+      nodeErrors: request.nodeErrors ?? {},
+      startedAt: request.startedAt ?? timestamp,
+      completedAt: request.completedAt ?? timestamp,
+      createdAt: request.createdAt ?? timestamp,
+      error: request.error ?? null,
+      source: this.recordString(request, ["source"]) ?? "fake-daemon"
+    };
+    this.workflowExecutions.set(workflowId, [
+      ...executions.filter((candidate) => this.executionRecordId(candidate) !== id),
+      execution
+    ]);
+    this.workflowSnapshot = {
+      ...this.workflowSnapshot,
+      runs: [
+        execution,
+        ...this.workflowSnapshot.runs.filter((run) => this.executionRecordId(run) !== id)
+      ]
+    };
+    return { ...execution };
+  }
+
+  private executeRuntimeWorkflowInMemory(params: JsonRecord): JsonRecord {
+    const request = isJsonRecord(params.request) ? params.request : params;
+    if (!isJsonRecord(request.definition)) {
+      throw new Error("workflow_execute_in_memory requires definition");
+    }
+    const timestamp = new Date(Date.now()).toISOString();
+    return {
+      status: "completed",
+      output: { ok: true },
+      nodeOutputs: {},
+      nodeLogs: {},
+      duration: 12,
+      startedAt: timestamp,
+      completedAt: timestamp
+    };
+  }
+
+  private listRuntimeWorkflowExecutions(params: JsonRecord): JsonRecord[] {
+    const workflowId = this.requiredRuntimeWorkflowId(params);
+    return this.workflowExecutionsFor(workflowId).map((execution) => ({ ...execution }));
+  }
+
+  private getRuntimeWorkflowExecution(params: JsonRecord): JsonRecord {
+    const workflowId = this.requiredRuntimeWorkflowId(params);
+    const executionId = this.recordString(params, EXECUTION_ID_KEYS);
+    if (!executionId) throw new Error("missing workflow execution id");
+    const execution = this.workflowExecutionsFor(workflowId).find(
+      (candidate) => this.executionRecordId(candidate) === executionId
+    );
+    if (!execution) throw new Error(`workflow execution ${executionId} not found`);
+    return { ...execution };
+  }
+
+  private runtimeExecutionRequest(params: JsonRecord): JsonRecord {
+    const request = params.request ?? params.execution;
+    if (isJsonRecord(request)) return request;
+    const input: JsonRecord = {};
+    if (Object.prototype.hasOwnProperty.call(params, "input")) input.input = params.input;
+    if (Object.prototype.hasOwnProperty.call(params, "triggerNodeId")) {
+      input.triggerNodeId = params.triggerNodeId;
+    }
+    if (Object.prototype.hasOwnProperty.call(params, "trigger_node_id")) {
+      input.triggerNodeId = params.trigger_node_id;
+    }
+    return input;
+  }
+
+  private workflowExecutionsFor(workflowId: string): JsonRecord[] {
+    const stored = this.workflowExecutions.get(workflowId);
+    if (stored) return stored;
+    return this.workflowSnapshot.runs.filter((run) =>
+      this.recordString(run, ["workflowId", "workflow_id", "workflowSlug", "workflow_slug"]) === workflowId
+    );
+  }
+
+  private findRuntimeWorkflow(workflowId: string): JsonRecord | null {
+    return this.workflowSnapshot.workflows.find((workflow) => this.workflowRecordId(workflow) === workflowId) ?? null;
+  }
+
+  private requiredRuntimeWorkflowId(params: JsonRecord): string {
+    const workflowId = this.recordString(params, WORKFLOW_ID_KEYS);
+    if (!workflowId) throw new Error("missing workflow id");
+    return workflowId;
+  }
+
+  private workflowRecordId(record: JsonRecord): string | null {
+    return this.recordString(record, WORKFLOW_ID_KEYS);
+  }
+
+  private executionRecordId(record: JsonRecord): string | null {
+    return this.recordString(record, EXECUTION_ID_KEYS);
+  }
+
+  private recordString(record: JsonRecord, keys: string[]): string | null {
+    for (const key of keys) {
+      const value = record[key];
+      if (typeof value !== "string") continue;
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+    return null;
+  }
+
   private workflowListResponse(): JsonRecord {
     return {
       workflows: this.workflowSnapshot.workflows.map((workflow) => ({ ...workflow })),
       runs: this.workflowSnapshot.runs.map((run) => ({ ...run })),
+      workflow_error: this.workflowSnapshot.workflow_error ?? null,
       connectors: this.workflowSnapshot.connectors?.map((connector) => ({ ...connector })) ?? [],
       connections: this.workflowSnapshot.connections?.map((connection) => ({ ...connection })) ?? [],
       connector_error: this.workflowSnapshot.connector_error ?? null,
@@ -1830,20 +2313,6 @@ export class FakeDaemon {
       monitor_memories: this.workflowSnapshot.monitor_memories?.map((memory) => ({ ...memory })) ?? [],
       monitor_memory_error: this.workflowSnapshot.monitor_memory_error ?? null
     };
-  }
-
-  private saveWorkflow(params: JsonRecord): JsonRecord {
-    const workflow = params.workflow as JsonRecord | undefined;
-    const slug = String(workflow?.slug ?? "");
-    if (!workflow || !slug) throw new Error("missing workflow");
-    this.workflowSnapshot = {
-      ...this.workflowSnapshot,
-      workflows: [
-        ...this.workflowSnapshot.workflows.filter((candidate) => candidate.slug !== slug),
-        { ...workflow }
-      ].sort((a, b) => String(a.slug ?? "").localeCompare(String(b.slug ?? "")))
-    };
-    return this.workflowListResponse();
   }
 
   private createWorkflowBinding(params: JsonRecord): JsonRecord {
@@ -2554,6 +3023,49 @@ export class FakeDaemon {
     return this.settingsSnapshot();
   }
 
+  private workflowBackendConfig(): JsonRecord {
+    return {
+      mode: this.workflowBackend.mode,
+      apiUrl: this.workflowBackend.apiUrl,
+      uiUrl: this.workflowBackend.uiUrl,
+      workspaceId: this.workflowBackend.workspaceId,
+      hasToken: this.workflowBackend.hasToken,
+      options: this.workflowBackend.options.map((option) => ({ ...option }))
+    };
+  }
+
+  private saveWorkflowBackendConfig(params: JsonRecord): JsonRecord {
+    const nextMode =
+      params.mode === "agent_env_cloud" || params.mode === "local"
+        ? (params.mode as WorkflowBackendModeFixture)
+        : this.workflowBackend.mode;
+    const token = typeof params.apiToken === "string" ? params.apiToken.trim() : "";
+    const keepToken = params.keepToken === true;
+    this.workflowBackend = {
+      ...this.workflowBackend,
+      mode: nextMode,
+      apiUrl: String(params.apiUrl ?? this.workflowBackend.apiUrl),
+      uiUrl: String(params.uiUrl ?? this.workflowBackend.uiUrl),
+      workspaceId: String(params.workspaceId ?? ""),
+      hasToken: token ? true : keepToken ? this.workflowBackend.hasToken : false
+    };
+    return this.workflowBackendConfig();
+  }
+
+  private workflowBackendConnectionResult(): JsonRecord {
+    return {
+      success: this.workflowBackendConnection.success,
+      runtime: { ...this.workflowBackendConnection.runtime },
+      auth: { ...this.workflowBackendConnection.auth },
+      workspace: { ...this.workflowBackendConnection.workspace }
+    };
+  }
+
+  private workflowUiUrl(): string {
+    const base = String(this.workflowBackend.uiUrl).replace(/\/+$/, "");
+    return base.endsWith("/workflows") ? base : `${base}/workflows`;
+  }
+
   private saveSecret(params: JsonRecord): JsonRecord {
     const id = typeof params.id === "string" && params.id.trim() ? params.id : `sec_${Date.now()}`;
     const now = Date.now();
@@ -2783,6 +3295,7 @@ export class FakeDaemon {
             ? { ...(this.networkProxy.lastTest as JsonRecord) }
             : null
       },
+      workflowBackend: this.workflowBackendConfig(),
       secrets: {
         storeFile: "/tmp/home/.puffer/secrets.json",
         keySource: "local-key-file",

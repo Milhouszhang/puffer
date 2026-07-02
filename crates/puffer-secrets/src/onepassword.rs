@@ -38,11 +38,22 @@ const OP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// threads (so a large output can't deadlock the child) and the process is killed
 /// on timeout — preventing the app-lock hang documented in onepassword-sdk-go#266.
 fn run_op(op_bin: &str, args: &[&str], timeout: Duration) -> Result<Output> {
-    let mut child = Command::new(op_bin)
+    let mut command = Command::new(op_bin);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Run the child in its own process group so a timeout can kill the whole
+    // tree. `op` (or, in tests, the fake shell) can fork grandchildren that a
+    // plain `child.kill()` leaves running; those keep the stdout/stderr pipe
+    // open and would block the reader-thread joins below until they exit.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("spawn `{op_bin}`"))?;
     let mut out = child.stdout.take().expect("piped stdout");
@@ -63,6 +74,14 @@ fn run_op(op_bin: &str, args: &[&str], timeout: Duration) -> Result<Output> {
             break status;
         }
         if start.elapsed() >= timeout {
+            // Kill the child's whole process group (negative pgid) so forked
+            // grandchildren die too and release the pipe; then reap and join.
+            #[cfg(unix)]
+            // SAFETY: `child` was spawned as its own group leader (pgid == pid),
+            // so signalling `-pid` targets exactly this call's process tree.
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
             let _ = out_reader.join();
@@ -76,7 +95,11 @@ fn run_op(op_bin: &str, args: &[&str], timeout: Duration) -> Result<Output> {
     };
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
-    Ok(Output { status, stdout, stderr })
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Returns whether a stored secret value is a 1Password secret reference.
@@ -217,16 +240,19 @@ fn install_op_cli() -> Result<()> {
         // Resolve winget to the per-user WindowsApps alias by absolute path (only
         // the same user can write there) instead of trusting PATH ordering.
         let winget = std::env::var_os("LOCALAPPDATA")
-            .map(|local| {
-                std::path::Path::new(&local).join("Microsoft\\WindowsApps\\winget.exe")
-            })
+            .map(|local| std::path::Path::new(&local).join("Microsoft\\WindowsApps\\winget.exe"))
             .filter(|path| path.exists())
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| "winget".to_string());
         let mut c = Command::new(winget);
         c.args([
-            "install", "--id", "AgileBits.1Password.CLI", "-e", "--silent",
-            "--accept-source-agreements", "--accept-package-agreements",
+            "install",
+            "--id",
+            "AgileBits.1Password.CLI",
+            "-e",
+            "--silent",
+            "--accept-source-agreements",
+            "--accept-package-agreements",
         ]);
         c
     };
@@ -369,8 +395,12 @@ fn resolve_with(op_bin: &str, reference: &str) -> Result<String> {
     if !is_op_reference(reference) {
         bail!("`{reference}` is not a 1Password secret reference (op://...)");
     }
-    let output = run_op(op_bin, &["read", "--no-newline", reference], OP_CALL_TIMEOUT)
-        .context("run 1Password CLI `op read` (is `op` installed and OP_SERVICE_ACCOUNT_TOKEN set?)")?;
+    let output = run_op(
+        op_bin,
+        &["read", "--no-newline", reference],
+        OP_CALL_TIMEOUT,
+    )
+    .context("run 1Password CLI `op read` (is `op` installed and OP_SERVICE_ACCOUNT_TOKEN set?)")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("`op read {reference}` failed: {}", stderr.trim());
@@ -443,10 +473,19 @@ fn import_resolved_with(op_bin: &str) -> Result<(Vec<ResolvedLogin>, Vec<String>
 fn list_login_refs(op_bin: &str) -> Result<Vec<OpItemRef>> {
     let output = run_op(
         op_bin,
-        &["item", "list", "--categories", "Login,Password", "--format", "json"],
+        &[
+            "item",
+            "list",
+            "--categories",
+            "Login,Password",
+            "--format",
+            "json",
+        ],
         OP_CALL_TIMEOUT,
     )
-    .context("run 1Password CLI `op item list` (is `op` installed and OP_SERVICE_ACCOUNT_TOKEN set?)")?;
+    .context(
+        "run 1Password CLI `op item list` (is `op` installed and OP_SERVICE_ACCOUNT_TOKEN set?)",
+    )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("`op item list` failed: {}", stderr.trim());
@@ -791,8 +830,12 @@ mod tests {
             // Fake `op` that hangs (mimics the app-lock hang from sdk-go#266).
             let op = write_fake_op(dir.path(), "sleep 30");
             let start = std::time::Instant::now();
-            let err = run_op(op.to_str().unwrap(), &["read", "x"], Duration::from_millis(300))
-                .unwrap_err();
+            let err = run_op(
+                op.to_str().unwrap(),
+                &["read", "x"],
+                Duration::from_millis(300),
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("timed out"));
             // Must return promptly (well under the fake's 30s sleep).
             assert!(start.elapsed() < Duration::from_secs(5));

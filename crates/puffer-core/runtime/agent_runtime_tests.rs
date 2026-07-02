@@ -3,7 +3,9 @@ use crate::runtime::tests::refresh_env_lock;
 use crate::MessageRole;
 use puffer_config::{ensure_workspace_dirs, ConfigPaths, PufferConfig};
 use puffer_provider_registry::{AuthMode, AuthStore, ProviderDescriptor, ProviderRegistry};
-use puffer_resources::{AgentSpec, LoadedItem, LoadedResources, SourceInfo, SourceKind};
+use puffer_resources::{
+    AgentMemoryScope, AgentSpec, LoadedItem, LoadedResources, SourceInfo, SourceKind,
+};
 use puffer_session_store::SessionMetadata;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -58,6 +60,41 @@ fn loaded_agent(
             path: format!("{id}.yaml").into(),
             kind: SourceKind::Builtin,
         },
+    }
+}
+
+#[test]
+fn build_agent_system_prompt_includes_persistent_agent_memory_when_configured() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = refresh_env_lock().lock().unwrap();
+    let old_home = std::env::var_os("PUFFER_HOME");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::env::set_var("PUFFER_HOME", &home);
+    let memory_path = home.join(".claude/agent-memory/reviewer/MEMORY.md");
+    std::fs::create_dir_all(memory_path.parent().unwrap()).unwrap();
+    std::fs::write(&memory_path, "Remember to review migrations carefully.").unwrap();
+
+    let mut agent = loaded_agent(
+        "reviewer",
+        "Reviews code carefully.",
+        "You are a reviewer.",
+        &["Read"],
+    );
+    agent.value.memory = Some(AgentMemoryScope::User);
+    let resources = LoadedResources::default();
+    let prompt =
+        super::agent_support::build_agent_system_prompt(temp.path(), &resources, &agent.value)
+            .unwrap();
+
+    assert!(prompt.contains("You are a reviewer."));
+    assert!(prompt.contains("Persistent Agent Memory"));
+    assert!(prompt.contains("Remember to review migrations carefully."));
+
+    if let Some(value) = old_home {
+        std::env::set_var("PUFFER_HOME", value);
+    } else {
+        std::env::remove_var("PUFFER_HOME");
     }
 }
 

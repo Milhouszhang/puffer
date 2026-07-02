@@ -11,7 +11,6 @@ use puffer_subscriptions::{
     SubscriberManifestRoots, TaggedFilterSpec, WorkflowBindingRun, WorkflowBindingSpec,
     WorkflowBindingStatus,
 };
-use puffer_workflow::{WorkflowDefinition, WorkflowRun, WorkflowStore};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::path::Path;
@@ -63,30 +62,12 @@ struct WorkflowInspectInput {
 }
 
 /// Executes `WorkflowList`.
-pub fn execute_workflow_list(_state: &mut AppState, cwd: &Path, _input: Value) -> Result<String> {
-    let store = workflow_store(cwd);
-    let workflows = store.list()?;
-    let runs = store.list_runs()?;
-    let mut summaries = workflows
-        .iter()
-        .map(|workflow| workflow_summary(workflow, &runs))
-        .collect::<Vec<_>>();
+pub fn execute_workflow_list(_state: &mut AppState, _cwd: &Path, _input: Value) -> Result<String> {
+    let mut summaries = Vec::new();
     if let Ok(manager) = subscription_manager() {
-        let native_slugs = workflows
-            .iter()
-            .map(|workflow| workflow.slug.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        let native_binding_slugs = workflows
-            .iter()
-            .map(|workflow| format!("workflow-{}", workflow.slug))
-            .collect::<std::collections::BTreeSet<_>>();
         for binding in manager.store().list() {
-            if !native_slugs.contains(binding.slug.as_str())
-                && !native_binding_slugs.contains(&binding.slug)
-            {
-                let runs = manager.history_store().list_for(&binding.slug);
-                summaries.push(binding_summary(&binding, &runs));
-            }
+            let runs = manager.history_store().list_for(&binding.slug);
+            summaries.push(binding_summary(&binding, &runs));
         }
     }
     Ok(serde_json::to_string_pretty(&json!({
@@ -95,23 +76,9 @@ pub fn execute_workflow_list(_state: &mut AppState, cwd: &Path, _input: Value) -
 }
 
 /// Executes `WorkflowToggle`.
-pub fn execute_workflow_toggle(_state: &mut AppState, cwd: &Path, input: Value) -> Result<String> {
+pub fn execute_workflow_toggle(_state: &mut AppState, _cwd: &Path, input: Value) -> Result<String> {
     let parsed: WorkflowToggleInput =
         serde_json::from_value(input).context("invalid WorkflowToggle input")?;
-    let store = workflow_store(cwd);
-    if let Some(mut workflow) = store.get(&parsed.slug)? {
-        workflow.enabled = parsed.enabled;
-        let workflow = store.upsert(workflow)?;
-        if let Ok(manager) = subscription_manager() {
-            let binding_id = format!("workflow-{}", workflow.slug);
-            if manager.store().get(&binding_id).is_some() {
-                let status = workflow_status(parsed.enabled);
-                manager.store().set_status(&binding_id, status)?;
-                manager.refresh_connection_consumers()?;
-            }
-        }
-        return Ok(serde_json::to_string_pretty(&workflow)?);
-    }
     if let Ok(manager) = subscription_manager() {
         if manager.store().get(&parsed.slug).is_some() {
             let binding = manager
@@ -291,23 +258,13 @@ pub fn execute_workflow_validate(
 }
 
 /// Executes `WorkflowInspect`.
-pub fn execute_workflow_inspect(_state: &mut AppState, cwd: &Path, input: Value) -> Result<String> {
+pub fn execute_workflow_inspect(
+    _state: &mut AppState,
+    _cwd: &Path,
+    input: Value,
+) -> Result<String> {
     let parsed: WorkflowInspectInput =
         serde_json::from_value(input).context("invalid WorkflowInspect input")?;
-    let store = workflow_store(cwd);
-    if let Some(workflow) = store.get(&parsed.slug)? {
-        let runs = store.list_runs_for(&parsed.slug)?;
-        if let Some(run) = select_run(&runs, parsed.run_idx, parsed.run_id.as_deref()) {
-            return Ok(serde_json::to_string_pretty(&json!({
-                "workflow": workflow,
-                "run": run_details(run),
-            }))?);
-        }
-        return Ok(serde_json::to_string_pretty(&json!({
-            "workflow": workflow,
-            "historical_runs": runs.iter().map(run_summary).collect::<Vec<_>>(),
-        }))?);
-    }
     if let Ok(manager) = subscription_manager() {
         if let Some(binding) = manager.store().get(&parsed.slug) {
             let runs = manager.history_store().list_for(&parsed.slug);
@@ -324,11 +281,6 @@ pub fn execute_workflow_inspect(_state: &mut AppState, cwd: &Path, input: Value)
         }
     }
     anyhow::bail!("workflow `{}` not found", parsed.slug)
-}
-
-fn workflow_store(cwd: &Path) -> WorkflowStore {
-    let paths = ConfigPaths::discover(cwd);
-    WorkflowStore::new(&paths.workspace_config_dir)
 }
 
 fn workflow_trigger_supported(
@@ -377,21 +329,6 @@ fn subscriber_manifest_roots(cwd: &Path) -> SubscriberManifestRoots {
     )
 }
 
-fn workflow_summary(workflow: &WorkflowDefinition, runs: &[WorkflowRun]) -> Value {
-    let latest = runs
-        .iter()
-        .filter(|run| run.workflow_slug == workflow.slug)
-        .max_by_key(|run| run.idx)
-        .map(run_summary);
-    json!({
-        "slug": workflow.slug,
-        "enabled": workflow.enabled,
-        "trigger": workflow.trigger,
-        "node_count": workflow.pipeline.nodes.len(),
-        "latest_run": latest,
-    })
-}
-
 fn binding_summary(binding: &WorkflowBindingSpec, runs: &[WorkflowBindingRun]) -> Value {
     let latest = runs
         .iter()
@@ -416,46 +353,6 @@ fn binding_summary(binding: &WorkflowBindingSpec, runs: &[WorkflowBindingRun]) -
     })
 }
 
-fn run_summary(run: &WorkflowRun) -> Value {
-    json!({
-        "run_idx": run.idx,
-        "run_id": run.run_id,
-        "trigger_info": run.trigger,
-        "action_summary": {
-            "status": run.status,
-            "nodes": run.nodes.iter().map(|node| {
-                json!({
-                    "id": node.id,
-                    "status": node.status,
-                    "output": node.output,
-                    "error": node.error,
-                })
-            }).collect::<Vec<_>>(),
-            "error": run.error,
-        },
-    })
-}
-
-fn run_details(run: &WorkflowRun) -> Value {
-    json!({
-        "run_idx": run.idx,
-        "run_id": run.run_id,
-        "trigger_info": run.trigger,
-        "action_log": run.nodes.iter().map(|node| {
-            json!({
-                "id": node.id,
-                "status": node.status,
-                "started_at_ms": node.started_at_ms,
-                "ended_at_ms": node.ended_at_ms,
-                "output": node.output,
-                "error": node.error,
-            })
-        }).collect::<Vec<_>>(),
-        "status": run.status,
-        "error": run.error,
-    })
-}
-
 fn binding_run_summary(run: &WorkflowBindingRun) -> Value {
     json!({
         "run_idx": run.idx,
@@ -473,17 +370,6 @@ fn binding_run_details(run: &WorkflowBindingRun) -> Value {
         "action_log": run.action_log,
         "status": run.status,
     })
-}
-
-fn select_run<'a>(
-    runs: &'a [WorkflowRun],
-    idx: Option<u64>,
-    run_id: Option<&str>,
-) -> Option<&'a WorkflowRun> {
-    if let Some(idx) = idx {
-        return runs.iter().find(|run| run.idx == idx);
-    }
-    run_id.and_then(|run_id| runs.iter().find(|run| run.run_id == run_id))
 }
 
 fn select_binding_run<'a>(

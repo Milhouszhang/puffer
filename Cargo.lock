@@ -4496,6 +4496,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+ "url",
  "urlencoding",
 ]
 
@@ -4640,6 +4641,7 @@ dependencies = [
  "puffer-provider-registry",
  "puffer-resources",
  "puffer-runner-api",
+ "puffer-runner-grpc",
  "puffer-secrets",
  "puffer-session-store",
  "puffer-skill-evolution",
@@ -4648,7 +4650,6 @@ dependencies = [
  "puffer-subscriptions",
  "puffer-tools",
  "puffer-transport-anthropic",
- "puffer-workflow",
  "qrcode",
  "rand 0.8.6",
  "regex",
@@ -4831,6 +4832,7 @@ dependencies = [
  "puffer-runner-local",
  "puffer-tools",
  "rmcp",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -4867,6 +4869,7 @@ dependencies = [
  "des",
  "dirs",
  "hmac 0.12.1",
+ "libc",
  "pbkdf2",
  "rand 0.8.6",
  "rusqlite",
@@ -5099,12 +5102,10 @@ name = "puffer-workflow"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "reqwest",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
- "time",
- "uuid",
 ]
 
 [[package]]

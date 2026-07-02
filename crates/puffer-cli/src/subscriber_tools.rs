@@ -1,7 +1,8 @@
 //! Internal CLI adapters for subscriber-backed and connection-backed tools.
 
 use crate::subscriber_tool_args::{
-    EmailArgs, EmailCommand, SlackArgs, SlackCommand, TelegramArgs, TelegramCommand,
+    EmailArgs, EmailCommand, RequestSecretArgs, RequestSecretCommand, SlackArgs, SlackCommand,
+    TelegramArgs, TelegramCommand,
 };
 use anyhow::{bail, Context, Result};
 use puffer_tools::internal_permissions::{
@@ -284,6 +285,61 @@ fn slack_default_connection(command: &SlackCommand) -> &'static str {
         SlackCommand::ConfigureApp { .. } => "slack-app",
         _ => "slack-login",
     }
+}
+
+/// Runs one `puffer internal-tool request-secret` command. The raw secret never
+/// reaches this child process: the parent returns only `PUFFER_SECRET_...`
+/// placeholders and non-secret metadata.
+pub(crate) fn run_request_secret(args: RequestSecretArgs) -> Result<()> {
+    let input = match args.command {
+        RequestSecretCommand::Search {
+            query,
+            origin,
+            username,
+            limit,
+        } => json!({
+            "action": "search",
+            "query": query,
+            "origin": origin,
+            "username": username,
+            "limit": limit,
+        }),
+        RequestSecretCommand::Request { id, name, reason } => json!({
+            "action": "request",
+            "id": id,
+            "name": name,
+            "reason": reason,
+        }),
+        RequestSecretCommand::Collect {
+            name,
+            description,
+            username,
+            origin,
+            prompt,
+        } => json!({
+            "action": "collect",
+            "name": name,
+            "description": description,
+            "username": username,
+            "origin": origin,
+            "prompt": prompt,
+        }),
+        RequestSecretCommand::Create {
+            name,
+            description,
+            value,
+            username,
+            origin,
+        } => json!({
+            "action": "create",
+            "name": name,
+            "description": description,
+            "value": value,
+            "username": username,
+            "origin": origin,
+        }),
+    };
+    execute_parent_internal_tool("request-secret", input)
 }
 
 fn execute_parent_internal_tool(tool_id: &str, input: Value) -> Result<()> {

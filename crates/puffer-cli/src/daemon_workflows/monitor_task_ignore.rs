@@ -90,11 +90,12 @@ pub(crate) fn handle_monitor_task_ignore(paths: &ConfigPaths, params: &Value) ->
         memory_content,
         ignore_filter,
     );
-    super::handle_workflow_list(paths)
+    super::handle_workflow_list_with_runtime(paths, false)
 }
 
 /// Backfills pre-agent ignore filters from tasks that were ignored before
 /// the router understood ignore filters.
+#[cfg(test)]
 pub(crate) fn sync_monitor_ignore_filters_from_tasks(paths: &ConfigPaths) -> Result<()> {
     let path = monitor_tasks_path(paths);
     let raw = match fs::read_to_string(&path) {
@@ -249,6 +250,7 @@ fn metadata_string(
         })
 }
 
+#[cfg(test)]
 fn metadata_bool(metadata: &Map<String, Value>, key: &str) -> bool {
     metadata.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
@@ -309,10 +311,23 @@ fn ensure_monitor_ignore_filter(metadata: &Map<String, Value>) -> Result<Option<
     let Some(mut binding) = manager.store().get(&monitor_slug(&connection_slug)) else {
         return Ok(Some(filter_json));
     };
-    if !binding_has_ignore_filter(&binding, &filter_json) {
+    let filter_added = !binding_has_ignore_filter(&binding, &filter_json);
+    if filter_added {
         binding.ignore_filters.push(filter);
         manager.store().upsert(binding)?;
-        manager.refresh_connection_consumers()?;
+        let manager = Arc::clone(&manager);
+        let connection_slug = connection_slug.clone();
+        let _ = thread::Builder::new()
+            .name("puffer-ignore-filter-refresh".to_string())
+            .spawn(move || {
+                if let Err(error) = manager.refresh_connection_consumers() {
+                    tracing::warn!(
+                        connection = %connection_slug,
+                        %error,
+                        "failed to refresh connection consumers after monitor ignore filter install"
+                    );
+                }
+            });
     }
     Ok(Some(filter_json))
 }

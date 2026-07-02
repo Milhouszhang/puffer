@@ -7,13 +7,36 @@ const MASK_PREFIX: &str = "PUFFER_SECRET_";
 
 /// Registers a raw secret value and returns its model-visible placeholder.
 pub(crate) fn register_masked_secret(state: &AppState, value: String) -> Result<String> {
-    let token = format!("{MASK_PREFIX}{}", Uuid::new_v4().simple());
-    state
+    let mut secrets = state
         .masked_secrets
         .lock()
-        .map_err(|_| anyhow::anyhow!("masked secret store lock poisoned"))?
-        .insert(token.clone(), value);
+        .map_err(|_| anyhow::anyhow!("masked secret store lock poisoned"))?;
+    // Reuse the existing placeholder for an identical value. Without this, a
+    // caller that repeatedly requests the same secret (e.g. a connector looping
+    // `request-secret` after an allow-all) would grow the store unbounded and
+    // slow every later redaction/expansion scan.
+    if let Some(token) = secrets
+        .iter()
+        .find_map(|(token, existing)| (existing == &value).then(|| token.clone()))
+    {
+        return Ok(token);
+    }
+    let token = format!("{MASK_PREFIX}{}", Uuid::new_v4().simple());
+    secrets.insert(token.clone(), value);
     Ok(token)
+}
+
+/// Returns whether any string inside a JSON tree contains a Puffer secret
+/// placeholder. Used by the parallel internal-tool batch path, which has no
+/// `&AppState` to expand placeholders, to detect secret-bearing input and route
+/// it back to the serial path instead of forwarding a literal placeholder.
+pub(crate) fn contains_secret_placeholder(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains(MASK_PREFIX),
+        Value::Array(items) => items.iter().any(contains_secret_placeholder),
+        Value::Object(map) => map.values().any(contains_secret_placeholder),
+        _ => false,
+    }
 }
 
 /// Replaces known secret placeholders inside a JSON tool input tree.
@@ -53,9 +76,13 @@ pub(crate) fn expand_secret_placeholder_value(state: &AppState, text: &str) -> R
 
 /// Redacts raw secret values from text using their registered placeholders.
 pub(crate) fn redact_known_secrets(state: &AppState, text: &str) -> String {
-    let Ok(secrets) = state.masked_secrets.lock() else {
-        return text.to_string();
-    };
+    // Recover the data even if the lock is poisoned: a poisoned mutex still holds
+    // valid entries, and returning the text unredacted would fail open and leak
+    // raw secret values. Redaction must never fail open.
+    let secrets = state
+        .masked_secrets
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut pairs = secrets
         .iter()
         .filter(|(_, secret)| !secret.is_empty())
@@ -150,6 +177,23 @@ mod tests {
                 note: None,
             },
         )
+    }
+
+    #[test]
+    fn register_masked_secret_reuses_token_for_identical_value() {
+        let state = temp_state();
+        let first = register_masked_secret(&state, "same-value".to_string()).unwrap();
+        let second = register_masked_secret(&state, "same-value".to_string()).unwrap();
+        let other = register_masked_secret(&state, "other-value".to_string()).unwrap();
+        // Identical values reuse one placeholder (bounds the store under repeated
+        // requests); distinct values get distinct placeholders.
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert_eq!(
+            state.masked_secrets.lock().unwrap().len(),
+            2,
+            "identical values must not create duplicate store entries"
+        );
     }
 
     #[test]

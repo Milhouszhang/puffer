@@ -39,7 +39,10 @@ fn lark_and_feishu_browser_templates_declare_per_brand_state_roots() {
     // and match what `lark_browser::save_config` writes.
     let lark_sub = lark.subscriber.as_ref().unwrap();
     assert_eq!(lark_sub.manifest_slug, "lark-browser");
-    assert_eq!(lark_sub.state_root.as_deref(), Some("lark-browser-accounts"));
+    assert_eq!(
+        lark_sub.state_root.as_deref(),
+        Some("lark-browser-accounts")
+    );
 
     let feishu_sub = feishu.subscriber.as_ref().unwrap();
     assert_eq!(feishu_sub.manifest_slug, "feishu-browser");
@@ -94,7 +97,10 @@ fn suggested_connection_slugs_match_connect_defaults() {
     assert_eq!(suggested_connection_slug("gmail-browser"), "gmail-browser");
     assert_eq!(suggested_connection_slug("gcal-browser"), "gcal-browser");
     assert_eq!(suggested_connection_slug("lark-browser"), "lark-browser");
-    assert_eq!(suggested_connection_slug("feishu-browser"), "feishu-browser");
+    assert_eq!(
+        suggested_connection_slug("feishu-browser"),
+        "feishu-browser"
+    );
     assert_eq!(suggested_connection_slug("discord-bot"), "discord-bot");
     assert_eq!(suggested_connection_slug("lark-login"), "lark-user");
     assert_eq!(suggested_connection_slug("lark-bot"), "lark-bot");

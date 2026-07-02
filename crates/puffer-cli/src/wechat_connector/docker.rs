@@ -103,7 +103,10 @@ struct ImagePlan {
 /// no Docker Desktop — and falls back to Docker otherwise. `DOCKER_BIN` /
 /// `WECHAT_CONTAINER_BIN` override the resolved binaries.
 fn select_runtime() -> (Runtime, String) {
-    match env_or("WECHAT_RUNTIME", "auto").to_ascii_lowercase().as_str() {
+    match env_or("WECHAT_RUNTIME", "auto")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "container" => (Runtime::Container, resolve_container_bin()),
         "docker" => (Runtime::Docker, env_or("DOCKER_BIN", "docker")),
         // `auto`: Apple `container` on macOS 26+ if installed, else Docker.
@@ -143,7 +146,10 @@ fn brew_install_container() -> Option<String> {
     use std::sync::OnceLock;
     static DONE: OnceLock<Option<String>> = OnceLock::new();
     DONE.get_or_init(|| {
-        if matches!(std::env::var("WECHAT_AUTO_INSTALL_CONTAINER").as_deref(), Ok("0")) {
+        if matches!(
+            std::env::var("WECHAT_AUTO_INSTALL_CONTAINER").as_deref(),
+            Ok("0")
+        ) {
             return None;
         }
         let brew = which_on_path("brew").or_else(|| {
@@ -156,11 +162,15 @@ fn brew_install_container() -> Option<String> {
             "wechat: Apple `container` not found — installing it via Homebrew (one-time, a few \
              minutes). Set WECHAT_AUTO_INSTALL_CONTAINER=0 to skip and use Docker."
         );
-        let _ = std::process::Command::new(&brew).args(["install", "container"]).status();
+        let _ = std::process::Command::new(&brew)
+            .args(["install", "container"])
+            .status();
         // The 1.0.0 bottle mislocated its plugins (apiserver crash-loop); the fix
         // shipped in 1.0.0_1, so update + upgrade past it.
         let _ = std::process::Command::new(&brew).arg("update").status();
-        let _ = std::process::Command::new(&brew).args(["upgrade", "container"]).status();
+        let _ = std::process::Command::new(&brew)
+            .args(["upgrade", "container"])
+            .status();
         locate_container_bin()
     })
     .clone()
@@ -221,7 +231,11 @@ pub(crate) fn teardown_runtimes() -> Vec<(String, bool)> {
 /// standard install locations, or `None` if Docker is not installed (so a
 /// Docker-free machine never tries to spawn it).
 fn locate_docker_bin() -> Option<String> {
-    if let Some(bin) = std::env::var("DOCKER_BIN").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+    if let Some(bin) = std::env::var("DOCKER_BIN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
         return Some(bin);
     }
     if let Some(path) = which_on_path("docker") {
@@ -350,7 +364,10 @@ impl WechatInstance {
         // A config that already fell back carries the base image + flag; honor it
         // without re-attempting the (failed) baked build.
         let on_base = cfg.image == base_image();
-        let keep = ImagePlan { image: cfg.image.clone(), runtime_a11y: cfg.runtime_a11y };
+        let keep = ImagePlan {
+            image: cfg.image.clone(),
+            runtime_a11y: cfg.runtime_a11y,
+        };
 
         if self.runtime == Runtime::Container {
             // `container` has its own image store (separate from Docker's).
@@ -375,7 +392,10 @@ impl WechatInstance {
             // Priority: build the baked a11y image (skipped if the config already
             // targets the base image — that build doesn't apply to it).
             if !on_base && self.try_build_atspi_image(cfg).await? {
-                return Ok(ImagePlan { image: cfg.image.clone(), runtime_a11y: false });
+                return Ok(ImagePlan {
+                    image: cfg.image.clone(),
+                    runtime_a11y: false,
+                });
             }
             // Fallback: base image + runtime a11y (fully Docker-free).
             if let Some(plan) = self.fall_back_to_base(cfg).await? {
@@ -415,7 +435,10 @@ impl WechatInstance {
             return Ok(keep);
         }
         if !on_base && self.try_build_atspi_image(cfg).await? {
-            return Ok(ImagePlan { image: cfg.image.clone(), runtime_a11y: false });
+            return Ok(ImagePlan {
+                image: cfg.image.clone(),
+                runtime_a11y: false,
+            });
         }
         if let Some(plan) = self.fall_back_to_base(cfg).await? {
             return Ok(plan);
@@ -458,7 +481,10 @@ impl WechatInstance {
         if let Err(error) = updated.save() {
             eprintln!("wechat: could not persist the runtime-a11y fallback config: {error:#}");
         }
-        Ok(Some(ImagePlan { image: base, runtime_a11y: true }))
+        Ok(Some(ImagePlan {
+            image: base,
+            runtime_a11y: true,
+        }))
     }
 
     /// Auto-builds the AT-SPI WeChat image when it is missing. That image bakes the
@@ -472,7 +498,10 @@ impl WechatInstance {
     /// packaged binary with no source tree skips this (the caller then falls back
     /// to the base image + runtime accessibility setup).
     async fn try_build_atspi_image(&self, cfg: &InstanceConfig) -> Result<bool> {
-        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/wechat-vz/image/build-image.sh");
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/wechat-vz/image/build-image.sh"
+        );
         if !Path::new(script).exists() {
             return Ok(false);
         }
@@ -481,7 +510,11 @@ impl WechatInstance {
              several minutes)…",
             cfg.image
         );
-        let runtime = if self.runtime == Runtime::Container { "container" } else { "docker" };
+        let runtime = if self.runtime == Runtime::Container {
+            "container"
+        } else {
+            "docker"
+        };
         let mut cmd = Command::new("bash");
         cmd.arg(script)
             .env("WECHAT_RUNTIME", runtime)
@@ -552,7 +585,10 @@ impl WechatInstance {
             && self.runtime == Runtime::Container
             && stderr_needs_kernel(&output.stderr)
         {
-            if let Ok(kr) = self.docker(&["system", "kernel", "set", "--recommended"]).await {
+            if let Ok(kr) = self
+                .docker(&["system", "kernel", "set", "--recommended"])
+                .await
+            {
                 if !kr.status.success() {
                     eprintln!(
                         "wechat: `container system kernel set --recommended` failed: {}",
@@ -578,7 +614,10 @@ impl WechatInstance {
                 String::from_utf8_lossy(&retry.stderr).trim()
             );
         }
-        bail!("failed to create wechat container `{}`: {stderr}", cfg.container_name())
+        bail!(
+            "failed to create wechat container `{}`: {stderr}",
+            cfg.container_name()
+        )
     }
 
     /// Layers the AT-SPI accessibility stack onto a base-image container at
@@ -613,7 +652,14 @@ impl WechatInstance {
 
         let name = self.container_name();
         let output = self
-            .docker(&["exec", "--user", "root", &name, "bash", RUNTIME_A11Y_APPLY_PATH])
+            .docker(&[
+                "exec",
+                "--user",
+                "root",
+                &name,
+                "bash",
+                RUNTIME_A11Y_APPLY_PATH,
+            ])
             .await?;
         if !output.status.success() {
             bail!(
@@ -763,7 +809,10 @@ impl WechatInstance {
             return None;
         }
         let value: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-        let entry = value.as_array().and_then(|items| items.first()).unwrap_or(&value);
+        let entry = value
+            .as_array()
+            .and_then(|items| items.first())
+            .unwrap_or(&value);
         let addr = entry
             .pointer("/status/networks/0/ipv4Address")
             .and_then(serde_json::Value::as_str)?;
@@ -831,7 +880,13 @@ impl WechatInstance {
         }
         // macOS app launch fallback (OrbStack, then Docker Desktop).
         for app in ["OrbStack", "Docker"] {
-            if Command::new("open").args(["-a", app]).status().await.map(|s| s.success()).unwrap_or(false) {
+            if Command::new("open")
+                .args(["-a", app])
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
                 return true;
             }
         }
@@ -911,8 +966,13 @@ impl WechatInstance {
                 let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
                     return Ok(false);
                 };
-                let entry = value.as_array().and_then(|items| items.first()).unwrap_or(&value);
-                Ok(entry.pointer("/status/state").and_then(serde_json::Value::as_str)
+                let entry = value
+                    .as_array()
+                    .and_then(|items| items.first())
+                    .unwrap_or(&value);
+                Ok(entry
+                    .pointer("/status/state")
+                    .and_then(serde_json::Value::as_str)
                     == Some("running"))
             }
         }
@@ -1060,7 +1120,10 @@ impl WechatInstance {
         }
         // PNG magic number sanity check.
         if output.stdout.len() < 8 || &output.stdout[..4] != b"\x89PNG" {
-            bail!("screenshot did not produce a PNG ({} bytes)", output.stdout.len());
+            bail!(
+                "screenshot did not produce a PNG ({} bytes)",
+                output.stdout.len()
+            );
         }
         Ok(output.stdout)
     }
@@ -1102,10 +1165,16 @@ impl WechatInstance {
             .with_context(|| format!("spawn python in `{name}`"))?;
         {
             let mut handle = child.stdin.take().context("python stdin missing")?;
-            handle.write_all(py.as_bytes()).await.context("write python source")?;
+            handle
+                .write_all(py.as_bytes())
+                .await
+                .context("write python source")?;
             handle.shutdown().await.ok();
         }
-        let output = child.wait_with_output().await.context("await python in container")?;
+        let output = child
+            .wait_with_output()
+            .await
+            .context("await python in container")?;
         Ok((
             output.status.success(),
             String::from_utf8_lossy(&output.stdout).to_string(),
@@ -1181,9 +1250,7 @@ impl WechatInstance {
 
     /// Returns the current mouse position (x,y) inside the container's display.
     pub(crate) async fn mouse_pos(&self) -> Result<(i32, i32)> {
-        let out = self
-            .exec_bash("xdotool getmouselocation --shell")
-            .await?;
+        let out = self.exec_bash("xdotool getmouselocation --shell").await?;
         let mut x = 0;
         let mut y = 0;
         for line in out.lines() {
@@ -1327,7 +1394,9 @@ mod tests {
             b"Error: default kernel not configured for architecture arm64, please use the \
               `container system kernel set` command to configure it"
         ));
-        assert!(!stderr_needs_kernel(b"Error: container name already in use"));
+        assert!(!stderr_needs_kernel(
+            b"Error: container name already in use"
+        ));
     }
 
     #[test]

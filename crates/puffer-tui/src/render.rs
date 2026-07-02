@@ -50,6 +50,14 @@ use std::cell::RefCell;
 use unicode_width::UnicodeWidthStr;
 const COMPOSER_SEPARATOR_COLOR: Color = Color::Indexed(214);
 
+/// Maximum width for transcript content to improve readability on wide terminals.
+const MAX_TRANSCRIPT_WIDTH: u16 = 120;
+
+/// Returns a capped transcript width: `min(width, MAX_TRANSCRIPT_WIDTH)`.
+fn capped_transcript_width(width: u16) -> u16 {
+    width.min(MAX_TRANSCRIPT_WIDTH)
+}
+
 thread_local! {
     static ACTIVE_OVERLAY: RefCell<Option<OverlayState>> = const { RefCell::new(None) };
     static ACTIVE_TOOL_DETAILS_EXPANDED: RefCell<bool> = const { RefCell::new(false) };
@@ -133,7 +141,7 @@ pub(crate) fn desired_height(
         0
     };
     let transcript_height = transcript_line_count_with_width(
-        width.max(1),
+        capped_transcript_width(width).max(1),
         state,
         resources,
         providers,
@@ -231,7 +239,10 @@ pub(crate) fn render(
         ])
         .split(frame.area());
     ACTIVE_TRANSCRIPT_VIEWPORT.with(|value| {
-        *value.borrow_mut() = Some(layout[1]);
+        *value.borrow_mut() = Some(Rect {
+            width: capped_transcript_width(layout[1].width),
+            ..layout[1]
+        });
     });
 
     if header_height > 0 && fixed_top_panel {
@@ -250,6 +261,11 @@ pub(crate) fn render(
         render_help_pane(frame, layout[1], state, commands, resources);
     } else {
         let follow_output = ACTIVE_FOLLOW_OUTPUT.with(|value| *value.borrow());
+        // Cap transcript area width for readability on wide terminals.
+        let transcript_area = Rect {
+            width: capped_transcript_width(layout[1].width),
+            ..layout[1]
+        };
         let body_scroll_offset = if follow_output {
             transcript_line_count(
                 state,
@@ -258,13 +274,13 @@ pub(crate) fn render(
                 auth_store,
                 pending_submit.is_active() || !pending_submit.queued_prompts.is_empty(),
             )
-            .saturating_sub(layout[1].height.max(1))
+            .saturating_sub(transcript_area.height.max(1))
         } else {
             scroll_offset
         };
         frame.render_widget(
             Paragraph::new(transcript_text(
-                layout[1].width.max(1),
+                transcript_area.width.max(1),
                 state,
                 resources,
                 providers,
@@ -274,7 +290,7 @@ pub(crate) fn render(
             ))
             .scroll((body_scroll_offset, 0))
             .wrap(Wrap { trim: false }),
-            layout[1],
+            transcript_area,
         );
     }
 
@@ -477,7 +493,7 @@ pub(crate) fn transcript_line_count(
     pending_submit: bool,
 ) -> u16 {
     transcript_line_count_with_width(
-        current_transcript_viewport().width.max(1),
+        capped_transcript_width(current_transcript_viewport().width).max(1),
         state,
         resources,
         providers,

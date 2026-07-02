@@ -70,7 +70,7 @@ fn workflows_command_is_registered_as_local_command() {
     assert_eq!(workflows.kind, CommandKind::Local);
     assert_eq!(
         workflows.argument_hint.as_deref(),
-        Some("[list|new|append|delete|actions|connections|connectors|tasks|runs] [query]")
+        Some("[list|append|delete|actions|connections|connectors|tasks] [query]")
     );
     assert_eq!(
         find_command(&commands, "workflow").map(|command| command.name.as_str()),
@@ -81,10 +81,7 @@ fn workflows_command_is_registered_as_local_command() {
 }
 
 #[test]
-fn workflows_command_summarizes_native_workflows() {
-    use puffer_workflow::{RegisterOptions, TriggerSpec, WorkflowStore};
-    use serde_json::json;
-
+fn workflows_command_summarizes_runtime_owned_workflows() {
     let tempdir = tempdir().unwrap();
     let paths = ConfigPaths::discover(tempdir.path());
     ensure_workspace_dirs(&paths).unwrap();
@@ -106,24 +103,6 @@ fn workflows_command_summarizes_native_workflows() {
         tempdir.path().to_path_buf(),
         session,
     );
-    WorkflowStore::new(&paths.workspace_config_dir)
-        .register_json(
-            json!({
-                "name": "Message triage",
-                "nodes": [{"id": "triage", "prompt": "Summarize the incoming message."}]
-            }),
-            RegisterOptions {
-                slug: Some("message-triage".to_string()),
-                trigger: Some(TriggerSpec::Connection {
-                    connection_slug: "telegram-user".to_string(),
-                    filter: None,
-                    pattern: Some("hi".to_string()),
-                    classify_prompt: None,
-                }),
-            },
-        )
-        .unwrap();
-
     dispatch_command(
         &mut state,
         &supported_commands(),
@@ -138,8 +117,9 @@ fn workflows_command_summarizes_native_workflows() {
     let text = &state.transcript.last().unwrap().text;
     assert!(text.contains("Workflow dashboard"));
     assert!(text.contains("monitor_tasks=0/0"));
-    assert!(text.contains("message-triage"));
-    assert!(text.contains("trigger=connection:telegram-user"));
+    assert!(
+        text.contains("definitions and execution history live in the configured workflow runtime")
+    );
     assert!(text.contains("none configured; run /connect"));
     assert!(text.contains("Monitor tasks"));
     assert!(text.contains("telegram-login"));
@@ -173,17 +153,8 @@ fn workflows_new_creates_disabled_starter_workflow() {
     .unwrap();
 
     let text = &state.transcript.last().unwrap().text;
-    assert!(text.contains("Created disabled workflow draft."));
-    assert!(text.contains("slug: customer-triage"));
-    assert!(text.contains("trigger: subscription:workspace.task.created"));
-    let workflows = puffer_workflow::WorkflowStore::new(&paths.workspace_config_dir)
-        .list()
-        .unwrap();
-    assert_eq!(workflows.len(), 1);
-    assert_eq!(workflows[0].slug, "customer-triage");
-    assert!(!workflows[0].enabled);
-    assert_eq!(workflows[0].pipeline.name, "Customer Triage");
-    assert_eq!(workflows[0].pipeline.nodes[0].id, "codex-task");
+    assert!(text.contains("Native workflow drafts were removed."));
+    assert!(text.contains("configured workflow runtime"));
 }
 
 #[test]
@@ -296,7 +267,7 @@ fn workflows_connectors_filter_shows_connect_commands() {
     .unwrap();
 
     let text = &state.transcript.last().unwrap().text;
-    assert!(text.contains("showing 2/12 connectors for query=\"telegram\""));
+    assert!(text.contains("showing 2/16 connectors for query=\"telegram\""));
     assert!(text.contains("telegram-login"));
     assert!(text.contains("actions=send_message"));
     assert!(text.contains("connect=/connect telegram-login telegram-user"));
@@ -362,8 +333,8 @@ fn workflows_connectors_filter_presets_use_stable_capability_terms() {
     .unwrap();
 
     let text = &state.transcript.last().unwrap().text;
-    assert!(text.contains("filters: trigger-ready | no-trigger | draft | append | has-actions"));
-    assert!(text.contains("showing 9/12 connectors for query=\"has-actions\""));
+    assert!(text.contains("filters: trigger-ready | no-trigger | append | has-actions"));
+    assert!(text.contains("showing 13/16 connectors for query=\"has-actions\""));
     assert!(text.contains("- gcal-browser [auth,events,no-trigger,actions]"));
     assert!(text.contains("- gmail-browser [auth,events,no-trigger,actions]"));
     assert!(text.contains("- telegram-login [auth,events,no-trigger,actions]"));
@@ -398,7 +369,7 @@ fn workflows_connectors_catalog_includes_serve_connectors_as_non_triggers() {
     .unwrap();
 
     let text = &state.transcript.last().unwrap().text;
-    assert!(text.contains("showing 1/12 connectors for query=\"discord\""));
+    assert!(text.contains("showing 1/16 connectors for query=\"discord\""));
     assert!(text.contains("discord-bot"));
     assert!(text.contains("connect=/connect discord-bot discord-bot"));
     assert!(text.contains("[auth,no-trigger]"));
@@ -431,7 +402,7 @@ fn workflows_connectors_catalog_does_not_include_http_ingress_presets() {
     .unwrap();
 
     let text = &state.transcript.last().unwrap().text;
-    assert!(text.contains("showing 0/12 connectors for query=\"github\""));
+    assert!(text.contains("showing 0/16 connectors for query=\"github\""));
     assert!(!text.contains("github-"));
     assert!(!text.contains("runtime=serve"));
 }
@@ -526,6 +497,7 @@ fn app_state_defaults_expose_command_state() {
             browser: puffer_config::BrowserConfig::default(),
             network: puffer_config::NetworkConfig::default(),
             media: puffer_config::MediaConfig::default(),
+            remote: puffer_config::RemoteConfig::default(),
             mascot: MascotConfig {
                 id: "clawd".to_string(),
                 display_name: "Clawd".to_string(),
@@ -536,6 +508,7 @@ fn app_state_defaults_expose_command_state() {
                 tmux_golden_mode: false,
                 status_line: None,
             },
+            workflow_backend: puffer_config::WorkflowBackendConfig::default(),
             remote_runner: None,
         },
         PathBuf::from("."),
@@ -710,6 +683,9 @@ fn resume_switches_to_matching_session_record() {
                 remote_session_id: None,
                 remote_session_url: None,
                 remote_session_status: None,
+                active_remote_runner_auth_token: None,
+                active_remote_runner_auth_secret_id: None,
+                active_remote_cwd: None,
                 active_team_name: None,
                 statusline_enabled: true,
                 working_dirs: vec![tempdir.path().join("secondary").display().to_string()],

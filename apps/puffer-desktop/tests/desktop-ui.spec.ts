@@ -271,31 +271,12 @@ test("Browser panel coalesces rapid screencast frames to the newest frame", asyn
   ).toBe(219);
 });
 
-test("Browser panel hydrates a connected agent tab from recorded frames", async ({ page }) => {
-  const daemon = new FakeDaemon({
-    emitBrowserOpenFrame: false,
-    emitBrowserResizeFrame: false
-  });
+test("Browser panel reopens a connected agent tab screencast when no frame is cached", async ({ page }) => {
+  const daemon = new FakeDaemon();
   daemon.setBrowserTabs("session-browser", {
     activeTabId: "tab-1",
     tabs: [{ ...browserTab("tab-1", "https://agent.example"), active: true }]
   });
-  daemon.setBrowserRecording("session-browser", [
-    {
-      frameId: "recorded-agent-frame",
-      backendSessionId: "session-browser:browser:tab-1",
-      rootSessionId: "session-browser",
-      tabId: "tab-1",
-      url: "https://agent.example",
-      title: "Agent page",
-      mimeType: "image/png",
-      encoding: "base64",
-      data: ONE_PIXEL_PNG,
-      width: 333,
-      height: 222,
-      recordedAtMs: Date.now()
-    }
-  ]);
   await daemon.install(page);
   await daemon.open(page);
 
@@ -305,58 +286,46 @@ test("Browser panel hydrates a connected agent tab from recorded frames", async 
   await daemon.waitForRequest("browser_agent", (request) =>
     request.params.action === "list" && request.params.sessionId === "session-browser"
   );
-  await daemon.waitForRequest("browser_resize", (request) =>
+  await daemon.waitForRequest("browser_open", (request) =>
     request.params.sessionId === "session-browser:browser:tab-1"
   );
   await expect(page.getByLabel("URL")).toHaveValue("https://agent.example");
   await expect.poll(async () =>
     page.locator(".pf-browser-canvas").evaluate((node) => (node as HTMLCanvasElement).width)
-  ).toBe(333);
+  ).toBe(960);
   await expect.poll(async () =>
     page.locator(".pf-browser-canvas").evaluate((node) => (node as HTMLCanvasElement).height)
-  ).toBe(222);
+  ).toBe(720);
 });
 
-test("Browser panel restores a recorded agent tab when daemon tab state is empty", async ({ page }) => {
+test("Browser panel opens an initial new tab when daemon tab state is empty", async ({ page }) => {
   const daemon = new FakeDaemon({
     emitBrowserOpenFrame: false,
     emitBrowserResizeFrame: false
   });
-  daemon.setBrowserRecording("session-browser", [
-    {
-      frameId: "recorded-only-frame",
-      backendSessionId: "session-browser:browser:t1",
-      rootSessionId: "session-browser",
-      tabId: "t1",
-      url: "https://recorded.example",
-      title: "Recorded page",
-      mimeType: "image/png",
-      encoding: "base64",
-      data: ONE_PIXEL_PNG,
-      width: 321,
-      height: 210,
-      recordedAtMs: Date.now()
-    }
-  ]);
   await daemon.install(page);
   await daemon.open(page);
 
   await openRegressionAgent(page);
   await openAgentPanel(page, "Browser");
 
-  await daemon.waitForRequest("browser_recording", (request) =>
-    request.params.sessionId === "session-browser"
+  await daemon.waitForRequest("browser_agent", (request) =>
+    request.params.action === "open" && request.params.sessionId === "session-browser"
   );
-  await expect(page.getByLabel("URL")).toHaveValue("https://recorded.example", { timeout: 1000 });
-  await expect.poll(async () =>
-    page.locator(".pf-browser-canvas").evaluate((node) => (node as HTMLCanvasElement).width)
-  ).toBe(321);
+  await expect(page.locator(".pf-browser-new-tab")).toBeVisible();
+  await expect(page.getByLabel("URL")).toHaveValue("");
 });
 
 test("Browser panel prefers recorded agent frames over stale saved tabs", async ({ page }) => {
   const daemon = new FakeDaemon({
     emitBrowserOpenFrame: false,
     emitBrowserResizeFrame: false
+  });
+  daemon.setBrowserTabs("session-browser", {
+    activeTabId: "agent-tab",
+    tabs: [
+      { ...browserTab("agent-tab", "https://agent-recorded.example/results", false), active: true }
+    ]
   });
   daemon.setBrowserRecording("session-browser", [
     {
@@ -778,8 +747,8 @@ test("Browser state errors disable navigation controls and stop canvas input", a
   );
 
   daemon.emit("browser:session-browser:browser:tab-1:state", {
-    url: "about:blank",
-    title: "",
+    url: "https://error.example",
+    title: "Error fixture",
     loading: false,
     error: "cdp socket closed"
   });
@@ -808,6 +777,12 @@ test("dispatches printable Browser keyboard input as key events", async ({ page 
   await openRegressionAgent(page);
   await openAgentPanel(page, "Browser");
   await daemon.waitForRequest("browser_open");
+  daemon.emit("browser:session-browser:browser:tab-1:state", {
+    url: "https://keys.example",
+    title: "Keys fixture",
+    loading: false
+  });
+  await expect(page.getByLabel("URL")).toHaveValue("https://keys.example");
 
   await page.locator(".pf-browser-canvas").click({ position: { x: 20, y: 20 } });
   await page.keyboard.press("a");
@@ -843,6 +818,12 @@ test("dispatches Browser Enter and Backspace as non-text key events", async ({ p
   await openRegressionAgent(page);
   await openAgentPanel(page, "Browser");
   await daemon.waitForRequest("browser_open");
+  daemon.emit("browser:session-browser:browser:tab-1:state", {
+    url: "https://keys.example",
+    title: "Keys fixture",
+    loading: false
+  });
+  await expect(page.getByLabel("URL")).toHaveValue("https://keys.example");
 
   await page.locator(".pf-browser-canvas").click({ position: { x: 20, y: 20 } });
   await page.keyboard.press("Enter");

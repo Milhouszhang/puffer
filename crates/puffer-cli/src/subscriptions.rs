@@ -16,7 +16,7 @@ mod slack_connector_actions;
 mod telegram_connector_actions;
 
 use anyhow::{Context, Result};
-use puffer_config::ConfigPaths;
+use puffer_config::{ConfigPaths, ProxyConfig};
 use puffer_core::install_subscription_manager;
 use puffer_provider_registry::{AuthStore, StoredCredential};
 use puffer_subscriber_runtime::{
@@ -118,6 +118,7 @@ pub(crate) fn install(
     paths: &ConfigPaths,
     auth_store: &AuthStore,
     anthropic_base_url: Option<&str>,
+    proxy_config: ProxyConfig,
 ) -> Result<SubscriptionRuntime> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -138,6 +139,8 @@ pub(crate) fn install(
     builder = builder.with_self_gate(Arc::new(crate::daemon_workflows::MonitorSelfGate::new(
         paths.clone(),
     )));
+    builder = builder
+        .with_run_finished_observer(crate::workflow_run_events::workflow_run_finished_observer());
     let manager = Arc::new(
         builder
             .build(handle)
@@ -155,6 +158,12 @@ pub(crate) fn install(
         paths: paths.clone(),
     }))
     .context("failed to install connector action executor")?;
+
+    // Apply the startup proxy config before autostart so the first-launched
+    // telegram-user child inherits the correct env block immediately, without
+    // waiting for a later set_proxy_config call from the daemon or a
+    // save-settings round-trip.
+    manager.set_proxy_config(proxy_config);
 
     autostart_subscribers(&manager, paths);
     let auth_stop = Arc::new(AtomicBool::new(false));

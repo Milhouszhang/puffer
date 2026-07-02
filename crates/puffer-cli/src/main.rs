@@ -67,6 +67,7 @@ mod subscriber_tools;
 mod subscriptions;
 #[cfg(unix)]
 mod wechat_connector;
+mod workflow_run_events;
 mod workflow_runtime;
 mod workflow_runtime_helpers;
 mod workflows;
@@ -156,6 +157,13 @@ fn run_main() -> Result<()> {
     let paths = ConfigPaths::discover(&cwd);
     ensure_workspace_dirs(&paths)?;
     let config = load_config(&paths)?;
+    // Apply proxy env vars (ALL_PROXY/HTTP(S)_PROXY/NO_PROXY) BEFORE any
+    // background thread or runtime spawns below (provider discovery, heartbeat,
+    // workflow runtime, subscriptions::install). Those threads build their own
+    // reqwest clients which snapshot the process env at construction; setting
+    // the vars here — at the single-threaded startup point — avoids a data race
+    // with `env::set_var` and guarantees first-launch requests are proxied.
+    crate::daemon::apply_proxy_env_at_startup(&config.network.proxy);
     let auth_path = paths.user_config_dir.join("auth.json");
     let mut auth_store = AuthStore::load(&auth_path)?;
     let mut resources = load_resources(&paths, &puffer_runner_local::LocalToolRunner::new())?;
@@ -262,7 +270,12 @@ fn run_main() -> Result<()> {
         None
     };
     let _subscription_runtime = if install_subscription_manager {
-        match subscriptions::install(&paths, &auth_store, anthropic_base.as_deref()) {
+        match subscriptions::install(
+            &paths,
+            &auth_store,
+            anthropic_base.as_deref(),
+            config.network.proxy.clone(),
+        ) {
             Ok(rt) => Some(rt),
             Err(error) => {
                 eprintln!("subscription manager failed to start: {error:#}");

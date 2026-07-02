@@ -178,6 +178,18 @@ constraints:
   `cargo test --workspace` (or `cargo nextest run --workspace`),
   `cargo fmt --all --check`, and
   `cargo clippy --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious`.
+  `scripts/ci-gates.sh` runs every CI gate locally in three parallel lanes
+  (root workspace, src-tauri, desktop frontend); `--quick` skips the test
+  suites for a fast compile+lint pass.
+- After resolving merge/rebase conflicts, run
+  `cargo check --workspace --all-targets` BEFORE committing. Git only detects
+  textual conflicts; a rename or signature change merged from the other side
+  breaks code (including `#[cfg(test)]` code, which plain `cargo check`
+  skips) with no conflict marker. The lefthook hooks intentionally skip
+  merge/rebase commits, so nothing else catches this before push.
+- Hooks can reject a commit after printing unrelated output; confirm HEAD
+  actually advanced (`git commit ... && git log --oneline -1`) before
+  building on top of it or pushing.
 - When adding new features, wire tests in the same step where practical.
 - When updating a component, write a new update spec in that component's
   `specs/<component>/` folder. Do not overwrite prior numbered specs; use the

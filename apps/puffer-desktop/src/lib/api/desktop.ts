@@ -1215,6 +1215,18 @@ export async function subscribeTelegramRelationships(
   return client.on("telegram:relationships", handler);
 }
 
+/** Subscribe to workflow/task run completions (Completed or Failed) pushed by
+ *  the daemon on the non-replay `workflow-run:finished` channel. Returns an
+ *  unsubscribe function. */
+export async function subscribeWorkflowRunFinished(
+  handler: (event: { slug: string; runId: string; status: string }) => void
+): Promise<() => void> {
+  const client = await ensureLocalDaemonClient();
+  return client.on("workflow-run:finished", (payload) => {
+    handler(payload as { slug: string; runId: string; status: string });
+  });
+}
+
 /** Rank the top-5 Telegram contacts by recent chat frequency and analyze each
  *  relationship. Progress streams over the `telegram:relationships` event channel
  *  (see subscribeTelegramRelationships).

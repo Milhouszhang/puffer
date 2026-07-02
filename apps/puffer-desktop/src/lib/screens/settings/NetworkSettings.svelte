@@ -328,6 +328,11 @@
             />
             <span>
               <strong>{item.uri}</strong>
+              {#if !item.uri.startsWith("socks5")}
+                <small class="pf-network-proxy-note">
+                  HTTP proxy can't carry Telegram — use a SOCKS5 endpoint for Telegram.
+                </small>
+              {/if}
               {#if visibleStatus[item.id].label}
                 <small
                   class="pf-network-status"
@@ -564,6 +569,13 @@
 
   .pf-network-status[data-state="checking"] {
     color: var(--puffer-accent);
+  }
+
+  .pf-network-proxy-note {
+    display: block;
+    margin-top: 2px;
+    color: var(--puffer-warn, #b9770e);
+    font-size: 11px;
   }
 
   .pf-network-proxy-actions,

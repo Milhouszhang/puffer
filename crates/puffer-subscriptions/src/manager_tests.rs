@@ -1075,7 +1075,7 @@ fn run_finished_test_binding() -> WorkflowBindingSpec {
         classify_prompt: None,
         classify_model: None,
         action: ActionSpec::RunWorkflow {
-            slug: "native".into(),
+            workflow_id: "native".into(),
         },
         created_at_ms: 0,
     }
@@ -1126,9 +1126,14 @@ fn builder_attaches_run_finished_observer_to_history_store() {
     manager
         .history_store()
         .append_action_result(
-            &run_finished_test_binding(), &run_finished_test_envelope(),
-            &crate::spec::ActionSpec::RunWorkflow { slug: "native".into() },
-            &run_finished_test_action_result(true), 1, 2,
+            &run_finished_test_binding(),
+            &run_finished_test_envelope(),
+            &crate::spec::ActionSpec::RunWorkflow {
+                workflow_id: "native".into(),
+            },
+            &run_finished_test_action_result(true),
+            1,
+            2,
         )
         .unwrap();
 

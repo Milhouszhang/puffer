@@ -557,7 +557,9 @@ mod tests {
         }
     }
 
-    fn counting_store(path: std::path::PathBuf) -> (WorkflowHistoryStore, std::sync::Arc<AtomicUsize>) {
+    fn counting_store(
+        path: std::path::PathBuf,
+    ) -> (WorkflowHistoryStore, std::sync::Arc<AtomicUsize>) {
         let count = std::sync::Arc::new(AtomicUsize::new(0));
         let c2 = count.clone();
         let store = WorkflowHistoryStore::load(path)
@@ -573,12 +575,28 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (store, count) = counting_store(temp.path().join("h.json"));
         store
-            .append_action_result(&binding(), &envelope(),
-                &ActionSpec::RunWorkflow { slug: "native".into() }, &run_result(true), 1, 2)
+            .append_action_result(
+                &binding(),
+                &envelope(),
+                &ActionSpec::RunWorkflow {
+                    workflow_id: "native".into(),
+                },
+                &run_result(true),
+                1,
+                2,
+            )
             .unwrap();
         store
-            .append_action_result(&binding(), &envelope(),
-                &ActionSpec::RunWorkflow { slug: "native".into() }, &run_result(false), 1, 2)
+            .append_action_result(
+                &binding(),
+                &envelope(),
+                &ActionSpec::RunWorkflow {
+                    workflow_id: "native".into(),
+                },
+                &run_result(false),
+                1,
+                2,
+            )
             .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 2); // one Completed + one Failed
     }
@@ -588,8 +606,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (store, count) = counting_store(temp.path().join("h.json"));
         store
-            .append_action_started(&binding(), &envelope(),
-                &ActionSpec::RunWorkflow { slug: "native".into() }, 1)
+            .append_action_started(
+                &binding(),
+                &envelope(),
+                &ActionSpec::RunWorkflow {
+                    workflow_id: "native".into(),
+                },
+                1,
+            )
             .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 0); // Running must not notify
     }
@@ -599,12 +623,25 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (store, count) = counting_store(temp.path().join("h.json"));
         let started = store
-            .append_action_started(&binding(), &envelope(),
-                &ActionSpec::RunWorkflow { slug: "native".into() }, 1)
+            .append_action_started(
+                &binding(),
+                &envelope(),
+                &ActionSpec::RunWorkflow {
+                    workflow_id: "native".into(),
+                },
+                1,
+            )
             .unwrap();
         store
-            .complete_action_result(started.idx,
-                &ActionSpec::RunWorkflow { slug: "native".into() }, &run_result(true), 1, 2)
+            .complete_action_result(
+                started.idx,
+                &ActionSpec::RunWorkflow {
+                    workflow_id: "native".into(),
+                },
+                &run_result(true),
+                1,
+                2,
+            )
             .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1); // the path a router-level hook would miss
     }
@@ -625,8 +662,14 @@ mod tests {
             usage: None,
         };
         store
-            .append_event_outcome(&binding(), &envelope(), log,
-                WorkflowBindingRunStatus::Completed, 1, 1)
+            .append_event_outcome(
+                &binding(),
+                &envelope(),
+                log,
+                WorkflowBindingRunStatus::Completed,
+                1,
+                1,
+            )
             .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
@@ -636,8 +679,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (store, count) = counting_store(temp.path().join("h.json"));
         store
-            .append_action_started(&binding(), &envelope(),
-                &ActionSpec::RunWorkflow { slug: "native".into() }, 1)
+            .append_action_started(
+                &binding(),
+                &envelope(),
+                &ActionSpec::RunWorkflow {
+                    workflow_id: "native".into(),
+                },
+                1,
+            )
             .unwrap();
         let reclaimed = store.expire_orphaned_running(i128::MAX); // fence after the run
         assert_eq!(reclaimed, 1);

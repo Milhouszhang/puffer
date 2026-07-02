@@ -82,6 +82,8 @@
     onResetAppearance: () => void;
     onRefresh: () => void;
     onLogout: (providerId: string) => void;
+    copilotLogin?: { userCode: string; verificationUri: string } | null;
+    onLoginCopilot?: (providerId: string) => void;
     onLoginOauth?: (providerId: string) => void;
     onApiKeyLogin?: (
       providerId: string,
@@ -1809,6 +1811,8 @@
           errorMessage={props.authError ?? null}
           externals={props.externals ?? []}
           busyImportKey={props.busyImportKey ?? null}
+          copilotLogin={props.copilotLogin ?? null}
+          onLoginCopilot={props.onLoginCopilot ?? (() => {})}
           onLoginOauth={props.onLoginOauth ?? (() => {})}
           onLoginApiKey={props.onApiKeyLogin ?? (() => {})}
           onLogout={props.onLogout}

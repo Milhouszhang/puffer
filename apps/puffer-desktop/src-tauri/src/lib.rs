@@ -63,6 +63,7 @@ const REGISTERED_TAURI_COMMANDS: &[&str] = &[
     "resolve_permission",
     "resolve_user_question",
     "cancel_turn",
+    "open_url",
     "open_image_dir",
     "open_video_dir",
     "summon_mini_window",
@@ -438,6 +439,16 @@ fn cancel_turn(
     backend_call(app, state, "cancel_turn", json!({ "turnId": turn_id })).map(|_| ())
 }
 
+/// Opens an external URL in the user's default browser. Used by flows like the
+/// GitHub Copilot device login where `window.open` is unreliable in the webview.
+#[tauri::command]
+fn open_url(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 fn open_image_dir(app: AppHandle, cwd: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
@@ -602,6 +613,7 @@ pub fn run() {
             resolve_permission,
             resolve_user_question,
             cancel_turn,
+            open_url,
             open_image_dir,
             open_video_dir,
             mini_window::summon_mini_window,

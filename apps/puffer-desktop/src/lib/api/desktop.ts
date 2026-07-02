@@ -895,6 +895,69 @@ export async function loginWithAgentEnv(): Promise<SettingsSnapshot> {
   return invoke<BackendSettingsSnapshot>("login_with_agentenv");
 }
 
+export interface CopilotLoginStartResult {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  interval: number;
+  expiresIn: number;
+}
+
+export interface CopilotLoginPollResult {
+  status: "pending" | "slow_down" | "done" | "error";
+  error?: string;
+  snapshot?: BackendSettingsSnapshot;
+}
+
+// Starts the GitHub Copilot device flow. Returns the code the user must enter
+// at the verification URL; no credential is stored until polling succeeds.
+export async function copilotLoginStart(
+  remote?: RemoteConnection
+): Promise<CopilotLoginStartResult> {
+  if (shouldInvokeRemote(remote)) {
+    return invoke<CopilotLoginStartResult>("copilot_login_start", { ...remoteArgs(remote) });
+  }
+  if (canReachDaemon()) {
+    const client = await ensureLocalDaemonClient();
+    return client.request<CopilotLoginStartResult>("copilot_login_start", {});
+  }
+  if (!canInvokeTauri()) {
+    return {
+      deviceCode: "mock-device",
+      userCode: "MOCK-CODE",
+      verificationUri: "https://github.com/login/device",
+      interval: 5,
+      expiresIn: 900
+    };
+  }
+  return invoke<CopilotLoginStartResult>("copilot_login_start", { ...remoteArgs(remote) });
+}
+
+// Polls the Copilot device flow once. On "done" the snapshot reflects the new
+// github-copilot credential.
+export async function copilotLoginPoll(
+  deviceCode: string,
+  remote?: RemoteConnection
+): Promise<CopilotLoginPollResult> {
+  if (shouldInvokeRemote(remote)) {
+    return invoke<CopilotLoginPollResult>("copilot_login_poll", {
+      deviceCode,
+      ...remoteArgs(remote)
+    });
+  }
+  if (canReachDaemon()) {
+    const client = await ensureLocalDaemonClient();
+    return client.request<CopilotLoginPollResult>("copilot_login_poll", { deviceCode });
+  }
+  if (!canInvokeTauri()) {
+    return { status: "error", error: "GitHub Copilot login is unavailable in this build." };
+  }
+  return invoke<CopilotLoginPollResult>("copilot_login_poll", {
+    deviceCode,
+    ...remoteArgs(remote)
+  });
+}
+
 export async function loginWithApiKey(
   providerId: string,
   apiKey: string,

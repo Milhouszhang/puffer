@@ -34,6 +34,8 @@
     loginWithApiKey,
     loginWithApiKeyViaDaemon,
     loginWithOauth,
+    copilotLoginStart,
+    copilotLoginPoll,
     deleteProject,
     deleteSession,
     listGroupedSessionsPageFromDaemon,
@@ -277,6 +279,8 @@
   let apiKeyConnectionFingerprints = $state<string[]>([]);
   let externalCredentials = $state<ExternalCredential[]>([]);
   let importBusyKey = $state<string | null>(null);
+  // Active GitHub Copilot device-flow login (shown while the user authorizes).
+  let copilotLogin = $state<{ userCode: string; verificationUri: string } | null>(null);
   let actionBusy = $state(false);
   let remoteOperation = $state<RemoteOperation | null>(null);
   let remoteBusy = $state(false);
@@ -1377,6 +1381,59 @@
     } catch (error) {
       authError = String(error);
       statusMessage = authError;
+    } finally {
+      authBusyProviderId = null;
+    }
+  }
+
+  // GitHub Copilot uses a GitHub device flow instead of the PKCE redirect: start
+  // the flow, show/copy the user code, open the verification page, then poll
+  // until the user authorizes (or it times out).
+  async function handleCopilotLogin(providerId: string) {
+    if (authBusyProviderId || importBusyKey) return;
+    if (hasConnectedProvider(providerId)) {
+      notifyDuplicateProviderConnection();
+      return;
+    }
+    authBusyProviderId = providerId;
+    authError = null;
+    const wasOnboarding = onboarding;
+    try {
+      const start = await copilotLoginStart(remoteConnection);
+      copilotLogin = { userCode: start.userCode, verificationUri: start.verificationUri };
+      // NOTE: auto window.open / clipboard don't work in the webview without a
+      // user gesture — the device-code card exposes explicit Copy/Open buttons.
+      statusMessage = `GitHub Copilot: enter code ${start.userCode} at ${start.verificationUri} to authorize.`;
+      const deadlineMs = Date.now() + (start.expiresIn > 0 ? start.expiresIn : 900) * 1000;
+      let intervalMs = Math.max(start.interval, 1) * 1000;
+      while (Date.now() < deadlineMs) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+        if (copilotLogin === null) return; // canceled elsewhere
+        const poll = await copilotLoginPoll(start.deviceCode, remoteConnection);
+        if (poll.status === "done" && poll.snapshot) {
+          settingsSnapshot = poll.snapshot;
+          onboardingCompleted = hasAvailableAgentProvider(settingsSnapshot);
+          onboarding = shouldShowOnboarding(settingsSnapshot);
+          if (wasOnboarding && !onboarding) {
+            tweaks = { ...tweaks, screen: "workspace" };
+          }
+          statusMessage = "Connected to GitHub Copilot.";
+          await refreshGroups();
+          copilotLogin = null;
+          return;
+        }
+        if (poll.status === "error") {
+          throw new Error(poll.error || "GitHub Copilot login failed.");
+        }
+        if (poll.status === "slow_down") {
+          intervalMs += 5000;
+        }
+      }
+      throw new Error("GitHub Copilot login timed out. Please try again.");
+    } catch (error) {
+      authError = String(error);
+      statusMessage = authError;
+      copilotLogin = null;
     } finally {
       authBusyProviderId = null;
     }
@@ -4722,6 +4779,8 @@
             errorMessage={authError}
             externals={externalCredentials}
             busyImportKey={importBusyKey}
+            copilotLogin={copilotLogin}
+            onLoginCopilot={(providerId) => void handleCopilotLogin(providerId)}
             onLoginOauth={(providerId) => void handleOauthLogin(providerId)}
             onLoginApiKey={(providerId, apiKey, options) =>
               void handleApiKeyLogin(providerId, apiKey, options)}
@@ -4845,6 +4904,8 @@
               onResetAppearance={resetAppearanceTweaks}
               onRefresh={() => void refreshSettings()}
               onLogout={(providerId) => void handleLogout(providerId)}
+              copilotLogin={copilotLogin}
+              onLoginCopilot={(providerId) => void handleCopilotLogin(providerId)}
               onLoginOauth={(providerId) => void handleOauthLogin(providerId)}
               onApiKeyLogin={(providerId, apiKey, options) =>
                 void handleApiKeyLogin(providerId, apiKey, options)}

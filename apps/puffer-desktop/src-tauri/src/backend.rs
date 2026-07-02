@@ -3075,7 +3075,7 @@ mod tests {
             Some("gpt-5.4"),
             vec![
                 bash_media_tool_event(
-                    "puffer internal-tool image-generation --prompt draw --count 2",
+                    "imagegen --prompt draw --count 2",
                     serde_json::json!({
                         "jobId": "job-1",
                         "requestedCount": 2,

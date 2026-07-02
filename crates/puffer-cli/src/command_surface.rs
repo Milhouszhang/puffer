@@ -47,10 +47,7 @@ pub(crate) fn run_mcp_command(
             add_mcp_server_from_json(paths, scope, &name, &json)
         }
         McpCommand::AddFromClaudeDesktop { scope } => {
-            println!(
-                "{}",
-                import_claude_desktop_mcp_servers(paths, scope)?
-            );
+            println!("{}", import_claude_desktop_mcp_servers(paths, scope)?);
             Ok(())
         }
         McpCommand::Remove { name, scope } => remove_mcp_server(paths, scope, &name),

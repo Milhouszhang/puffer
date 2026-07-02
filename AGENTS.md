@@ -174,7 +174,10 @@ constraints:
 - Prefer incremental commits for small, coherent steps.
 - Create any additional git worktrees under the repo-local `.worktree/`
   directory.
-- Keep the workspace green with `cargo test --workspace`.
+- Keep the workspace green against the same gates CI enforces:
+  `cargo test --workspace` (or `cargo nextest run --workspace`),
+  `cargo fmt --all --check`, and
+  `cargo clippy --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious`.
 - When adding new features, wire tests in the same step where practical.
 - When updating a component, write a new update spec in that component's
   `specs/<component>/` folder. Do not overwrite prior numbered specs; use the

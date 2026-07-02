@@ -1,7 +1,7 @@
+use puffer_provider_registry::{AxisRole, ControlKind};
 use puffer_session_store::{
     AttachmentState, MessageActor, SessionStore, StoredAttachment, StoredAttachmentKind,
 };
-use puffer_provider_registry::{AxisRole, ControlKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;

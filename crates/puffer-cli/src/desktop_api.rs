@@ -22,15 +22,15 @@ use uuid::Uuid;
 use crate::cli_args::DesktopApiCommand;
 use crate::desktop_activity::session_activity_status;
 use crate::desktop_api_types::{
-    AgentDiffDto, AgentDiffEntryDto, AgentDiffFileDto, AuthProviderStatusDto,
-    BrowserCaptchaSettingsDto, BrowserCaptchaSolverDto, BrowserExtensionDto, BrowserSettingsDto,
-    ChatAttachmentDto, ChatAttachmentSourceDto, DiffSummaryDto, DivergenceReportDto,
-    ExternalCredentialDto, FolderGroupDto, MediaGenerationSettingsDto, MediaSettingsDto,
-    NetworkProxySettingsDto, ProviderSummaryDto, RepoActionResultDto, RepoPullRequestDto,
-    RepoStatusDto, ResourceCountsDto, SanitizedProxyEndpointDto, SecretSourceDto, SecretSummaryDto,
-    SecretsSettingsDto, SessionDetailDto, SessionGroupsPageDto, SessionListItemDto,
-    SettingsConfigDto, SettingsSessionSummaryDto, SettingsSnapshotDto, TimelineItemDto,
-    AgentEnvSandboxDefaultsDto, AgentEnvSettingsDto, RemoteSettingsDto, SshHostSettingsDto,
+    AgentDiffDto, AgentDiffEntryDto, AgentDiffFileDto, AgentEnvSandboxDefaultsDto,
+    AgentEnvSettingsDto, AuthProviderStatusDto, BrowserCaptchaSettingsDto, BrowserCaptchaSolverDto,
+    BrowserExtensionDto, BrowserSettingsDto, ChatAttachmentDto, ChatAttachmentSourceDto,
+    DiffSummaryDto, DivergenceReportDto, ExternalCredentialDto, FolderGroupDto,
+    MediaGenerationSettingsDto, MediaSettingsDto, NetworkProxySettingsDto, ProviderSummaryDto,
+    RemoteSettingsDto, RepoActionResultDto, RepoPullRequestDto, RepoStatusDto, ResourceCountsDto,
+    SanitizedProxyEndpointDto, SecretSourceDto, SecretSummaryDto, SecretsSettingsDto,
+    SessionDetailDto, SessionGroupsPageDto, SessionListItemDto, SettingsConfigDto,
+    SettingsSessionSummaryDto, SettingsSnapshotDto, SshHostSettingsDto, TimelineItemDto,
     WorkflowBackendOptionDto, WorkflowBackendSettingsDto,
 };
 

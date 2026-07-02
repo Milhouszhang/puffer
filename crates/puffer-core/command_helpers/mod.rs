@@ -68,7 +68,6 @@ pub use pentest::{
     prepare_pentest_command, PentestCommand, PentestStart, DEFAULT_PENTEST_MAX_DISPATCHES_PER_ITER,
     DEFAULT_PENTEST_MAX_ITERATIONS, PENTEST_USAGE,
 };
-pub use session::{sanitize_tool_invocation_input, sanitized_tool_invocation_input};
 pub use plugins::PluginActionEntry;
 pub(crate) use plugins::{
     handle_plugin_command, reload_plugins_summary, render_plugin_actions, render_plugin_summary,
@@ -86,6 +85,7 @@ pub(crate) use session::{
     handle_remote_env_command, handle_session_command, handle_tag_command, render_memory_panel,
     render_session_overlay, render_session_panel,
 };
+pub use session::{sanitize_tool_invocation_input, sanitized_tool_invocation_input};
 pub use tasks::TaskActionEntry;
 pub(crate) use tasks::{handle_tasks_command, render_task_actions, render_tasks_panel_text};
 pub(crate) use terminal_setup::{

@@ -1,0 +1,9 @@
+# Keep GitHub Actions versions current automatically (e.g. the manual
+# checkout/setup-node v4 -> v5 bump). Monthly cadence keeps noise low;
+# each update PR is validated by the full CI gate like any other change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

@@ -1,0 +1,5 @@
+# nextest profiles for the src-tauri workspace (nextest resolves config per
+# workspace root, so the repo-root config does not apply here). Mirrors it.
+[profile.ci]
+slow-timeout = { period = "120s", terminate-after = 3 }
+fail-fast = false

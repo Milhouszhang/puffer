@@ -740,7 +740,8 @@ mod tests {
         let error = parse_openai_sse_response(stream).unwrap_err();
         let rendered = error.to_string();
         assert!(
-            rendered.contains("context_too_large") && rendered.contains("exceeds the context window"),
+            rendered.contains("context_too_large")
+                && rendered.contains("exceeds the context window"),
             "expected the real code/message to surface, got: {rendered}"
         );
         assert!(is_openai_sse_api_error(&error));

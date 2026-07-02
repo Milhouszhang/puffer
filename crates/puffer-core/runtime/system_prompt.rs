@@ -535,7 +535,43 @@ mod tests {
         SourceKind,
     };
     use std::collections::BTreeSet;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    // `load_context_blocks` reads `$HOME/.claude` and `$HOME/.puffer` in addition
+    // to the project dir, so tests that assert on the *absence* of user-global
+    // files must isolate HOME. Serialize the process-global HOME mutation so
+    // concurrent tests in this binary never observe a half-applied value.
+    static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Points `$HOME` at `path` for the current test and restores it on drop.
+    struct ScopedHome {
+        previous: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedHome {
+        fn set(path: &Path) -> Self {
+            let guard = HOME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            Self {
+                previous,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
 
     fn prompt_template(template: &str, for_model: Option<&str>) -> LoadedItem<PromptTemplate> {
         LoadedItem {
@@ -889,6 +925,11 @@ mod tests {
     #[test]
     fn load_user_prompt_loads_user_facts() {
         let tmp = tempfile::tempdir().unwrap();
+        // Isolate HOME so a developer's real ~/.claude/user.md or ~/.puffer/user.md
+        // can't leak in and break the "absent -> None" assertion below.
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = ScopedHome::set(&home);
         assert!(load_user_prompt(tmp.path()).is_none());
         std::fs::write(tmp.path().join("user.md"), "## home-address\n\n123 Main St").unwrap();
         let user = load_user_prompt(tmp.path()).unwrap();

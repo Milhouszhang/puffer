@@ -1847,11 +1847,7 @@ fn handle_lark_browser_list_chats(state: &DaemonState, params: &Value) -> Result
         .and_then(Value::as_str)
         .unwrap_or("");
     let manager = puffer_core::subscription_manager()?;
-    crate::lark_browser::list_chats_via_subscriber(
-        &manager,
-        state.config_paths(),
-        connection_slug,
-    )
+    crate::lark_browser::list_chats_via_subscriber(&manager, state.config_paths(), connection_slug)
 }
 
 fn handle_canvas_state_update(state: &DaemonState, params: &Value) -> Result<Value> {
@@ -6929,25 +6925,24 @@ mod tests {
         append_ordered_turn_progress, apply_daemon_yolo_mode, apply_turn_model_override,
         apply_turn_request_options, browser_launch_settings_or_default,
         browser_permission_payload_json, browser_status_for_turn, cancel_all_active_turns,
-        connector_setup_connect_args, connector_setup_id, daemon_now_ms,
-        desktop_latency_ms, file_media_mime_type, generated_video_handler,
-        handle_create_file_media_access, handle_create_generated_video_access,
-        handle_create_openai_realtime_client_secret, handle_create_session, handle_generate_media,
-        handle_import_external_credential, handle_list_lambda_skill_libraries,
-        handle_list_media_capabilities, handle_list_permissions, handle_list_provider_models,
-        handle_load_session_detail, handle_local_model_status, handle_login_with_api_key,
-        handle_logout_provider, handle_read_generated_media_preview,
-        handle_remove_lambda_skill_library, handle_save_lambda_skill_library,
-        handle_save_permissions, handle_save_proxy_settings, handle_set_lambda_skill_approval,
-        handle_set_lambda_skill_enabled, handle_update_config, model_descriptor_dto,
-        parse_single_byte_range, permission_review_payload_json,
+        connector_setup_connect_args, connector_setup_id, daemon_now_ms, desktop_latency_ms,
+        file_media_mime_type, generated_video_handler, handle_create_file_media_access,
+        handle_create_generated_video_access, handle_create_openai_realtime_client_secret,
+        handle_create_session, handle_generate_media, handle_import_external_credential,
+        handle_list_lambda_skill_libraries, handle_list_media_capabilities,
+        handle_list_permissions, handle_list_provider_models, handle_load_session_detail,
+        handle_local_model_status, handle_login_with_api_key, handle_logout_provider,
+        handle_read_generated_media_preview, handle_remove_lambda_skill_library,
+        handle_save_lambda_skill_library, handle_save_permissions, handle_save_proxy_settings,
+        handle_set_lambda_skill_approval, handle_set_lambda_skill_enabled, handle_update_config,
+        model_descriptor_dto, parse_single_byte_range, permission_review_payload_json,
         realtime_session_config_from_params, report_cancelled_turn, requires_explicit_subscription,
         resolve_create_session_model_id, resolve_monitor_reply_turn_scope, run_off_runtime,
         session_used_browser_tool, start_connector_setup_turn, turn_browser_tab_context,
-        CancelToken, ConnectionGuard, MONITOR_REPLY_ACTION_PROMPT_SCOPE,
-        DaemonState, GenerateMediaArtifactResult, GenerateMediaResult, GeneratedVideoRangeError,
-        GeneratedVideoTicket, ServerEnvelope, TurnHandle, TurnProgress, TurnProgressItem,
-        TurnRequestOptions,
+        CancelToken, ConnectionGuard, DaemonState, GenerateMediaArtifactResult,
+        GenerateMediaResult, GeneratedVideoRangeError, GeneratedVideoTicket, ServerEnvelope,
+        TurnHandle, TurnProgress, TurnProgressItem, TurnRequestOptions,
+        MONITOR_REPLY_ACTION_PROMPT_SCOPE,
     };
     use axum::{
         extract::{Path as AxumPath, State},
@@ -8650,6 +8645,10 @@ models: []
     #[test]
     fn read_generated_media_preview_resolves_session_cwd() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let session_store = SessionStore::from_paths(&paths).unwrap();
         let workspace = temp.path().join("other-workspace");
@@ -8674,6 +8673,10 @@ models: []
     #[test]
     fn read_generated_media_preview_returns_video_poster_bytes() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let session_store = SessionStore::from_paths(&paths).unwrap();
         let workspace = temp.path().join("other-workspace");
@@ -8734,6 +8737,10 @@ models: []
     #[test]
     fn create_file_media_access_returns_ticket_for_video() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let workspace_root = paths.workspace_root.clone();
         std::fs::create_dir_all(&workspace_root).unwrap();
@@ -8758,6 +8765,10 @@ models: []
     #[test]
     fn create_file_media_access_rejects_directory() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let dir = paths.workspace_root.join("clip.mp4");
         std::fs::create_dir_all(&dir).unwrap();
@@ -8774,6 +8785,10 @@ models: []
     #[test]
     fn create_file_media_access_rejects_non_video() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let workspace_root = paths.workspace_root.clone();
         std::fs::create_dir_all(&workspace_root).unwrap();
@@ -8792,6 +8807,10 @@ models: []
     #[test]
     fn create_file_media_access_rejects_missing_path() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let missing = paths.workspace_root.join("nope.mp4");
         let state = test_state_with_paths(paths);
@@ -8807,6 +8826,10 @@ models: []
     #[test]
     fn create_generated_video_access_returns_ticket_path() {
         let temp = tempfile::tempdir().unwrap();
+        // Isolate the user config dir into the tempdir; without this
+        // `discover` resolves it under the real $HOME/.puffer, so parallel
+        // tests share one session store and race ("No such file").
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let paths = ConfigPaths::discover(temp.path());
         let session_store = SessionStore::from_paths(&paths).unwrap();
         let workspace = temp.path().join("other-workspace");
@@ -8871,6 +8894,7 @@ models: []
     #[test]
     fn generated_video_ticket_lookup_prunes_expired_entries() {
         let temp = tempfile::tempdir().unwrap();
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let state = test_state_with_paths(ConfigPaths::discover(temp.path()));
         state.generated_video_tickets.lock().unwrap().insert(
             "expired".to_string(),
@@ -8889,6 +8913,7 @@ models: []
     #[tokio::test]
     async fn generated_video_handler_serves_full_body() {
         let temp = tempfile::tempdir().unwrap();
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let state = Arc::new(test_state_with_paths(ConfigPaths::discover(temp.path())));
         let video_path = temp.path().join("generated.mp4");
         std::fs::write(&video_path, b"0123456789").unwrap();
@@ -8924,6 +8949,7 @@ models: []
     #[tokio::test]
     async fn generated_video_handler_serves_single_range() {
         let temp = tempfile::tempdir().unwrap();
+        let _home = puffer_config::set_puffer_home_override(temp.path());
         let state = Arc::new(test_state_with_paths(ConfigPaths::discover(temp.path())));
         let video_path = temp.path().join("generated.mp4");
         std::fs::write(&video_path, b"0123456789").unwrap();

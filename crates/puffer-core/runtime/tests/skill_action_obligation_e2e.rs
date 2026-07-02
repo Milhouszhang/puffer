@@ -3,6 +3,16 @@
 use super::*;
 use puffer_resources::{LoadedItem, SkillSpec, SourceInfo, SourceKind};
 
+/// Serializes on the shared env mutex so a concurrent transport test can't flip
+/// `PUFFER_OPENAI_WEBSOCKET` mid-run. These tests drive the SSE responses path
+/// against an HTTP mock; if the var leaks in as set, the client tries a
+/// WebSocket upgrade against the SSE server and the turn diverges.
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::test_locks::env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn session_for(cwd: &std::path::Path) -> SessionMetadata {
     SessionMetadata {
         id: Uuid::new_v4(),
@@ -163,6 +173,8 @@ fn openai_state(cwd: &std::path::Path) -> AppState {
 
 #[test]
 fn openai_responses_skill_action_obligation_reminds_then_accepts_write() {
+    let _env = env_lock();
+    std::env::remove_var("PUFFER_OPENAI_WEBSOCKET");
     let temp = tempfile::tempdir().unwrap();
     let write_path = temp.path().join("started.txt");
     let write_args =
@@ -220,6 +232,8 @@ fn openai_responses_skill_action_obligation_reminds_then_accepts_write() {
 
 #[test]
 fn openai_responses_skill_action_obligation_fails_after_second_no_tool_text() {
+    let _env = env_lock();
+    std::env::remove_var("PUFFER_OPENAI_WEBSOCKET");
     let temp = tempfile::tempdir().unwrap();
     let (base_url, requests, server) = spawn_server("text/event-stream", 3, |index| match index {
         0 => openai_responses_function_call_sse(
@@ -262,6 +276,8 @@ fn openai_responses_skill_action_obligation_fails_after_second_no_tool_text() {
 
 #[test]
 fn openai_responses_skill_action_obligation_fails_when_turn_budget_expires() {
+    let _env = env_lock();
+    std::env::remove_var("PUFFER_OPENAI_WEBSOCKET");
     let temp = tempfile::tempdir().unwrap();
     let (base_url, requests, server) = spawn_server("text/event-stream", 1, |_| {
         openai_responses_function_call_sse(

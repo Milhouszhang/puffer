@@ -212,7 +212,7 @@ fn ip_is_private_or_local(ip: IpAddr) -> bool {
 }
 
 fn is_ipv6_documentation(ip: Ipv6Addr) -> bool {
-    (ip.segments()[0] & 0xfff0) == 0x2001 && ip.segments()[1] == 0x0db8
+    ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8
 }
 
 fn read_limited_response_body(response: reqwest::blocking::Response) -> Result<Vec<u8>> {

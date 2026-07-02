@@ -5,9 +5,8 @@ use crate::dtos::{
     ChatAttachmentSourceDto, DiffSummaryDto, DivergenceReportDto, ExternalCredentialDto,
     FolderGroupDto, MediaCapabilityInfoDto, MediaGenerationSettingsDto, MediaSettingsDto,
     ProviderSummaryDto, ResourceCountsDto, SecretSourceDto, SecretSummaryDto, SecretsSettingsDto,
-    SessionDetailDto,
-    SessionListItemDto, SettingsConfigDto, SettingsSessionSummaryDto, SettingsSnapshotDto,
-    TimelineItemDto,
+    SessionDetailDto, SessionListItemDto, SettingsConfigDto, SettingsSessionSummaryDto,
+    SettingsSnapshotDto, TimelineItemDto,
 };
 use crate::events::EventEmitter;
 use crate::repo_actions;
@@ -3075,7 +3074,7 @@ mod tests {
             Some("gpt-5.4"),
             vec![
                 bash_media_tool_event(
-                    "puffer internal-tool image-generation --prompt draw --count 2",
+                    "imagegen --prompt draw --count 2",
                     serde_json::json!({
                         "jobId": "job-1",
                         "requestedCount": 2,
@@ -3894,28 +3893,15 @@ fn stored_session_activity_status(events: &[StoredEvent]) -> &'static str {
 }
 
 fn latest_stored_action_requires_permission(events: &[StoredEvent]) -> bool {
-    for event in events.iter().rev() {
-        match event {
-            StoredEvent::System { text, .. } => return text_requires_permission(text),
-            StoredEvent::Tool { output, .. } => return output_requires_permission(output),
-            StoredEvent::User { .. } | StoredEvent::Assistant { .. } => return false,
-        }
+    match events.last() {
+        Some(StoredEvent::System { text, .. }) => text_requires_permission(text),
+        Some(StoredEvent::Tool { output, .. }) => output_requires_permission(output),
+        Some(StoredEvent::User { .. } | StoredEvent::Assistant { .. }) | None => false,
     }
-    false
 }
 
 fn latest_stored_action_is_unanswered(events: &[StoredEvent]) -> bool {
-    for event in events.iter().rev() {
-        match event {
-            StoredEvent::User { .. } => return true,
-            StoredEvent::Assistant { .. }
-            | StoredEvent::System { .. }
-            | StoredEvent::Tool { .. } => {
-                return false;
-            }
-        }
-    }
-    false
+    matches!(events.last(), Some(StoredEvent::User { .. }))
 }
 
 fn text_requires_permission(text: &str) -> bool {

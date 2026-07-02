@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  # Gate PRs, and the mainline itself after merge. Feature-branch pushes are
+  # covered by their PR run, so this avoids the push+pull_request double-run.
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: CI only needs to read the checkout. Overrides the repo
+# default token scope so a compromised action can't write to the repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Cancel superseded PR runs, but let every master run finish so the
+  # mainline history has no coverage gaps between rapid merges.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # The `--tests` gate links 100+ integration-test binaries; with debug
+  # symbols (the bulk of a debug binary) that `target/` exhausts the runner's
+  # disk ("No space left on device"). Debug symbols are useless in CI, so drop
+  # them — much smaller target/, faster linking, identical test behavior.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  # Runners ship tmux, so `require_tmux_or_skip` would RUN the TUI snapshot
+  # tests — which are terminal-/timing-fragile in CI and fail deterministically.
+  # Force them to skip; they still run locally for anyone who wants them.
+  PUFFER_SKIP_TMUX_TESTS: "1"
+
+jobs:
+  rust:
+    name: Rust (build + test)
+    runs-on: ubuntu-latest
+    # Safety net: the workspace suite runs in ~3 min; a stuck test (e.g. a
+    # blocked global-singleton channel) must not burn the 6h GitHub default.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Only master writes to the 10GB Actions cache quota; PR branches
+          # read it but don't evict the mainline baseline with per-PR entries.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - uses: taiki-e/install-action@nextest
+
+      # --- Hard gate: compile the whole workspace including test, integration,
+      # example, and bench targets (`--all-targets`), so a compile break outside
+      # production code (e.g. in a `crates/*/tests/` file) fails CI. This is
+      # also the only step that truly LINKS every target; nextest and clippy
+      # below share its artifacts, so it costs little beyond that link. ---
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      # --- Hard gate: the whole-workspace test suite via nextest (process-
+      # per-test isolation, ~40% faster in CI than cargo test, and the `ci`
+      # profile in .config/nextest.toml kills any single wedged test instead
+      # of letting it stall the job). Runs lib + bin unit tests (incl. the
+      # bin-only `puffer-cli`) AND the integration test targets under
+      # `crates/*/tests/`. Runs in parallel — `ConfigPaths::discover` isolates
+      # `user_config_dir` under the OS temp dir, so no race on the real
+      # ~/.puffer.
+      #
+      # Integration tests that need infra CI does not provide self-exclude:
+      # tmux TUI tests are skipped via PUFFER_SKIP_TMUX_TESTS, and the few
+      # needing the workflow-runtime Docker image / a real browser are
+      # `#[ignore]`d. Run the full set locally with tmux installed. ---
+      - name: Test (nextest)
+        run: cargo nextest run --workspace --locked --profile ci
+
+      # nextest cannot run doctests; without this step any future doctest
+      # would silently never execute in CI. Currently 0 doctests, ~30s warm.
+      - name: Doc tests
+        run: cargo test --workspace --doc --locked
+
+      # --- Hard gate: formatting drift was settled in one workspace-wide
+      # rustfmt commit; from here on any drift fails fast. ---
+      - name: Rustfmt
+        run: cargo fmt --all --check
+
+      # --- Hard gate: `correctness` flags real defects (bad comparisons,
+      # ignored #[must_use], always-true/false conditions) and `suspicious`
+      # catches bug-adjacent patterns like MutexGuard held across await.
+      # Style/pedantic warnings stay informational and never block. ---
+      - name: Clippy (correctness + suspicious gate)
+        run: cargo clippy --workspace --all-targets --locked -- -D clippy::correctness -D clippy::suspicious
+
+  desktop:
+    name: Desktop (build + check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/puffer-desktop
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          # Single source of truth for the Node version (24 = Active LTS
+          # until 2028-04; Node 20 went EOL 2026-04-30).
+          node-version-file: apps/puffer-desktop/.nvmrc
+          cache: npm
+          cache-dependency-path: apps/puffer-desktop/package-lock.json
+
+      - name: Install deps
+        run: npm ci
+
+      # --- Hard gates: all currently green, so the desktop job is now a real
+      # gate (previously every step was informational and could never fail). ---
+      - name: Build (vite)
+        run: npm run build
+
+      - name: svelte-check
+        run: npm run check
+
+      # Pure-node config/asset assertions (no browser). The Playwright UI
+      # suites are intentionally left out — they need browser binaries and a
+      # running app, which is a separate CI investment.
+      - name: Node tests
+        run: |
+          npm run test:tauri-config
+          npm run test:sidebar-css
+          npm run test:provider-visuals
+
+  desktop-backend:
+    name: Desktop backend (test + clippy)
+    runs-on: ubuntu-latest
+    # `apps/puffer-desktop/src-tauri` is a separate Cargo workspace that the
+    # root `cargo build --workspace` skips. Its 100+ unit tests were never
+    # run in CI (a plain `cargo check` doesn't even compile #[cfg(test)]
+    # code) — one of them rotted unnoticed. Runs in parallel with the other
+    # jobs, so this full gate has no critical-path cost.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libwebkit2gtk-4.1-dev \
+            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/puffer-desktop/src-tauri
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Test (nextest, src-tauri)
+        run: cargo nextest run --manifest-path apps/puffer-desktop/src-tauri/Cargo.toml --locked --profile ci
+
+      - name: Rustfmt (src-tauri)
+        run: cargo fmt --all --check --manifest-path apps/puffer-desktop/src-tauri/Cargo.toml
+
+      # Same deny groups as the root workspace so both codebases meet one bar.
+      - name: Clippy (correctness + suspicious gate)
+        run: cargo clippy --manifest-path apps/puffer-desktop/src-tauri/Cargo.toml --all-targets --locked -- -D clippy::correctness -D clippy::suspicious

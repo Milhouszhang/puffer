@@ -566,11 +566,21 @@ mod tests {
     fn system32_resolves_a_real_kernel_path() {
         let cmd = system32("cmd.exe");
         let lower = cmd.to_ascii_lowercase();
-        assert!(lower.ends_with("\\system32\\cmd.exe"), "unexpected path: {cmd}");
-        assert!(std::path::Path::new(&cmd).exists(), "cmd.exe should exist at {cmd}");
+        assert!(
+            lower.ends_with("\\system32\\cmd.exe"),
+            "unexpected path: {cmd}"
+        );
+        assert!(
+            std::path::Path::new(&cmd).exists(),
+            "cmd.exe should exist at {cmd}"
+        );
         // Poisoning %SystemRoot% must NOT change the kernel-resolved path.
         std::env::set_var("SystemRoot", "Z:\\attacker");
-        assert_eq!(system32("cmd.exe"), cmd, "SystemRoot env must not influence system32()");
+        assert_eq!(
+            system32("cmd.exe"),
+            cmd,
+            "SystemRoot env must not influence system32()"
+        );
         std::env::remove_var("SystemRoot");
     }
 
@@ -585,18 +595,31 @@ mod tests {
         // A plain directory is accepted.
         assert!(ensure_vault_dir_not_reparse(&normal).is_ok());
         // A not-yet-created directory is accepted (SecretVault::open creates it).
-        let missing = tmp.path().join("does-not-exist").to_string_lossy().to_string();
+        let missing = tmp
+            .path()
+            .join("does-not-exist")
+            .to_string_lossy()
+            .to_string();
         assert!(ensure_vault_dir_not_reparse(&missing).is_ok());
         // Plant a junction (no admin needed) and confirm it is refused.
         let link = tmp.path().join("junction");
         let status = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J", &link.to_string_lossy(), &real.to_string_lossy()])
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &real.to_string_lossy(),
+            ])
             .creation_flags(CREATE_NO_WINDOW)
             .status()
             .expect("run mklink");
         assert!(status.success(), "mklink /J should succeed without admin");
         let junction = link.to_string_lossy().to_string();
         let verdict = ensure_vault_dir_not_reparse(&junction);
-        assert!(verdict.is_err(), "a junction vault dir must be refused, got {verdict:?}");
+        assert!(
+            verdict.is_err(),
+            "a junction vault dir must be refused, got {verdict:?}"
+        );
     }
 }

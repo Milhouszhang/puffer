@@ -887,14 +887,16 @@ printf '%s\n%s\n%s\n' "$ack1" "$ack2" "$ack3" > '{}'
         .unwrap();
 
         assert_eq!(store.get("conn").unwrap().cursor.as_deref(), Some("c3"));
-        let batches = processor.batches.lock().unwrap();
-        assert_eq!(
-            batches.as_slice(),
-            &[
-                vec!["one".to_string()],
-                vec!["two".to_string(), "three".to_string()]
-            ]
-        );
+        {
+            let batches = processor.batches.lock().unwrap();
+            assert_eq!(
+                batches.as_slice(),
+                &[
+                    vec!["one".to_string()],
+                    vec!["two".to_string(), "three".to_string()]
+                ]
+            );
+        }
         let acks = std::fs::read_to_string(ack_path).unwrap();
         assert!(acks.contains("\"event_id\":\"e1\""));
         assert!(acks.contains("\"event_id\":\"e2\""));

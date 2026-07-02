@@ -292,7 +292,7 @@ test("stale recording frames for unknown tabs do not steal input focus", async (
   });
 
   await expect(page.locator(".pf-browser-tab.active")).toContainText("New tab");
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
   await page.locator(".pf-browser-canvas").click();
   await page.keyboard.type("abc123");
   await daemon.waitForRequest("browser_input", (request) =>

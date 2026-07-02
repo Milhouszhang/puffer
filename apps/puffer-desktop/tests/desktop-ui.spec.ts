@@ -205,7 +205,7 @@ test("opens the Browser tab against a mocked desktop daemon", async ({ page }) =
     request.params.sessionId === "session-browser:browser:tab-1"
   );
 
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
   await expect(page.locator(".pf-browser-status")).toHaveText("Connected");
   await expect(page.locator(".pf-browser-canvas")).toBeVisible();
   await expect(page.locator(".pf-browser-error")).toHaveCount(0);
@@ -571,7 +571,7 @@ test("sends Browser tab navigation through the daemon bridge", async ({ page }) 
   const request = await daemon.waitForRequest("browser_navigate");
   expect(request.params).toMatchObject({
     sessionId: "session-browser:browser:tab-1",
-    url: "example.com"
+    url: "https://example.com"
   });
   await expect(page.getByLabel("URL")).toHaveValue("https://example.com");
 });
@@ -639,7 +639,7 @@ test("late Browser navigation failures stay scoped to the submitted tab", async 
   await expect(page.locator(".pf-browser-tab")).toHaveCount(2);
 
   await page.locator(".pf-browser-tab").nth(0).click();
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
   daemon.delayFailure(
     "browser_navigate",
     (request) => request.params.sessionId === "session-browser:browser:tab-1",
@@ -653,10 +653,10 @@ test("late Browser navigation failures stay scoped to the submitted tab", async 
   );
 
   await page.locator(".pf-browser-tab").nth(1).click();
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
   await page.waitForTimeout(170);
 
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
   await expect(page.locator(".pf-browser-error")).toHaveCount(0);
 });
 
@@ -2032,7 +2032,7 @@ test("Browser pane resets daemon tabs when switching agents", async ({ page }) =
   await daemon.waitForRequest("browser_open", (request) =>
     request.params.sessionId === "session-beta-browser:browser:tab-1"
   );
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
 
   daemon.emit("browser:session-alpha-browser:tabs", {
     activeTabId: "tab-late-alpha",
@@ -2048,13 +2048,13 @@ test("Browser pane resets daemon tabs when switching agents", async ({ page }) =
     ]
   });
   await page.waitForTimeout(80);
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
 
   await page.getByLabel("URL").fill("beta.example");
   await page.getByLabel("URL").press("Enter");
   await daemon.waitForRequest("browser_navigate", (request) =>
     request.params.sessionId === "session-beta-browser:browser:tab-1" &&
-    request.params.url === "beta.example"
+    request.params.url === "https://beta.example"
   );
 });
 

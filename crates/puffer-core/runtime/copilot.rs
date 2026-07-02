@@ -30,6 +30,34 @@ const DEFAULT_COPILOT_API: &str = "https://api.githubcopilot.com";
 pub(crate) struct CopilotAuth {
     pub token: String,
     pub api_url: String,
+    /// Auto-mode session for plans without manual model selection (Free /
+    /// Student since GitHub's 2026-06-24 policy change). Chat requests on
+    /// those plans must carry `Copilot-Session-Token`; direct model selection
+    /// is server-rejected with `model_not_supported`. `None` on paid plans
+    /// (their models work directly) or when minting the session failed.
+    pub session: Option<CopilotSession>,
+}
+
+/// A minted `/models/session` auto-mode session: the JWT chat requests attach
+/// as `Copilot-Session-Token`. Its `available_models` are the plan's actually
+/// servable models (model discovery intersects the catalog with them).
+#[derive(Clone)]
+pub(crate) struct CopilotSession {
+    pub token: String,
+}
+
+/// True for SKUs that only get auto model selection (no manual picker):
+/// GitHub's free/student/no-auth tiers. Queried from the token envelope —
+/// `sku` and `limited_user_quotas` — rather than hardcoding model lists, so
+/// plan reshuffles surface as data changes, not code changes.
+fn copilot_sku_is_auto_only(envelope: &serde_json::Value) -> bool {
+    let sku = envelope.get("sku").and_then(|s| s.as_str()).unwrap_or("");
+    sku.starts_with("free_")
+        || sku == "no_auth_limited_copilot"
+        || envelope
+            .get("limited_user_quotas")
+            .map(|q| !q.is_null())
+            .unwrap_or(false)
 }
 
 struct CachedToken {
@@ -101,7 +129,21 @@ pub(crate) fn copilot_bearer_token(github_token: &str) -> Result<CopilotAuth> {
         .trim_end_matches('/')
         .to_string();
 
-    let auth = CopilotAuth { token, api_url };
+    // Auto-only plans need a `/models/session` auto-mode session for chat to
+    // work at all. Minting is unbilled and the session outlives the bearer's
+    // cache window (~1h vs ~25min), so mint alongside each exchange. Failure
+    // is tolerated: chat then runs without the header (direct mode).
+    let session = if copilot_sku_is_auto_only(&value) {
+        mint_auto_session(&client, &api_url, &token)
+    } else {
+        None
+    };
+
+    let auth = CopilotAuth {
+        token,
+        api_url,
+        session,
+    };
     cache().lock().unwrap().insert(
         github_token.to_string(),
         CachedToken {
@@ -110,4 +152,28 @@ pub(crate) fn copilot_bearer_token(github_token: &str) -> Result<CopilotAuth> {
         },
     );
     Ok(auth)
+}
+
+/// Mints an auto-mode session (`POST /models/session`) and returns its JWT.
+/// Best-effort: any failure returns `None` and chat proceeds without it.
+fn mint_auto_session(client: &Client, api_url: &str, bearer: &str) -> Option<CopilotSession> {
+    let response = client
+        .post(format!("{api_url}/models/session"))
+        .header("Authorization", format!("Bearer {bearer}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("User-Agent", "GitHubCopilotChat/0.31.0")
+        .header("Editor-Version", "vscode/1.104.0")
+        .header("Editor-Plugin-Version", "copilot-chat/0.31.0")
+        .header("Copilot-Integration-Id", "vscode-chat")
+        .header("X-GitHub-Api-Version", "2025-10-01")
+        .json(&serde_json::json!({ "auto_mode": { "model_hints": ["auto"] } }))
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let value: serde_json::Value = response.json().ok()?;
+    let token = value.get("session_token")?.as_str()?.to_string();
+    Some(CopilotSession { token })
 }

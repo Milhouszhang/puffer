@@ -612,6 +612,13 @@ pub(super) fn resolve_openai_execution_config(
     if provider.id == "github-copilot" {
         if let Some(StoredCredential::OAuth(credential)) = auth_store.get(provider.id.as_str()) {
             let copilot = super::copilot::copilot_bearer_token(&credential.access_token)?;
+            let mut custom_headers = custom_headers;
+            // Auto-only plans (Free/Student): chat only works inside an
+            // auto-mode session — the server rejects direct model selection
+            // with `model_not_supported` without this header.
+            if let Some(session) = &copilot.session {
+                custom_headers.push(("Copilot-Session-Token".to_string(), session.token.clone()));
+            }
             return Ok(OpenAIExecutionConfig {
                 provider_id: provider.id.clone(),
                 request_config: OpenAIRequestConfig {

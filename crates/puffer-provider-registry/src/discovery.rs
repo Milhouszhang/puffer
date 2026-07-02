@@ -86,38 +86,14 @@ fn copilot_policy_ok(entry: &Value) -> bool {
     }
 }
 
-/// True for Copilot's internal / experimental models that aren't meant to be
-/// user-selectable chat models (routing helpers, compaction, IDE-internal).
-/// Only used in the auto-only-SKU fallback below.
-fn copilot_model_is_internal(entry: &Value) -> bool {
-    let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-    let vendor = entry.get("vendor").and_then(|v| v.as_str()).unwrap_or_default();
-    vendor.eq_ignore_ascii_case("experimental")
-        || id.starts_with("mai-code")
-        || id == "oswe-vscode-prime"
-        || id == "trajectory-compaction"
-}
-
-/// Base model families that Copilot Free/Student SKUs could still call directly
-/// via `/chat/completions` as of 2026-07 (verified empirically): the standard
-/// OpenAI tier. Everything premium (claude-*, gemini-*, gpt-5*) and the legacy
-/// gpt-4/gpt-4-turbo families return `model_not_supported` on those SKUs.
-///
-/// This is a LAST-RESORT fallback only (see `copilot_filter_selectable`), and
-/// the most likely piece to rot: GitHub reshuffled Copilot plan/model policy
-/// three times in four months (2026-03-12 Student SKU, 2026-06-01 usage-based
-/// billing, 2026-06-24 auto-only selection for Free/Student). Revisit when
-/// Copilot models misbehave.
-const COPILOT_FREE_TIER_FAMILIES: &[&str] = &["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-3.5-turbo"];
-
-/// True when the entry's `capabilities.family` is in the free-tier base set.
-fn copilot_model_is_free_tier_family(entry: &Value) -> bool {
-    entry
-        .get("capabilities")
-        .and_then(|caps| caps.get("family"))
-        .and_then(|family| family.as_str())
-        .map(|family| COPILOT_FREE_TIER_FAMILIES.contains(&family))
-        .unwrap_or(false)
+/// True when the server marks this entry as the account's default or fallback
+/// chat model (`is_chat_default` / `is_chat_fallback`). Used only as the
+/// last-resort display set when the session endpoint is unreachable — these
+/// flags are queried per-account, so plan reshuffles surface as data changes,
+/// not code changes.
+fn copilot_model_is_default_or_fallback(entry: &Value) -> bool {
+    let flag = |key: &str| entry.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    flag("is_chat_default") || flag("is_chat_fallback")
 }
 
 const OPENAI_CODEX_ORIGINATOR: &str = "codex_cli_rs";
@@ -247,9 +223,11 @@ impl ModelDiscoveryClient {
     ///    false` on EVERY model, so when step 1 matches nothing we ask the
     ///    auto-mode routing endpoint `POST /models/session`, whose
     ///    `available_models` lists what the backend will actually serve this
-    ///    account.
-    /// 3. If that endpoint is unavailable, fall back to the empirically-known
-    ///    free-tier base families (see COPILOT_FREE_TIER_FAMILIES).
+    ///    account (chat requests then attach the session's
+    ///    `Copilot-Session-Token`; see puffer-core's copilot runtime).
+    /// 3. If that endpoint is unavailable, fall back to the server-marked
+    ///    `is_chat_default` / `is_chat_fallback` entries — also per-account
+    ///    metadata, so no model list is hardcoded anywhere in this chain.
     fn copilot_filter_selectable(
         &self,
         payload: &mut Value,
@@ -293,13 +271,12 @@ impl ModelDiscoveryClient {
             }
         }
 
-        // 3. Last resort: the free-tier base families verified to accept direct
-        //    chat requests on Free/Student SKUs (2026-07 snapshot; volatile).
+        // 3. Last resort (session endpoint unreachable): the server-marked
+        //    default/fallback chat models — still queried per-account.
         data.retain(|entry| {
             copilot_model_is_chat(entry)
                 && copilot_policy_ok(entry)
-                && !copilot_model_is_internal(entry)
-                && copilot_model_is_free_tier_family(entry)
+                && copilot_model_is_default_or_fallback(entry)
         });
     }
 

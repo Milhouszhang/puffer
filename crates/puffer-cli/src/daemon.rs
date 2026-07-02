@@ -59,7 +59,8 @@ use puffer_provider_openai::{
     OpenAIRealtimeClientSecretRequest, OpenAIRequestConfig,
 };
 use puffer_provider_registry::{
-    AuthStore, ModelDescriptor, ProviderDescriptor, ProviderRegistry, StoredCredential,
+    AuthStore, ModelDescriptor, OAuthCredential, ProviderDescriptor, ProviderRegistry,
+    StoredCredential,
 };
 use puffer_resources::{load_resources, LoadedResources, McpServerSpec};
 use puffer_secrets::{SecretUpsert, SecretVault};
@@ -1509,6 +1510,12 @@ async fn dispatch_request(
         "login_with_agentenv" => {
             respond!(detached!(|s| handle_login_with_agentenv(&s)))
         }
+        "copilot_login_start" => {
+            respond!(detached!(|s, p| handle_copilot_login_start(&s, &p)))
+        }
+        "copilot_login_poll" => {
+            respond!(detached!(|s, p| handle_copilot_login_poll(&s, &p)))
+        }
         "list_external_credentials" => {
             respond!(detached!(|s| handle_list_external_credentials(&s)))
         }
@@ -2933,6 +2940,68 @@ fn string_at_any(value: &Value, paths: &[&[&str]]) -> Option<String> {
         }
     }
     None
+}
+
+/// Starts the GitHub Copilot device-flow login. Returns the user code +
+/// verification URL for the client to display; no credential is stored yet.
+fn handle_copilot_login_start(_state: &DaemonState, _params: &Value) -> Result<Value> {
+    let start = crate::copilot_login::start_device_flow()?;
+    Ok(json!({
+        "deviceCode": start.device_code,
+        "userCode": start.user_code,
+        "verificationUri": start.verification_uri,
+        "interval": start.interval,
+        "expiresIn": start.expires_in,
+    }))
+}
+
+/// Polls the Copilot device flow once. On success stores the GitHub token as the
+/// `github-copilot` OAuth credential and returns the refreshed settings
+/// snapshot; otherwise reports the poll status so the client can keep waiting.
+fn handle_copilot_login_poll(state: &DaemonState, params: &Value) -> Result<Value> {
+    let device_code = params
+        .get("deviceCode")
+        .or_else(|| params.get("device_code"))
+        .and_then(|v| v.as_str())
+        .context("missing deviceCode")?;
+    match crate::copilot_login::poll_device_flow(device_code)? {
+        crate::copilot_login::DeviceFlowPoll::Pending => Ok(json!({ "status": "pending" })),
+        crate::copilot_login::DeviceFlowPoll::SlowDown => Ok(json!({ "status": "slow_down" })),
+        crate::copilot_login::DeviceFlowPoll::Failed(err) => {
+            Ok(json!({ "status": "error", "error": err }))
+        }
+        crate::copilot_login::DeviceFlowPoll::Done(token) => {
+            let mut inputs = state.build_runtime_inputs()?;
+            let auth_path = state.paths.user_config_dir.join("auth.json");
+            set_stored_credential(
+                &mut inputs.auth_store,
+                "github-copilot".to_string(),
+                StoredCredential::OAuth(OAuthCredential {
+                    access_token: token,
+                    ..Default::default()
+                }),
+            );
+            inputs.auth_store.save(&auth_path)?;
+            let _ = desktop_api::ensure_default_routing(
+                &state.paths,
+                &inputs.providers,
+                &inputs.auth_store,
+                "github-copilot",
+            );
+            reload_daemon_config(state)?;
+            let fresh = state.build_runtime_inputs()?;
+            let config = state.config.lock().unwrap().clone();
+            let snapshot: SettingsSnapshotDto = desktop_api::load_settings_snapshot(
+                &state.paths,
+                &config,
+                &fresh.resources,
+                &fresh.providers,
+                &fresh.auth_store,
+                &fresh.session_store,
+            )?;
+            Ok(json!({ "status": "done", "snapshot": snapshot }))
+        }
+    }
 }
 
 /// Lists importable credentials discovered under external tool config roots.

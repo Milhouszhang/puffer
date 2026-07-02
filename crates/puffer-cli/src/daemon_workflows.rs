@@ -30,7 +30,9 @@ mod telegram_diagnostics_export_tests;
 pub(crate) use binding_create::handle_workflow_binding_create;
 pub(crate) use binding_delete::handle_workflow_binding_delete;
 pub(crate) use connection_delete::handle_workflow_connection_delete;
-pub(crate) use connector_action_execute::handle_connector_action_execute;
+pub(crate) use connector_action_execute::{
+    handle_connector_action_draft_status, handle_connector_action_execute,
+};
 pub(crate) use monitor_action_execute::handle_monitor_action_execute;
 pub(crate) use monitor_create::handle_monitor_create;
 pub(crate) use monitor_history::handle_monitor_history_list;
@@ -486,7 +488,7 @@ fn monitor_task_json(
             &["memory_path", "memoryPath"]
         ),
         "ignored": monitor_metadata_bool(&task.metadata, "ignored"),
-        "actions": monitor_actions(&task.metadata),
+        "actions": monitor_actions_for_status(&task.metadata, &task.status),
         "possible_ignore_reasons": monitor_ignore_reasons(&task.metadata),
         "monitor": task_snapshot::metadata_value(
             &task.metadata,
@@ -575,6 +577,20 @@ fn monitor_actions(metadata: &Map<String, Value>) -> Vec<Value> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn monitor_actions_for_status(metadata: &Map<String, Value>, status: &str) -> Vec<Value> {
+    if monitor_task_status_is_terminal(status) {
+        return Vec::new();
+    }
+    monitor_actions(metadata)
+}
+
+fn monitor_task_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "completed" | "cancelled" | "deleted" | "ignored" | "stopped"
+    )
 }
 
 fn monitor_ignore_reasons(metadata: &Map<String, Value>) -> Vec<Value> {
@@ -736,6 +752,32 @@ mod tests {
                         },
                         "started_at_ms": 10,
                         "updated_at_ms": 20
+                    },
+                    {
+                        "task_id": "monitor-sent",
+                        "subject": "Answer Telegram follow-up",
+                        "description": "Alice asked for the next update.",
+                        "status": "completed",
+                        "metadata": {
+                            "_monitor": true,
+                            "monitor_connection": "telegram-user",
+                            "monitor_connector": "telegram-login",
+                            "actions": [
+                                {
+                                    "actionName": "Send",
+                                    "actionPrompt": "Send the approved Telegram reply."
+                                }
+                            ],
+                            "pending_action": {
+                                "id": "telegram-action-1",
+                                "type": "telegram_reply_draft_intent",
+                                "status": "sent",
+                                "version": 4,
+                                "agent_draft_text": "Thanks, sent."
+                            }
+                        },
+                        "started_at_ms": 30,
+                        "updated_at_ms": 40
                     }
                 ]
             }))
@@ -746,7 +788,7 @@ mod tests {
         let snapshot = handle_workflow_list(&paths).unwrap();
         let tasks = snapshot["monitor_tasks"].as_array().unwrap();
 
-        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0]["task_id"], "monitor-1");
         assert_eq!(tasks[0]["monitor_connection"], "telegram-user");
         assert_eq!(tasks[0]["monitor_connector"], "telegram-login");
@@ -781,6 +823,9 @@ mod tests {
             tasks[0]["pending_reply"]["agent_draft_text"],
             "Deployment finished an hour ago."
         );
+        assert_eq!(tasks[1]["task_id"], "monitor-sent");
+        assert_eq!(tasks[1]["pending_action"]["status"], "sent");
+        assert!(tasks[1]["actions"].as_array().unwrap().is_empty());
         assert_eq!(snapshot["monitor_task_error"], Value::Null);
     }
 

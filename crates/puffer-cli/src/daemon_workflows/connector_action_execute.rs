@@ -23,6 +23,13 @@ struct ConnectorActionExecuteParams {
     client_request_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ConnectorActionDraftStatusParams {
+    #[serde(alias = "draftId")]
+    draft_id: String,
+    version: u64,
+}
+
 trait ConnectorActionDraftExecutor: Send + Sync {
     fn execute_connector_action(
         &self,
@@ -66,6 +73,36 @@ pub(crate) fn handle_connector_action_execute(
         params,
         &InstalledConnectorActionDraftExecutor,
     )
+}
+
+pub(crate) fn handle_connector_action_draft_status(
+    paths: &ConfigPaths,
+    params: &Value,
+) -> Result<Value> {
+    let params: ConnectorActionDraftStatusParams = serde_json::from_value(params.clone())
+        .context("invalid connector action draft status params")?;
+    let draft_id = non_empty(&params.draft_id)
+        .context("missing draft_id")?
+        .to_string();
+
+    let path = outbound_action_drafts_path(paths);
+    let store = read_store(&path)?;
+    let draft = find_draft(&store, &draft_id)?;
+    validate_draft_identity(draft, &draft_id, params.version)?;
+    validate_draft_provenance(draft)?;
+
+    Ok(json!({
+        "draftId": draft_id,
+        "version": params.version,
+        "status": string_field(draft, &["status"]).unwrap_or("unknown"),
+        "error": draft.get("error").cloned().unwrap_or(Value::Null),
+        "receipt": draft.get("receipt").cloned().unwrap_or(Value::Null),
+        "updatedAtMs": draft
+            .get("updated_at_ms")
+            .or_else(|| draft.get("updatedAtMs"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    }))
 }
 
 fn handle_connector_action_execute_with_executor(
@@ -260,6 +297,17 @@ fn find_draft_mut<'a>(store: &'a mut Value, draft_id: &str) -> Result<&'a mut Ma
         .ok_or_else(|| anyhow!("connector action draft `{draft_id}` not found"))
 }
 
+fn find_draft<'a>(store: &'a Value, draft_id: &str) -> Result<&'a Map<String, Value>> {
+    store
+        .get("drafts")
+        .and_then(Value::as_array)
+        .context("draft store missing drafts array")?
+        .iter()
+        .find(|draft| draft.get("id").and_then(Value::as_str) == Some(draft_id))
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("connector action draft `{draft_id}` not found"))
+}
+
 fn validate_draft_identity(draft: &Map<String, Value>, draft_id: &str, version: u64) -> Result<()> {
     if draft.get("id").and_then(Value::as_str) != Some(draft_id) {
         bail!("draft_id mismatch");
@@ -448,6 +496,30 @@ mod tests {
 
         assert_eq!(result["status"], "already_sent");
         assert!(executor.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn connector_action_draft_status_reads_sent_store_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let mut store = draft_store();
+        store["drafts"][0]["status"] = json!("sent");
+        store["drafts"][0]["receipt"] = json!({"ok": true});
+        write_draft_store(&paths, store);
+
+        let result = handle_connector_action_draft_status(
+            &paths,
+            &json!({
+                "draftId": "draft-1",
+                "version": 1
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result["draftId"], "draft-1");
+        assert_eq!(result["version"], 1);
+        assert_eq!(result["status"], "sent");
+        assert_eq!(result["receipt"], json!({"ok": true}));
     }
 
     #[test]

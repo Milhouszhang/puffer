@@ -1676,6 +1676,9 @@ async fn dispatch_request(
         "connector_action_execute" => respond!(
             crate::daemon_workflows::handle_connector_action_execute(&state.paths, &params)
         ),
+        "connector_action_draft_status" => respond!(
+            crate::daemon_workflows::handle_connector_action_draft_status(&state.paths, &params)
+        ),
         "monitor_memory_save" | "task_monitor_memory_save" => respond!(
             crate::daemon_workflows::handle_monitor_memory_save(&state.paths, &params)
         ),

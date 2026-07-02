@@ -1,7 +1,12 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
   import { ensureLocalDaemonClient } from "../../api/daemonClient";
-  import { browserRecording, type BrowserRecordedFrame } from "../../api/desktop";
+  import {
+    browserRecording,
+    connectorActionDraftStatus,
+    executeConnectorActionDraft,
+    type BrowserRecordedFrame
+  } from "../../api/desktop";
   import Icon, { type IconName } from "../../design/Icon.svelte";
   import HighlightedLine from "../../components/HighlightedLine.svelte";
   import { chatFileTarget, fileOpenIntent, type ChatOpenIntent } from "../../chatOpenIntent";
@@ -31,7 +36,18 @@
   type McpDetail = { label: string; value: string };
   type McpSection = { title: string; rows: string[]; body?: string | null; empty?: string | null };
   type McpRender = { mode: "mcp"; title: string; meta: string[]; details: McpDetail[]; sections: McpSection[]; error?: string | null };
-  type ToolRender = FileRender | BashRender | ListRender | WebRender | McpRender;
+  type ConnectorDraftRender = {
+    mode: "connector-draft";
+    draftId: string;
+    status: string;
+    version: number;
+    connectorSlug: string;
+    connectionSlug: string;
+    action: string;
+    recipient: string;
+    message: string;
+  };
+  type ToolRender = FileRender | BashRender | ListRender | WebRender | McpRender | ConnectorDraftRender;
   type RecordingFrame = BrowserRecordedFrame & { src: string };
 
   function iconFor(name: string | null | undefined): IconName {
@@ -789,12 +805,37 @@
     return { mode: "web", title: url, meta, body };
   }
 
+  function connectorDraftRenderFor(
+    name: string,
+    output: Record<string, unknown> | null
+  ): ConnectorDraftRender | null {
+    if (name !== "ConnectorActionDraft") return null;
+    const draft = recordField(output, "draft");
+    if (!draft) return null;
+    const draftId = stringField(draft, ["id", "draftId", "draft_id"]);
+    const version = numberField(draft, ["version"]);
+    const message = stringField(draft, ["message"]);
+    if (!draftId || version === null || !message) return null;
+    return {
+      mode: "connector-draft",
+      draftId,
+      version,
+      message,
+      status: stringField(draft, ["status"]) ?? "draft_ready",
+      connectorSlug: stringField(draft, ["connectorSlug", "connector_slug"]) ?? "",
+      connectionSlug: stringField(draft, ["connectionSlug", "connection_slug"]) ?? "",
+      action: stringField(draft, ["action"]) ?? "send_message",
+      recipient: stringField(draft, ["recipientStableId", "recipient_stable_id", "to", "recipient"]) ?? ""
+    };
+  }
+
   function renderFor(
     name: string,
     input: Record<string, unknown> | null,
     output: Record<string, unknown> | null
   ): ToolRender | null {
-    return fileRenderFor(name, input, output)
+    return connectorDraftRenderFor(name, output)
+      ?? fileRenderFor(name, input, output)
       ?? bashRenderFor(name, input, output)
       ?? mcpRenderFor(name, input, output)
       ?? listRenderFor(name, input, output)
@@ -828,6 +869,9 @@
   let canvasSpec = $derived(normalizeCanvasSpec(inputJson));
   let isCanvasTool = $derived(isCanvasToolCall(toolName, canvasSpec));
   let canvasId = $derived(stringField(outputJson, ["canvasId", "canvas_id"]));
+  let connectorDraftSendState = $state<"idle" | "sending" | "sent" | "error">("idle");
+  let connectorDraftSendError = $state("");
+  let connectorDraftStatusKey = "";
   let recordingFrames = $state<RecordingFrame[]>([]);
   let selectedFrameId = $state<string | null>(null);
   let recordingDisposer: (() => void) | null = null;
@@ -1038,6 +1082,7 @@
   // Actions default closed; Canvas is a user-facing widget and opens inline.
   function initialCollapsed(): boolean {
     if (isCanvasTool) return false;
+    if (toolRender?.mode === "connector-draft") return false;
     return defaultCollapsed;
   }
 
@@ -1048,6 +1093,9 @@
     if (isCanvasTool && !canvasAutoExpanded) {
       collapsed = false;
       canvasAutoExpanded = true;
+    }
+    if (toolRender?.mode === "connector-draft") {
+      collapsed = false;
     }
   });
 
@@ -1066,6 +1114,82 @@
 
   function handleHeadClick() {
     if (toggleable) collapsed = !collapsed;
+  }
+
+  function clientRequestId(prefix: string): string {
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+      return `${prefix}-${crypto.randomUUID()}`;
+    }
+    return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+
+  function applyConnectorDraftStatus(status: string, error: unknown = null) {
+    if (status === "sent" || status === "already_sent") {
+      connectorDraftSendState = "sent";
+      connectorDraftSendError = "";
+      return;
+    }
+    if (status === "sending") {
+      connectorDraftSendState = "sending";
+      connectorDraftSendError = "";
+      return;
+    }
+    if (status === "send_uncertain") {
+      connectorDraftSendState = "error";
+      connectorDraftSendError = "Send status is uncertain. Check Telegram before retrying.";
+      return;
+    }
+    if (status === "send_failed") {
+      connectorDraftSendState = "error";
+      connectorDraftSendError = valueText(error) || "Send failed.";
+      return;
+    }
+    connectorDraftSendState = "idle";
+    connectorDraftSendError = "";
+  }
+
+  async function refreshConnectorDraftStatus(draft: ConnectorDraftRender, expectedKey: string) {
+    try {
+      const result = await connectorActionDraftStatus({
+        draftId: draft.draftId,
+        version: draft.version
+      });
+      if (connectorDraftStatusKey !== expectedKey) return;
+      applyConnectorDraftStatus(result.status, result.error);
+    } catch {
+      if (connectorDraftStatusKey !== expectedKey) return;
+    }
+  }
+
+  $effect(() => {
+    if (toolRender?.mode !== "connector-draft") return;
+    const key = `${toolRender.draftId}:${toolRender.version}`;
+    if (connectorDraftStatusKey === key) return;
+    connectorDraftStatusKey = key;
+    applyConnectorDraftStatus(toolRender.status);
+    void refreshConnectorDraftStatus(toolRender, key);
+  });
+
+  async function sendConnectorDraft(draft: ConnectorDraftRender) {
+    if (connectorDraftSendState === "sending") return;
+    connectorDraftSendState = "sending";
+    connectorDraftSendError = "";
+    try {
+      const result = await executeConnectorActionDraft({
+        draftId: draft.draftId,
+        version: draft.version,
+        approvedMessage: draft.message,
+        clientRequestId: clientRequestId(draft.draftId)
+      });
+      connectorDraftSendState = result.status === "sent" || result.status === "already_sent" ? "sent" : "idle";
+      if (connectorDraftSendState !== "sent") {
+        connectorDraftSendError = result.status || "Could not send draft.";
+        connectorDraftSendState = "error";
+      }
+    } catch (err) {
+      connectorDraftSendError = err instanceof Error ? err.message : String(err);
+      connectorDraftSendState = "error";
+    }
   }
 </script>
 
@@ -1124,6 +1248,29 @@
           {:else}
             <div class="pf-browser-empty">No browser frames recorded for this action yet.</div>
           {/if}
+        </div>
+      {:else if toolRender?.mode === "connector-draft"}
+        <div class="pf-connector-draft" data-state={connectorDraftSendState}>
+          <div class="pf-connector-draft-head">
+            <span class="pf-connector-draft-title">Drafted message</span>
+            <span class="pf-connector-draft-recipient">{toolRender.recipient}</span>
+          </div>
+          <blockquote>{toolRender.message}</blockquote>
+          <div class="pf-connector-draft-actions">
+            <button
+              type="button"
+              class="sc-btn pf-connector-draft-send"
+              data-size="sm"
+              disabled={connectorDraftSendState === "sending" || connectorDraftSendState === "sent"}
+              onclick={() => void sendConnectorDraft(toolRender)}
+            >
+              <Icon name={connectorDraftSendState === "sent" ? "check" : "bolt"} size={12} />
+              {connectorDraftSendState === "sending" ? "Sending" : connectorDraftSendState === "sent" ? "Sent" : "Approve and send"}
+            </button>
+            {#if connectorDraftSendError}
+              <span class="pf-connector-draft-error">{connectorDraftSendError}</span>
+            {/if}
+          </div>
         </div>
       {:else if toolRender?.mode === "read" || toolRender?.mode === "diff"}
         <div class="pf-file-render" data-mode={toolRender.mode}>
@@ -1491,6 +1638,71 @@
   }
   .pf-structured-render[data-error="true"] .pf-render-title {
     color: var(--destructive);
+  }
+  .pf-connector-draft {
+    border-top: 1px solid color-mix(in oklab, var(--puffer-accent) 28%, var(--border));
+    background: var(--background);
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    font-family: var(--font-sans);
+    font-size: var(--pf-chat-detail-size);
+  }
+  .pf-connector-draft-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .pf-connector-draft-title {
+    font-weight: 650;
+    color: var(--foreground);
+  }
+  .pf-connector-draft-recipient {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted-foreground);
+    font-family: var(--font-mono);
+    font-size: var(--pf-chat-code-size);
+  }
+  .pf-connector-draft blockquote {
+    margin: 0;
+    padding: 10px 12px;
+    border-left: 3px solid color-mix(in oklab, var(--puffer-accent) 45%, var(--border));
+    background: color-mix(in oklab, var(--muted) 38%, transparent);
+    color: var(--foreground);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.45;
+  }
+  .pf-connector-draft-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .pf-connector-draft-actions .sc-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .pf-connector-draft-send {
+    border-color: color-mix(in oklab, var(--puffer-accent) 72%, var(--border));
+    background: var(--puffer-accent);
+    color: var(--puffer-accent-foreground);
+  }
+  .pf-connector-draft-send:hover:not(:disabled) {
+    background: color-mix(in oklab, var(--puffer-accent) 88%, black);
+  }
+  .pf-connector-draft-send:disabled {
+    opacity: 0.72;
+  }
+  .pf-connector-draft-error {
+    color: var(--destructive);
+    font-size: var(--pf-chat-meta-size);
   }
   .pf-render-label {
     padding: 5px 8px;

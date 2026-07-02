@@ -1,4 +1,5 @@
 mod backend;
+mod badge;
 mod browser;
 mod browser_debug;
 mod cef_host;
@@ -74,6 +75,7 @@ const REGISTERED_TAURI_COMMANDS: &[&str] = &[
     "browser_cef_native_history",
     "browser_cef_native_close",
     "browser_cef_native_hide",
+    "badge_bump",
 ];
 
 fn backend_call(
@@ -562,6 +564,8 @@ pub fn run() {
         })
         .manage(backend)
         .manage(launcher)
+        .manage(std::sync::Mutex::new(badge::BadgeState::default()))
+        .on_window_event(badge::handle_window_event)
         .invoke_handler(tauri::generate_handler![
             backend_request,
             list_grouped_sessions,
@@ -603,6 +607,7 @@ pub fn run() {
             cef_host::browser_cef_native_history,
             cef_host::browser_cef_native_close,
             cef_host::browser_cef_native_hide,
+            badge::badge_bump,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Corbina desktop");

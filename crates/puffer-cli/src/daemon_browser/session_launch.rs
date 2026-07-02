@@ -61,6 +61,9 @@ pub(super) fn configure_chrome_command(
             .arg(format!("--disable-extensions-except={joined}"))
             .arg(format!("--load-extension={joined}"));
     }
+    for arg in launch_settings.proxy_args() {
+        command.arg(arg);
+    }
     command.arg(DEFAULT_URL);
 }
 

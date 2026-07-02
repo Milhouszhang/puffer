@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+puffer-config = { path = "../puffer-config" }
 puffer-subscriber-runtime = { path = "../puffer-subscriber-runtime" }
 regex.workspace = true
 rusqlite.workspace = true

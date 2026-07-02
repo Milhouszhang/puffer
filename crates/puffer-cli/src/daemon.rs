@@ -40,7 +40,7 @@ use puffer_config::{
 use puffer_core::{
     command_surface, default_effort_level, dispatch_command, enter_plan_mode, execute_connect_flow,
     execute_user_turn_streaming_with_prompt_tools_and_cancel, provider_preference_family,
-    supported_effort_levels, with_user_question_prompt_handler, AppState,
+    subscription_manager, supported_effort_levels, with_user_question_prompt_handler, AppState,
     BrowserPermissionPromptActionSet, BrowserPermissionPromptSource,
     BrowserPermissionPromptTargetClass, CancelToken, MessageRole, ModelPreferenceFamily,
     PermissionPromptAction, PermissionPromptRequest, ToolCallRequest, ToolInvocation,
@@ -235,6 +235,25 @@ async fn run_async(options: DaemonOptions) -> Result<()> {
         disable_auto_title,
         yolo,
     )?;
+    // Proxy env vars (ALL_PROXY/HTTP(S)_PROXY/NO_PROXY) are applied earlier in
+    // `run_main`, immediately after config load and BEFORE any background thread
+    // (provider discovery, heartbeat, workflow runtime, subscriptions::install)
+    // spawns, so their reqwest clients observe the proxy. See
+    // `apply_proxy_env_at_startup`.
+    // Overwrite the proxy config the manager received during install() with the
+    // daemon's own startup config. install() already applies the proxy before
+    // autostart_subscribers so the first launch is correct; this call ensures
+    // the manager holds the daemon-local config (which may differ if the config
+    // file was modified between install() and run_async()) so that any future
+    // respawn (e.g. after an auth failure) also uses the right settings.
+    let startup_proxy_clone = state.config.lock().unwrap().network.proxy.clone();
+    match subscription_manager() {
+        Ok(manager) => manager.set_proxy_config(startup_proxy_clone),
+        Err(error) => tracing::warn!(
+            %error,
+            "subscription manager unavailable at startup; proxy not pushed to subscribers"
+        ),
+    }
     if let Some(prompt) = system_prompt_1
         .as_deref()
         .map(str::trim)
@@ -248,6 +267,7 @@ async fn run_async(options: DaemonOptions) -> Result<()> {
         std::env::remove_var("PUFFER_NO_BROWSER");
     }
     let state = Arc::new(state);
+    crate::workflow_run_events::set_workflow_run_event_sink(state.event_sender());
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
@@ -986,6 +1006,20 @@ fn proxy_test_error_message(endpoint: &ProxyEndpoint, error: &anyhow::Error) -> 
         format!("{truncated}...")
     } else {
         truncated
+    }
+}
+
+/// Applies the configured proxy to this process's environment. Call ONCE during
+/// daemon startup, before any outbound HTTP — `env::set_var` is process-global
+/// and not safe to race against live readers, and reqwest memoizes system
+/// proxies, so this is intentionally never called again at runtime.
+pub(crate) fn apply_proxy_env_at_startup(proxy: &puffer_config::ProxyConfig) {
+    let block = puffer_config::proxy_env_block(proxy);
+    for (key, value) in &block.set {
+        std::env::set_var(key, value);
+    }
+    for key in &block.unset {
+        std::env::remove_var(key);
     }
 }
 
@@ -2396,6 +2430,38 @@ fn handle_save_proxy_settings(state: &DaemonState, params: &Value) -> Result<Val
     config.network.proxy.validate()?;
     save_user_config(&state.paths, &config).context("save user config")?;
     reload_daemon_config(state)?;
+    // Rebuild managed-Chrome launch settings from the freshly reloaded config so
+    // the new `--proxy-server` flags take effect on the next browser launch
+    // without a daemon restart. Mirrors `DaemonState::load`: staging failures
+    // degrade to defaults rather than aborting the settings save.
+    {
+        let fresh_config = state.config.lock().unwrap().clone();
+        let launch_settings = browser_launch_settings_or_default(
+            BrowserLaunchSettings::from_config(&state.paths, &fresh_config),
+        );
+        if let Err(error) = state.browsers.update_launch_settings(launch_settings) {
+            tracing::warn!(%error, "failed to refresh browser launch settings after proxy change");
+        }
+    }
+    // Push the new proxy config into the manager and respawn proxy-sensitive
+    // subscribers (Telegram) so the change takes effect without an app restart.
+    // Failures here are logged but must not prevent the settings save from
+    // succeeding.
+    {
+        let proxy = state.config.lock().unwrap().network.proxy.clone();
+        match subscription_manager() {
+            Ok(manager) => {
+                manager.set_proxy_config(proxy);
+                if let Err(error) = manager.respawn_proxy_sensitive_subscribers() {
+                    tracing::warn!(%error, "failed to respawn subscribers after proxy change");
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "subscription manager unavailable; proxy change not pushed to subscribers"
+            ),
+        }
+    }
     let fresh = state.build_runtime_inputs()?;
     let config = state.config.lock().unwrap().clone();
     let snapshot: SettingsSnapshotDto = desktop_api::load_settings_snapshot(
@@ -6921,9 +6987,14 @@ fn apply_daemon_yolo_mode(app_state: &mut AppState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workflow_run_finished_channel_is_not_replayed() {
+        assert!(!super::is_replay_channel("workflow-run:finished"));
+    }
+
     use super::{
-        append_ordered_turn_progress, apply_daemon_yolo_mode, apply_turn_model_override,
-        apply_turn_request_options, browser_launch_settings_or_default,
+        append_ordered_turn_progress, apply_daemon_yolo_mode, apply_proxy_env_at_startup,
+        apply_turn_model_override, apply_turn_request_options, browser_launch_settings_or_default,
         browser_permission_payload_json, browser_status_for_turn, cancel_all_active_turns,
         connector_setup_connect_args, connector_setup_id, daemon_now_ms, desktop_latency_ms,
         file_media_mime_type, generated_video_handler, handle_create_file_media_access,
@@ -12023,5 +12094,35 @@ input_schema:
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn apply_proxy_env_sets_then_clears() {
+        use puffer_config::{ProxyConfig, ProxyEndpoint, ProxyScheme};
+        let enabled = ProxyConfig {
+            enabled: true,
+            selected: Some("p".into()),
+            bypass: vec![],
+            proxies: vec![ProxyEndpoint {
+                id: "p".into(),
+                scheme: ProxyScheme::Socks5,
+                host: "127.0.0.1".into(),
+                port: 7890,
+                username: None,
+                password: None,
+            }],
+        };
+        apply_proxy_env_at_startup(&enabled);
+        assert_eq!(
+            std::env::var("ALL_PROXY").unwrap(),
+            "socks5://127.0.0.1:7890"
+        );
+
+        let disabled = ProxyConfig {
+            enabled: false,
+            ..enabled.clone()
+        };
+        apply_proxy_env_at_startup(&disabled);
+        assert!(std::env::var("ALL_PROXY").is_err());
     }
 }

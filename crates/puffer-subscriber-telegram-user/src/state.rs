@@ -168,6 +168,33 @@ pub fn resolve_api_credentials(
     Ok((DEFAULT_API_ID, DEFAULT_API_HASH.to_string()))
 }
 
+/// grammers requires a `socks5://` URL; reject http/empty/other schemes.
+/// `socks5h://` (DNS-via-proxy variant) is normalized to `socks5://` so that
+/// operators who configure the system-wide ALL_PROXY with the `h` suffix are
+/// not silently dropped — grammers handles remote DNS resolution internally.
+fn normalize_telegram_proxy(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if let Some(rest) = value.strip_prefix("socks5h://") {
+        return Some(format!("socks5://{rest}"));
+    }
+    value.starts_with("socks5://").then(|| value.to_string())
+}
+
+/// Resolves the Telegram SOCKS5 proxy from the environment. An explicit
+/// `PUFFER_TELEGRAM_PROXY` wins; otherwise fall back to the de-facto
+/// `ALL_PROXY`/`all_proxy`. The first value that is a valid `socks5://` URL is
+/// used; non-socks5 values are skipped (so an HTTP `ALL_PROXY` is ignored).
+fn telegram_proxy_url() -> Option<String> {
+    for key in ["PUFFER_TELEGRAM_PROXY", "ALL_PROXY", "all_proxy"] {
+        if let Ok(value) = std::env::var(key) {
+            if let Some(url) = normalize_telegram_proxy(&value) {
+                return Some(url);
+            }
+        }
+    }
+    None
+}
+
 /// Returns default Telegram client identity metadata to match the built-in API
 /// credential pair.
 pub fn default_init_params() -> grammers_client::InitParams {
@@ -179,6 +206,7 @@ pub fn default_init_params() -> grammers_client::InitParams {
         system_lang_code: "en".to_string(),
         catch_up: false,
         update_queue_limit: None,
+        proxy_url: telegram_proxy_url(),
         ..Default::default()
     }
 }
@@ -231,6 +259,27 @@ impl LoginState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_telegram_proxy_accepts_socks5_and_normalizes_socks5h() {
+        assert_eq!(
+            normalize_telegram_proxy("socks5://127.0.0.1:7890"),
+            Some("socks5://127.0.0.1:7890".to_string())
+        );
+        // trims surrounding whitespace
+        assert_eq!(
+            normalize_telegram_proxy("  socks5://h:1  "),
+            Some("socks5://h:1".to_string())
+        );
+        // socks5h:// (DNS-via-proxy) is normalized to socks5:// for grammers
+        assert_eq!(
+            normalize_telegram_proxy("socks5h://h:1"),
+            Some("socks5://h:1".to_string())
+        );
+        assert_eq!(normalize_telegram_proxy("http://127.0.0.1:7890"), None);
+        assert_eq!(normalize_telegram_proxy("127.0.0.1:7890"), None);
+        assert_eq!(normalize_telegram_proxy(""), None);
+    }
 
     #[test]
     fn resolve_api_credentials_uses_hardcoded_default_without_config() {

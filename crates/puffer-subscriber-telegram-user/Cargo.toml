@@ -10,7 +10,7 @@ aes = "0.8.4"
 base64.workspace = true
 cbc = "0.1.2"
 dirs.workspace = true
-grammers-client = "0.7"
+grammers-client = { version = "0.7", features = ["proxy"] }
 grammers-session = "0.7"
 grammers-tl-types = "0.7"
 hermes-tdata = "0.1.1"

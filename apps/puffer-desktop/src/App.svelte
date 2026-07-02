@@ -61,6 +61,7 @@
     loadDefaultWorkspace,
     loadDesktopPins,
     setDesktopPin,
+    subscribeWorkflowRunFinished,
     updateConfig,
     type AgentTurnSubmitOptions,
     type GeneratedMediaArtifactResult,
@@ -94,6 +95,8 @@
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { invoke } from "@tauri-apps/api/core";
+  import { canInvokeTauri } from "./lib/api/daemonClient";
   import { detectPlatform } from "./lib/shell/platform";
   import type {
     DesktopPreferences,
@@ -1189,9 +1192,23 @@
       });
     }
 
+    // Workflow/task run completions badge the dock when the window is
+    // unfocused (the native badge_bump command is itself focus-gated).
+    let unsubWorkflowRun: (() => void) | null = null;
+    void subscribeWorkflowRunFinished(() => {
+      if (canInvokeTauri()) {
+        void invoke("badge_bump").catch(() => {});
+      }
+    }).then((unsub) => {
+      // If we already unmounted before the subscription resolved, drop it now.
+      if (miniDisposed) unsub();
+      else unsubWorkflowRun = unsub;
+    });
+
     return () => {
       miniDisposed = true;
       miniUnlisten?.();
+      unsubWorkflowRun?.();
       cancelRecapBlurTimer();
       clearDaemonClientListeners();
       sessionSubscriptionGeneration += 1;
@@ -4298,6 +4315,9 @@
   function handleSessionEvent(sid: string, ev: SessionStreamEvent) {
     const selectedForEvent = selectedSession?.id === sid;
     if (isTurnSettled(sid, ev.turnId)) return;
+    if (ev.type === "turn-complete" && !ev.replay && canInvokeTauri()) {
+      void invoke("badge_bump").catch(() => {});
+    }
     const ignoredForSelected = selectedForEvent && shouldIgnoreTurnEvent(sid, ev.turnId);
     if (!ignoredForSelected) applySidebarSessionEvent(sid, ev);
     if (ignoredForSelected) {
@@ -4835,6 +4855,7 @@
               onRunRemoteBash={(command) => void handleRemoteBash(command)}
               onReadRemoteFile={(path) => void handleRemoteRead(path)}
               onWriteRemoteFile={(path, contents) => void handleRemoteWrite(path, contents)}
+              onStatus={(message) => (statusMessage = message)}
             />
           {/if}
         </div>

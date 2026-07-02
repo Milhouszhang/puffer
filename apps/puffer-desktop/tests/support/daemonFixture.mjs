@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
  * @typedef {Object} DaemonFixtureOptions
  * @property {string} [openaiBaseUrl]
  * @property {string} [anthropicBaseUrl]
- * @property {string} [openaiApiKey]  // 默认 "sk-test"
+ * @property {string} [openaiApiKey]  // defaults to "sk-test"
  * @property {string} defaultProvider
  * @property {string} defaultModel
  */

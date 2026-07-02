@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// 起一个与用户 dev 数据完全隔离的 Puffer 实例，打印可直接打开的 URL。
-// 用法: node scripts/agent-app.mjs [--provider mock|real]
+// Start a Puffer instance fully isolated from the user's dev data and print a directly openable URL.
+// Usage: node scripts/agent-app.mjs [--provider mock|real]
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,7 +32,7 @@ async function viteRunning() {
 }
 
 async function ensureVite() {
-  if (await viteRunning()) return null; // 复用，退出时不碰它
+  if (await viteRunning()) return null; // reuse; leave it alone on exit
   const vite = spawn(
     process.execPath,
     ["./node_modules/vite/bin/vite.js", "--host", "127.0.0.1", "--port", "1420"],
@@ -78,9 +78,9 @@ console.log(`AGENT_APP_URL=${VITE_URL}/?${params.toString()}`);
 console.log("agent-app: ready. Ctrl-C to stop and clean up.");
 
 async function shutdown() {
-  await fixture.stop(); // 杀 daemon + 清临时目录
+  await fixture.stop(); // kill daemon + remove temp dir
   if (mock) await mock.stop();
-  if (vite) vite.kill(); // 只杀自起的 Vite
+  if (vite) vite.kill(); // only kill a self-started Vite
   process.exit(0);
 }
 process.on("SIGINT", shutdown);

@@ -1,109 +1,112 @@
-# Agent 自动化 UI 测试工作流设计
+# Agent-Driven Automated UI Testing Workflow — Design
 
-日期：2026-07-02
-分支：`feat/agent-ui-testing`
-状态：已批准
+Date: 2026-07-02
+Branch: `feat/agent-ui-testing`
+Status: Approved
 
-## 背景与目标
+## Background and Goals
 
-Puffer desktop（`apps/puffer-desktop`，Svelte 5 + Tauri 2）已具备完整的测试地基：
+Puffer desktop (`apps/puffer-desktop`, Svelte 5 + Tauri 2) already has a solid testing foundation:
 
-- Playwright 1.59.1 + 30+ 个 `tests/*-ui.spec.ts`（桩掉 `__TAURI_INTERNALS__` 的 mock 层）
-- `tests/real-daemon-ui.spec.ts` 内嵌的 `DaemonFixture`：spawn 真实 `target/debug/puffer` daemon（隔离临时 HOME/workspace + mock provider），通过 URL query（`corbinaBackend`/`corbinaToken`）把 handshake 注入前端——**前后端走 HTTP，浏览器即可触达真实后端，无需驱动 WKWebView**
-- Storybook（端口 6006，含 a11y addon）
-- `scripts/ci-gates.sh` 回归门槛
+- Playwright 1.59.1 + 30+ `tests/*-ui.spec.ts` files (a mock layer that stubs `__TAURI_INTERNALS__`)
+- `DaemonFixture` embedded in `tests/real-daemon-ui.spec.ts`: spawns a real `target/debug/puffer` daemon (isolated temp HOME/workspace + mock providers) and injects the handshake into the frontend via URL query params (`corbinaBackend`/`corbinaToken`) — **frontend and backend talk over HTTP, so a plain browser can reach the real backend; no WKWebView driving required**
+- Storybook (port 6006, with the a11y addon)
+- `scripts/ci-gates.sh` regression gates
 
-目标：在此地基上整合一套 **agent 驱动的自动化测试工作流**，用"agent 探索 → 产出报告 → 固化为回归 spec"替代人工测试，缩短人工测试时间。测试资产（spec）复利增长是省时间的根本机制。
+Goal: build on this foundation to integrate an **agent-driven automated testing workflow** that replaces manual testing with "agent explores → produces a report → hardens findings into regression specs", cutting manual testing time. Compounding growth of test assets (specs) is the fundamental time-saving mechanism.
 
-约束：不考虑向后兼容；只考虑长期收益、稳定和性能；防止过度设计。
+Constraints: no backward compatibility concerns; optimize only for long-term value, stability, and performance; guard against over-engineering.
 
-## 场景路由（核心决策表）
+## Scenario Routing (Core Decision Table)
 
-| 场景 | 工具 | 产出物 | 替代的人工工作 |
+| Scenario | Tool | Deliverable | Manual work replaced |
 |---|---|---|---|
-| 新功能验收（功能流程探索） | agent-browser + `agent-app.mjs` 隔离环境 | 探索报告 + 固化的 `*-ui.spec.ts` | 手动点一遍新功能各路径 |
-| UI/UX 审查（样式改动、视觉状态遍历） | agent-browser 截图 + agent 视觉判断；组件级走 Storybook:6006 | 视觉问题清单 + `toHaveScreenshot()` 基线 spec | 人眼逐状态检查布局/暗色/hover |
-| Bug 深挖（daemon 协议、网络、console） | playwright-mcp（网络拦截、trace、console） | 根因分析 + 最小复现 spec | 手动开 DevTools 抓包排查 |
-| 回归防护（每次提交） | repo 的 `@playwright/test`（无 agent、无 LLM） | ci-gates 通过/失败 | 手动回归测试 |
+| New-feature acceptance (flow exploration) | agent-browser + `agent-app.mjs` isolated environment | Exploration report + hardened `*-ui.spec.ts` | Manually clicking through every path of a new feature |
+| UI/UX review (style changes, visual state sweep) | agent-browser screenshots + agent visual judgment; component-level via Storybook:6006 | Visual issue list + `toHaveScreenshot()` baseline specs | Eyeballing layout/dark mode/hover state by state |
+| Bug deep-dive (daemon protocol, network, console) | playwright-mcp (network interception, trace, console) | Root cause analysis + minimal reproduction spec | Manually opening DevTools to capture and debug |
+| Regression protection (every commit) | Repo's `@playwright/test` (no agent, no LLM) | ci-gates pass/fail | Manual regression testing |
 
-路由原则：高频迭代用 agent-browser（token 效率约 4 倍于 MCP 方案，且底层同为 Playwright，role-based 定位可 1:1 翻译成 spec）；深度调试用 playwright-mcp（网络/trace 能力）；CI 永远不依赖 agent。
+Routing principles: use agent-browser for high-frequency iteration (~4x the token efficiency of the MCP option, same Playwright underneath, and role-based locators translate 1:1 into specs); use playwright-mcp for deep debugging (network/trace capabilities); CI never depends on an agent.
 
-工具选型依据（2026-07 调研）：agent-browser（Vercel 官方）与 playwright-mcp（Microsoft 官方，34k+ stars）均为主流稳定工具；实测 10 步任务 token 消耗约 27k vs 114k，故探索层默认 agent-browser。
+Tool selection rationale (researched 2026-07): agent-browser (official Vercel) and playwright-mcp (official Microsoft, 34k+ stars) are both mainstream, stable tools; a measured 10-step task consumed ~27k vs ~114k tokens, hence agent-browser as the exploration-layer default.
 
-## 架构与数据流
+## Architecture and Data Flow
 
 ```
-┌─ 探索模式（本地）──────────────────────────────────────┐
+┌─ Exploration mode (local) ──────────────────────────────┐
 │ scripts/agent-app.mjs                                   │
-│   ├─ 起隔离 daemon（临时 HOME/workspace，mock provider）│
-│   ├─ 复用正在跑的 Vite:1420，没有则自己拉起              │
-│   └─ 打印: http://127.0.0.1:1420/?skipOnboarding=1      │
+│   ├─ spawns an isolated daemon (temp HOME/workspace,    │
+│   │  mock provider)                                     │
+│   ├─ reuses a running Vite on :1420, or starts its own  │
+│   └─ prints: http://127.0.0.1:1420/?skipOnboarding=1    │
 │            &corbinaBackend=<url>&corbinaToken=<token>   │
 │                          ↓                              │
-│ agent-browser / playwright-mcp 打开该 URL（工具无关）    │
-│   → 真实前端 + 真实 Rust 后端，与用户 dev 数据完全隔离    │
+│ agent-browser / playwright-mcp opens that URL           │
+│ (tool-agnostic)                                         │
+│   → real frontend + real Rust backend, fully isolated   │
+│     from the user's dev data                            │
 └─────────────────────────────────────────────────────────┘
-┌─ 固化模式（CI）────────────────────────────────────────┐
-│ agent 把发现写成 tests/*-ui.spec.ts                      │
+┌─ Hardening mode (CI) ───────────────────────────────────┐
+│ agent writes findings as tests/*-ui.spec.ts             │
 │   → import tests/support/daemonFixture.mjs              │
 │   → npm run test:desktop-ui → ci-gates                  │
 └─────────────────────────────────────────────────────────┘
 ```
 
-关键机制：handshake 通过 URL query 注入，同一个 Vite 实例可同时服务用户的 dev app 和 agent 的隔离实例，互不干扰，无需第二端口。
+Key mechanism: the handshake is injected via URL query params, so a single Vite instance can serve the user's dev app and the agent's isolated instance simultaneously without interference — no second port needed.
 
-## 组件（4 个改动点，约 200 行新代码，零新增运行时依赖）
+## Components (4 change points, ~200 lines of new code, zero new runtime dependencies)
 
 1. **`tests/support/daemonFixture.mjs`**
-   从 `real-daemon-ui.spec.ts` 抽出 `DaemonFixture` 与 provider mock（OpenAI/Anthropic），改写为 `.mjs` + JSDoc 类型；原 spec 改为 import，不留兼容层。
-   选 `.mjs` 而非 `.ts`：CLI 脚本与 TS spec 均可直接 import，不引入 tsx/ts-node 依赖。
+   Extract `DaemonFixture` and the provider mocks (OpenAI/Anthropic) from `real-daemon-ui.spec.ts`, rewritten as `.mjs` + JSDoc types; the original spec switches to importing it, with no compatibility layer left behind.
+   `.mjs` over `.ts`: both the CLI script and TS specs can import it directly without introducing a tsx/ts-node dependency.
 
-2. **`scripts/agent-app.mjs`**（约 80 行）
-   - `--provider mock|real`：默认 mock；`real` 从 `RELAYDANCE_API_KEY` 环境变量读密钥、指向 relaydance 网关，密钥缺失即 fail-fast
-   - mock provider 返回固定 canned 回复（对 UI 流程测试已足够；不做回复脚本化配置，YAGNI）
-   - Vite 生命周期：1420 已有 Vite 在跑则复用且退出时不碰它；没有则自己拉起并在退出时负责杀掉
-   - 最后打印带 handshake 参数的完整 URL（人和任何 agent 工具都能直接打开）
-   - SIGINT/SIGTERM 时杀 daemon（及自起的 Vite）、清临时目录
+2. **`scripts/agent-app.mjs`** (~80 lines)
+   - `--provider mock|real`: defaults to mock; `real` reads the key from the `RELAYDANCE_API_KEY` environment variable and points at the relaydance gateway, failing fast if the key is missing
+   - The mock provider returns a fixed canned reply (sufficient for UI flow testing; no scripted reply configuration — YAGNI)
+   - Vite lifecycle: if a Vite is already running on 1420, reuse it and leave it alone on exit; otherwise start one and take responsibility for killing it on exit
+   - Finally prints the full URL with handshake params (humans and any agent tool can open it directly)
+   - On SIGINT/SIGTERM: kill the daemon (and any self-started Vite), clean up the temp directory
 
-3. **`.mcp.json`**（新建，仓库当前没有此文件）
-   加 playwright-mcp（`npx @playwright/mcp@latest`），角色限定为 Bug 深挖场景；MCP 工具延迟加载，不用不吃 token。
+3. **`.mcp.json`** (new; the repo currently has no such file)
+   Add playwright-mcp (`npx @playwright/mcp@latest`), scoped to the bug deep-dive scenario; MCP tools load lazily, costing no tokens when unused.
 
 4. **`AGENTS.md`**
-   新增一节：场景路由表 + 探索→固化工作流约定（spec 放 `tests/`、role-based selector 风格、必须过 `npm run test:desktop-ui` 才算固化、组件级 UI 审查首选 Storybook）。
+   New section: scenario routing table + explore→harden workflow conventions (specs live in `tests/`, role-based selector style, must pass `npm run test:desktop-ui` to count as hardened, component-level UI review prefers Storybook).
 
-5. **视觉基线的平台边界（复查补漏）**
-   `toHaveScreenshot()` 基线是平台相关的：CI 跑在 `ubuntu-latest`，而基线在 macOS 生成，字体/抗锯齿差异会导致 CI 必然误报。因此视觉 spec 独立存放（`tests/visual/*.spec.ts`）、独立脚本 `test:desktop-visual`，**只在 macOS 本地跑**（开发者/agent 提交前验证），不进 GitHub CI；功能 spec 照常进 CI。何时值得在 CI 容器里重建 Linux 基线，留待视觉 spec 积累到有维护痛点时再评估。
+5. **Visual baseline platform boundary (review addendum)**
+   `toHaveScreenshot()` baselines are platform-dependent: CI runs on `ubuntu-latest` while baselines are generated on macOS, so font/anti-aliasing differences would make CI fail spuriously. Visual specs therefore live separately (`tests/visual/*.spec.ts`) with their own script `test:desktop-visual`, and **run on macOS locally only** (developer/agent pre-commit verification), staying out of GitHub CI; functional specs go into CI as usual. Whether rebuilding Linux baselines inside a CI container is worthwhile is deferred until visual specs accumulate enough to cause maintenance pain.
 
-## 错误处理
+## Error Handling
 
-- `target/debug/puffer` 不存在 → 报错并提示 `cargo build -p puffer-cli`
-- handshake 15s 超时 → 转储 daemon stderr 后退出
-- Vite 拉起失败 → 明确报错，不静默重试
-- `--provider real` 且 `RELAYDANCE_API_KEY` 缺失 → fail-fast
-- 一律 fail-fast，不做自动恢复（开发工具，失败要显眼）
+- `target/debug/puffer` missing → error out with a hint to run `cargo build -p puffer-cli`
+- Handshake timeout (15s) → dump daemon stderr, then exit
+- Vite failed to start → explicit error, no silent retry
+- `--provider real` with `RELAYDANCE_API_KEY` missing → fail fast
+- Fail fast across the board, no automatic recovery (this is a dev tool; failures must be loud)
 
-## 测试策略
+## Testing Strategy
 
-- 抽取重构的正确性：由现有 `real-daemon-ui.spec.ts` 继续通过来保证（它是抽取模块的第一个消费者）
-- `agent-app.mjs`：一个最小 smoke spec——启动脚本、解析输出 URL、确认 daemon 进程存活且 URL 可访问（HTTP 200）、发 SIGTERM 后确认进程退出与临时目录清理
-- UI/UX 探索产出的视觉问题固化为 `tests/visual/` 下的 `toHaveScreenshot()` 基线 spec，经 `test:desktop-visual` 在 macOS 本地验证（见组件 5 的平台边界）
+- Correctness of the extraction refactor: guaranteed by the existing `real-daemon-ui.spec.ts` continuing to pass (it is the extracted module's first consumer)
+- `agent-app.mjs`: one minimal smoke spec — start the script, parse the printed URL, confirm the daemon process is alive and the URL is reachable (HTTP 200), send SIGTERM and confirm process exit plus temp directory cleanup
+- Visual issues found during UI/UX exploration are hardened into `toHaveScreenshot()` baseline specs under `tests/visual/`, verified locally on macOS via `test:desktop-visual` (see component 5 for the platform boundary)
 
-## 明确不做（防过度设计边界）
+## Explicitly Out of Scope (over-engineering guardrails)
 
-- 进程内插桩（Victauri 式自研）：Puffer 前后端走 HTTP handshake，浏览器已能触达真实后端，此类方案解决的是 Puffer 不存在的问题
-- agent 探索进 CI：CI 只跑固化 spec，不依赖 LLM
-- Claude Code 技能封装：流程跑顺（约两周）后按真实痛点再评估
-- 截图基线之外的视觉回归服务
-- 第二 Vite 端口隔离
-- 原生壳层（Dock 角标、窗口、菜单）自动化：无主流方案，维持 OS 级人工验证
+- In-process instrumentation (Victauri-style homegrown tooling): Puffer's frontend and backend talk over an HTTP handshake, so a browser can already reach the real backend — that class of solution addresses a problem Puffer doesn't have
+- Agent exploration in CI: CI only runs hardened specs, never depends on an LLM
+- Claude Code skill packaging: re-evaluate against real pain points once the workflow has been running smoothly (~two weeks)
+- Visual regression services beyond screenshot baselines
+- A second Vite port for isolation
+- Native shell automation (Dock badge, windows, menus): no mainstream solution exists; keep OS-level manual verification
 
-## 决策记录
+## Decision Log
 
-| 决策 | 结论 | 依据 |
+| Decision | Conclusion | Rationale |
 |---|---|---|
-| 首要用途 | 探索+固化闭环 | 测试资产复利增长，长期收益最大 |
-| LLM provider | mock 默认，real（relaydance）可选 | 确定性、免费、快；全链路验证按需 |
-| CI 范围 | 仅固化 spec | CI 稳定性最高，不依赖 agent/LLM |
-| 入口形态 | 独立 CLI 脚本 | 人和 agent 通用，工具无关 |
-| 探索默认工具 | agent-browser | token 效率 ~4 倍、已安装零配置、固化映射与 playwright-mcp 等价 |
-| 深挖工具 | playwright-mcp | 网络拦截/trace/console 能力 |
+| Primary use case | Explore + harden loop | Test assets compound; highest long-term value |
+| LLM provider | mock by default, real (relaydance) optional | Deterministic, free, fast; full-chain verification on demand |
+| CI scope | Hardened specs only | Maximum CI stability, no agent/LLM dependency |
+| Entry point form | Standalone CLI script | Works for humans and agents alike, tool-agnostic |
+| Default exploration tool | agent-browser | ~4x token efficiency, already installed with zero config, hardening mapping equivalent to playwright-mcp |
+| Deep-dive tool | playwright-mcp | Network interception/trace/console capabilities |

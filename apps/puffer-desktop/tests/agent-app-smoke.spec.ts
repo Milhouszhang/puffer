@@ -20,7 +20,7 @@ test("agent-app.mjs prints a reachable URL and cleans up on SIGTERM", async () =
   const root = line("AGENT_APP_ROOT=")!;
   expect(root).toBeTruthy();
 
-  const res = await fetch(url); // Playwright webServer 已保证 1420 有 Vite
+  const res = await fetch(url); // Playwright webServer already guarantees Vite on 1420
   expect(res.status).toBe(200);
   expect(url).toContain("corbinaBackend=");
   expect(url).toContain("corbinaToken=");

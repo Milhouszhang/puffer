@@ -231,9 +231,7 @@ fn handle_command(
                 return Ok(());
             };
             match slack_browser_actions::handle_action(env, config, handshake, action, &input) {
-                Ok(payload) => {
-                    emit_control(&env.topic, "slack_browser_action_complete", payload)
-                }
+                Ok(payload) => emit_control(&env.topic, "slack_browser_action_complete", payload),
                 Err(error) => emit_control(
                     &env.topic,
                     "slack_browser_action_error",
@@ -400,8 +398,13 @@ fn poll_once(
         raw_value
     };
 
-    let sidebar_events =
-        process_sidebar_poll(&parsed, &config.connection, CONNECTOR_SLUG, seen, &active_channel_id);
+    let sidebar_events = process_sidebar_poll(
+        &parsed,
+        &config.connection,
+        CONNECTOR_SLUG,
+        seen,
+        &active_channel_id,
+    );
     let sidebar_emitted = sidebar_events.len();
     for event in sidebar_events {
         emit_event(event)?;
@@ -461,7 +464,10 @@ pub(crate) async fn run_subscriber() -> anyhow::Result<()> {
             }
             Err(error) => {
                 handshake = None;
-                eprintln!("slack-browser: poll_loop_error topic={} error={error:#}", env.topic);
+                eprintln!(
+                    "slack-browser: poll_loop_error topic={} error={error:#}",
+                    env.topic
+                );
                 emit_control(
                     &env.topic,
                     "poll_error",
@@ -644,7 +650,10 @@ mod sidebar_poll_tests {
 
     #[test]
     fn not_loaded_leaves_seen_uninitialized() {
-        let p = parsed(false, serde_json::json!([{"channel_id":"C1","name":"g","unread":true,"mention":false}]));
+        let p = parsed(
+            false,
+            serde_json::json!([{"channel_id":"C1","name":"g","unread":true,"mention":false}]),
+        );
         let mut seen = SeenState::default();
         let ev = process_sidebar_poll(&p, "c", "slack-browser", &mut seen, "");
         assert!(ev.is_empty());
@@ -654,7 +663,10 @@ mod sidebar_poll_tests {
 
     #[test]
     fn first_loaded_poll_seeds_only() {
-        let p = parsed(true, serde_json::json!([{"channel_id":"C1","name":"g","unread":true,"mention":false}]));
+        let p = parsed(
+            true,
+            serde_json::json!([{"channel_id":"C1","name":"g","unread":true,"mention":false}]),
+        );
         let mut seen = SeenState::default();
         let ev = process_sidebar_poll(&p, "c", "slack-browser", &mut seen, "");
         assert!(ev.is_empty());
@@ -664,8 +676,14 @@ mod sidebar_poll_tests {
 
     #[test]
     fn post_init_emits_new_changed_row() {
-        let p = parsed(true, serde_json::json!([{"channel_id":"C2","name":"x","unread":true,"mention":true}]));
-        let mut seen = SeenState { initialized: true, seen: Default::default() };
+        let p = parsed(
+            true,
+            serde_json::json!([{"channel_id":"C2","name":"x","unread":true,"mention":true}]),
+        );
+        let mut seen = SeenState {
+            initialized: true,
+            seen: Default::default(),
+        };
         let ev = process_sidebar_poll(&p, "c", "slack-browser", &mut seen, "");
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].payload["channel_id"], "C2");
@@ -676,11 +694,17 @@ mod sidebar_poll_tests {
 
     #[test]
     fn suppresses_active_channel_row() {
-        let p = parsed(true, serde_json::json!([
-            {"channel_id":"ACTIVE","name":"a","unread":true,"mention":false},
-            {"channel_id":"OTHER","name":"b","unread":true,"mention":false}
-        ]));
-        let mut seen = SeenState { initialized: true, seen: Default::default() };
+        let p = parsed(
+            true,
+            serde_json::json!([
+                {"channel_id":"ACTIVE","name":"a","unread":true,"mention":false},
+                {"channel_id":"OTHER","name":"b","unread":true,"mention":false}
+            ]),
+        );
+        let mut seen = SeenState {
+            initialized: true,
+            seen: Default::default(),
+        };
         let ev = process_sidebar_poll(&p, "c", "slack-browser", &mut seen, "ACTIVE");
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].payload["channel_id"], "OTHER");
@@ -694,8 +718,18 @@ mod emit_tests {
     #[test]
     fn event_payload_has_monitor_keys_and_no_is_outgoing_in_schema_fields() {
         let ev = build_message_event(
-            "slack-browser", "C123", "general", "channel",
-            "Alice", "U999", "hi", true, false, false, "active", "1718000000.000100",
+            "slack-browser",
+            "C123",
+            "general",
+            "channel",
+            "Alice",
+            "U999",
+            "hi",
+            true,
+            false,
+            false,
+            "active",
+            "1718000000.000100",
             "conn1:C123:1718000000.000100",
         );
         assert_eq!(ev.kind, "message");
@@ -708,7 +742,10 @@ mod emit_tests {
         assert_eq!(ev.payload["event_type"], "message");
         assert_eq!(ev.payload["source"], "active");
         assert_eq!(ev.payload["ts"], "1718000000.000100");
-        assert_eq!(ev.dedup_key.as_deref(), Some("conn1:C123:1718000000.000100"));
+        assert_eq!(
+            ev.dedup_key.as_deref(),
+            Some("conn1:C123:1718000000.000100")
+        );
     }
 
     #[test]
@@ -733,7 +770,10 @@ mod active_drain_tests {
 
     #[test]
     fn no_channel_open_no_events() {
-        let p = drain("", serde_json::json!([{"ts":"1.1","sender_id":"U1","text":"x"}]));
+        let p = drain(
+            "",
+            serde_json::json!([{"ts":"1.1","sender_id":"U1","text":"x"}]),
+        );
         let mut seen = SeenState::default();
         let (c, ev) = process_active_drain(&p, "c", "slack-browser", "U1", &mut seen);
         assert!(c.is_empty());
@@ -743,7 +783,10 @@ mod active_drain_tests {
 
     #[test]
     fn first_poll_seeds_no_emit() {
-        let p = drain("C1", serde_json::json!([{"ts":"1718000000.000100","sender_id":"U2","text":"hello"}]));
+        let p = drain(
+            "C1",
+            serde_json::json!([{"ts":"1718000000.000100","sender_id":"U2","text":"hello"}]),
+        );
         let mut seen = SeenState::default();
         let (c, ev) = process_active_drain(&p, "c", "slack-browser", "U1", &mut seen);
         assert_eq!(c, "C1");
@@ -754,11 +797,17 @@ mod active_drain_tests {
 
     #[test]
     fn second_poll_emits_with_direction() {
-        let p = drain("C1", serde_json::json!([
-            {"ts":"1718000000.000200","sender_id":"U1","text":"my reply"},
-            {"ts":"1718000000.000300","sender_id":"U2","text":"their msg"}
-        ]));
-        let mut seen = SeenState { initialized: true, seen: Default::default() };
+        let p = drain(
+            "C1",
+            serde_json::json!([
+                {"ts":"1718000000.000200","sender_id":"U1","text":"my reply"},
+                {"ts":"1718000000.000300","sender_id":"U2","text":"their msg"}
+            ]),
+        );
+        let mut seen = SeenState {
+            initialized: true,
+            seen: Default::default(),
+        };
         let (c, ev) = process_active_drain(&p, "c", "slack-browser", "U1", &mut seen);
         assert_eq!(c, "C1");
         assert_eq!(ev.len(), 2);
@@ -774,8 +823,14 @@ mod active_drain_tests {
 
     #[test]
     fn unknown_self_id_never_outgoing() {
-        let p = drain("C1", serde_json::json!([{"ts":"1718000000.000400","sender_id":"U1","text":"x"}]));
-        let mut seen = SeenState { initialized: true, seen: Default::default() };
+        let p = drain(
+            "C1",
+            serde_json::json!([{"ts":"1718000000.000400","sender_id":"U1","text":"x"}]),
+        );
+        let mut seen = SeenState {
+            initialized: true,
+            seen: Default::default(),
+        };
         let (_c, ev) = process_active_drain(&p, "c", "slack-browser", "", &mut seen);
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].payload["is_outgoing"], false); // empty self_id: never guess outgoing
@@ -803,7 +858,11 @@ mod config_tests {
         let ws = std::path::Path::new("/workspace/ws");
         save_config(&paths, ws, "myconn", "T123", "U456").unwrap();
         let dir = state_dir(&paths, "myconn");
-        assert!(dir.ends_with("slack-browser-accounts/myconn"), "got {}", dir.display());
+        assert!(
+            dir.ends_with("slack-browser-accounts/myconn"),
+            "got {}",
+            dir.display()
+        );
         assert!(dir.starts_with(&paths.user_config_dir));
         let loaded = load_config_from_dir(&dir).unwrap().expect("config exists");
         assert_eq!(loaded.connection, "myconn");

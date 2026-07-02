@@ -800,13 +800,13 @@ mod tests {
             text_lines(&text),
             vec![
                 "## Heading",
-                "",               // 1 blank line after heading
+                "", // 1 blank line after heading
                 "Paragraph one.",
-                "",               // 1 blank line between paragraphs
+                "", // 1 blank line between paragraphs
                 "Paragraph two.",
-                "",               // 1 blank line before heading
+                "", // 1 blank line before heading
                 "## Another",
-                "",               // 1 blank line before list
+                "", // 1 blank line before list
                 "- item",
             ]
         );

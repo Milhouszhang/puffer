@@ -4286,8 +4286,10 @@ mod tests {
             Some(6080),
             false,
         );
-        let (candidate, subject) =
-            issue625_candidate("Telegram: a re-paraphrased subject for the same message", Some(6080));
+        let (candidate, subject) = issue625_candidate(
+            "Telegram: a re-paraphrased subject for the same message",
+            Some(6080),
+        );
         let v = duplicate_monitor_task_skip(&[original], &candidate, &subject)
             .expect("same message id must dedup across completion");
         assert_eq!(v["reason"], "duplicate_source");
@@ -4435,7 +4437,8 @@ mod tests {
         }))
         .expect("construct generic.review StoredTask");
         // A re-delivery of message 6090 (same chat) as a fresh single-source candidate.
-        let (candidate, subject) = issue625_candidate("Telegram: a re-paraphrased subject", Some(6090));
+        let (candidate, subject) =
+            issue625_candidate("Telegram: a re-paraphrased subject", Some(6090));
         let v = duplicate_monitor_task_skip(&[existing], &candidate, &subject)
             .expect("re-delivery of a message already in a generic.review task should dedup");
         assert_eq!(v["reason"], "duplicate_source");

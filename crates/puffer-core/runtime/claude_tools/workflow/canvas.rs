@@ -116,8 +116,16 @@ fn collect_initial_values(node: &Value, values: &mut Map<String, Value>) {
 fn interactive_node_type(node_type: &str) -> bool {
     matches!(
         node_type,
-        "toggle" | "singleSelect" | "multiSelect" | "slider" | "barSelect" | "textInput"
-            | "textarea" | "editableTable" | "mediaPicker" | "dependentSelect"
+        "toggle"
+            | "singleSelect"
+            | "multiSelect"
+            | "slider"
+            | "barSelect"
+            | "textInput"
+            | "textarea"
+            | "editableTable"
+            | "mediaPicker"
+            | "dependentSelect"
     )
 }
 
@@ -590,8 +598,14 @@ mod tests {
         let mut state = temp_state(cwd.clone());
         let spec = json!({ "title": "T", "body": "not even json" });
         let err = execute_canvas(&mut state, &cwd, spec).unwrap_err();
-        assert!(err.to_string().contains("body"), "error names the body field");
-        assert!(!canvas_dir(&cwd).exists(), "no partial canvas artifacts written");
+        assert!(
+            err.to_string().contains("body"),
+            "error names the body field"
+        );
+        assert!(
+            !canvas_dir(&cwd).exists(),
+            "no partial canvas artifacts written"
+        );
     }
 
     #[test]
@@ -637,7 +651,7 @@ mod tests {
         ]});
         let values = initial_canvas_values(&spec);
         assert_eq!(values["script"], json!(""));
-        assert_eq!(values["sb"], json!([["shot-001","x"]]));
+        assert_eq!(values["sb"], json!([["shot-001", "x"]]));
         assert_eq!(values["noRows"], json!([]));
         assert_eq!(values["badRows"], json!([]));
         assert_eq!(values["pickOne"], Value::Null);

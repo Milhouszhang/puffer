@@ -26,6 +26,10 @@ uuid.workspace = true
 # Reading 1Password `.1pux` export archives (a ZIP wrapping export.data JSON).
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# Unix: kill a timed-out `op` call's whole process group (see run_op).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 # Windows Chrome/Chromium (DPAPI + App-Bound Encryption) credential import.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

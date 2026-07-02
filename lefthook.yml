@@ -1,0 +1,45 @@
+# lefthook — local git hooks for fast pre-commit / pre-push feedback.
+#
+# One-time setup:
+#   brew install lefthook      # or: cargo install lefthook
+#   lefthook install           # writes .git/hooks/*
+#
+# Emergency bypass:  git commit --no-verify  /  git push --no-verify
+#
+# Design goal (minimal intrusion): hooks only scan the files YOU changed, so
+# pre-existing formatting drift elsewhere in the tree never blocks your commit.
+# The authoritative, full-tree gate lives in CI (.github/workflows/ci.yml).
+
+pre-commit:
+  parallel: true
+  # Skip while completing a merge/rebase: the staged set then includes files
+  # you never hand-edited, so file-scoped format/type checks would flag other
+  # people's drift and block the merge (mirrors the pre-push clippy skip).
+  skip:
+    - merge
+    - rebase
+  commands:
+    # Format-check only the staged Rust files — fast, file-scoped.
+    rustfmt:
+      glob: "*.rs"
+      run: rustfmt --edition 2021 --check {staged_files}
+    # Type-check the Svelte/TS desktop app when its sources are touched.
+    svelte-check:
+      root: "apps/puffer-desktop/"
+      glob: "apps/puffer-desktop/**/*.{ts,svelte}"
+      run: npm run check
+
+pre-push:
+  parallel: true
+  commands:
+    # Compiles the workspace (hard-fails on real build errors) and surfaces
+    # clippy lints. Denies the same groups as CI (`correctness` is deny by
+    # default; `suspicious` is added to match) so a push that would fail the
+    # CI clippy gate fails here first. Still NOT `-D warnings`: ordinary
+    # style/pedantic warnings stay informational and don't block the push.
+    clippy:
+      glob: "*.rs"
+      skip:
+        - merge
+        - rebase
+      run: cargo clippy --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious

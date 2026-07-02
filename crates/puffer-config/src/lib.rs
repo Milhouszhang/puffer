@@ -536,6 +536,21 @@ fn default_recap_cooldown_messages() -> usize {
     2
 }
 
+/// Returns true when `workspace_root` canonicalizes to a path under the
+/// canonicalized OS temporary directory. Used by `ConfigPaths::discover` to
+/// isolate `user_config_dir` for tests run under a tempdir workspace. Any
+/// canonicalization failure (e.g. a path that does not exist yet) returns
+/// false, preserving production resolution.
+fn under_temp_dir(workspace_root: &Path) -> bool {
+    let (Ok(root), Ok(tmp)) = (
+        workspace_root.canonicalize(),
+        std::env::temp_dir().canonicalize(),
+    ) else {
+        return false;
+    };
+    root.starts_with(tmp)
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfigPaths {
     pub workspace_root: PathBuf,
@@ -549,12 +564,23 @@ impl ConfigPaths {
     pub fn discover(workspace_root: impl Into<PathBuf>) -> Self {
         let workspace_root = workspace_root.into();
         let workspace_config_dir = workspace_root.join(".puffer");
-        let user_config_dir = home_override::puffer_home_override()
-            .or_else(|| std::env::var_os("PUFFER_HOME").map(PathBuf::from))
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".puffer");
+        // Precedence: explicit override → `$PUFFER_HOME` → temp-dir rule →
+        // `$HOME`/home_dir. The temp-dir rule isolates `user_config_dir` under
+        // a per-test workspace so parallel tests never race on the real
+        // `~/.puffer`; production roots (outside the temp dir) are unchanged.
+        let user_config_dir = if let Some(over) = home_override::puffer_home_override() {
+            over.join(".puffer")
+        } else if let Some(env_home) = std::env::var_os("PUFFER_HOME") {
+            PathBuf::from(env_home).join(".puffer")
+        } else if under_temp_dir(&workspace_root) {
+            workspace_root.join(".puffer-user")
+        } else {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".puffer")
+        };
         let builtin_resources_dir = env::var_os(BUILTIN_RESOURCES_DIR_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| workspace_root.join("resources"));
@@ -784,6 +810,15 @@ mod tests {
             std::env::set_var("PUFFER_HOME", path);
             Self { old_home }
         }
+
+        /// Clears `PUFFER_HOME` for the guard's lifetime so `discover` falls
+        /// through to the temp-dir rule / `$HOME`. Restores the prior value on
+        /// drop.
+        fn unset() -> Self {
+            let old_home = std::env::var_os("PUFFER_HOME");
+            std::env::remove_var("PUFFER_HOME");
+            Self { old_home }
+        }
     }
 
     impl Drop for ScopedPufferHome {
@@ -816,6 +851,48 @@ mod tests {
                 std::env::remove_var(BUILTIN_RESOURCES_DIR_ENV);
             }
         }
+    }
+
+    #[test]
+    fn discover_isolates_user_config_dir_under_tempdir() {
+        let _guard = lock_puffer_home();
+        let _home = ScopedPufferHome::unset();
+        let temp = tempdir().expect("tempdir");
+
+        let paths = ConfigPaths::discover(temp.path());
+
+        assert_eq!(paths.user_config_dir, temp.path().join(".puffer-user"));
+    }
+
+    #[test]
+    fn discover_uses_home_for_non_temp_root() {
+        let _guard = lock_puffer_home();
+        let _home = ScopedPufferHome::unset();
+        // A fixed, non-existent path is neither under the temp dir nor
+        // canonicalizable, so `discover` must fall through to `$HOME/.puffer`.
+        let root = PathBuf::from("/some/non-temp/project");
+
+        let paths = ConfigPaths::discover(&root);
+
+        let expected = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)
+            .expect("home dir")
+            .join(".puffer");
+        assert_eq!(paths.user_config_dir, expected);
+    }
+
+    #[test]
+    fn discover_override_wins_over_tempdir_rule() {
+        let _guard = lock_puffer_home();
+        let _home = ScopedPufferHome::unset();
+        let override_home = tempdir().expect("override home");
+        let _override = set_puffer_home_override(override_home.path());
+        let workspace = tempdir().expect("workspace tempdir");
+
+        let paths = ConfigPaths::discover(workspace.path());
+
+        assert_eq!(paths.user_config_dir, override_home.path().join(".puffer"));
     }
 
     #[test]

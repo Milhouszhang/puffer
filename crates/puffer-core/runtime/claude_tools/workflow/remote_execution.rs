@@ -330,8 +330,12 @@ fn enter_remote(state: &mut AppState, cwd: &Path, input: RemoteExecutionInput) -
     let runner_auth_secret_id = normalize(input.runner_auth_secret_id.clone());
     let mut active_runner_auth_secret_id = None;
     let mut runner_auth_token = if let Some(token) = normalize(input.runner_auth_token.clone()) {
-        active_runner_auth_secret_id =
-            Some(store_inline_runner_auth_token(cwd, &target_type, &id, &token)?);
+        active_runner_auth_secret_id = Some(store_inline_runner_auth_token(
+            cwd,
+            &target_type,
+            &id,
+            &token,
+        )?);
         Some(token)
     } else if let Some(token) = reveal_optional_secret(cwd, runner_auth_secret_id.as_deref())? {
         active_runner_auth_secret_id = runner_auth_secret_id;

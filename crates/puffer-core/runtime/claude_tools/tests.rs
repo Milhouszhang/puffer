@@ -271,19 +271,30 @@ fn null_optional_read_fields_are_treated_as_absent() {
 
 #[test]
 fn parallel_bash_media_broker_exposes_endpoint_to_child() {
+    use crate::permissions::ToolPermissionBehavior;
     use crate::runtime::internal_tool_permissions::{
         MediaCapabilityContext, MediaPermissionSnapshot, SubscriberPermissionSnapshot,
     };
-    use crate::permissions::ToolPermissionBehavior;
     let dir = tempfile::tempdir().unwrap();
     let providers = puffer_provider_registry::ProviderRegistry::new();
     let auth_store = puffer_provider_registry::AuthStore::default();
     let cache = puffer_media::ExactMediaDiscoveryCache::empty();
     let ctx = MediaCapabilityContext {
-        permissions: MediaPermissionSnapshot { image: ToolPermissionBehavior::Allow, video: ToolPermissionBehavior::Allow, capabilities: ToolPermissionBehavior::Allow },
-        subscriber: SubscriberPermissionSnapshot { telegram: ToolPermissionBehavior::Deny, email: ToolPermissionBehavior::Deny },
-        image_settings: None, video_settings: None,
-        providers: &providers, auth_store: &auth_store, discovery_cache: &cache, process_store: None,
+        permissions: MediaPermissionSnapshot {
+            image: ToolPermissionBehavior::Allow,
+            video: ToolPermissionBehavior::Allow,
+            capabilities: ToolPermissionBehavior::Allow,
+        },
+        subscriber: SubscriberPermissionSnapshot {
+            telegram: ToolPermissionBehavior::Deny,
+            email: ToolPermissionBehavior::Deny,
+        },
+        image_settings: None,
+        video_settings: None,
+        providers: &providers,
+        auth_store: &auth_store,
+        discovery_cache: &cache,
+        process_store: None,
     };
     let def = puffer_tools::builtin_tool_definition(puffer_tools::ToolKind::Bash);
     let result = execute_parallel_bash_with_media_broker(
@@ -298,25 +309,39 @@ fn parallel_bash_media_broker_exposes_endpoint_to_child() {
     )
     .expect("bash exec");
     let printed = result.output.stdout;
-    assert!(printed.contains("127.0.0.1:"), "child did not see broker endpoint: {printed:?}");
+    assert!(
+        printed.contains("127.0.0.1:"),
+        "child did not see broker endpoint: {printed:?}"
+    );
 }
 
 #[test]
 fn parallel_bash_media_broker_supports_concurrent_workers() {
+    use crate::permissions::ToolPermissionBehavior;
     use crate::runtime::internal_tool_permissions::{
         MediaCapabilityContext, MediaPermissionSnapshot, SubscriberPermissionSnapshot,
     };
-    use crate::permissions::ToolPermissionBehavior;
     let dir = tempfile::tempdir().unwrap();
     let providers = puffer_provider_registry::ProviderRegistry::new();
     let auth_store = puffer_provider_registry::AuthStore::default();
     let cache = puffer_media::ExactMediaDiscoveryCache::empty();
     let def = puffer_tools::builtin_tool_definition(puffer_tools::ToolKind::Bash);
     let ctx = MediaCapabilityContext {
-        permissions: MediaPermissionSnapshot { image: ToolPermissionBehavior::Allow, video: ToolPermissionBehavior::Allow, capabilities: ToolPermissionBehavior::Allow },
-        subscriber: SubscriberPermissionSnapshot { telegram: ToolPermissionBehavior::Deny, email: ToolPermissionBehavior::Deny },
-        image_settings: None, video_settings: None,
-        providers: &providers, auth_store: &auth_store, discovery_cache: &cache, process_store: None,
+        permissions: MediaPermissionSnapshot {
+            image: ToolPermissionBehavior::Allow,
+            video: ToolPermissionBehavior::Allow,
+            capabilities: ToolPermissionBehavior::Allow,
+        },
+        subscriber: SubscriberPermissionSnapshot {
+            telegram: ToolPermissionBehavior::Deny,
+            email: ToolPermissionBehavior::Deny,
+        },
+        image_settings: None,
+        video_settings: None,
+        providers: &providers,
+        auth_store: &auth_store,
+        discovery_cache: &cache,
+        process_store: None,
     };
     std::thread::scope(|s| {
         let h: Vec<_> = (0..2).map(|_| s.spawn(|| {
@@ -328,7 +353,10 @@ fn parallel_bash_media_broker_supports_concurrent_workers() {
         })).collect();
         for handle in h {
             let out = handle.join().unwrap().output.stdout;
-            assert!(out.contains("127.0.0.1:"), "worker missing endpoint: {out:?}");
+            assert!(
+                out.contains("127.0.0.1:"),
+                "worker missing endpoint: {out:?}"
+            );
         }
     });
 }

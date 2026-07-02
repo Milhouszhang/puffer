@@ -1120,7 +1120,14 @@ pub(crate) fn compact_conversation_with(
     input_tokens_hint: Option<usize>,
     summary_fn: &dyn Fn(&str, &str) -> Option<String>,
 ) -> bool {
-    compact_conversation_inner(items, provider, model_id, input_tokens_hint, summary_fn, false)
+    compact_conversation_inner(
+        items,
+        provider,
+        model_id,
+        input_tokens_hint,
+        summary_fn,
+        false,
+    )
 }
 
 /// Like [`compact_conversation_with`] but ignores the context-window
@@ -2195,7 +2202,9 @@ mod tests {
             let mut v = Vec::new();
             for i in 0..8 {
                 v.push(ConversationItem::user_message(format!("user {i}")));
-                v.push(ConversationItem::assistant_message(format!("assistant {i}")));
+                v.push(ConversationItem::assistant_message(format!(
+                    "assistant {i}"
+                )));
             }
             v
         };
@@ -2235,7 +2244,9 @@ mod tests {
         let mut items = Vec::new();
         for i in 0..8 {
             items.push(ConversationItem::user_message(format!("user {i}")));
-            items.push(ConversationItem::assistant_message(format!("assistant {i}")));
+            items.push(ConversationItem::assistant_message(format!(
+                "assistant {i}"
+            )));
         }
         let before = items.len();
         assert!(force_compact_conversation_with(

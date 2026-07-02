@@ -1,5 +1,7 @@
 use crate::browser_args::BrowserArgs;
-use crate::media_internal_tools::{ImageGenerationArgs, MediaCapabilitiesArgs, VideoGenerationArgs};
+use crate::media_internal_tools::{
+    ImageGenerationArgs, MediaCapabilitiesArgs, VideoGenerationArgs,
+};
 use crate::non_interactive::NonInteractiveArgs;
 use crate::subscriber_tool_args::{EmailArgs, RequestSecretArgs, SlackArgs, TelegramArgs};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -780,7 +782,13 @@ mod tests {
 
     #[test]
     fn mcp_add_from_desktop_accepts_scope_override() {
-        let cli = Cli::parse_from(["puffer", "mcp", "add-from-claude-desktop", "--scope", "user"]);
+        let cli = Cli::parse_from([
+            "puffer",
+            "mcp",
+            "add-from-claude-desktop",
+            "--scope",
+            "user",
+        ]);
         let Some(Command::Mcp {
             command: Some(McpCommand::AddFromClaudeDesktop { scope }),
         }) = cli.subcommand

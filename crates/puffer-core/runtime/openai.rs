@@ -151,9 +151,11 @@ pub(super) fn execute_openai_tool_calls(
         tc.name == "Bash" && matches!(permissions[i], PermissionOutcome::Allowed(_))
     });
     let mut media_snapshot = if has_permitted_bash {
-        Some(super::internal_tool_permissions::MediaCapabilitySnapshot::capture(
-            cwd, resources, state, registry,
-        )?)
+        Some(
+            super::internal_tool_permissions::MediaCapabilitySnapshot::capture(
+                cwd, resources, state, registry,
+            )?,
+        )
     } else {
         None
     };

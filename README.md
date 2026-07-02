@@ -24,6 +24,43 @@ bash scripts/report-large-files.sh
 `scripts/report-large-files.sh` is informational by default. Use it to make
 large-file risk visible when a change touches a known oversized module.
 
+## Git hooks & CI
+
+Local git hooks are managed by [lefthook](https://github.com/evilmartians/lefthook).
+There is no root `package.json` to auto-install from, so run this once after
+cloning:
+
+```bash
+brew install lefthook   # or: cargo install lefthook
+lefthook install        # writes .git/hooks/*
+```
+
+- **pre-commit** (fast, file-scoped): rustfmt-check on staged `*.rs`, plus
+  svelte-check when `apps/puffer-desktop` sources change.
+- **pre-push**: `cargo clippy --workspace --all-targets` with the same deny
+  groups as CI (*correctness* + *suspicious*), so a push that would fail the
+  CI clippy gate fails locally first. Ordinary warnings do not block.
+- Emergency bypass is `git commit/push --no-verify` — prefer fixing the finding.
+
+CI (`.github/workflows/ci.yml`) is the authoritative full-tree gate. All steps
+are hard gates, in three parallel jobs:
+
+- **Rust**: `cargo build --workspace --all-targets` (compiles production, test,
+  integration, example, and bench targets, so a compile break anywhere fails
+  CI), `cargo nextest run --workspace --profile ci` (unit + integration tests;
+  the `ci` profile in `.config/nextest.toml` kills wedged tests), `cargo fmt
+  --check`, and clippy with the `correctness` + `suspicious` groups denied.
+- **Desktop**: `vite build` + svelte-check + node tests on the Node version
+  pinned in `apps/puffer-desktop/.nvmrc`.
+- **Desktop backend** (`apps/puffer-desktop/src-tauri`, a separate workspace):
+  the same nextest / rustfmt / clippy gates as the root workspace.
+
+Rust tests run in parallel: `ConfigPaths::discover` isolates `user_config_dir`
+under the OS temp dir in tests, so the suite does not race on the real
+`~/.puffer`. Tests needing infra CI lacks self-exclude: tmux TUI tests are
+skipped via `PUFFER_SKIP_TMUX_TESTS=1`, and the few needing the local
+workflow-runtime image or a real browser are `#[ignore]`d; run those locally.
+
 ## Repo Map
 
 `Cargo.toml` is the source of truth for workspace membership. Main areas:

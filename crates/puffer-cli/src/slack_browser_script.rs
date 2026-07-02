@@ -169,7 +169,10 @@ pub(crate) const SLACK_OBSERVER_DRAIN_JS: &str = r#"(() => {
 })()"#;
 
 pub(crate) fn sidebar_loaded(result: &serde_json::Value) -> bool {
-    result.get("loaded").and_then(|v| v.as_bool()).unwrap_or(false)
+    result
+        .get("loaded")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,18 +184,35 @@ pub(crate) struct SidebarRow {
 }
 
 pub(crate) fn parse_sidebar_rows(result: &serde_json::Value) -> Vec<SidebarRow> {
-    result.get("rows").and_then(|v| v.as_array()).map(|rows| {
-        rows.iter().filter_map(|r| {
-            let channel_id = r.get("channel_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            if channel_id.is_empty() { return None; }
-            Some(SidebarRow {
-                channel_id,
-                name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                unread: r.get("unread").and_then(|v| v.as_bool()).unwrap_or(false),
-                mention: r.get("mention").and_then(|v| v.as_bool()).unwrap_or(false),
-            })
-        }).collect()
-    }).unwrap_or_default()
+    result
+        .get("rows")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    let channel_id = r
+                        .get("channel_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if channel_id.is_empty() {
+                        return None;
+                    }
+                    Some(SidebarRow {
+                        channel_id,
+                        name: r
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        unread: r.get("unread").and_then(|v| v.as_bool()).unwrap_or(false),
+                        mention: r.get("mention").and_then(|v| v.as_bool()).unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,31 +225,55 @@ pub(crate) struct ActiveMsg {
 /// A real Slack message ts is `<digits>.<digits>`. Optimistic/client ids are not.
 pub(crate) fn is_message_ts(ts: &str) -> bool {
     match ts.split_once('.') {
-        Some((a, b)) => !a.is_empty() && !b.is_empty()
-            && a.bytes().all(|c| c.is_ascii_digit())
-            && b.bytes().all(|c| c.is_ascii_digit()),
+        Some((a, b)) => {
+            !a.is_empty()
+                && !b.is_empty()
+                && a.bytes().all(|c| c.is_ascii_digit())
+                && b.bytes().all(|c| c.is_ascii_digit())
+        }
         None => false,
     }
 }
 
 pub(crate) fn parse_active_drain(result: &serde_json::Value) -> (String, String, Vec<ActiveMsg>) {
-    let channel_id = result.get("channel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let channel_id = result
+        .get("channel_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let channel_name = result
         .get("channel_name")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let msgs = result.get("items").and_then(|v| v.as_array()).map(|items| {
-        items.iter().filter_map(|m| {
-            let ts = m.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-            if !is_message_ts(ts) { return None; }
-            Some(ActiveMsg {
-                ts: ts.to_string(),
-                sender_id: m.get("sender_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                text: m.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            })
-        }).collect()
-    }).unwrap_or_default();
+    let msgs = result
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|m| {
+                    let ts = m.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+                    if !is_message_ts(ts) {
+                        return None;
+                    }
+                    Some(ActiveMsg {
+                        ts: ts.to_string(),
+                        sender_id: m
+                            .get("sender_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        text: m
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     (channel_id, channel_name, msgs)
 }
 

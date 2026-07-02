@@ -22,15 +22,15 @@ mod daemon_files;
 mod daemon_fs_watch;
 mod daemon_gcal_browser_setup;
 mod daemon_gmail_browser_setup;
+mod daemon_lambda_skills;
 #[path = "daemon_lark_browser_setup.rs"]
 mod daemon_lark_browser_setup;
-mod daemon_slack_browser_setup;
-mod daemon_lambda_skills;
 mod daemon_local_model;
 mod daemon_lsp;
 mod daemon_pty;
 mod daemon_secrets;
 mod daemon_singleton;
+mod daemon_slack_browser_setup;
 mod daemon_telegram_ranking;
 mod daemon_title;
 mod daemon_turn_recovery;
@@ -49,19 +49,19 @@ mod gmail_browser;
 mod gmail_browser_log;
 mod heartbeat;
 mod internal_tools;
-mod lark_connector;
 #[path = "lark_browser.rs"]
 mod lark_browser;
 #[path = "lark_browser_script.rs"]
 mod lark_browser_script;
-mod slack_browser;
-#[path = "slack_browser_script.rs"]
-mod slack_browser_script;
+mod lark_connector;
 mod media_internal_tools;
 mod non_interactive;
 mod project_metadata;
 mod resource_fs;
 mod runner_selection;
+mod slack_browser;
+#[path = "slack_browser_script.rs"]
+mod slack_browser_script;
 mod subscriber_tool_args;
 mod subscriber_tools;
 mod subscriptions;

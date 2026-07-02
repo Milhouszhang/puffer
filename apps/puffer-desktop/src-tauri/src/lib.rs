@@ -465,7 +465,11 @@ fn video_dir_for_cwd(cwd: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(all(target_os = "macos", puffer_desktop_cef_native))]
-fn spawn_cef_native_warmup(app_handle: AppHandle, smoke_url: Option<String>, prewarm_targets: usize) {
+fn spawn_cef_native_warmup(
+    app_handle: AppHandle,
+    smoke_url: Option<String>,
+    prewarm_targets: usize,
+) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use tauri::Manager;

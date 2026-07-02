@@ -60,14 +60,19 @@ Puffer desktop（`apps/puffer-desktop`，Svelte 5 + Tauri 2）已具备完整的
 
 2. **`scripts/agent-app.mjs`**（约 80 行）
    - `--provider mock|real`：默认 mock；`real` 从 `RELAYDANCE_API_KEY` 环境变量读密钥、指向 relaydance 网关，密钥缺失即 fail-fast
-   - 复用/拉起 Vite，最后打印带 handshake 参数的完整 URL（人和任何 agent 工具都能直接打开）
-   - SIGINT 时杀 daemon、清临时目录
+   - mock provider 返回固定 canned 回复（对 UI 流程测试已足够；不做回复脚本化配置，YAGNI）
+   - Vite 生命周期：1420 已有 Vite 在跑则复用且退出时不碰它；没有则自己拉起并在退出时负责杀掉
+   - 最后打印带 handshake 参数的完整 URL（人和任何 agent 工具都能直接打开）
+   - SIGINT/SIGTERM 时杀 daemon（及自起的 Vite）、清临时目录
 
-3. **`.mcp.json`**
+3. **`.mcp.json`**（新建，仓库当前没有此文件）
    加 playwright-mcp（`npx @playwright/mcp@latest`），角色限定为 Bug 深挖场景；MCP 工具延迟加载，不用不吃 token。
 
 4. **`AGENTS.md`**
-   新增一节：场景路由表 + 探索→固化工作流约定（spec 放 `tests/`、role-based selector 风格、UI/UX 问题优先固化为 `toHaveScreenshot()` 基线、必须过 `npm run test:desktop-ui` 才算固化、组件级 UI 审查首选 Storybook）。
+   新增一节：场景路由表 + 探索→固化工作流约定（spec 放 `tests/`、role-based selector 风格、必须过 `npm run test:desktop-ui` 才算固化、组件级 UI 审查首选 Storybook）。
+
+5. **视觉基线的平台边界（复查补漏）**
+   `toHaveScreenshot()` 基线是平台相关的：CI 跑在 `ubuntu-latest`，而基线在 macOS 生成，字体/抗锯齿差异会导致 CI 必然误报。因此视觉 spec 独立存放（`tests/visual/*.spec.ts`）、独立脚本 `test:desktop-visual`，**只在 macOS 本地跑**（开发者/agent 提交前验证），不进 GitHub CI；功能 spec 照常进 CI。何时值得在 CI 容器里重建 Linux 基线，留待视觉 spec 积累到有维护痛点时再评估。
 
 ## 错误处理
 
@@ -80,8 +85,8 @@ Puffer desktop（`apps/puffer-desktop`，Svelte 5 + Tauri 2）已具备完整的
 ## 测试策略
 
 - 抽取重构的正确性：由现有 `real-daemon-ui.spec.ts` 继续通过来保证（它是抽取模块的第一个消费者）
-- `agent-app.mjs`：一个最小 smoke spec——启动脚本、解析输出 URL、请求 daemon 健康端点、确认退出时清理
-- UI/UX 探索产出的视觉问题优先固化为 `toHaveScreenshot()` 基线 spec
+- `agent-app.mjs`：一个最小 smoke spec——启动脚本、解析输出 URL、确认 daemon 进程存活且 URL 可访问（HTTP 200）、发 SIGTERM 后确认进程退出与临时目录清理
+- UI/UX 探索产出的视觉问题固化为 `tests/visual/` 下的 `toHaveScreenshot()` 基线 spec，经 `test:desktop-visual` 在 macOS 本地验证（见组件 5 的平台边界）
 
 ## 明确不做（防过度设计边界）
 

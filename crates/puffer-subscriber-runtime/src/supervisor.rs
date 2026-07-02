@@ -460,7 +460,10 @@ cmd = ["sh", "run.sh"]
             .expect("channel closed before event arrived");
 
         let text = &envelope.event.text;
-        assert!(text.contains("A=applied"), "env_set not applied; got: {text}");
+        assert!(
+            text.contains("A=applied"),
+            "env_set not applied; got: {text}"
+        );
         assert!(
             text.contains("U= ") || text.trim_end().ends_with("U="),
             "env_unset not applied; got: {text}"

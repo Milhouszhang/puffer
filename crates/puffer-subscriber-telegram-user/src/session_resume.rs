@@ -84,7 +84,10 @@ pub(crate) async fn try_resume_session(env: &SkillEnv) -> anyhow::Result<Session
             });
         }
         Err(_elapsed) => {
-            let detail = format!("connect timed out after {}s", RESUME_CONNECT_TIMEOUT.as_secs());
+            let detail = format!(
+                "connect timed out after {}s",
+                RESUME_CONNECT_TIMEOUT.as_secs()
+            );
             crate::health::report_resume_failed(
                 env,
                 "connect_timeout",

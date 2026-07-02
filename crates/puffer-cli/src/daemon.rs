@@ -6994,8 +6994,7 @@ mod tests {
 
     use super::{
         append_ordered_turn_progress, apply_daemon_yolo_mode, apply_proxy_env_at_startup,
-        apply_turn_model_override,
-        apply_turn_request_options, browser_launch_settings_or_default,
+        apply_turn_model_override, apply_turn_request_options, browser_launch_settings_or_default,
         browser_permission_payload_json, browser_status_for_turn, cancel_all_active_turns,
         connector_setup_connect_args, connector_setup_id, daemon_now_ms, desktop_latency_ms,
         file_media_mime_type, generated_video_handler, handle_create_file_media_access,
@@ -12114,9 +12113,15 @@ input_schema:
             }],
         };
         apply_proxy_env_at_startup(&enabled);
-        assert_eq!(std::env::var("ALL_PROXY").unwrap(), "socks5://127.0.0.1:7890");
+        assert_eq!(
+            std::env::var("ALL_PROXY").unwrap(),
+            "socks5://127.0.0.1:7890"
+        );
 
-        let disabled = ProxyConfig { enabled: false, ..enabled.clone() };
+        let disabled = ProxyConfig {
+            enabled: false,
+            ..enabled.clone()
+        };
         apply_proxy_env_at_startup(&disabled);
         assert!(std::env::var("ALL_PROXY").is_err());
     }

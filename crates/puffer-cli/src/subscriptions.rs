@@ -139,9 +139,8 @@ pub(crate) fn install(
     builder = builder.with_self_gate(Arc::new(crate::daemon_workflows::MonitorSelfGate::new(
         paths.clone(),
     )));
-    builder = builder.with_run_finished_observer(
-        crate::workflow_run_events::workflow_run_finished_observer(),
-    );
+    builder = builder
+        .with_run_finished_observer(crate::workflow_run_events::workflow_run_finished_observer());
     let manager = Arc::new(
         builder
             .build(handle)

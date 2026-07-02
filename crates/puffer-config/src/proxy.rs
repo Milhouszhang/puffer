@@ -194,10 +194,14 @@ impl ProxyConfig {
 /// Env vars Puffer manages for proxy routing. Listed for the "clear" path so a
 /// disabled config removes any ambient (shell-inherited) proxy.
 const PROXY_ENV_KEYS: &[&str] = &[
-    "ALL_PROXY", "all_proxy",
-    "HTTP_PROXY", "http_proxy",
-    "HTTPS_PROXY", "https_proxy",
-    "NO_PROXY", "no_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
     "PUFFER_TELEGRAM_PROXY",
 ];
 
@@ -248,14 +252,24 @@ pub fn proxy_env_block(proxy: &ProxyConfig) -> ProxyEnvBlock {
         .collect::<Vec<_>>()
         .join(",");
     let mut set = Vec::new();
-    for key in ["ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+    for key in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+    ] {
         set.push((key.to_string(), uri.clone()));
     }
     set.push(("NO_PROXY".to_string(), no_proxy.clone()));
     set.push(("no_proxy".to_string(), no_proxy));
     // PUFFER_TELEGRAM_PROXY intentionally left unset: telegram falls back to
     // ALL_PROXY, so one var covers it. It is in the clear list for "disabled".
-    ProxyEnvBlock { set, unset: Vec::new() }
+    ProxyEnvBlock {
+        set,
+        unset: Vec::new(),
+    }
 }
 
 fn default_proxy_bypass() -> Vec<String> {
@@ -288,8 +302,8 @@ fn validate_bypass_entry(entry: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ProxyConfig, ProxyEndpoint, ProxyScheme, PufferConfig};
     use super::{proxy_env_block, PROXY_ENV_KEYS};
+    use crate::{ProxyConfig, ProxyEndpoint, ProxyScheme, PufferConfig};
 
     #[test]
     fn proxy_config_defaults_to_disabled_with_bypass_entries() {
@@ -442,7 +456,10 @@ password = "secret"
             username: Some("u ser".into()),
             password: Some("p@ss".into()),
         };
-        assert_eq!(ep.to_uri().unwrap(), "socks5://u%20ser:p%40ss@127.0.0.1:7890");
+        assert_eq!(
+            ep.to_uri().unwrap(),
+            "socks5://u%20ser:p%40ss@127.0.0.1:7890"
+        );
     }
 
     fn cfg(enabled: bool, scheme: ProxyScheme) -> ProxyConfig {
@@ -467,7 +484,10 @@ password = "secret"
         let set: std::collections::HashMap<_, _> = block.set.iter().cloned().collect();
         assert_eq!(set.get("ALL_PROXY").unwrap(), "socks5://127.0.0.1:7890");
         assert_eq!(set.get("all_proxy").unwrap(), "socks5://127.0.0.1:7890");
-        assert_eq!(set.get("NO_PROXY").unwrap(), "localhost,127.0.0.1,::1,example.com");
+        assert_eq!(
+            set.get("NO_PROXY").unwrap(),
+            "localhost,127.0.0.1,::1,example.com"
+        );
         assert!(block.unset.is_empty());
     }
 

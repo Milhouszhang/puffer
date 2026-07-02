@@ -1341,7 +1341,9 @@ async fn verify_imported_session(
         }
     }
 
-    Ok(VerifyOutcome::Failed(VerifyFailure::Unreachable(last_unreachable)))
+    Ok(VerifyOutcome::Failed(VerifyFailure::Unreachable(
+        last_unreachable,
+    )))
 }
 
 fn rewrite_imported_session_dc(env: &SkillEnv, dc_id: i32) -> anyhow::Result<()> {
@@ -1407,7 +1409,8 @@ mod tests {
 
     #[test]
     fn verify_failure_message_distinguishes_network_from_rejection() {
-        let (class, msg) = verify_failure_login_error(&VerifyFailure::Unreachable("io timeout".into()));
+        let (class, msg) =
+            verify_failure_login_error(&VerifyFailure::Unreachable("io timeout".into()));
         assert_eq!(class, "network");
         assert!(msg.contains("network/proxy"), "network message: {msg}");
 

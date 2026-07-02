@@ -32,7 +32,7 @@ pub use project_memory::{
     ProjectRegistry, ResolvedProjectMemory,
 };
 pub use proxy::{
-    proxy_env_block, NetworkConfig, ProxyConfig, ProxyEnvBlock, ProxyEndpoint, ProxyScheme,
+    proxy_env_block, NetworkConfig, ProxyConfig, ProxyEndpoint, ProxyEnvBlock, ProxyScheme,
     SanitizedProxyEndpoint,
 };
 pub use settings_catalog::{

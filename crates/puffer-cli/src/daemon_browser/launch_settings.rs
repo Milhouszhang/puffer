@@ -148,12 +148,7 @@ fn chrome_proxy_args(proxy: &ProxyConfig) -> Vec<String> {
         ProxyScheme::Socks5h => "socks5",
         other => other.as_uri_scheme(),
     };
-    let server = format!(
-        "{}://{}:{}",
-        scheme,
-        endpoint.host.trim(),
-        endpoint.port
-    );
+    let server = format!("{}://{}:{}", scheme, endpoint.host.trim(), endpoint.port);
     let mut bypass = vec!["<-loopback>".to_string()];
     bypass.extend(
         proxy

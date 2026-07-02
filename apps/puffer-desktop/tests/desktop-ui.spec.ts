@@ -749,6 +749,7 @@ test("late Browser devtools events do not leak into a switched agent", async ({ 
   await daemon.waitForRequest("browser_open", (request) =>
     request.params.sessionId === "session-beta-browser:browser:tab-1"
   );
+  await page.getByRole("button", { name: "DevTools" }).click();
 
   daemon.emit("browser:session-alpha-browser:browser:tab-1:devtools", {
     kind: "console",

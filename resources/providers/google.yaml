@@ -1,0 +1,33 @@
+id: google
+display_name: Google
+# Google Gemini exposes an OpenAI-compatible Chat Completions API. We encode the
+# `/v1beta/openai` prefix in `base_url` and keep the default
+# `chat_completions_path` (`/chat/completions`) so requests hit
+# `…/v1beta/openai/chat/completions`. Auth is a Gemini API key sent as
+# `Authorization: Bearer <key>`, which the openai-completions adapter already does.
+base_url: https://generativelanguage.googleapis.com/v1beta/openai
+default_api: openai-completions
+auth_modes:
+  - api_key
+discovery:
+  path: /models
+  response: open_ai_models
+  api: openai-completions
+  context_window: 1048576
+  max_output_tokens: 65536
+  supports_reasoning: true
+models:
+  - id: gemini-2.5-flash
+    display_name: Gemini 2.5 Flash
+    provider: google
+    api: openai-completions
+    context_window: 1048576
+    max_output_tokens: 65536
+    supports_reasoning: true
+  - id: gemini-2.5-pro
+    display_name: Gemini 2.5 Pro
+    provider: google
+    api: openai-completions
+    context_window: 1048576
+    max_output_tokens: 65536
+    supports_reasoning: true

@@ -1,0 +1,62 @@
+id: github-copilot
+display_name: GitHub Copilot
+# GitHub Copilot's chat endpoint (`api.githubcopilot.com`) speaks the OpenAI
+# Chat Completions wire format, so it reuses the openai-completions adapter.
+# What is special is auth: login is a GitHub OAuth *device flow* (not the PKCE
+# redirect used by openai/anthropic), and the stored GitHub token (`gho_`/`ghu_`)
+# must be exchanged at runtime for a short-lived Copilot bearer via
+# `api.github.com/copilot_internal/v2/token`. That exchange + caching lives in
+# `puffer-core/runtime/copilot.rs`; here we only declare the wire + the client
+# identity headers Copilot requires (it rejects requests without them).
+base_url: https://api.githubcopilot.com
+# Copilot serves Chat Completions at `/chat/completions` (NO `/v1` prefix).
+# Override the default `/v1/chat/completions` so we don't 404.
+chat_completions_path: /chat/completions
+default_api: openai-completions
+auth_modes:
+  - oauth
+# Auto-detect the models this account actually has access to. Copilot's
+# `/models` is OpenAI-shaped; the discovery request is authenticated with the
+# exchanged Copilot token (see discovery.rs copilot handling).
+discovery:
+  path: /models
+  response: open_ai_models
+  api: openai-completions
+  context_window: 128000
+  max_output_tokens: 16384
+# Client-identity headers Copilot requires (it rejects requests without them).
+# GitHub gates response shape/entitlement by client identity and
+# `X-GitHub-Api-Version`, and reshuffles Copilot plan/model policy often (three
+# plan/billing changes in 2026 H1 alone) — bump these when Copilot responses
+# start misbehaving. Versions mirror current clients as of 2026-07.
+headers:
+  Copilot-Integration-Id: vscode-chat
+  Editor-Version: vscode/1.104.0
+  Editor-Plugin-Version: copilot-chat/0.31.0
+  User-Agent: GitHubCopilotChat/0.31.0
+  X-GitHub-Api-Version: "2025-10-01"
+# Static fallback shown before the first discovery completes. Only base-tier
+# models every plan can call directly — premium models are plan-gated and
+# discovery adds them for entitled accounts.
+models:
+  - id: gpt-4o
+    display_name: GPT-4o (Copilot)
+    provider: github-copilot
+    api: openai-completions
+    context_window: 128000
+    max_output_tokens: 16384
+    supports_reasoning: false
+  - id: gpt-4o-mini
+    display_name: GPT-4o mini (Copilot)
+    provider: github-copilot
+    api: openai-completions
+    context_window: 128000
+    max_output_tokens: 16384
+    supports_reasoning: false
+  - id: gpt-4.1
+    display_name: GPT-4.1 (Copilot)
+    provider: github-copilot
+    api: openai-completions
+    context_window: 128000
+    max_output_tokens: 16384
+    supports_reasoning: false

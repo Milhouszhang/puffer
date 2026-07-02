@@ -26,6 +26,7 @@ mod blocking_loop;
 mod browser_auto_review;
 pub mod claude_tools;
 mod context_usage;
+mod copilot;
 pub mod errors;
 mod filesystem_access;
 pub mod goals;

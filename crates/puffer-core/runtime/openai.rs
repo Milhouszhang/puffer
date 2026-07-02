@@ -606,6 +606,38 @@ pub(super) fn resolve_openai_execution_config(
     append_default_openai_headers(&mut custom_headers, provider.id.as_str(), None);
     let session_id = Some(state.session.id.to_string());
     let originator = OPENAI_CODEX_ORIGINATOR.to_string();
+    // GitHub Copilot: the stored credential is a GitHub OAuth token, but the
+    // chat endpoint wants a short-lived Copilot bearer. Exchange (and cache) it
+    // here; the client-identity headers come from the descriptor's `headers`.
+    if provider.id == "github-copilot" {
+        if let Some(StoredCredential::OAuth(credential)) = auth_store.get(provider.id.as_str()) {
+            let copilot = super::copilot::copilot_bearer_token(&credential.access_token)?;
+            return Ok(OpenAIExecutionConfig {
+                provider_id: provider.id.clone(),
+                request_config: OpenAIRequestConfig {
+                    // Use the account-specific endpoint from the token exchange
+                    // (individual / business / enterprise), not the descriptor's
+                    // placeholder host.
+                    base_url: copilot.api_url.clone(),
+                    version: openai_request_version(provider, false),
+                    auth: OpenAIAuth::ApiKey(copilot.token),
+                    originator,
+                    session_id,
+                    account_id: None,
+                    custom_headers,
+                    query_params: provider
+                        .query_params
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                    chat_completions_path: provider.chat_completions_path.clone(),
+                    responses_path: None,
+                },
+                refresh_token: None,
+                codex_style: false,
+            });
+        }
+    }
     match auth_store.get(provider.id.as_str()) {
         Some(StoredCredential::ApiKey { key }) => Ok(OpenAIExecutionConfig {
             provider_id: provider.id.clone(),

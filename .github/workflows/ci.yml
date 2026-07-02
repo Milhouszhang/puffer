@@ -50,6 +50,10 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only master writes to the 10GB Actions cache quota; PR branches
+          # read it but don't evict the mainline baseline with per-PR entries.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - uses: taiki-e/install-action@nextest
 
@@ -76,6 +80,11 @@ jobs:
       # `#[ignore]`d. Run the full set locally with tmux installed. ---
       - name: Test (nextest)
         run: cargo nextest run --workspace --locked --profile ci
+
+      # nextest cannot run doctests; without this step any future doctest
+      # would silently never execute in CI. Currently 0 doctests, ~30s warm.
+      - name: Doc tests
+        run: cargo test --workspace --doc --locked
 
       # --- Hard gate: formatting drift was settled in one workspace-wide
       # rustfmt commit; from here on any drift fails fast. ---
@@ -152,6 +161,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: apps/puffer-desktop/src-tauri
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - uses: taiki-e/install-action@nextest
 

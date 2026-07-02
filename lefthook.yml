@@ -33,11 +33,13 @@ pre-push:
   parallel: true
   commands:
     # Compiles the workspace (hard-fails on real build errors) and surfaces
-    # clippy lints. Intentionally NOT `-D warnings`, so pre-existing warnings
-    # stay informational and don't block the push.
+    # clippy lints. Denies the same groups as CI (`correctness` is deny by
+    # default; `suspicious` is added to match) so a push that would fail the
+    # CI clippy gate fails here first. Still NOT `-D warnings`: ordinary
+    # style/pedantic warnings stay informational and don't block the push.
     clippy:
       glob: "*.rs"
       skip:
         - merge
         - rebase
-      run: cargo clippy --workspace --all-targets
+      run: cargo clippy --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious

@@ -37,9 +37,9 @@ lefthook install        # writes .git/hooks/*
 
 - **pre-commit** (fast, file-scoped): rustfmt-check on staged `*.rs`, plus
   svelte-check when `apps/puffer-desktop` sources change.
-- **pre-push**: `cargo clippy --workspace --all-targets`. Ordinary warnings
-  do not block, but clippy's *correctness* lints are deny-by-default, so a
-  correctness error will fail the push.
+- **pre-push**: `cargo clippy --workspace --all-targets` with the same deny
+  groups as CI (*correctness* + *suspicious*), so a push that would fail the
+  CI clippy gate fails locally first. Ordinary warnings do not block.
 - Emergency bypass is `git commit/push --no-verify` — prefer fixing the finding.
 
 CI (`.github/workflows/ci.yml`) is the authoritative full-tree gate. All steps

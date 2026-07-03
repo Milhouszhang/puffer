@@ -243,7 +243,7 @@
   <div class="pf-settings-note">Preview mode - launch Puffer in the desktop app to edit secrets.</div>
 {/if}
 
-<div class="pf-settings-row">
+<div class="pf-settings-row pf-secret-stacked">
   <div class="meta">
     <div class="label">Secret store</div>
     <div class="desc">Encrypted JSON with a platform-held key.</div>
@@ -254,13 +254,19 @@
   </div>
 </div>
 
-<div class="pf-settings-row" style="align-items: start;">
+<div class="pf-settings-row pf-secret-stacked">
   <div class="meta">
     <div class="label">Add secret</div>
     <div class="desc">Stored value is never rendered after save.</div>
   </div>
-  <div class="pf-mcp-form">
-    <div class="pf-mcp-form-grid">
+  <form
+    class="pf-secret-form"
+    onsubmit={(e) => {
+      e.preventDefault();
+      saveStoredSecret();
+    }}
+  >
+    <div class="pf-secret-form-grid">
       <label>
         Name
         <input
@@ -272,13 +278,15 @@
         />
       </label>
       <label>
-        Description
+        Value
         <input
           class="sc-input"
-          placeholder="What this secret is for"
-          value={form.description}
+          type="password"
+          autocomplete="off"
+          placeholder="Secret value"
+          value={form.value}
           disabled={disabled}
-          oninput={(e) => (form.description = (e.currentTarget as HTMLInputElement).value)}
+          oninput={(e) => (form.value = (e.currentTarget as HTMLInputElement).value)}
         />
       </label>
       <label>
@@ -301,61 +309,65 @@
           oninput={(e) => (form.origin = (e.currentTarget as HTMLInputElement).value)}
         />
       </label>
-      <label>
-        Value
-        <input
-          class="sc-input"
-          type="password"
-          autocomplete="off"
-          value={form.value}
+      <label class="pf-secret-field-wide">
+        Description
+        <textarea
+          class="sc-input pf-secret-description"
+          rows="2"
+          placeholder="What this secret is for"
+          value={form.description}
           disabled={disabled}
-          oninput={(e) => (form.value = (e.currentTarget as HTMLInputElement).value)}
-        />
+          oninput={(e) => (form.description = (e.currentTarget as HTMLTextAreaElement).value)}
+        ></textarea>
       </label>
     </div>
     <div class="pf-secrets-actions">
-      {#each importSources as src (src.id)}
+      <button
+        type="submit"
+        class="sc-btn"
+        data-variant="default"
+        data-size="sm"
+        disabled={disabled || !form.label.trim() || !form.value}
+      >
+        <Icon name="plus" size={12} />{saving ? "Saving..." : "Save secret"}
+      </button>
+    </div>
+    <div class="pf-secrets-import">
+      <span class="pf-secrets-import-label">Or import existing credentials</span>
+      <div class="pf-secrets-import-buttons">
+        {#each importSources as src (src.id)}
+          <button
+            type="button"
+            class="sc-btn"
+            data-variant="outline"
+            data-size="sm"
+            disabled={disabled || !src.available}
+            title={src.available ? `Sync saved logins from ${src.label}` : `${src.label} not detected on this machine`}
+            onclick={() => importFromSource(src.id)}
+          >
+            <Icon name="key" size={12} />{importingSource === src.id
+              ? "Syncing..."
+              : src.id === "1password"
+                ? "Sync from 1Password"
+                : `Sync from ${src.label}`}
+          </button>
+        {/each}
         <button
           type="button"
           class="sc-btn"
           data-variant="outline"
           data-size="sm"
-          disabled={disabled || !src.available}
-          title={src.available ? `Sync saved logins from ${src.label}` : `${src.label} not detected on this machine`}
-          onclick={() => importFromSource(src.id)}
+          disabled={disabled}
+          title="Import a 1Password export file (File → Export → 1PUX in the app) — no 1Password CLI needed"
+          onclick={importOnePasswordExportFile}
         >
-          <Icon name="key" size={12} />{importingSource === src.id
+          <Icon name="key" size={12} />{importingSource === "__1pux__"
             ? "Syncing..."
-            : src.id === "1password"
-              ? "Sync from 1Password"
-              : `Sync from ${src.label}`}
+            : "Import 1Password export (.1pux)"}
         </button>
-      {/each}
-      <button
-        type="button"
-        class="sc-btn"
-        data-variant="outline"
-        data-size="sm"
-        disabled={disabled}
-        title="Import a 1Password export file (File → Export → 1PUX in the app) — no 1Password CLI needed"
-        onclick={importOnePasswordExportFile}
-      >
-        <Icon name="key" size={12} />{importingSource === "__1pux__"
-          ? "Syncing..."
-          : "Import 1Password export (.1pux)"}
-      </button>
-      <button
-        type="button"
-        class="sc-btn"
-        data-variant="default"
-        data-size="sm"
-        disabled={disabled || !form.label.trim() || !form.value}
-        onclick={saveStoredSecret}
-      >
-        <Icon name="plus" size={12} />{saving ? "Saving..." : "Save secret"}
-      </button>
+      </div>
     </div>
-  </div>
+  </form>
 </div>
 
 <div class="pf-secret-list-toolbar">
@@ -433,9 +445,97 @@
 </div>
 
 <style>
+  .pf-secret-stacked {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+    gap: 12px;
+  }
+
+  .pf-secret-stacked .pf-path-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--muted-foreground);
+    min-width: 0;
+  }
+
+  .pf-secret-stacked .pf-path-label {
+    display: inline-block;
+    min-width: 48px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 10px;
+    font-family: var(--font-sans);
+  }
+
+  .pf-secret-stacked .pf-path-value {
+    color: var(--foreground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
+    max-width: calc(100% - 56px);
+    vertical-align: bottom;
+  }
+
+  .pf-secret-form {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .pf-secret-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    color: var(--muted-foreground);
+    font-size: 11.5px;
+  }
+
+  .pf-secret-form-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 12px;
+  }
+
+  .pf-secret-field-wide {
+    grid-column: 1 / -1;
+  }
+
+  .pf-secret-description {
+    resize: none;
+    height: auto;
+    min-height: 0;
+    line-height: 1.4;
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
   .pf-secrets-actions {
     display: flex;
     justify-content: flex-end;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .pf-secrets-import {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 4px;
+    padding-top: 12px;
+    border-top: 1px dashed var(--border);
+  }
+
+  .pf-secrets-import-label {
+    color: var(--muted-foreground);
+    font-size: 11.5px;
+  }
+
+  .pf-secrets-import-buttons {
+    display: flex;
     gap: 8px;
     flex-wrap: wrap;
   }
@@ -545,12 +645,20 @@
   }
 
   @media (max-width: 720px) {
-    .pf-secrets-actions {
-      justify-content: stretch;
+    .pf-secret-form-grid {
+      grid-template-columns: minmax(0, 1fr);
     }
 
-    .pf-secrets-actions .sc-btn {
+    .pf-secrets-actions,
+    .pf-secrets-import-buttons {
+      align-items: stretch;
+      flex-direction: column;
+    }
+
+    .pf-secrets-actions .sc-btn,
+    .pf-secrets-import-buttons .sc-btn {
       flex: 1;
+      width: 100%;
     }
 
     .pf-secret-list-toolbar {

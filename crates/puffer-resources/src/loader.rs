@@ -2055,6 +2055,59 @@ media:
     }
 
     #[test]
+    fn merge_order_puffer_overrides_external_overrides_plugin() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let home = temp.path().join("home");
+
+        let write_skill = |dir: &Path, description: &str| {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: dupe\ndescription: {description}\n---\nBody\n"),
+            )
+            .unwrap();
+        };
+
+        let plugin_root = home.join(".claude/plugins/cache/market/p/1.0.0");
+        write_skill(&plugin_root.join("skills/dupe"), "from plugin");
+        let manifest = serde_json::json!({
+            "version": 2,
+            "plugins": { "p@market": [{ "scope": "user", "installPath": plugin_root }] }
+        });
+        fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+        fs::write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            manifest.to_string(),
+        )
+        .unwrap();
+
+        write_skill(&home.join(".claude/skills/dupe"), "from user claude");
+        // Workspace .puffer resources layer merges after all external
+        // sources, so it must win.
+        write_skill(
+            &root.join(".puffer/resources/skills/dupe"),
+            "from puffer workspace",
+        );
+
+        let paths = ConfigPaths {
+            workspace_root: root.clone(),
+            workspace_config_dir: root.join(".puffer"),
+            user_config_dir: home.join(".puffer"),
+            builtin_resources_dir: root.join("resources"),
+        };
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+
+        let dupe = skill_by_name(&loaded, "dupe").expect("skill loads");
+        assert_eq!(dupe.value.description, "from puffer workspace");
+        assert!(
+            loaded.diagnostics.iter().any(|diag| diag.contains("dupe")),
+            "overrides should be recorded: {:?}",
+            loaded.diagnostics
+        );
+    }
+
+    #[test]
     fn lambda_skill_library_imports_generated_external_skills() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("workspace");

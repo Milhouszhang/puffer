@@ -175,7 +175,7 @@ test("workspace switch clears live agents from the previous daemon", async ({ pa
   daemon.setGroupedSessionFilter(() => false);
 
   await expect(dialog).toHaveCount(0);
-  await expect(page.getByRole("region", { name: "Session history" })).toHaveCount(0);
+  await expect(page.locator(".pf-pw-list")).not.toContainText("Old workspace live agent");
   await expect(
     page.locator(".pf-sidebar-agent-row").filter({ hasText: "Old workspace live agent" })
   ).toHaveCount(0);
@@ -407,7 +407,7 @@ test("workspace search includes session notes in history results", async ({ page
   const project = page.locator(".pf-pw-project").filter({ hasText: "puffer-note-search" });
   await expect(project.getByText("Workspace note target")).toBeVisible();
   await expect(
-    page.getByLabel("Session history").getByRole("button", { name: /Workspace note target/ })
+    page.locator(".pf-pw-list").getByRole("button", { name: /Workspace note target/ })
   ).toBeVisible();
 });
 
@@ -480,8 +480,8 @@ test("workspace search keeps keyboard focus when filtering removes the focused r
 
   const search = page.getByLabel("Search workspace");
   await search.fill("focused search drop");
-  const row = page.getByRole("region", { name: "Session history" })
-    .getByRole("button", { name: /Focused search drop/ });
+  const row = page.locator(".pf-pw-list")
+    .getByRole("button", { name: /^Open session Focused search drop/ });
   await expect(row).toBeVisible();
   await row.focus();
   await expect(row).toBeFocused();
@@ -534,7 +534,7 @@ test("workspace project rows collapse and expand their session list", async ({ p
   await expect(expand).toHaveAttribute("aria-expanded", "false");
   await expect(project.getByText("Collapse alpha")).toHaveCount(0);
   await expect(project.getByText("Collapse beta")).toHaveCount(0);
-  await expect(project).toContainText("2 sessions");
+  await expect(project).toHaveAttribute("data-collapsed", "true");
 
   await expand.click();
   await expect(project.getByRole("button", { name: "Collapse puffer-collapse" })).toHaveAttribute(
@@ -593,15 +593,12 @@ test("workspace board does not list child sessions as top-level history", async 
   await daemon.install(page);
   await daemon.open(page);
 
-  const history = page.locator(".pf-pw-history");
   const project = page.locator(".pf-pw-project").filter({ hasText: "puffer-subagents" });
-  await expect(history.getByText("Parent workspace agent")).toBeVisible();
-  await expect(history.getByText("Child workspace agent")).toHaveCount(0);
   await expect(project.getByText("Parent workspace agent")).toBeVisible();
   await expect(project.getByText("Child workspace agent")).toHaveCount(0);
-  await expect(project).toContainText("1 active");
+  await expect(project.locator(".pf-pw-agent")).toHaveCount(1);
 
-  await project.getByRole("button", { name: "Details" }).click();
+  await project.getByRole("button", { name: "Open details for puffer-subagents" }).click();
   const projectDetail = page.locator(".pf-fpb");
   await expect(projectDetail.getByText("Parent workspace agent")).toBeVisible();
   await expect(projectDetail.getByText("Child workspace agent")).toHaveCount(0);
@@ -624,12 +621,12 @@ test("workspace search includes older sessions beyond the first page", async ({ 
   await daemon.open(page);
 
   const project = page.locator(".pf-pw-project").filter({ hasText: "puffer-history" });
-  await expect(project).toContainText("7 sessions");
+  await expect(project.locator(".pf-pw-agent")).toHaveCount(7);
   await expect(project.getByText("Deep history session")).toBeVisible();
 
   await page.getByLabel("Search workspace").fill("deep history");
   await expect(project.getByText("Deep history session")).toBeVisible();
-  await project.getByRole("button", { name: /Deep history session/ }).click();
+  await project.getByRole("button", { name: /^Open session Deep history session/ }).click();
   await expect(page.locator(".pf-composer textarea")).toBeVisible();
 });
 
@@ -691,7 +688,7 @@ test("session history keeps older sessions available after starting a new agent"
   await daemon.install(page);
   await daemon.open(page);
 
-  await expect(page.getByRole("region", { name: "Session history" })).toContainText("Old browser plan");
+  await expect(page.locator(".pf-pw-list")).toContainText("Old browser plan");
 
   await page
     .locator(".pf-pw-project")
@@ -703,7 +700,7 @@ test("session history keeps older sessions available after starting a new agent"
   await expect(page.locator(".pf-agent-detail")).toBeVisible();
   await page.getByRole("button", { name: "Back" }).click();
 
-  const history = page.getByRole("region", { name: "Session history" });
+  const history = page.locator(".pf-pw-list");
   await expect(history).toContainText("Old browser plan");
   await expect(history).toContainText("New Session");
   await history.getByRole("button", { name: /Old browser plan/ }).click();
@@ -738,7 +735,7 @@ test("close session returns to workspace without removing history", async ({ pag
   await daemon.install(page);
   await daemon.open(page);
 
-  const history = page.getByRole("region", { name: "Session history" });
+  const history = page.locator(".pf-pw-list");
   await history.getByRole("button", { name: /Closable history session/ }).click();
   await expect(page.locator(".pf-agent-detail .primary-title")).toContainText("Closable history session");
 
@@ -784,7 +781,7 @@ test("close session clears remembered restore target without removing history", 
   });
   await daemon.open(page);
 
-  const history = page.getByRole("region", { name: "Session history" });
+  const history = page.locator(".pf-pw-list");
   await history.getByRole("button", { name: /Remembered closable session/ }).click();
   await expect(page.locator(".pf-agent-detail .primary-title")).toContainText(
     "Remembered closable session"
@@ -803,7 +800,7 @@ test("close session clears remembered restore target without removing history", 
   await page.reload();
   await expect(page.locator(".pf-agent-detail")).toHaveCount(0);
   await expect(page.locator(".pf-pw-list")).toBeVisible();
-  await expect(page.getByRole("region", { name: "Session history" })).toContainText(
+  await expect(page.locator(".pf-pw-list")).toContainText(
     "Remembered closable session"
   );
 });
@@ -907,7 +904,7 @@ test("narrow workspace reconnect clears banner and preserves session navigation"
   await daemon.install(page);
   await daemon.open(page);
 
-  const history = page.getByRole("region", { name: "Session history" });
+  const history = page.locator(".pf-pw-list");
   await history.getByRole("button", { name: /Narrow reconnect/ }).click();
   await expect(page.locator(".pf-agent-detail .primary-title")).toContainText("Narrow reconnect");
 
@@ -956,7 +953,7 @@ test("closed remembered session ignores stale workspace update events", async ({
   });
   await daemon.open(page);
 
-  const history = page.getByRole("region", { name: "Session history" });
+  const history = page.locator(".pf-pw-list");
   await history.getByRole("button", { name: /Stale closed session/ }).click();
   await expect(page.locator(".pf-agent-detail .primary-title")).toContainText(
     "Stale closed session"
@@ -1046,7 +1043,7 @@ test("late workspace refresh does not hide a newly created session", async ({ pa
   await daemon.install(page);
   await daemon.open(page);
 
-  const history = page.getByRole("region", { name: "Session history" });
+  const history = page.locator(".pf-pw-list");
   await expect(history).toContainText("Stale history base");
 
   daemon.delayResponse("list_grouped_sessions", () => true, 900);
@@ -1105,8 +1102,8 @@ test("session history keeps opened sessions after a later stale grouped refresh"
   await daemon.install(page);
   await daemon.open(page);
 
-  const history = page.getByRole("region", { name: "Session history" });
-  await history.getByRole("button", { name: /Alpha stale history/ }).click();
+  const history = page.locator(".pf-pw-list");
+  await history.getByRole("button", { name: /^Open session Alpha stale history/ }).click();
   await expect(page.locator(".pf-agent-detail .primary-title")).toContainText("Alpha stale history");
   await page.getByRole("button", { name: "Back" }).click();
 
@@ -1114,18 +1111,18 @@ test("session history keeps opened sessions after a later stale grouped refresh"
     (metadata) => String(metadata.sessionId ?? "") !== "session-history-alpha"
   );
   const previousRefreshes = daemon.requests.filter(
-    (request) => request.method === "list_grouped_sessions"
+    (request) => request.method === "list_grouped_sessions_page"
   ).length;
   daemon.emit("workspace:sessions:changed", { reason: "stale-alpha-drop" });
   await daemon.waitForRequest(
-    "list_grouped_sessions",
+    "list_grouped_sessions_page",
     (request) =>
-      daemon.requests.filter((candidate) => candidate.method === "list_grouped_sessions")
+      daemon.requests.filter((candidate) => candidate.method === "list_grouped_sessions_page")
         .indexOf(request) >= previousRefreshes
   );
 
   await expect(history).toContainText("Alpha stale history");
-  await history.getByRole("button", { name: /Beta stable history/ }).click();
+  await history.getByRole("button", { name: /^Open session Beta stable history/ }).click();
   await expect(page.locator(".pf-agent-detail .primary-title")).toContainText("Beta stable history");
   await page.getByRole("button", { name: "Back" }).click();
 
@@ -1167,7 +1164,7 @@ test("active agents includes an opened session before grouped history catches up
   await expect(activeList.getByText("No agents match")).toHaveCount(0);
 
   await page.getByRole("button", { name: "Back" }).click();
-  const history = page.getByRole("region", { name: "Session history" });
+  const history = page.locator(".pf-pw-list");
   await expect(history).toContainText("New Session");
 
   await page
@@ -1217,7 +1214,7 @@ test("active agents keeps a fallback-created session after opening older history
 
   await expect(page.locator(".pf-agent-detail .primary-title")).toContainText("New Session");
   await page.getByRole("button", { name: "Back" }).click();
-  await page.getByRole("region", { name: "Session history" })
+  await page.locator(".pf-pw-list")
     .getByRole("button", { name: /Old active history/ })
     .click();
   await expect(page.locator(".pf-agent-detail .primary-title")).toContainText("Old active history");
@@ -1377,9 +1374,11 @@ test("workspace board renders daemon session activity states", async ({ page }) 
   await daemon.open(page);
 
   const project = page.locator(".pf-pw-project").filter({ hasText: "puffer-active" });
-  await expect(project).toContainText("2 active");
+  await expect(project.locator('.pf-pw-agent[data-status="running"]')).toHaveCount(1);
+  await expect(project.locator('.pf-pw-agent[data-status="awaiting"]')).toHaveCount(1);
+  await expect(project.locator('.pf-pw-agent[data-status="idle"]')).toHaveCount(1);
 
-  await project.getByRole("button", { name: "Details" }).click();
+  await project.getByRole("button", { name: "Open details for puffer-active" }).click();
   const runningColumn = page.locator(".pf-fpb-col").filter({ hasText: "Running" });
   await expect(runningColumn.getByText("Running checkout fix")).toBeVisible();
   await expect(runningColumn.getByText("Awaiting deploy approval")).toBeVisible();
@@ -1501,7 +1500,10 @@ test("workspace agent cards keep full session titles for responsive ellipsis", a
 
   await expect(agent.locator(".title")).toHaveText(longTitle);
   await expect(agent).toHaveAttribute("type", "button");
-  await expect(agent).toHaveAttribute("title", new RegExp(`^${longTitle} - Running -`));
+  await expect(project.locator(".pf-pw-agent-wrap")).toHaveAttribute(
+    "title",
+    new RegExp(`^${longTitle} - running -`)
+  );
 });
 
 test("running daemon sessions keep the composer from starting another turn", async ({ page }) => {

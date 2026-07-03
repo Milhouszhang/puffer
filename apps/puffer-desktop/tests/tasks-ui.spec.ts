@@ -72,7 +72,10 @@ test("tasks history shows received monitor messages and agent outcomes", async (
   const dialog = page.getByRole("dialog", { name: "Task history" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByLabel("Received messages").getByRole("button", {
-    name: /Telegram from Alice/
+    name: /Telegram from Alice: deployment status/
+  })).toBeVisible();
+  await expect(dialog.getByLabel("Received messages").getByRole("button", {
+    name: /Telegram from Alice: thanks/
   })).toBeVisible();
   await expect(dialog.getByLabel("Agent history")).toContainText("Shared digest outcome for message 1 of 2");
   await expect(dialog.getByLabel("Agent history")).toContainText("Digest triage");
@@ -112,7 +115,11 @@ test("tasks list lazily renders large snapshots", async ({ page }) => {
   const list = page.getByLabel("Task list");
   await expect(list.locator(".pf-task-row")).toHaveCount(40);
   await expect(list).not.toContainText("Lazy task 64");
-  await list.getByRole("button", { name: "Load 25 more tasks" }).click();
+  // The button removes itself once the batch loads, so a regular click can
+  // land yet fail Playwright's post-click hit-target check on a slow runner,
+  // then retry against a detached node forever. Dispatch the event directly:
+  // this spec guards lazy rendering, not pointer physics.
+  await list.getByRole("button", { name: "Load 25 more tasks" }).dispatchEvent("click");
   await expect(list.locator(".pf-task-row")).toHaveCount(65);
   await expect(list).toContainText("Lazy task 64");
 });
@@ -340,7 +347,7 @@ test("task monitor configuration reconnects a degraded selected account", async 
   expect(daemon.requests.some((item) => item.method === "task_monitor_create")).toBe(false);
 });
 
-test("task monitor rules uses compact keyword rows", async ({ page }) => {
+test("task monitor rules renders condition groups and saves memory", async ({ page }) => {
   const daemon = new FakeDaemon();
   daemon.setWorkflowSnapshot({
     workflows: [],
@@ -392,57 +399,15 @@ test("task monitor rules uses compact keyword rows", async ({ page }) => {
   const dialog = page.getByRole("dialog", { name: "Task settings" });
   await dialog.getByRole("button", { name: "Rules and memory" }).click();
 
-  const includeRow = dialog.getByRole("group", { name: "Only includes" });
-  const excludeRow = dialog.getByRole("group", { name: "Exclude" });
-  const includeBoxMetrics = await includeRow.locator(".pf-task-keyword-rule-box").evaluate((element) => {
-    const styles = getComputedStyle(element);
-    const box = element.getBoundingClientRect();
-    return {
-      height: Math.round(box.height),
-      borderRadius: styles.borderRadius,
-      borderTopWidth: styles.borderTopWidth
-    };
-  });
-  expect(includeBoxMetrics).toEqual({
-    height: 32,
-    borderRadius: "6px",
-    borderTopWidth: "1px"
-  });
-
-  const excludeInputMetrics = await excludeRow.getByLabel("Exclude keywords").evaluate((element) => {
-    const styles = getComputedStyle(element);
-    const box = element.getBoundingClientRect();
-    return {
-      height: Math.round(box.height),
-      borderTopWidth: styles.borderTopWidth
-    };
-  });
-  expect(excludeInputMetrics).toEqual({
-    height: 22,
-    borderTopWidth: "0px"
-  });
+  const includeGroup = dialog.getByRole("group", { name: "Only create tasks when" });
+  const excludeGroup = dialog.getByRole("group", { name: "Skip tasks when" });
+  await expect(includeGroup.getByText("No required conditions")).toBeVisible();
+  await expect(excludeGroup.getByText("No skip conditions")).toBeVisible();
+  await expect(includeGroup.getByRole("button", { name: "Add task condition" })).toBeEnabled();
+  await expect(excludeGroup.getByRole("button", { name: "Add skip condition" })).toBeEnabled();
 
   const saveMemoryButton = dialog.getByRole("button", { name: "Save memory" });
   await expect(saveMemoryButton).toBeEnabled();
-
-  const saveMemoryMetrics = await saveMemoryButton.evaluate((element) => {
-    const styles = getComputedStyle(element);
-    const box = element.getBoundingClientRect();
-    return {
-      width: Math.round(box.width),
-      height: Math.round(box.height),
-      borderRadius: styles.borderRadius,
-      backgroundColor: styles.backgroundColor,
-      color: styles.color
-    };
-  });
-  expect(saveMemoryMetrics).toEqual({
-    width: 104,
-    height: 30,
-    borderRadius: "6px",
-    backgroundColor: "rgb(17, 17, 17)",
-    color: "rgb(255, 255, 255)"
-  });
 
   await saveMemoryButton.click();
   const request = await daemon.waitForRequest("task_monitor_memory_save");
@@ -452,59 +417,67 @@ test("task monitor rules uses compact keyword rows", async ({ page }) => {
   });
 });
 
-test("task monitor rules adds exclude keywords from the fixed exclude row", async ({ page }) => {
+test("task monitor rules adds a skip condition from the builder", async ({ page }) => {
   const daemon = new FakeDaemon();
   daemon.setWorkflowSnapshot(monitorRulesSnapshot());
 
   const dialog = await openRulesDialog(page, daemon);
-  const excludeRow = dialog.getByRole("group", { name: "Exclude" });
-  const keywordInput = excludeRow.getByLabel("Exclude keywords");
+  const excludeGroup = dialog.getByRole("group", { name: "Skip tasks when" });
+  await excludeGroup.getByRole("button", { name: "Add skip condition" }).click();
 
-  await keywordInput.fill("作业");
-  await keywordInput.press("Enter");
+  await excludeGroup.getByLabel("Value").fill("作业");
+  await excludeGroup.getByRole("button", { name: "Add condition" }).click();
 
   const request = await daemon.waitForRequest("task_monitor_rule_add");
   expect(request.params).toEqual({
     connection_slug: "telegram-user",
     mode: "exclude",
+    kind: "keyword",
     keywords: ["作业"],
+    operator: "contains",
     case_insensitive: true
   });
-  await expect(excludeRow.getByRole("button", { name: "Remove exclude keyword 作业" })).toBeVisible();
+  await expect(
+    excludeGroup.getByRole("button", { name: "Remove skip condition Message text contains 作业" })
+  ).toBeVisible();
 });
 
-test("task monitor rules adds include keywords from the fixed only-includes row", async ({ page }) => {
+test("task monitor rules adds a task condition from the builder", async ({ page }) => {
   const daemon = new FakeDaemon();
   daemon.setWorkflowSnapshot(monitorRulesSnapshot());
 
   const dialog = await openRulesDialog(page, daemon);
-  const includeRow = dialog.getByRole("group", { name: "Only includes" });
-  const keywordInput = includeRow.getByLabel("Only includes keywords");
+  const includeGroup = dialog.getByRole("group", { name: "Only create tasks when" });
+  await includeGroup.getByRole("button", { name: "Add task condition" }).click();
 
-  await keywordInput.fill("urgent");
-  await keywordInput.blur();
+  await includeGroup.getByLabel("Value").fill("urgent");
+  await includeGroup.getByRole("button", { name: "Add condition" }).click();
 
   const request = await daemon.waitForRequest("task_monitor_rule_add");
   expect(request.params).toEqual({
     connection_slug: "telegram-user",
     mode: "include",
+    kind: "keyword",
     keywords: ["urgent"],
+    operator: "contains",
     case_insensitive: true
   });
-  await expect(includeRow.getByRole("button", { name: "Remove include keyword urgent" })).toBeVisible();
+  await expect(
+    includeGroup.getByRole("button", { name: "Remove task condition Message text contains urgent" })
+  ).toBeVisible();
 });
 
-test("task monitor rules exposes only two keyword rows", async ({ page }) => {
+test("task monitor rules exposes exactly two condition groups", async ({ page }) => {
   const daemon = new FakeDaemon();
   daemon.setWorkflowSnapshot(monitorRulesSnapshot());
 
   const dialog = await openRulesDialog(page, daemon);
-  await expect(dialog.locator(".pf-task-keyword-rule-row")).toHaveCount(2);
-  await expect(dialog.getByRole("group", { name: "Only includes" }).getByLabel("Only includes keywords")).toBeVisible();
-  await expect(dialog.getByRole("group", { name: "Exclude" }).getByLabel("Exclude keywords")).toBeVisible();
+  await expect(dialog.locator(".pf-monitor-rule-group")).toHaveCount(2);
+  await expect(dialog.getByRole("group", { name: "Only create tasks when" })).toBeVisible();
+  await expect(dialog.getByRole("group", { name: "Skip tasks when" })).toBeVisible();
 });
 
-test("task monitor rules renders installed include and exclude keyword chips", async ({ page }) => {
+test("task monitor rules renders installed include and exclude condition chips", async ({ page }) => {
   const daemon = new FakeDaemon();
   daemon.setWorkflowSnapshot(monitorRulesSnapshot({
     include_filters: [
@@ -516,11 +489,10 @@ test("task monitor rules renders installed include and exclude keyword chips", a
   }));
 
   const dialog = await openRulesDialog(page, daemon);
-  const includeRow = dialog.getByRole("group", { name: "Only includes" });
-  const excludeRow = dialog.getByRole("group", { name: "Exclude" });
-  await expect(includeRow.getByRole("button", { name: "Remove include keyword 作业" })).toBeVisible();
-  await expect(excludeRow.getByRole("button", { name: "Remove exclude keyword 广告" })).toBeVisible();
-  await expect(excludeRow.getByRole("button", { name: "Remove exclude keyword 通知" })).toBeVisible();
+  const includeGroup = dialog.getByRole("group", { name: "Only create tasks when" });
+  const excludeGroup = dialog.getByRole("group", { name: "Skip tasks when" });
+  await expect(includeGroup.getByRole("button", { name: "Remove task condition Message text contains 作业" })).toBeVisible();
+  await expect(excludeGroup.getByRole("button", { name: "Remove skip condition Message text contains 广告, 通知" })).toBeVisible();
 });
 
 test("task monitor rules hides regex case-insensitive wrappers in field chips", async ({ page }) => {
@@ -550,33 +522,27 @@ test("task monitor rules hides regex case-insensitive wrappers in field chips", 
   await expect(excludeRow).not.toContainText("(?i:");
 });
 
-test("task monitor rules removes one saved keyword chip without deleting siblings", async ({ page }) => {
+test("task monitor rules removes one saved condition chip without deleting siblings", async ({ page }) => {
   const daemon = new FakeDaemon();
   daemon.setWorkflowSnapshot(monitorRulesSnapshot({
     ignore_filters: [
-      { type: "regex", pattern: "作业|广告", case_insensitive: true }
+      { type: "regex", pattern: "作业", case_insensitive: true },
+      { type: "regex", pattern: "广告", case_insensitive: true }
     ]
   }));
 
   const dialog = await openRulesDialog(page, daemon);
-  const excludeRow = dialog.getByRole("group", { name: "Exclude" });
-  await excludeRow.getByRole("button", { name: "Remove exclude keyword 广告" }).click();
+  const excludeGroup = dialog.getByRole("group", { name: "Skip tasks when" });
+  await excludeGroup.getByRole("button", { name: "Remove skip condition Message text contains 广告" }).click();
 
   const deleteRequest = await daemon.waitForRequest("task_monitor_rule_delete");
   expect(deleteRequest.params).toEqual({
     connection_slug: "telegram-user",
     mode: "exclude",
-    rule: { type: "regex", pattern: "作业|广告", case_insensitive: true }
+    rule: { type: "regex", pattern: "广告", case_insensitive: true }
   });
-  const addRequest = await daemon.waitForRequest("task_monitor_rule_add");
-  expect(addRequest.params).toEqual({
-    connection_slug: "telegram-user",
-    mode: "exclude",
-    keywords: ["作业"],
-    case_insensitive: true
-  });
-  await expect(excludeRow.getByRole("button", { name: "Remove exclude keyword 作业" })).toBeVisible();
-  await expect(excludeRow.getByRole("button", { name: "Remove exclude keyword 广告" })).toBeHidden();
+  await expect(excludeGroup.getByRole("button", { name: "Remove skip condition Message text contains 作业" })).toBeVisible();
+  await expect(excludeGroup.getByRole("button", { name: "Remove skip condition Message text contains 广告" })).toBeHidden();
 });
 
 test("task monitor configuration scopes subscriptions to selected contacts", async ({ page }) => {

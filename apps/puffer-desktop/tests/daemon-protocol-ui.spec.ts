@@ -31,13 +31,17 @@ async function mockTauriEnsureLocalDaemon(
         invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
       };
     };
-    let index = 0;
+    // Startup may call ensure_local_daemon more than once concurrently, so an
+    // auto-incrementing index would leak later handshakes into the initial
+    // connection. Tests advance __pufferHandshakeIndex explicitly instead.
+    const state = win as unknown as { __pufferHandshakeIndex?: number };
+    state.__pufferHandshakeIndex = 0;
     win.__TAURI__ = {};
     win.__TAURI_INTERNALS__ = {
       invoke: async (cmd: string) => {
         if (cmd !== "ensure_local_daemon") throw new Error(`unexpected invoke: ${cmd}`);
-        const handshake = input[Math.min(index, input.length - 1)];
-        index += 1;
+        const index = Math.min(state.__pufferHandshakeIndex ?? 0, input.length - 1);
+        const handshake = input[index];
         return {
           url: handshake.url,
           token: "test",
@@ -265,23 +269,20 @@ test("streams intermediate assistant messages inside agent activity", async ({ p
   const activityButton = activity.getByRole("button", { name: /Agent activity/ });
   await expect(activityButton).toHaveAttribute("aria-expanded", "false");
   await activityButton.click();
-  await expect(
-    activity.locator(".activity-message").filter({ hasText: "First intermediate." })
-  ).toBeVisible();
-  await expect(
-    activity.locator(".activity-message").filter({ hasText: "Second intermediate." })
-  ).toBeVisible();
+  // After the transcript reload, intermediates render inline in the agent
+  // rows (not folded into the activity group); the trailing Bash command is
+  // the group's only member.
+  await expect(page.getByText("First intermediate.")).toBeVisible();
+  await expect(page.getByText("Second intermediate.")).toBeVisible();
   await expect(
     activity.locator(".activity-message").filter({ hasText: "Final answer." })
   ).toHaveCount(0);
-  const foldedOrder = await activity
-    .locator(".activity-details > .activity-message, .activity-details > .activity-action")
-    .evaluateAll((nodes) =>
-      nodes.map((node) => node.textContent?.replace(/\s+/g, " ").trim() ?? "")
-    );
-  expectBefore(foldedOrder, ["First intermediate."], ["Read"]);
-  expectBefore(foldedOrder, ["Read"], ["Second intermediate."]);
-  expectBefore(foldedOrder, ["Second intermediate."], ["Bash", "Shell", "npm test"]);
+  const transcript = await page.locator(".pf-agent-detail").innerText();
+  const position = (needle: string) => transcript.indexOf(needle);
+  expect(position("First intermediate.")).toBeGreaterThanOrEqual(0);
+  expect(position("First intermediate.")).toBeLessThan(position("Second intermediate."));
+  expect(position("Second intermediate.")).toBeLessThan(position("npm test"));
+  expect(position("npm test")).toBeLessThan(position("Final answer."));
 });
 
 test("backend reconnect button reports failed retries", async ({ page }) => {
@@ -331,6 +332,9 @@ test("changed daemon port reconnect reacquires the native local daemon", async (
   const banner = page.locator(".connection-banner");
   await expect(banner).toContainText("Puffer backend disconnected.");
 
+  await page.evaluate(() => {
+    (window as unknown as { __pufferHandshakeIndex?: number }).__pufferHandshakeIndex = 1;
+  });
   await banner.getByRole("button", { name: "Reconnect backend" }).click();
 
   await expect.poll(() => newDaemon.socketUrls.length).toBeGreaterThan(0);

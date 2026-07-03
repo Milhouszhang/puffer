@@ -77,6 +77,7 @@ test("skip flag does not bypass provider login when auth is empty", async ({ pag
   });
   await daemon.open(page);
 
+  await page.getByRole("button", { name: /Next/ }).click();
   await expect(page.getByRole("heading", { name: "Popular providers" })).toBeVisible();
   await expect(page.getByRole("button", { name: "New agent in puffer" })).toHaveCount(0);
 });
@@ -174,6 +175,7 @@ test("skip flag does not bypass provider login with only non-agent auth", async 
   });
   await daemon.open(page);
 
+  await page.getByRole("button", { name: /Next/ }).click();
   await expect(page.getByRole("heading", { name: "Popular providers" })).toBeVisible();
   await expect(page.getByText("Workspace is ready")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "New agent in puffer" })).toHaveCount(0);

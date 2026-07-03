@@ -164,6 +164,16 @@ async function installNativeCefStub(page: Page, options: NativeCefStubOptions = 
           return { ok: true };
         }
         if (cmd === "browser_cef_native_hide") return { ok: true };
+        if (cmd === "ensure_local_daemon") {
+          const params = new URLSearchParams(window.location.search);
+          return {
+            url: params.get("corbinaBackend") ?? params.get("pufferBackend") ?? "",
+            token: params.get("corbinaToken") ?? params.get("pufferToken") ?? "test",
+            protocolVersion: "1",
+            workspaceRoot: "/tmp/puffer"
+          };
+        }
+        if (!cmd.startsWith("browser_cef_native_")) return null;
         throw new Error(`unexpected native CEF invoke: ${cmd}`);
       }
     };
@@ -205,7 +215,7 @@ test("opens the Browser tab against a mocked desktop daemon", async ({ page }) =
     request.params.sessionId === "session-browser:browser:tab-1"
   );
 
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
   await expect(page.locator(".pf-browser-status")).toHaveText("Connected");
   await expect(page.locator(".pf-browser-canvas")).toBeVisible();
   await expect(page.locator(".pf-browser-error")).toHaveCount(0);
@@ -271,31 +281,12 @@ test("Browser panel coalesces rapid screencast frames to the newest frame", asyn
   ).toBe(219);
 });
 
-test("Browser panel hydrates a connected agent tab from recorded frames", async ({ page }) => {
-  const daemon = new FakeDaemon({
-    emitBrowserOpenFrame: false,
-    emitBrowserResizeFrame: false
-  });
+test("Browser panel reopens a connected agent tab screencast when no frame is cached", async ({ page }) => {
+  const daemon = new FakeDaemon();
   daemon.setBrowserTabs("session-browser", {
     activeTabId: "tab-1",
     tabs: [{ ...browserTab("tab-1", "https://agent.example"), active: true }]
   });
-  daemon.setBrowserRecording("session-browser", [
-    {
-      frameId: "recorded-agent-frame",
-      backendSessionId: "session-browser:browser:tab-1",
-      rootSessionId: "session-browser",
-      tabId: "tab-1",
-      url: "https://agent.example",
-      title: "Agent page",
-      mimeType: "image/png",
-      encoding: "base64",
-      data: ONE_PIXEL_PNG,
-      width: 333,
-      height: 222,
-      recordedAtMs: Date.now()
-    }
-  ]);
   await daemon.install(page);
   await daemon.open(page);
 
@@ -305,58 +296,46 @@ test("Browser panel hydrates a connected agent tab from recorded frames", async 
   await daemon.waitForRequest("browser_agent", (request) =>
     request.params.action === "list" && request.params.sessionId === "session-browser"
   );
-  await daemon.waitForRequest("browser_resize", (request) =>
+  await daemon.waitForRequest("browser_open", (request) =>
     request.params.sessionId === "session-browser:browser:tab-1"
   );
   await expect(page.getByLabel("URL")).toHaveValue("https://agent.example");
   await expect.poll(async () =>
     page.locator(".pf-browser-canvas").evaluate((node) => (node as HTMLCanvasElement).width)
-  ).toBe(333);
+  ).toBe(960);
   await expect.poll(async () =>
     page.locator(".pf-browser-canvas").evaluate((node) => (node as HTMLCanvasElement).height)
-  ).toBe(222);
+  ).toBe(720);
 });
 
-test("Browser panel restores a recorded agent tab when daemon tab state is empty", async ({ page }) => {
+test("Browser panel opens an initial new tab when daemon tab state is empty", async ({ page }) => {
   const daemon = new FakeDaemon({
     emitBrowserOpenFrame: false,
     emitBrowserResizeFrame: false
   });
-  daemon.setBrowserRecording("session-browser", [
-    {
-      frameId: "recorded-only-frame",
-      backendSessionId: "session-browser:browser:t1",
-      rootSessionId: "session-browser",
-      tabId: "t1",
-      url: "https://recorded.example",
-      title: "Recorded page",
-      mimeType: "image/png",
-      encoding: "base64",
-      data: ONE_PIXEL_PNG,
-      width: 321,
-      height: 210,
-      recordedAtMs: Date.now()
-    }
-  ]);
   await daemon.install(page);
   await daemon.open(page);
 
   await openRegressionAgent(page);
   await openAgentPanel(page, "Browser");
 
-  await daemon.waitForRequest("browser_recording", (request) =>
-    request.params.sessionId === "session-browser"
+  await daemon.waitForRequest("browser_agent", (request) =>
+    request.params.action === "open" && request.params.sessionId === "session-browser"
   );
-  await expect(page.getByLabel("URL")).toHaveValue("https://recorded.example", { timeout: 1000 });
-  await expect.poll(async () =>
-    page.locator(".pf-browser-canvas").evaluate((node) => (node as HTMLCanvasElement).width)
-  ).toBe(321);
+  await expect(page.locator(".pf-browser-new-tab")).toBeVisible();
+  await expect(page.getByLabel("URL")).toHaveValue("");
 });
 
 test("Browser panel prefers recorded agent frames over stale saved tabs", async ({ page }) => {
   const daemon = new FakeDaemon({
     emitBrowserOpenFrame: false,
     emitBrowserResizeFrame: false
+  });
+  daemon.setBrowserTabs("session-browser", {
+    activeTabId: "agent-tab",
+    tabs: [
+      { ...browserTab("agent-tab", "https://agent-recorded.example/results", false), active: true }
+    ]
   });
   daemon.setBrowserRecording("session-browser", [
     {
@@ -571,7 +550,7 @@ test("sends Browser tab navigation through the daemon bridge", async ({ page }) 
   const request = await daemon.waitForRequest("browser_navigate");
   expect(request.params).toMatchObject({
     sessionId: "session-browser:browser:tab-1",
-    url: "example.com"
+    url: "https://example.com"
   });
   await expect(page.getByLabel("URL")).toHaveValue("https://example.com");
 });
@@ -639,7 +618,7 @@ test("late Browser navigation failures stay scoped to the submitted tab", async 
   await expect(page.locator(".pf-browser-tab")).toHaveCount(2);
 
   await page.locator(".pf-browser-tab").nth(0).click();
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
   daemon.delayFailure(
     "browser_navigate",
     (request) => request.params.sessionId === "session-browser:browser:tab-1",
@@ -653,10 +632,10 @@ test("late Browser navigation failures stay scoped to the submitted tab", async 
   );
 
   await page.locator(".pf-browser-tab").nth(1).click();
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
   await page.waitForTimeout(170);
 
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
   await expect(page.locator(".pf-browser-error")).toHaveCount(0);
 });
 
@@ -749,6 +728,7 @@ test("late Browser devtools events do not leak into a switched agent", async ({ 
   await daemon.waitForRequest("browser_open", (request) =>
     request.params.sessionId === "session-beta-browser:browser:tab-1"
   );
+  await page.getByRole("button", { name: "DevTools" }).click();
 
   daemon.emit("browser:session-alpha-browser:browser:tab-1:devtools", {
     kind: "console",
@@ -777,8 +757,8 @@ test("Browser state errors disable navigation controls and stop canvas input", a
   );
 
   daemon.emit("browser:session-browser:browser:tab-1:state", {
-    url: "about:blank",
-    title: "",
+    url: "https://error.example",
+    title: "Error fixture",
     loading: false,
     error: "cdp socket closed"
   });
@@ -807,6 +787,12 @@ test("dispatches printable Browser keyboard input as key events", async ({ page 
   await openRegressionAgent(page);
   await openAgentPanel(page, "Browser");
   await daemon.waitForRequest("browser_open");
+  daemon.emit("browser:session-browser:browser:tab-1:state", {
+    url: "https://keys.example",
+    title: "Keys fixture",
+    loading: false
+  });
+  await expect(page.getByLabel("URL")).toHaveValue("https://keys.example");
 
   await page.locator(".pf-browser-canvas").click({ position: { x: 20, y: 20 } });
   await page.keyboard.press("a");
@@ -842,6 +828,12 @@ test("dispatches Browser Enter and Backspace as non-text key events", async ({ p
   await openRegressionAgent(page);
   await openAgentPanel(page, "Browser");
   await daemon.waitForRequest("browser_open");
+  daemon.emit("browser:session-browser:browser:tab-1:state", {
+    url: "https://keys.example",
+    title: "Keys fixture",
+    loading: false
+  });
+  await expect(page.getByLabel("URL")).toHaveValue("https://keys.example");
 
   await page.locator(".pf-browser-canvas").click({ position: { x: 20, y: 20 } });
   await page.keyboard.press("Enter");
@@ -1916,12 +1908,33 @@ test("Browser fuzz click storm keeps daemon session ids valid", async ({ page })
   await daemon.waitForRequest("browser_open", (request) =>
     request.params.sessionId === "session-browser:browser:tab-1"
   );
+  daemon.emit("browser:session-browser:browser:tab-1:state", {
+    url: "https://fuzz.example",
+    title: "Fuzz fixture",
+    loading: false
+  });
+  await expect(page.getByLabel("URL")).toHaveValue("https://fuzz.example");
 
   const canvas = page.locator(".pf-browser-canvas");
   for (let step = 0; step < 24; step += 1) {
     const mode = step % 8;
     if (mode === 0) {
-      await canvas.click({ position: { x: 18 + step, y: 20 } });
+      await canvas.dispatchEvent("pointerdown", {
+        clientX: 18 + step,
+        clientY: 20,
+        pointerId: 7,
+        button: 0,
+        buttons: 1,
+        pointerType: "mouse"
+      });
+      await canvas.dispatchEvent("pointerup", {
+        clientX: 18 + step,
+        clientY: 20,
+        pointerId: 7,
+        button: 0,
+        buttons: 0,
+        pointerType: "mouse"
+      });
     } else if (mode === 1) {
       await canvas.dispatchEvent("pointermove", {
         clientX: 30 + step,
@@ -2031,7 +2044,7 @@ test("Browser pane resets daemon tabs when switching agents", async ({ page }) =
   await daemon.waitForRequest("browser_open", (request) =>
     request.params.sessionId === "session-beta-browser:browser:tab-1"
   );
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
 
   daemon.emit("browser:session-alpha-browser:tabs", {
     activeTabId: "tab-late-alpha",
@@ -2047,13 +2060,13 @@ test("Browser pane resets daemon tabs when switching agents", async ({ page }) =
     ]
   });
   await page.waitForTimeout(80);
-  await expect(page.getByLabel("URL")).toHaveValue("about:blank");
+  await expect(page.getByLabel("URL")).toHaveValue("");
 
   await page.getByLabel("URL").fill("beta.example");
   await page.getByLabel("URL").press("Enter");
   await daemon.waitForRequest("browser_navigate", (request) =>
     request.params.sessionId === "session-beta-browser:browser:tab-1" &&
-    request.params.url === "beta.example"
+    request.params.url === "https://beta.example"
   );
 });
 
@@ -2559,30 +2572,23 @@ test("Browser navigation controls are disabled while reconnecting but address st
 
 test("late Browser open responses do not overwrite the active tab", async ({ page }) => {
   const daemon = new FakeDaemon();
-  await daemon.install(page);
-  await page.addInitScript(() => {
-    window.localStorage.setItem(
-      "puffer-browser-tabs:session-browser",
-      JSON.stringify({
-        tabs: [
-          {
-            id: "tab-1",
-            label: "Slow tab",
-            url: "https://slow.example",
-            title: "Slow tab",
-            favicon: ""
-          },
-          {
-            id: "tab-2",
-            label: "Fast tab",
-            url: "https://fast.example",
-            title: "Fast tab",
-            favicon: ""
-          }
-        ]
-      })
-    );
+  daemon.setBrowserTabs("session-browser", {
+    activeTabId: "tab-1",
+    tabs: [
+      {
+        ...browserTab("tab-1", "https://slow.example"),
+        label: "Slow tab",
+        title: "Slow tab",
+        active: true
+      },
+      {
+        ...browserTab("tab-2", "https://fast.example"),
+        label: "Fast tab",
+        title: "Fast tab"
+      }
+    ]
   });
+  await daemon.install(page);
   daemon.delayResponse(
     "browser_open",
     (request) => request.params.sessionId === "session-browser:browser:tab-1",

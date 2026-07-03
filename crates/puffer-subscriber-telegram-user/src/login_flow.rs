@@ -10,22 +10,18 @@
 
 use serde_json::{json, Value};
 
+/// User-facing error shown when a bounded login network call times out.
+/// Rendered verbatim by the desktop client, so keep it friendly and free
+/// of internal detail. Shared by [`describe`] and the QR error paths.
+pub const TELEGRAM_UNREACHABLE_MESSAGE: &str =
+    "Couldn't reach Telegram. Check your internet connection and try again.";
+
 /// Login flow phase. `C` = login-code token, `P` = 2FA password token.
 pub enum LoginPhase<C, P> {
     Idle,
-    CodeSent {
-        token: C,
-        requested_at_ms: u64,
-    },
-    PasswordPending {
-        token: P,
-        hint: Option<String>,
-    },
-    QrPending {
-        dc_id: i32,
-        expires_at: i32,
-        refreshes: u8,
-    },
+    CodeSent { token: C, requested_at_ms: u64 },
+    PasswordPending { token: P, hint: Option<String> },
+    QrPending { dc_id: i32, refreshes: u8 },
     Authorized,
 }
 
@@ -363,11 +359,7 @@ fn describe<P>(err: ErrClass<P>) -> (&'static str, bool, String) {
             "Telegram requested an auth restart".into(),
         ),
         ErrClass::Transport(text) => ("transport", true, text),
-        ErrClass::Timeout => (
-            "network_timeout",
-            true,
-            "Couldn't reach Telegram. Check your internet connection and try again.".into(),
-        ),
+        ErrClass::Timeout => ("network_timeout", true, TELEGRAM_UNREACHABLE_MESSAGE.into()),
         ErrClass::Fatal(text) => ("failed", false, text),
     }
 }
@@ -376,7 +368,6 @@ fn describe<P>(err: ErrClass<P>) -> (&'static str, bool, String) {
 mod tests {
     use super::*;
 
-    // Migrated from login.rs::tests (those get deleted in Task 3).
     #[test]
     fn transport_errors_classify_as_transport() {
         for text in [

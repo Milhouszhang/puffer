@@ -22,8 +22,8 @@ use crate::login_flow::{
 };
 use crate::state::{default_init_params, resolve_api_credentials, PersistedCredentials, SkillEnv};
 
-pub type LivePhase = LoginPhase<LoginToken, PasswordToken>;
-pub type LiveErr = ErrClass<PasswordToken>;
+pub(crate) type LivePhase = LoginPhase<LoginToken, PasswordToken>;
+pub(crate) type LiveErr = ErrClass<PasswordToken>;
 
 /// Bound on every MTProto round-trip in the login flow. Without it an
 /// unreachable/half-dead Telegram connection blocks the sequential command
@@ -110,14 +110,14 @@ fn user_data(user: &grammers_client::types::User) -> AuthorizedUser {
 
 /// Owns the login flow for one subscriber: the grammers client handle, the
 /// explicit phase, and the cross-phase credentials (preserved across failed
-/// attempts, like the old `clear_tokens()` did).
+/// attempts so a retry can reuse them without re-sending them).
 pub struct LoginSession {
-    pub env: SkillEnv,
-    pub client: Option<Client>,
-    pub phase: LivePhase,
-    pub api_id: Option<i32>,
-    pub api_hash: Option<String>,
-    pub phone: Option<String>,
+    pub(crate) env: SkillEnv,
+    pub(crate) client: Option<Client>,
+    pub(crate) phase: LivePhase,
+    pub(crate) api_id: Option<i32>,
+    pub(crate) api_hash: Option<String>,
+    pub(crate) phone: Option<String>,
 }
 
 impl LoginSession {
@@ -238,12 +238,14 @@ impl LoginSession {
             return self.emit_one(login_flow::wrong_phase_error("submit_code", name));
         };
         let Some(client) = self.client.clone() else {
+            // Defensive: `CodeSent` implies a client. If the invariant broke,
+            // the token was already consumed by the phase reset above, so the
+            // only recovery is restarting the login flow.
             return self.emit_one(login_flow::wrong_phase_error("submit_code", "no_client"));
         };
 
         let mut result = bounded_sign_in(&client, &token, &code).await;
-        // Reconnect-once on transport failure (absorbs the old
-        // submit_code_with_reconnect): a clean disconnect between
+        // Reconnect-once on transport failure: a clean disconnect between
         // request_login_code and submit is common after idle minutes.
         if matches!(result, Err(ErrClass::Transport(_))) {
             match self.reconnect_login_client().await {
@@ -273,6 +275,9 @@ impl LoginSession {
             return self.emit_one(login_flow::wrong_phase_error("submit_password", name));
         };
         let Some(client) = self.client.clone() else {
+            // Defensive: `PasswordPending` implies a client. If the invariant
+            // broke, the token was already consumed by the phase reset above,
+            // so the only recovery is restarting the login flow.
             return self.emit_one(login_flow::wrong_phase_error(
                 "submit_password",
                 "no_client",

@@ -29,7 +29,7 @@ mod history_cache;
 mod import;
 mod logging;
 mod login;
-pub mod login_flow;
+mod login_flow;
 mod notifications;
 mod outbound;
 mod peer_cache;
@@ -49,7 +49,7 @@ pub use crate::history_cache::{TelegramHistoryCache, TelegramHistoryContextMessa
 /// directly (see `puffer-cli`'s `connect` subcommand). The internal
 /// `login` and `state` modules stay private so unrelated helpers
 /// (`PersistedCredentials`, `default_init_params`, …) don't leak.
-pub use crate::login::{LivePhase, LoginSession};
+pub use crate::login::LoginSession;
 pub use crate::peer_cache::{
     hydrate_contact_book_cache, hydrate_recent_dialog_peer_cache, RecentDialogPeerCacheHydration,
 };

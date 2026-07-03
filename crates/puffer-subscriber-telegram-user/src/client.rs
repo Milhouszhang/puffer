@@ -177,7 +177,11 @@ pub async fn run() -> anyhow::Result<()> {
                             session.client = Some(recovered);
                             session.phase = LoginPhase::Authorized;
                         }
-                        OfflineResumeAttempt::AuthRequired => {}
+                        OfflineResumeAttempt::AuthRequired => {
+                            // `login_required` was just emitted: restart the
+                            // promoted-session watermark from this moment.
+                            login_required_since = SystemTime::now();
+                        }
                         OfflineResumeAttempt::StillOffline(next_state) => {
                             offline_state = Some(next_state);
                         }
@@ -906,7 +910,6 @@ async fn handle_login_command(
 }
 
 /// Which of the six login commands a runtime command was, for outcome mapping.
-#[derive(Clone, Copy, PartialEq)]
 enum LoginCommandKind {
     Start,
     QrStart,
@@ -1350,11 +1353,90 @@ fn import_payload(outcome: &TdataImportOutcome) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_offline_retry_delay, session_file_changed_since, startup_monitoring_boundary,
-        verify_failure_login_error, VerifyFailure, OFFLINE_RESUME_RETRY_INITIAL_DELAY,
+        next_offline_retry_delay, runtime_login_outcome, session_file_changed_since,
+        startup_monitoring_boundary, verify_failure_login_error, LoginCommandKind,
+        RuntimeCommandOutcome, VerifyFailure, OFFLINE_RESUME_RETRY_INITIAL_DELAY,
         OFFLINE_RESUME_RETRY_MAX_DELAY,
     };
+    use crate::login::LoginSession;
+    use crate::login_flow::LoginPhase;
+    use crate::state::SkillEnv;
     use std::time::Duration;
+
+    fn session_with_phase(
+        temp: &tempfile::TempDir,
+        phase: crate::login::LivePhase,
+    ) -> LoginSession {
+        let mut session = LoginSession::new(SkillEnv {
+            state_dir: temp.path().to_path_buf(),
+            session_path: temp.path().join("telegram.session"),
+            topic: "telegram-user".to_string(),
+            workspace_config_dir: None,
+            live_session_path: None,
+        });
+        session.phase = phase;
+        session
+    }
+
+    /// Pins the post-`handle_login_command` outcome mapping to the per-arm
+    /// behavior the command loops had before `LoginSession` (QR completion
+    /// replaces the client, QR 2FA starts reauth, wrong-phase rejects and
+    /// pending states continue). `CodeSent`/`PasswordPending` phases carry
+    /// grammers tokens that cannot be constructed in tests; their arms are
+    /// covered by the login_flow transition table instead.
+    #[test]
+    fn runtime_login_outcome_maps_phase_transitions() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let authorized = session_with_phase(&temp, LoginPhase::Authorized);
+        // QR flow completed within this call: the session client was replaced.
+        assert!(matches!(
+            runtime_login_outcome(LoginCommandKind::QrWait, "qr_pending", &authorized),
+            RuntimeCommandOutcome::ClientReplaced
+        ));
+        // Wrong-phase reject in `wait` leaves an authorized phase untouched.
+        assert!(matches!(
+            runtime_login_outcome(LoginCommandKind::QrWait, "authorized", &authorized),
+            RuntimeCommandOutcome::Continue
+        ));
+        // Successful tdata import always replaces the client.
+        assert!(matches!(
+            runtime_login_outcome(LoginCommandKind::Import, "authorized", &authorized),
+            RuntimeCommandOutcome::ClientReplaced
+        ));
+
+        let qr_pending = session_with_phase(
+            &temp,
+            LoginPhase::QrPending {
+                dc_id: 2,
+                refreshes: 0,
+            },
+        );
+        // QR token emitted, waiting for approval: stay in the current loop.
+        assert!(matches!(
+            runtime_login_outcome(LoginCommandKind::QrStart, "authorized", &qr_pending),
+            RuntimeCommandOutcome::Continue
+        ));
+
+        let idle = session_with_phase(&temp, LoginPhase::Idle);
+        // Failed login start / import keeps the update loop running.
+        assert!(matches!(
+            runtime_login_outcome(LoginCommandKind::Start, "authorized", &idle),
+            RuntimeCommandOutcome::Continue
+        ));
+        assert!(matches!(
+            runtime_login_outcome(LoginCommandKind::Import, "authorized", &idle),
+            RuntimeCommandOutcome::Continue
+        ));
+        assert!(matches!(
+            runtime_login_outcome(LoginCommandKind::SubmitCode, "code_sent", &idle),
+            RuntimeCommandOutcome::Continue
+        ));
+        assert!(matches!(
+            runtime_login_outcome(LoginCommandKind::SubmitPassword, "password_pending", &idle),
+            RuntimeCommandOutcome::Continue
+        ));
+    }
 
     #[test]
     fn session_file_changed_since_detects_promotion() {

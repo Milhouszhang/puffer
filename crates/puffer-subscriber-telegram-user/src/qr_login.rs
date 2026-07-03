@@ -21,17 +21,12 @@ use tracing::{info, warn};
 
 use crate::events::emit_control;
 use crate::login::{self, LiveErr, LoginSession, LOGIN_NETWORK_TIMEOUT};
-use crate::login_flow::{self, ErrClass, LoginPhase};
+use crate::login_flow::{self, ErrClass, LoginPhase, TELEGRAM_UNREACHABLE_MESSAGE};
 use crate::state::{default_init_params, resolve_api_credentials, PersistedCredentials, SkillEnv};
 
 const DEFAULT_QR_WAIT_SECONDS: u64 = 120;
 const DEFAULT_DC_ID: i32 = 2;
 
-/// User-facing error emitted when a QR-login network call times out. The
-/// desktop client renders `payload.error` verbatim, so keep it friendly and
-/// free of internal detail.
-const QR_UNREACHABLE_MESSAGE: &str =
-    "Couldn't reach Telegram. Check your internet connection and try again.";
 const MAX_QR_MIGRATIONS: usize = 4;
 const MAX_QR_IMPORT_TOKEN_REFRESHES: usize = 2;
 
@@ -42,8 +37,9 @@ fn emit_control_spec(
     emit_control(&session.env.topic, spec.kind, spec.payload)
 }
 
-/// Terminal QR failure: drop the attempt (client + phase) like the old
-/// `QrLoginState` teardown did, then emit the error event.
+/// Terminal QR failure: tear down the in-flight attempt entirely (client +
+/// phase) so no later command can act on a half-dead connection, then emit
+/// the error event.
 fn fail(session: &mut LoginSession, event: login_flow::ControlEventSpec) -> anyhow::Result<()> {
     session.client = None;
     session.phase = LoginPhase::Idle;
@@ -53,7 +49,7 @@ fn fail(session: &mut LoginSession, event: login_flow::ControlEventSpec) -> anyh
 /// Renders a classified bounded-call failure for QR error payloads.
 fn qr_err_text(err: LiveErr) -> String {
     match err {
-        ErrClass::Timeout => QR_UNREACHABLE_MESSAGE.to_string(),
+        ErrClass::Timeout => TELEGRAM_UNREACHABLE_MESSAGE.to_string(),
         ErrClass::Transport(text) | ErrClass::Fatal(text) => text,
         ErrClass::AuthRestart => "Telegram requested an auth restart".to_string(),
         _ => "QR login failed".to_string(),
@@ -124,6 +120,12 @@ pub async fn start(
         }
     };
 
+    // While the phase is `QrPending`, this handle is the (unauthenticated)
+    // QR-attempt client. A runtime re-login therefore repoints the session's
+    // client away from the previously authorized handle until the QR flow
+    // completes or fails; business commands routed through the session are
+    // rejected by Telegram during that window. Accepted: re-login normally
+    // happens because the old authorization is already broken.
     session.client = Some(client);
     handle_login_token(session, DEFAULT_DC_ID, 0, token).await
 }
@@ -236,7 +238,6 @@ async fn handle_login_token(
                 emit_qr_token(&session.env, &login_token, None)?;
                 session.phase = LoginPhase::QrPending {
                     dc_id,
-                    expires_at: login_token.expires,
                     refreshes: refreshes as u8,
                 };
                 return Ok(());
@@ -290,7 +291,7 @@ async fn handle_login_token(
                                 "qr_migrate_timeout",
                                 "qr_failed",
                                 false,
-                                QR_UNREACHABLE_MESSAGE.to_string(),
+                                TELEGRAM_UNREACHABLE_MESSAGE.to_string(),
                             ),
                         );
                     }
@@ -320,7 +321,6 @@ async fn handle_login_token(
                                     )?;
                                     session.phase = LoginPhase::QrPending {
                                         dc_id,
-                                        expires_at: login_token.expires,
                                         refreshes: refreshes as u8,
                                     };
                                     return Ok(());

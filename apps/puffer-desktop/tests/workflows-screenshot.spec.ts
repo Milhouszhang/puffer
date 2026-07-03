@@ -40,7 +40,8 @@ test("workflows detail screenshot (json editor open)", async ({ page }) => {
 
   await openWorkflowDetail(page);
   await page.waitForTimeout(300);
-  await page.getByRole("tab", { name: "JSON" }).click();
+  // The JSON editor tab became a collapsible Configuration JSON section.
+  await page.getByText("Configuration JSON").click();
   await page.waitForTimeout(300);
   await page.screenshot({ path: "test-results/workflows-detail-json.png", fullPage: true });
 });

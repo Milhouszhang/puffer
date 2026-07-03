@@ -156,6 +156,22 @@ class StrictSubscriptionDaemon {
           sessions: [this.session()]
         }]));
         return;
+      case "list_grouped_sessions_page":
+        socket.send(responseFrame(message.id, {
+          groups: [{
+            folderId: "/tmp/puffer",
+            folderLabel: "puffer",
+            folderPath: "/tmp/puffer",
+            sessionCount: 1,
+            sessions: [this.session()]
+          }],
+          offset: 0,
+          limit: 30,
+          returnedSessions: 1,
+          totalSessions: 1,
+          hasMore: false
+        }));
+        return;
       case "load_session_detail":
         socket.send(responseFrame(message.id, {
           session: this.session(),
@@ -272,7 +288,7 @@ test("browser state errors leave the address bar editable", async ({ page }) => 
   await expect(address).toHaveValue("https://recovered.example.test");
 });
 
-test("stale recording frames for unknown tabs do not steal input focus", async ({ page }) => {
+test("recording frames for unknown tabs adopt the recorded tab and route input to it", async ({ page }) => {
   const daemon = new FakeDaemon();
   await openBrowserPane(page, daemon);
 
@@ -291,12 +307,14 @@ test("stale recording frames for unknown tabs do not steal input focus", async (
     recordedAtMs: Date.now() - 60_000
   });
 
-  await expect(page.locator(".pf-browser-tab.active")).toContainText("New tab");
-  await expect(page.getByLabel("URL")).toHaveValue("");
+  // Live recording events for unknown tabs adopt the recorded tab (issue
+  // #649), so it becomes active and canvas input routes to its session.
+  await expect(page.locator(".pf-browser-tab.active")).toContainText("Stale recording tab");
+  await expect(page.getByLabel("URL")).toHaveValue("https://stale-recording.example.test");
   await page.locator(".pf-browser-canvas").click();
   await page.keyboard.type("abc123");
   await daemon.waitForRequest("browser_input", (request) =>
-    request.params.sessionId === "session-browser:browser:tab-1"
+    request.params.sessionId === "session-browser:browser:tab-stale"
   );
 });
 
@@ -441,7 +459,7 @@ test("workspace turn completion clears active running state before transcript re
   await expect(composer).toBeEnabled();
 });
 
-test("stop disables pending permission approval controls", async ({ page }) => {
+test("stop clears pending permission approval controls", async ({ page }) => {
   const daemon = new FakeDaemon();
   daemon.delayResponse("cancel_turn", () => true, 800);
   await daemon.install(page);
@@ -460,12 +478,14 @@ test("stop disables pending permission approval controls", async ({ page }) => {
     summary: "Run rm -rf /tmp/nope",
     reason: "Needs shell access"
   });
-  const allowOnce = page.getByRole("button", { name: "Allow once" });
+  const allowOnce = page.getByRole("button", { name: "Approve once" });
   await expect(allowOnce).toBeEnabled();
 
+  // Stopping the turn now settles it and clears its pending approval prompt
+  // instead of disabling the controls in place.
   await page.getByRole("button", { name: "Stop turn" }).click();
   await daemon.waitForRequest("cancel_turn");
-  await expect(allowOnce).toBeDisabled();
+  await expect(allowOnce).toHaveCount(0);
 });
 
 test("file save success preserves edits typed while save is in flight", async ({ page }) => {
@@ -506,7 +526,7 @@ test("settings provider credential success stays in provider settings", async ({
   await daemon.open(page, { allowUnauthenticatedWorkspace: true });
   await openProviderSettings(page);
 
-  const openAiCard = page.locator(".provider-card").filter({ hasText: "OpenAI" });
+  const openAiCard = page.locator(".provider-card").filter({ has: page.getByRole("heading", { name: "OpenAI", exact: true }) });
   await openAiCard.getByRole("button", { name: "Add connect", exact: true }).click();
   const openAiModal = page.getByRole("dialog", { name: "Connect OpenAI" });
   await openAiModal.getByLabel("API key for OpenAI").fill("sk-openai-longhunt");
@@ -515,7 +535,7 @@ test("settings provider credential success stays in provider settings", async ({
   await expect(page.getByRole("heading", { name: "Providers", exact: true })).toBeVisible();
   await expect(openAiModal).toHaveCount(0);
 
-  const anthropicCard = page.locator(".provider-card").filter({ hasText: "Anthropic" });
+  const anthropicCard = page.locator(".provider-card").filter({ has: page.getByRole("heading", { name: "Anthropic", exact: true }) });
   await anthropicCard.getByRole("button", { name: "Add connect" }).click();
   await page.getByRole("dialog", { name: "Connect Anthropic" }).getByRole("button", { name: /Use credentials from/ }).click();
   await daemon.waitForRequest("import_external_credential", (request) => request.params.providerId === "anthropic");
@@ -583,12 +603,12 @@ test("in-flight permission responses stay disabled across session round trips", 
     summary: "Run duplicate-sensitive command",
     reason: "Needs one approval only."
   });
-  await page.getByRole("button", { name: "Allow once" }).click();
+  await page.getByRole("button", { name: "Approve once" }).click();
   await daemon.waitForRequest("resolve_permission");
 
   await page.getByRole("button", { name: /Permission roundtrip B/ }).first().click();
   await page.getByRole("button", { name: /Permission roundtrip A/ }).first().click();
-  await expect(page.getByRole("button", { name: "Allow once" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Approve once" })).toBeDisabled();
   await page.waitForTimeout(80);
   expect(daemon.requests.filter((request) => request.method === "resolve_permission")).toHaveLength(1);
 });
@@ -724,6 +744,13 @@ test("submitted prompt survives reload while turn start is pending", async ({ pa
 test("browser Ctrl+L releases the remote Control modifier", async ({ page }) => {
   const daemon = new FakeDaemon();
   await openBrowserPane(page, daemon);
+  // Clear the new-tab overlay so the canvas can receive pointer input.
+  daemon.emit("browser:session-browser:browser:tab-1:state", {
+    url: "https://ctrl-l.example",
+    title: "Ctrl+L fixture",
+    loading: false
+  });
+  await expect(page.getByLabel("URL")).toHaveValue("https://ctrl-l.example");
 
   await page.locator(".pf-browser-canvas").click();
   const before = daemon.requests.length;
@@ -754,8 +781,13 @@ test("pending credential import disables default model save", async ({ page }) =
   await daemon.open(page, { allowUnauthenticatedWorkspace: true });
   await openProviderSettings(page);
 
-  const anthropicCard = page.locator(".provider-card").filter({ hasText: "Anthropic" });
-  await anthropicCard.getByRole("button", { name: /Use credentials from/ }).click();
+  // Saved-credential imports moved into the provider connect modal.
+  const anthropicCard = page.locator(".provider-card").filter({ has: page.getByRole("heading", { name: "Anthropic", exact: true }) });
+  await anthropicCard.getByRole("button", { name: "Add connect" }).click();
+  await page
+    .getByRole("dialog", { name: "Connect Anthropic" })
+    .getByRole("button", { name: /Use credentials from/ })
+    .click();
   await daemon.waitForRequest("import_external_credential");
   await expect(page.getByRole("button", { name: "Save default" })).toBeDisabled();
 });

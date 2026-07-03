@@ -864,11 +864,18 @@ struct ExternalResourceRoot {
 /// lets later entries override earlier ones on name collision.
 fn external_resource_roots(
     paths: &ConfigPaths,
-    _diagnostics: &mut Vec<String>,
+    diagnostics: &mut Vec<String>,
 ) -> Vec<ExternalResourceRoot> {
     let mut roots = Vec::new();
     if let Some(home) = paths.user_config_dir.parent() {
         let claude = home.join(".claude");
+        for plugin_root in crate::plugin_manifest::installed_plugin_roots(&claude, diagnostics) {
+            roots.push(ExternalResourceRoot {
+                skills_dir: plugin_root.join("skills"),
+                commands_dir: plugin_root.join("commands"),
+                kind: SourceKind::User,
+            });
+        }
         roots.push(ExternalResourceRoot {
             skills_dir: claude.join("skills"),
             commands_dir: claude.join("commands"),
@@ -1991,6 +1998,60 @@ media:
             "unreferenced cache files must not produce diagnostics: {:?}",
             loaded.diagnostics
         );
+    }
+
+    #[test]
+    fn installed_plugin_skills_load_from_manifest_roots_only() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let home = temp.path().join("home");
+
+        let live = home.join(".claude/plugins/cache/market/ecc/2.0.0");
+        fs::create_dir_all(live.join("skills/rust-review")).unwrap();
+        fs::write(
+            live.join("skills/rust-review/SKILL.md"),
+            "---\nname: rust-review\ndescription: Review Rust code\n---\nBody\n",
+        )
+        .unwrap();
+        fs::create_dir_all(live.join("commands")).unwrap();
+        fs::write(
+            live.join("commands/ecc-review.md"),
+            "---\ndescription: Run the ecc review\n---\nReview.\n",
+        )
+        .unwrap();
+
+        // Stale cached version not referenced by the manifest.
+        let stale = home.join(".claude/plugins/cache/market/ecc/2.0.0-rc.1");
+        fs::create_dir_all(stale.join("skills/stale-skill")).unwrap();
+        fs::write(
+            stale.join("skills/stale-skill/SKILL.md"),
+            "---\nname: stale-skill\ndescription: Old version\n---\nBody\n",
+        )
+        .unwrap();
+
+        let manifest = serde_json::json!({
+            "version": 2,
+            "plugins": { "ecc@market": [{ "scope": "user", "installPath": live }] }
+        });
+        fs::write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            manifest.to_string(),
+        )
+        .unwrap();
+
+        let paths = ConfigPaths {
+            workspace_root: root.clone(),
+            workspace_config_dir: root.join(".puffer"),
+            user_config_dir: home.join(".puffer"),
+            builtin_resources_dir: root.join("resources"),
+        };
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+
+        let plugin_skill =
+            skill_by_name(&loaded, "rust-review").expect("manifest plugin skill imports");
+        assert_eq!(plugin_skill.source_info.kind, SourceKind::User);
+        assert!(skill_by_name(&loaded, "ecc-review").is_some());
+        assert!(skill_by_name(&loaded, "stale-skill").is_none());
     }
 
     #[test]

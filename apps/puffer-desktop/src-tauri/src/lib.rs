@@ -1,3 +1,4 @@
+mod agentenv_auth;
 mod backend;
 mod badge;
 mod browser;
@@ -43,6 +44,7 @@ const REGISTERED_TAURI_COMMANDS: &[&str] = &[
     "merge_pull_request",
     "load_settings_snapshot",
     "login_with_oauth",
+    "login_with_agentenv",
     "login_with_api_key",
     "logout_provider",
     "list_external_credentials",
@@ -200,6 +202,12 @@ fn login_with_oauth(
         "login_with_oauth",
         json!({ "providerId": provider_id }),
     )
+}
+
+#[tauri::command]
+fn login_with_agentenv(app: AppHandle, state: State<'_, SharedBackend>) -> Result<Value, String> {
+    agentenv_auth::login_with_agentenv().map_err(|error| error.to_string())?;
+    backend_call(app, state, "load_settings_snapshot", json!({}))
 }
 
 #[tauri::command]
@@ -575,6 +583,7 @@ pub fn run() {
             merge_pull_request,
             load_settings_snapshot,
             login_with_oauth,
+            login_with_agentenv,
             login_with_api_key,
             logout_provider,
             list_external_credentials,

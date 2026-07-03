@@ -880,6 +880,21 @@ export async function loginWithOauth(
   });
 }
 
+export async function loginWithAgentEnv(): Promise<SettingsSnapshot> {
+  if (canReachDaemon()) {
+    const client = await ensureLocalDaemonClient();
+    return client.request<BackendSettingsSnapshot>(
+      "login_with_agentenv",
+      {},
+      { timeoutMs: 180_000 }
+    );
+  }
+  if (!canInvokeTauri()) {
+    return mockSettingsSnapshot;
+  }
+  return invoke<BackendSettingsSnapshot>("login_with_agentenv");
+}
+
 export async function loginWithApiKey(
   providerId: string,
   apiKey: string,

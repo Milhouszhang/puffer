@@ -4419,6 +4419,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "puffer-automation"
+version = "0.1.0"
+dependencies = [
+ "puffer-subscriptions",
+ "puffer-workflow",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "puffer-cli"
 version = "0.1.0"
 dependencies = [
@@ -4434,6 +4448,7 @@ dependencies = [
  "libc",
  "notify",
  "portable-pty",
+ "puffer-automation",
  "puffer-config",
  "puffer-connector-core",
  "puffer-connector-discord",

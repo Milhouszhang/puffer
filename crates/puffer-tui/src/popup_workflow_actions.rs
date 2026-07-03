@@ -153,6 +153,7 @@ fn workflow_action_type(action: &ActionSpec) -> &'static str {
         ActionSpec::FileAppend { .. } => "file_append",
         ActionSpec::ForwardMessage { .. } => "forward_message",
         ActionSpec::RunWorkflow { .. } => "run_workflow",
+        ActionSpec::RunAutomation { .. } => "run_automation",
         ActionSpec::ConnectorAct { .. } => "connector_act",
         ActionSpec::ToolCall { .. } => "tool_call",
         ActionSpec::TriageAgent { .. } => "triage_agent",
@@ -171,6 +172,7 @@ fn workflow_action_target(action: &ActionSpec) -> String {
             format!("platform={platform} target={target}")
         }
         ActionSpec::RunWorkflow { workflow_id } => format!("workflow={workflow_id}"),
+        ActionSpec::RunAutomation { automation_id } => format!("automation={automation_id}"),
         ActionSpec::ConnectorAct {
             connector_slug,
             action,

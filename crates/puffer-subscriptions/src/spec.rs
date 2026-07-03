@@ -80,7 +80,7 @@ pub enum WorkflowBindingStatus {
 }
 
 /// Puffer-side filter syntax.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum FilterSpec {
     /// Tagged filter form, for explicit regex or Puffer path expressions.
@@ -90,7 +90,7 @@ pub enum FilterSpec {
 }
 
 /// Explicit filter variants.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaggedFilterSpec {
     /// Matches event text using Rust regex syntax.
@@ -162,6 +162,14 @@ pub enum ActionSpec {
         /// backwards compatibility with existing binding payloads.
         #[serde(rename = "slug")]
         workflow_id: String,
+    },
+    /// Trigger a Puffer Automation by its product-level Automation id.
+    ///
+    /// The Automation runner compiles and owns any internal AgentEnv workflow
+    /// artifacts; this action must not expose those runtime ids.
+    RunAutomation {
+        /// Stable Puffer Automation id.
+        automation_id: String,
     },
     /// Invoke a connector action.
     ConnectorAct {
@@ -358,6 +366,9 @@ fn validate_action(action: &ActionSpec) -> Result<(), String> {
             }
         }
         ActionSpec::RunWorkflow { workflow_id } => validate_runtime_workflow_id(workflow_id)?,
+        ActionSpec::RunAutomation { automation_id } => {
+            validate_slug("run_automation.automation_id", automation_id)?
+        }
         ActionSpec::ConnectorAct {
             connector_slug,
             action,
@@ -845,6 +856,26 @@ mod tests {
         let error = validate_action_spec(&action).unwrap_err();
 
         assert!(error.contains("AgentEnv workflow runtime id"));
+    }
+
+    #[test]
+    fn run_automation_accepts_puffer_automation_ids() {
+        let action = ActionSpec::RunAutomation {
+            automation_id: "reply-helper".into(),
+        };
+
+        validate_action_spec(&action).unwrap();
+    }
+
+    #[test]
+    fn run_automation_rejects_runtime_workflow_ids() {
+        let action = ActionSpec::RunAutomation {
+            automation_id: "Wf_01HX.Runtime:123".into(),
+        };
+
+        let error = validate_action_spec(&action).unwrap_err();
+
+        assert!(error.contains("kebab-case"));
     }
 
     #[test]

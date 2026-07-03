@@ -1140,6 +1140,7 @@ fn action_label(action: &ActionSpec) -> &'static str {
         ActionSpec::FileAppend { .. } => "file_append",
         ActionSpec::ForwardMessage { .. } => "forward_message",
         ActionSpec::RunWorkflow { .. } => "run_workflow",
+        ActionSpec::RunAutomation { .. } => "run_automation",
         ActionSpec::ConnectorAct { .. } => "connector_act",
         ActionSpec::ToolCall { .. } => "tool_call",
         ActionSpec::TriageAgent { .. } => "triage_agent",

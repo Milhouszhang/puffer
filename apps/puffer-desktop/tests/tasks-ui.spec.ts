@@ -115,7 +115,11 @@ test("tasks list lazily renders large snapshots", async ({ page }) => {
   const list = page.getByLabel("Task list");
   await expect(list.locator(".pf-task-row")).toHaveCount(40);
   await expect(list).not.toContainText("Lazy task 64");
-  await list.getByRole("button", { name: "Load 25 more tasks" }).click();
+  // The button removes itself once the batch loads, so a regular click can
+  // land yet fail Playwright's post-click hit-target check on a slow runner,
+  // then retry against a detached node forever. Dispatch the event directly:
+  // this spec guards lazy rendering, not pointer physics.
+  await list.getByRole("button", { name: "Load 25 more tasks" }).dispatchEvent("click");
   await expect(list.locator(".pf-task-row")).toHaveCount(65);
   await expect(list).toContainText("Lazy task 64");
 });

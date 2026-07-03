@@ -34,7 +34,7 @@ use puffer_config::ConfigPaths;
 use puffer_subscriber_email::{save_email_config, EmailConfig};
 use puffer_subscriber_runtime::Event;
 use puffer_subscriber_telegram_user::{qr_start, qr_wait, LoginSession, SkillEnv};
-use puffer_subscriptions::{ConnectionRecord, ConnectionStore};
+use puffer_subscriptions::{ConnectionRecord, ConnectionState, ConnectionStore};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -340,6 +340,17 @@ fn register_connection(
     let store = ConnectionStore::load(&path).with_context(|| format!("load {}", path.display()))?;
     if let Some(existing) = store.get(slug) {
         if existing.connector_slug == connector_slug {
+            // Re-login: a fresh authorization supersedes any Degraded /
+            // AuthRequired state left from the previous session (#752).
+            store
+                .update(slug, |record| {
+                    if record.state != ConnectionState::Disabled {
+                        record.state = ConnectionState::Authenticated;
+                    }
+                    record.health = None;
+                    record.auth_failure_notified = false;
+                })
+                .with_context(|| format!("reset connection `{slug}` in {}", path.display()))?;
             return Ok(());
         }
         anyhow::bail!(
@@ -460,6 +471,34 @@ mod tests {
             }
             other => panic!("unexpected action: {other:?}"),
         }
+    }
+
+    #[test]
+    fn reregister_resets_degraded_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        register_telegram_connection(&paths, "telegram-user").unwrap();
+        let store = ConnectionStore::load(&connections_store_path(&paths)).unwrap();
+        store
+            .update("telegram-user", |record| {
+                record.state = puffer_subscriptions::ConnectionState::Degraded;
+                record.auth_failure_notified = true;
+            })
+            .unwrap();
+
+        // Re-login re-registers the same slug: the record must be reset.
+        register_telegram_connection(&paths, "telegram-user").unwrap();
+
+        let record = ConnectionStore::load(&connections_store_path(&paths))
+            .unwrap()
+            .get("telegram-user")
+            .unwrap();
+        assert_eq!(
+            record.state,
+            puffer_subscriptions::ConnectionState::Authenticated
+        );
+        assert!(record.health.is_none());
+        assert!(!record.auth_failure_notified);
     }
 
     fn paths(root: &std::path::Path) -> ConfigPaths {

@@ -138,6 +138,9 @@ pub async fn run() -> anyhow::Result<()> {
     // command stream still have a single owner.
     let mut offline_state: Option<OfflineResumeState> = None;
     let mut recovered_offline_since_ms: Option<i64> = None;
+    // Watermark for detecting a session promoted by an external `puffer
+    // connect` login while we are parked in the login phase (#752).
+    let mut login_required_since = SystemTime::now();
     match try_resume_session(&env).await? {
         SessionResume::Resumed(c) => {
             emit_control(&env.topic, "ready", json!({ "resumed": true }))?;
@@ -146,6 +149,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
         SessionResume::AuthRequired => {
             emit_control(&env.topic, "login_required", json!({}))?;
+            login_required_since = SystemTime::now();
         }
         SessionResume::Transient(detail) => {
             let state = OfflineResumeState::new(detail);
@@ -225,6 +229,28 @@ pub async fn run() -> anyhow::Result<()> {
                 // deliberately do NOT trigger a resume retry; the retry timer
                 // is owned by this state machine.
                 let offline = offline_state.is_some();
+                // An external `puffer connect` login may have promoted a fresh
+                // session while we were parked here (#752). Adopt it instead
+                // of answering a stale ok:false forever.
+                if !offline {
+                    if let Some(mtime) =
+                        session_file_changed_since(&env.session_path, login_required_since)
+                    {
+                        // Advance the watermark first: if this resume fails
+                        // (file invalid), don't re-dial on every probe tick.
+                        login_required_since = mtime;
+                        if let SessionResume::Resumed(resumed) = try_resume_session(&env).await? {
+                            emit_control(
+                                &env.topic,
+                                "auth_ok",
+                                json!({ "ok": true, "authenticated": true, "offline": false }),
+                            )?;
+                            session.client = Some(resumed);
+                            session.phase = LoginPhase::Authorized;
+                            continue; // exits the login loop; update loop emits `ready`
+                        }
+                    }
+                }
                 emit_control(
                     &env.topic,
                     "auth_ok",
@@ -806,6 +832,14 @@ async fn abort_startup_hydration(
     let _ = hydration.await;
 }
 
+/// Detects an externally promoted session: `puffer connect` renames its
+/// staging file onto the live path after a successful login (#551), which
+/// carries an mtime newer than the moment we parked in the login phase.
+fn session_file_changed_since(path: &std::path::Path, since: SystemTime) -> Option<SystemTime> {
+    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    (mtime > since).then_some(mtime)
+}
+
 fn persist_live_session_state(env: &SkillEnv, client: &Client) {
     client.sync_update_state();
     if let Err(error) = client.session().save_to_file(&env.session_path) {
@@ -1316,10 +1350,30 @@ fn import_payload(outcome: &TdataImportOutcome) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_offline_retry_delay, startup_monitoring_boundary, verify_failure_login_error,
-        VerifyFailure, OFFLINE_RESUME_RETRY_INITIAL_DELAY, OFFLINE_RESUME_RETRY_MAX_DELAY,
+        next_offline_retry_delay, session_file_changed_since, startup_monitoring_boundary,
+        verify_failure_login_error, VerifyFailure, OFFLINE_RESUME_RETRY_INITIAL_DELAY,
+        OFFLINE_RESUME_RETRY_MAX_DELAY,
     };
     use std::time::Duration;
+
+    #[test]
+    fn session_file_changed_since_detects_promotion() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("telegram.session");
+        let before = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+
+        assert!(
+            session_file_changed_since(&path, before).is_none(),
+            "missing file"
+        );
+
+        std::fs::write(&path, b"session").unwrap();
+        let mtime = session_file_changed_since(&path, before).expect("newer file detected");
+        assert!(
+            session_file_changed_since(&path, mtime).is_none(),
+            "not newer than its own mtime"
+        );
+    }
 
     #[test]
     fn verify_failure_message_distinguishes_network_from_rejection() {

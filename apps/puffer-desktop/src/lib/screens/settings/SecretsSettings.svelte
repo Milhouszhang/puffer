@@ -26,6 +26,7 @@
     origin: ""
   });
   let saving = $state(false);
+  let showAddForm = $state(false);
   // Shared "an import is running" marker, also used for the .1pux button via the
   // `__1pux__` sentinel so only one import runs at a time.
   let importingSource = $state<string | null>(null);
@@ -130,6 +131,17 @@
     visibleSecretCount = Math.min(visibleSecretCount + SECRET_PAGE_SIZE, filteredSecrets.length);
   }
 
+  function openAddForm() {
+    showAddForm = true;
+    error = null;
+    saved = null;
+  }
+
+  function cancelAddForm() {
+    showAddForm = false;
+    form = { label: "", description: "", value: "", username: "", origin: "" };
+  }
+
   async function saveStoredSecret() {
     const label = form.label.trim();
     if (disabled || !label || !form.value) return;
@@ -146,6 +158,7 @@
       });
       form = { label: "", description: "", value: "", username: "", origin: "" };
       saved = `Saved ${label}`;
+      showAddForm = false;
       props.onRefresh();
     } catch (e) {
       error = (e as Error).message ?? String(e);
@@ -184,6 +197,7 @@
       if (errors.length > 0) {
         error = errors.join("; ");
       }
+      showAddForm = false;
       props.onRefresh();
     } catch (e) {
       error = (e as Error).message ?? String(e);
@@ -221,6 +235,7 @@
         skipped ? `, skipped ${skipped}` : ""
       }.`;
       if (errors.length > 0) error = errors.join("; ");
+      showAddForm = false;
       props.onRefresh();
     } catch (e) {
       error = (e as Error).message ?? String(e);
@@ -243,7 +258,7 @@
   <div class="pf-settings-note">Preview mode - launch Puffer in the desktop app to edit secrets.</div>
 {/if}
 
-<div class="pf-settings-row pf-secret-stacked">
+<div class="pf-settings-row">
   <div class="meta">
     <div class="label">Secret store</div>
     <div class="desc">Encrypted JSON with a platform-held key.</div>
@@ -254,6 +269,7 @@
   </div>
 </div>
 
+{#if showAddForm}
 <div class="pf-settings-row pf-secret-stacked">
   <div class="meta">
     <div class="label">Add secret</div>
@@ -323,6 +339,16 @@
     </div>
     <div class="pf-secrets-actions">
       <button
+        type="button"
+        class="sc-btn"
+        data-variant="outline"
+        data-size="sm"
+        disabled={saving}
+        onclick={cancelAddForm}
+      >
+        Cancel
+      </button>
+      <button
         type="submit"
         class="sc-btn"
         data-variant="default"
@@ -369,7 +395,7 @@
     </div>
   </form>
 </div>
-
+{:else}
 <div class="pf-secret-list-toolbar">
   <label class="pf-secret-search">
     <Icon name="search" size={13} />
@@ -390,13 +416,16 @@
       </button>
     {/if}
   </label>
-  <div class="pf-secret-result-count">
-    {#if searchTerms.length > 0}
-      Showing {filteredSecrets.length} of {secrets.length}
-    {:else}
-      {secrets.length} stored secret{secrets.length === 1 ? "" : "s"}
-    {/if}
-  </div>
+  <button
+    type="button"
+    class="sc-btn"
+    data-variant="default"
+    data-size="sm"
+    disabled={disabled}
+    onclick={openAddForm}
+  >
+    <Icon name="plus" size={12} />Add secret
+  </button>
 </div>
 
 <div class="pf-mcp-list">
@@ -443,40 +472,45 @@
     <div class="pf-empty">No secrets match "{searchQuery.trim()}".</div>
   {/if}
 </div>
+{/if}
 
 <style>
   .pf-secret-stacked {
     grid-template-columns: minmax(0, 1fr);
     align-items: stretch;
     gap: 12px;
+    border-bottom: 0;
   }
 
-  .pf-secret-stacked .pf-path-list {
+  .pf-path-list {
+    justify-self: end;
     display: flex;
     flex-direction: column;
     gap: 4px;
     font-family: var(--font-mono);
     font-size: 11.5px;
     color: var(--muted-foreground);
+    text-align: right;
+    max-width: 340px;
     min-width: 0;
   }
 
-  .pf-secret-stacked .pf-path-label {
-    display: inline-block;
-    min-width: 48px;
+  .pf-path-label {
+    color: var(--muted-foreground);
+    display: block;
     text-transform: uppercase;
     letter-spacing: 0.06em;
     font-size: 10px;
     font-family: var(--font-sans);
   }
 
-  .pf-secret-stacked .pf-path-value {
+  .pf-path-value {
     color: var(--foreground);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     display: inline-block;
-    max-width: calc(100% - 56px);
+    max-width: 100%;
     vertical-align: bottom;
   }
 
@@ -597,13 +631,6 @@
     color: var(--foreground);
   }
 
-  .pf-secret-result-count {
-    flex: 0 0 auto;
-    color: var(--muted-foreground);
-    font-size: 12px;
-    white-space: nowrap;
-  }
-
   .pf-secret-card {
     grid-template-columns: 32px minmax(0, 1fr) minmax(84px, 160px) auto;
   }
@@ -669,10 +696,6 @@
     .pf-secret-search {
       max-width: none;
       width: 100%;
-    }
-
-    .pf-secret-result-count {
-      white-space: normal;
     }
 
     .pf-secret-card {

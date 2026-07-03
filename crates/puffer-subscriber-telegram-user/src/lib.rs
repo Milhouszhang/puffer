@@ -49,9 +49,7 @@ pub use crate::history_cache::{TelegramHistoryCache, TelegramHistoryContextMessa
 /// directly (see `puffer-cli`'s `connect` subcommand). The internal
 /// `login` and `state` modules stay private so unrelated helpers
 /// (`PersistedCredentials`, `default_init_params`, …) don't leak.
-pub use crate::login::{
-    submit_code as login_submit_code, submit_password as login_submit_password, CodeSubmitOutcome,
-};
+pub use crate::login::{LivePhase, LoginSession};
 pub use crate::peer_cache::{
     hydrate_contact_book_cache, hydrate_recent_dialog_peer_cache, RecentDialogPeerCacheHydration,
 };
@@ -59,7 +57,7 @@ pub use crate::qr_login::{
     start as qr_login_start, wait as qr_login_wait, QrLoginOutcome, QrLoginState,
 };
 pub use crate::state::{
-    default_init_params, resolve_api_credentials, LoginState, PersistedCredentials, SkillEnv,
+    default_init_params, resolve_api_credentials, PersistedCredentials, SkillEnv,
 };
 
 /// Re-export of the underlying `grammers_client::Client`. Public so
@@ -67,7 +65,3 @@ pub use crate::state::{
 /// successive command calls without depending on `grammers-client`
 /// themselves.
 pub use grammers_client::{Client, Config};
-
-/// Starts a Telegram login attempt. Renamed re-export of
-/// `login::start` to avoid the bare `start` symbol leaking through.
-pub use crate::login::start as login_start;

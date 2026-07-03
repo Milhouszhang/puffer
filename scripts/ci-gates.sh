@@ -8,10 +8,11 @@
 #   scripts/ci-gates.sh          # all gates (~5 min, bounded by root nextest)
 #   scripts/ci-gates.sh --quick  # compile + lint gates only, skip test suites
 #
-# The three lanes are independent build graphs, so they genuinely overlap:
+# The four lanes are independent build graphs, so they genuinely overlap:
 #   A: root workspace    — fmt, clippy, nextest, doc tests
 #   B: src-tauri         — fmt, clippy, nextest   (separate Cargo workspace)
 #   C: desktop frontend  — svelte-check, node tests
+#   D: desktop UI        — full Playwright suite (skipped in --quick)
 # Within a lane, cargo steps stay sequential (they share the target/ lock).
 set -u
 
@@ -52,9 +53,20 @@ lane_frontend() {
   npm run test:provider-visuals || return 1
 }
 
-lane_root     > "$LOGDIR/root.log"     2>&1 & PID_ROOT=$!
-lane_tauri    > "$LOGDIR/tauri.log"    2>&1 & PID_TAURI=$!
-lane_frontend > "$LOGDIR/frontend.log" 2>&1 & PID_FRONTEND=$!
+# Full Playwright UI suite (~2 min). Playwright manages its own vite webServer
+# (reuses a dev server already on 1420). pipefail so a pipeline can never mask
+# playwright's exit code.
+lane_desktop_ui() {
+  set -o pipefail
+  [ "$QUICK" = 1 ] && return 0
+  cd apps/puffer-desktop || return 1
+  npx playwright test || return 1
+}
+
+lane_root       > "$LOGDIR/root.log"       2>&1 & PID_ROOT=$!
+lane_tauri      > "$LOGDIR/tauri.log"      2>&1 & PID_TAURI=$!
+lane_frontend   > "$LOGDIR/frontend.log"   2>&1 & PID_FRONTEND=$!
+lane_desktop_ui > "$LOGDIR/desktop-ui.log" 2>&1 & PID_DESKTOP_UI=$!
 
 FAILED=0
 report() { # name pid logfile
@@ -70,6 +82,7 @@ report() { # name pid logfile
 report "root workspace (fmt + clippy + tests)" "$PID_ROOT" "$LOGDIR/root.log"
 report "src-tauri (fmt + clippy + tests)"      "$PID_TAURI" "$LOGDIR/tauri.log"
 report "desktop frontend (svelte-check + node tests)" "$PID_FRONTEND" "$LOGDIR/frontend.log"
+report "desktop UI (playwright suite)"         "$PID_DESKTOP_UI" "$LOGDIR/desktop-ui.log"
 
 if [ "$FAILED" = 0 ]; then
   echo "All CI gates green. Full logs: $LOGDIR"

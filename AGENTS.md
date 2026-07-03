@@ -235,3 +235,23 @@ Conventions:
   or `npm run test:desktop-visual` (visual) passes.
 - Keep `tests/visual/` out of GitHub CI and run it on macOS only: screenshot
   baselines are macOS-generated and diverge on the ubuntu CI runners.
+
+Spec-rot rules (distilled from the 2026-07 sweep that revived 86 dead specs):
+
+- No pixel or computed-style assertions (heights, radii, rgb colors) in
+  functional specs — they die on every restyle. Assert roles, labels, and
+  structural attributes; visual intent belongs in `tests/visual/`.
+- Match cards/rows by exact accessible heading, not `hasText` substrings: the
+  Custom provider card's "OpenAI-compatible" copy silently redirected six
+  specs to the wrong dialog for weeks.
+- No DOM-identity probes (tagging nodes and asserting the tag survives) —
+  row keying/grouping is an implementation detail that legitimately changes.
+  Assert user-visible invariants instead (one row per message, no duplicates).
+- Any `__TAURI_INTERNALS__` stub must answer `ensure_local_daemon` with the
+  FakeDaemon handshake — Tauri-mode startup resolves its daemon through that
+  invoke, and a throwing stub hangs every spec at the sidebar.
+- Mock daemons should reject unknown RPC methods loudly (the
+  StrictSubscriptionDaemon pattern), never answer with silent empties — a new
+  daemon method then fails the suite the day it ships instead of rotting.
+- Never pipe a test run through `tail`/`head` without `set -o pipefail`: the
+  pipeline's exit code masked 77 failures as a green run once already.

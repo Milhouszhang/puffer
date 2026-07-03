@@ -429,8 +429,13 @@ test("New browser tab ignores repeated clicks while open is in flight", async ({
 
   await page.waitForTimeout(50);
 
+  // The pane now auto-opens tab-1 through browser_agent open on startup, so
+  // count only the user-initiated tab-2 open.
   const opens = daemon.requests.filter(
-    (request) => request.method === "browser_agent" && request.params.action === "open"
+    (request) =>
+      request.method === "browser_agent" &&
+      request.params.action === "open" &&
+      request.params.tabId === "tab-2"
   );
   expect(opens).toHaveLength(1);
   await expect(addTab).toBeDisabled();

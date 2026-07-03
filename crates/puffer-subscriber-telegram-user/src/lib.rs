@@ -29,6 +29,7 @@ mod history_cache;
 mod import;
 mod logging;
 mod login;
+pub mod login_flow;
 mod notifications;
 mod outbound;
 mod peer_cache;

@@ -1,6 +1,5 @@
 export type ScreenId =
   | "workspace"
-  | "workflows"
   | "automation"
   | "tasks"
   | "settings"
@@ -60,10 +59,9 @@ export function loadTweaks(): Tweaks {
 }
 
 function normalizeScreen(value: unknown): ScreenId {
-  if (value === "pipelines") return "workflows";
+  if (value === "pipelines" || value === "workflows") return "automation";
   if (value === "telegram-relationships") return "contacts";
   return value === "workspace" ||
-    value === "workflows" ||
     value === "automation" ||
     value === "tasks" ||
     value === "settings" ||

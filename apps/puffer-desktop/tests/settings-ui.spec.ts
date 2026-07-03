@@ -17,9 +17,9 @@ async function openProviderSetup(page: Page, providerName: string) {
   return page.getByRole("dialog", { name: `Connect ${displayName}` });
 }
 
-async function openWorkflowBackendSettings(page: Page) {
+async function openAutomationRuntimeSettings(page: Page) {
   await page.getByRole("button", { name: "Settings" }).click();
-  await page.locator(".pf-settings-nav").getByRole("button", { name: "Workflows" }).click();
+  await page.locator(".pf-settings-nav").getByRole("button", { name: "Automation Runtime" }).click();
   return page.locator(".pf-settings-pane");
 }
 
@@ -186,6 +186,111 @@ test("web preview falls back to workspace daemon handshake when dev default is u
   await expect(pane.locator(".pf-settings-row").filter({ hasText: "Daemon" })).toContainText(
     "ws://127.0.0.1:17779/ws"
   );
+});
+
+test("settings exposes automation runtime configuration", async ({ page }) => {
+  const daemon = new FakeDaemon();
+  await daemon.install(page);
+  await daemon.open(page, { allowUnauthenticatedWorkspace: true });
+
+  const pane = await openAutomationRuntimeSettings(page);
+  await expect(pane.getByRole("heading", { name: "Automation Runtime" })).toBeVisible();
+  await expect(pane.getByRole("radiogroup", { name: "Automation runtime mode" })).toBeVisible();
+  await expect(pane.getByText("Workflow", { exact: true })).toHaveCount(0);
+  await expect(pane.getByText("Local runtime", { exact: true })).toBeVisible();
+});
+
+test("automation runtime settings switch between Local and Cloud defaults", async ({ page }) => {
+  const daemon = new FakeDaemon();
+  await daemon.install(page);
+  await daemon.open(page);
+
+  const pane = await openAutomationRuntimeSettings(page);
+
+  await expect(pane.getByRole("radio", { name: /Run locally/ })).toBeChecked();
+  await expect(pane.getByLabel("API URL")).toHaveCount(0);
+  await expect(pane.getByLabel("Workspace ID")).toHaveCount(0);
+  await expect(pane.getByLabel("API Token")).toHaveCount(0);
+  await expect(pane.getByText("Managed")).toBeVisible();
+
+  await pane.getByRole("radio", { name: /Run on AgentEnv Cloud/ }).check();
+  await expect(pane.getByLabel("API URL")).toHaveValue("https://api.agentenv.io");
+  await expect(pane.getByLabel("Automation Console URL")).toHaveValue("https://agentenv.io");
+  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
+});
+
+test("automation runtime settings save token and show masked configured state", async ({ page }) => {
+  const daemon = new FakeDaemon();
+  await daemon.install(page);
+  await daemon.open(page);
+
+  const pane = await openAutomationRuntimeSettings(page);
+  await pane.getByRole("radio", { name: /Run on AgentEnv Cloud/ }).check();
+  await pane.getByLabel("Workspace ID").fill("workspace-cloud");
+  await pane.getByLabel("API Token").fill("cloud-secret-token");
+  await pane.getByRole("button", { name: "Save" }).click();
+
+  const save = await daemon.waitForRequest("workflow_backend_save_config");
+  expect(save.params).toMatchObject({
+    mode: "agent_env_cloud",
+    apiUrl: "https://api.agentenv.io",
+    uiUrl: "https://agentenv.io",
+    workspaceId: "workspace-cloud",
+    apiToken: "cloud-secret-token"
+  });
+  await expect(pane.getByLabel("API Token")).toHaveValue("");
+  await expect(pane.locator(".pf-workflow-backend-token .pf-status-pill")).toContainText("Configured");
+  await expect(pane.getByText("Automation runtime settings saved. API token is configured.")).toBeVisible();
+  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
+});
+
+test("automation runtime settings test connection success", async ({ page }) => {
+  const daemon = new FakeDaemon();
+  await daemon.install(page);
+  await daemon.open(page);
+
+  const pane = await openAutomationRuntimeSettings(page);
+  await pane.getByRole("button", { name: "Test Connection" }).click();
+
+  const save = await daemon.waitForRequest("workflow_backend_save_config");
+  expect(save.params).toMatchObject({
+    mode: "local",
+    apiUrl: "http://127.0.0.1:3000",
+    uiUrl: "http://localhost:5173",
+    workspaceId: "",
+    apiToken: null
+  });
+  await daemon.waitForRequest("workflow_backend_test_connection");
+  await expect(pane.getByLabel("Automation runtime connection result")).toContainText("Connection succeeded.");
+  await expect(pane.getByLabel("API Token")).toHaveCount(0);
+  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
+});
+
+test("automation runtime settings test connection failure", async ({ page }) => {
+  const daemon = new FakeDaemon();
+  daemon.setWorkflowBackendConnection({
+    success: false,
+    runtime: { state: "passed", message: "Automation runtime API is reachable." },
+    auth: {
+      state: "failed",
+      message: "invalid token",
+      error: { kind: "invalid_token", message: "invalid token", statusCode: 401 }
+    },
+    workspace: { state: "skipped", message: "Skipped because authentication did not pass." }
+  });
+  await daemon.install(page);
+  await daemon.open(page);
+
+  const pane = await openAutomationRuntimeSettings(page);
+  await pane.getByRole("radio", { name: /Run on AgentEnv Cloud/ }).check();
+  await pane.getByLabel("API Token").fill("bad-token");
+  await pane.getByRole("button", { name: "Test Connection" }).click();
+
+  await daemon.waitForRequest("workflow_backend_test_connection");
+  await expect(pane.getByLabel("Automation runtime connection result")).toContainText("Unable to connect to automation runtime.");
+  await expect(pane.getByLabel("Automation runtime connection result")).toContainText("invalid token");
+  await expect(pane.getByLabel("API Token")).toHaveValue("");
+  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
 });
 
 test("default model cannot be saved before provider models load", async ({ page }) => {
@@ -1922,89 +2027,16 @@ test("MCP settings do not reload-loop when no servers are configured", async ({ 
   expect(daemon.requests.filter((request) => request.method === "list_mcp_servers")).toHaveLength(1);
 });
 
-test("workflow settings switch between Local and Cloud defaults", async ({ page }) => {
+test("settings does not expose legacy Workflows runtime labels", async ({ page }) => {
   const daemon = new FakeDaemon();
   await daemon.install(page);
   await daemon.open(page);
 
-  const pane = await openWorkflowBackendSettings(page);
-
-  await expect(pane.getByRole("radio", { name: /Run locally/ })).toBeChecked();
-  await expect(pane.getByLabel("API URL")).toHaveValue("http://127.0.0.1:3000");
-  await expect(pane.getByLabel("Workflow Console URL")).toHaveValue("http://localhost:5173");
-
-  await pane.getByRole("radio", { name: /Run on AgentEnv Cloud/ }).check();
-  await expect(pane.getByLabel("API URL")).toHaveValue("https://api.agentenv.io");
-  await expect(pane.getByLabel("Workflow Console URL")).toHaveValue("https://agentenv.io");
-  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
-});
-
-test("workflow settings save token and show masked configured state", async ({ page }) => {
-  const daemon = new FakeDaemon();
-  await daemon.install(page);
-  await daemon.open(page);
-
-  const pane = await openWorkflowBackendSettings(page);
-  await pane.getByLabel("Workspace ID").fill("workspace-local");
-  await pane.getByLabel("API Token").fill("local-secret-token");
-  await pane.getByRole("button", { name: "Save" }).click();
-
-  const save = await daemon.waitForRequest("workflow_backend_save_config");
-  expect(save.params).toMatchObject({
-    mode: "local",
-    apiUrl: "http://127.0.0.1:3000",
-    uiUrl: "http://localhost:5173",
-    workspaceId: "workspace-local",
-    apiToken: "local-secret-token"
-  });
-  await expect(pane.getByLabel("API Token")).toHaveValue("");
-  await expect(pane.locator(".pf-workflow-backend-token .pf-status-pill")).toContainText("Configured");
-  await expect(pane.getByText("Workflow settings saved. API token is configured.")).toBeVisible();
-  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
-});
-
-test("workflow settings test connection success", async ({ page }) => {
-  const daemon = new FakeDaemon();
-  await daemon.install(page);
-  await daemon.open(page);
-
-  const pane = await openWorkflowBackendSettings(page);
-  await pane.getByLabel("Workspace ID").fill("workspace-local");
-  await pane.getByLabel("API Token").fill("local-secret-token");
-  await pane.getByRole("button", { name: "Test Connection" }).click();
-
-  await daemon.waitForRequest("workflow_backend_save_config");
-  await daemon.waitForRequest("workflow_backend_test_connection");
-  await expect(pane.getByLabel("Workflow connection result")).toContainText("Connection succeeded.");
-  await expect(pane.getByLabel("Workflow connection result")).toContainText("Workflow runtime API is reachable.");
-  await expect(pane.getByLabel("API Token")).toHaveValue("");
-  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
-});
-
-test("workflow settings test connection failure", async ({ page }) => {
-  const daemon = new FakeDaemon();
-  daemon.setWorkflowBackendConnection({
-    success: false,
-    runtime: { state: "passed", message: "Workflow runtime API is reachable." },
-    auth: {
-      state: "failed",
-      message: "invalid token",
-      error: { kind: "invalid_token", message: "invalid token", statusCode: 401 }
-    },
-    workspace: { state: "skipped", message: "Skipped because authentication did not pass." }
-  });
-  await daemon.install(page);
-  await daemon.open(page);
-
-  const pane = await openWorkflowBackendSettings(page);
-  await pane.getByLabel("API Token").fill("bad-token");
-  await pane.getByRole("button", { name: "Test Connection" }).click();
-
-  await daemon.waitForRequest("workflow_backend_test_connection");
-  await expect(pane.getByLabel("Workflow connection result")).toContainText("Unable to connect to workflow runtime.");
-  await expect(pane.getByLabel("Workflow connection result")).toContainText("invalid token");
-  await expect(pane.getByLabel("API Token")).toHaveValue("");
-  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
+  await page.getByRole("button", { name: "Settings" }).click();
+  await expect(page.locator(".pf-settings-nav").getByRole("button", { name: "Workflows" })).toHaveCount(0);
+  await expect(page.getByLabel("Workflow Console URL")).toHaveCount(0);
+  await expect(page.locator(".pf-settings-nav").getByRole("button", { name: "Automation Runtime" })).toBeVisible();
+  expect(daemon.requests.some((request) => request.method.startsWith("workflow_backend_"))).toBe(false);
 });
 
 test("connector settings renders dynamic AskUserQuestion inputs", async ({ page }) => {

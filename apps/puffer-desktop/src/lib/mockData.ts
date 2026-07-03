@@ -692,14 +692,14 @@ export const mockSettingsSnapshot: SettingsSnapshot = {
       {
         mode: "local",
         label: "Run locally",
-        description: "Connects to a workflow runtime running on this device.",
+        description: "Connects to an automation runtime running on this device.",
         apiUrl: "http://127.0.0.1:3000",
         uiUrl: "http://localhost:5173"
       },
       {
         mode: "agent_env_cloud",
         label: "Run on AgentEnv Cloud",
-        description: "Sends required workflow data to AgentEnv Cloud for execution.",
+        description: "Sends required automation data to AgentEnv Cloud for execution.",
         apiUrl: "https://api.agentenv.io",
         uiUrl: "https://agentenv.io"
       }

@@ -1041,6 +1041,13 @@ fn health_from_control_event(envelope: &EventEnvelope) -> Option<ConnectionHealt
             updated_at_ms: envelope.received_at_ms,
             next_retry_at_ms: None,
         }),
+        "login_complete" => Some(ConnectionHealth {
+            status: ConnectionHealthStatus::Ok,
+            reason: Some("login_complete".into()),
+            detail: None,
+            updated_at_ms: envelope.received_at_ms,
+            next_retry_at_ms: None,
+        }),
         _ => None,
     }
 }

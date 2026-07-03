@@ -128,13 +128,49 @@ jobs:
         run: npm run check
 
       # Pure-node config/asset assertions (no browser). The Playwright UI
-      # suites are intentionally left out — they need browser binaries and a
-      # running app, which is a separate CI investment.
+      # suites run in the separate desktop-ui job.
       - name: Node tests
         run: |
           npm run test:tauri-config
           npm run test:sidebar-css
           npm run test:provider-visuals
+
+  desktop-ui:
+    name: Desktop UI (playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: apps/puffer-desktop
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: apps/puffer-desktop/.nvmrc
+          cache: npm
+          cache-dependency-path: apps/puffer-desktop/package-lock.json
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      # Full mocked-daemon UI suite (~2 min locally). Playwright starts its
+      # own vite webServer; specs run against FakeDaemon, no real backend.
+      # NOTE: if tests/visual/ gains macOS-only screenshot baselines, exclude
+      # it here (see AGENTS.md — visual baselines diverge on ubuntu runners).
+      - name: Playwright UI suite
+        run: npx playwright test
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-test-results
+          path: apps/puffer-desktop/test-results/
+          retention-days: 7
 
   desktop-backend:
     name: Desktop backend (test + clippy)

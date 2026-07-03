@@ -181,14 +181,13 @@ test("PLUS-121: review agents keep review state in the active sidebar", async ({
   await daemon.install(page);
   await daemon.open(page);
 
+  // The sidebar state filter was removed; the surviving contract is that each
+  // agent row still renders its activity state.
   const sidebar = page.locator(".pf-sidebar-agents");
   const reviewRow = sidebar.locator(".pf-sidebar-agent-row").filter({ hasText: "Review ready" });
   await expect(reviewRow.locator('.state[data-state="review"]')).toHaveText("review");
-
-  await sidebar.getByLabel("Filter by state").selectOption("review");
-  await expect(sidebar.locator(".pf-sidebar-label .count")).toHaveText("1");
-  await expect(sidebar.getByText("Review ready")).toBeVisible();
-  await expect(sidebar.getByText("Running build")).toHaveCount(0);
+  const runningRow = sidebar.locator(".pf-sidebar-agent-row").filter({ hasText: "Running build" });
+  await expect(runningRow.locator('.state[data-state="running"]')).toHaveText("running");
 });
 
 test("PLUS-121: collapsed active projects do not leak across same-name folders", async ({

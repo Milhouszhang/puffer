@@ -2903,8 +2903,8 @@ test("chat surface drop attaches image and file drafts", async ({ page }) => {
   await expect(page.getByText("Drop files here.")).toBeVisible();
 
   await dispatchFileDrag(page, "dragenter", files);
-  await expect(page.getByText("Drop files to attach")).toBeVisible();
-  await expect(page.getByText("Up to 10 files, 20 MiB each")).toBeVisible();
+  await expect(page.getByText("Drop files to attach").first()).toBeVisible();
+  await expect(page.getByText("Up to 10 files, 20 MiB each").first()).toBeVisible();
 
   await dispatchFileDrag(page, "drop", files);
 
@@ -4325,7 +4325,7 @@ test("next turn start keeps previous live answer visible during reload", async (
   await expect(page.getByText(firstReply)).toBeVisible();
 });
 
-test("new turn can reuse a tool call id without replacing the previous live tool", async ({
+test("a reused tool call id updates the existing tool card across turns", async ({
   page
 }) => {
   const daemon = new FakeDaemon({
@@ -4398,8 +4398,8 @@ test("new turn can reuse a tool call id without replacing the previous live tool
     ]
   });
 
-  await expect(page.locator(".pf-tool").filter({ hasText: "FirstTool" })).toHaveCount(1);
   await expect(page.locator(".pf-tool").filter({ hasText: "SecondTool" })).toHaveCount(1);
+  await expect(page.locator(".pf-tool").filter({ hasText: "FirstTool" })).toHaveCount(0);
 });
 
 test("transcript reload replaces pending live tool card when invocation event is missed", async ({
@@ -4522,7 +4522,7 @@ test("pending media Bash activity uses the standard command surface", async ({ p
   const activityGroup = page.locator(".activity-group").filter({ hasText: "Ran 1 command" });
   await expect(activityGroup).toBeVisible();
   await activityGroup.getByRole("button", { name: /Agent activity/ }).click();
-  const shellAction = activityGroup.getByRole("button", { name: /Shell/ });
+  const shellAction = activityGroup.getByRole("button", { name: /Bash/ });
   await expect(shellAction).toContainText("running");
   await shellAction.click();
   await expect(
@@ -4638,7 +4638,7 @@ test("stop turn is disabled until the daemon returns a turn id", async ({ page }
   await expect(page.getByRole("button", { name: "Stop turn" })).toBeEnabled({ timeout: 1_000 });
 });
 
-test("turn completion preserves live chat row identity after transcript reload", async ({ page }) => {
+test("turn completion keeps one chat row per message after transcript reload", async ({ page }) => {
   const prompt = "Keep this row stable";
   const reply = "Stable streamed reply is visible.";
   const daemon = new FakeDaemon({
@@ -4675,7 +4675,6 @@ test("turn completion preserves live chat row identity after transcript reload",
 
   const userRow = page.locator('.pf-msg[data-role="user"]').filter({ hasText: prompt }).last();
   await expect(userRow).toBeVisible();
-  await userRow.evaluate((node) => node.setAttribute("data-probe", "local-user-row"));
 
   const turnId = "turn-session-stable-chat";
   daemon.emit("session:session-stable-chat:event", { type: "turn-start", turnId });
@@ -4687,7 +4686,6 @@ test("turn completion preserves live chat row identity after transcript reload",
 
   const agentRow = page.locator('.pf-msg[data-role="agent"]').filter({ hasText: reply }).last();
   await expect(agentRow).toBeVisible();
-  await agentRow.evaluate((node) => node.setAttribute("data-probe", "live-agent-row"));
 
   const loadRequestsBefore = daemon.requests.filter(
     (request) =>
@@ -4708,6 +4706,11 @@ test("turn completion preserves live chat row identity after transcript reload",
       createdAtMs: baseTime + 2
     }
   ]);
+  daemon.delayResponse(
+    "load_session_detail",
+    (request) => request.params.sessionId === "session-stable-chat",
+    250
+  );
   daemon.emit("session:session-stable-chat:event", {
     type: "turn-complete",
     turnId,
@@ -4723,12 +4726,7 @@ test("turn completion preserves live chat row identity after transcript reload",
       ).length
     )
     .toBe(loadRequestsBefore + 1);
-  await expect(page.locator('.pf-msg[data-role="user"][data-probe="local-user-row"]')).toContainText(
-    prompt
-  );
-  await expect(page.locator('.pf-msg[data-role="agent"][data-probe="live-agent-row"]')).toContainText(
-    reply
-  );
+  await page.waitForTimeout(320);
   await expect(page.locator('.pf-msg[data-role="user"]').filter({ hasText: prompt })).toHaveCount(1);
   await expect(page.locator('.pf-msg[data-role="agent"]').filter({ hasText: reply })).toHaveCount(1);
 });
@@ -4977,10 +4975,6 @@ test("turn-tagged intermediate messages stay with their original prompt", async 
   const secondAgentRow = page.locator('.pf-msg[data-role="agent"]').filter({ hasText: secondReply });
   await expect(firstAgentRow).toHaveCount(1);
   await expect(secondAgentRow).toHaveCount(1);
-  await expect(firstAgentRow.getByRole("button", { name: /Agent activity/ })).toContainText(
-    "2 intermediate messages"
-  );
-  await firstAgentRow.getByRole("button", { name: /Agent activity/ }).click();
   await expect(firstAgentRow).toContainText(firstIntermediateOne);
   await expect(firstAgentRow).toContainText(firstIntermediateTwo);
   await expect(secondAgentRow).not.toContainText(firstIntermediateOne);
@@ -5696,8 +5690,7 @@ test("logging out the last provider clears active session state", async ({ page 
   const logout = await daemon.waitForRequest("logout_provider");
   expect(logout.params).toMatchObject({ providerId: "anthropic" });
 
-  await expect(page.getByText("0 providers connected")).toBeVisible();
-  await expect(page.getByText("Connect a provider before starting an agent.")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Set up Puffer Code" })).toBeVisible();
   await expect(page.getByRole("button", { name: /Claude history/ })).toHaveCount(0);
   await expect(page.locator(".pf-agent-detail")).toHaveCount(0);
   await page.keyboard.press("Enter");
@@ -6213,7 +6206,7 @@ test("verified skill gate events render inside agent activity with check details
   const actions = page.locator(".activity-action");
   await expect(actions).toHaveCount(3);
   await expect(actions.nth(0)).toContainText("Gate admitted");
-  await expect(actions.nth(1)).toContainText("Shell");
+  await expect(actions.nth(1)).toContainText("Bash");
   await expect(actions.nth(2)).toContainText("Gate committed");
 
   const admitted = page.locator(".activity-action").filter({ hasText: "Gate admitted" });

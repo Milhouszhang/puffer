@@ -510,7 +510,12 @@ function failure(id: number | string, error: string): string {
   return JSON.stringify({ type: "response", id, ok: false, error });
 }
 
-function browserTabInfo(tabId: string, url = "about:blank", active = true): JsonRecord {
+function browserTabInfo(
+  tabId: string,
+  url = "about:blank",
+  active = true,
+  rootSessionId = session.sessionId
+): JsonRecord {
   return {
     tabId,
     label: tabId === "tab-1" ? "New tab" : "Fixture tab",
@@ -519,7 +524,7 @@ function browserTabInfo(tabId: string, url = "about:blank", active = true): Json
     loading: false,
     connected: true,
     active,
-    backendSessionId: `${session.sessionId}:browser:${tabId}`,
+    backendSessionId: `${rootSessionId}:browser:${tabId}`,
     nativeCefSessionId: nativeCefSessionId(tabId),
     createdAtMs: now,
     updatedAtMs: Date.now()
@@ -3412,7 +3417,7 @@ export class FakeDaemon {
       const set = this.tabSet(sessionId);
       set.activeTabId = tabId;
       this.refreshActiveFlags(set);
-      return set.tabs.find((tab) => tab.tabId === tabId) ?? browserTabInfo(tabId);
+      return set.tabs.find((tab) => tab.tabId === tabId) ?? browserTabInfo(tabId, "about:blank", true, sessionId);
     }
     if (action === "close") {
       const tabId = String(params.tabId ?? "tab-1");
@@ -3428,7 +3433,7 @@ export class FakeDaemon {
         return set.tabs.find((tab) => tab.active === true) ?? set.tabs[0];
       }
       const tabId = typeof params.tabId === "string" ? params.tabId : `t${this.nextTab++}`;
-      return this.upsertTab(sessionId, browserTabInfo(tabId, String(params.url ?? "about:blank")));
+      return this.upsertTab(sessionId, browserTabInfo(tabId, String(params.url ?? "about:blank"), true, sessionId));
     }
     throw new Error(`Unhandled browser_agent action: ${action}`);
   }
@@ -3495,7 +3500,7 @@ export class FakeDaemon {
     const rootSessionId = backendSessionId.slice(0, markerIndex);
     const tabId = backendSessionId.slice(markerIndex + marker.length);
     if (!rootSessionId || !tabId) return;
-    this.upsertTab(rootSessionId, browserTabInfo(tabId, url));
+    this.upsertTab(rootSessionId, browserTabInfo(tabId, url, true, rootSessionId));
   }
 
   private ptySet(sessionId: string): PtySet {

@@ -4032,8 +4032,10 @@
     }
     const streamingItems = items.filter((item) => isStreamingAssistantForTurn(item, turnId));
     if (streamingItems.length === 0 && timelineHasBody(items, "assistant", trimmed)) return items;
+    // The completion text is authoritative for this turn: partial streamed
+    // fragments that diverge from it must not survive next to the final reply.
     return [
-      ...items,
+      ...items.filter((item) => !isStreamingAssistantForTurn(item, turnId)),
       {
         id: `live-complete-assistant-${turnId}`,
         kind: "assistant",

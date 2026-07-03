@@ -98,6 +98,8 @@ test("deleting a project removes all of its sessions", async ({ page }) => {
   expect(sessionsBefore).toBeGreaterThan(0);
 
   await projectRow.getByRole("button", { name: /^Delete project / }).click();
+  // Project deletion now confirms through an in-app modal, not window.confirm.
+  await page.locator(".pf-project-delete-confirm").click();
 
   const request = await daemon.waitForRequest("delete_project");
   expect(typeof request.params.folderPath).toBe("string");

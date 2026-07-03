@@ -53,9 +53,7 @@ pub use crate::login::{LivePhase, LoginSession};
 pub use crate::peer_cache::{
     hydrate_contact_book_cache, hydrate_recent_dialog_peer_cache, RecentDialogPeerCacheHydration,
 };
-pub use crate::qr_login::{
-    start as qr_login_start, wait as qr_login_wait, QrLoginOutcome, QrLoginState,
-};
+pub use crate::qr_login::{start as qr_start, wait as qr_wait};
 pub use crate::state::{
     default_init_params, resolve_api_credentials, PersistedCredentials, SkillEnv,
 };

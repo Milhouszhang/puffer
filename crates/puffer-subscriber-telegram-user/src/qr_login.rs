@@ -4,39 +4,28 @@
 //! TL schema includes the raw `auth.exportLoginToken` and
 //! `auth.importLoginToken` calls. This module wraps those calls behind the
 //! subscriber command protocol and persists the same session file used by the
-//! phone-code login path.
+//! phone-code login path. The attempt's client and phase live on the shared
+//! [`LoginSession`]; every MTProto round-trip is bounded at
+//! [`LOGIN_NETWORK_TIMEOUT`].
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use grammers_client::{
-    session::Session,
-    types::{PasswordToken, User},
-    Client, Config, InvocationError,
-};
+use grammers_client::{session::Session, types::User, Client, Config, InvocationError};
 use grammers_tl_types as tl;
 use serde_json::json;
 use tokio::time::{timeout, timeout_at, Instant};
 use tracing::{info, warn};
 
 use crate::events::emit_control;
-use crate::login;
-use crate::state::{
-    default_init_params, resolve_api_credentials, LoginState, PersistedCredentials, SkillEnv,
-};
+use crate::login::{self, LiveErr, LoginSession, LOGIN_NETWORK_TIMEOUT};
+use crate::login_flow::{self, ErrClass, LoginPhase};
+use crate::state::{default_init_params, resolve_api_credentials, PersistedCredentials, SkillEnv};
 
 const DEFAULT_QR_WAIT_SECONDS: u64 = 120;
 const DEFAULT_DC_ID: i32 = 2;
-
-/// Per-call bound on the MTProto network round-trips that mint the QR login
-/// token (DC connect + `auth.exportLoginToken`). Without it, an unreachable
-/// Telegram blocks these `.await`s indefinitely and the caller never emits a
-/// `login_qr` event — surfacing in the desktop client as an endless "Sending…"
-/// spinner with no error (agentenv/monorepo#705). On timeout we emit
-/// `login_error` so the UI shows an actionable message instead of hanging.
-const QR_NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// User-facing error emitted when a QR-login network call times out. The
 /// desktop client renders `payload.error` verbatim, so keep it friendly and
@@ -46,69 +35,76 @@ const QR_UNREACHABLE_MESSAGE: &str =
 const MAX_QR_MIGRATIONS: usize = 4;
 const MAX_QR_IMPORT_TOKEN_REFRESHES: usize = 2;
 
-/// In-memory state for a QR login attempt between `login-qr` and
-/// `login-qr-wait`.
-pub struct QrLoginState {
-    client: Client,
-    api_id: i32,
-    api_hash: String,
-    dc_id: i32,
-    import_token_expired_refreshes: usize,
+fn emit_control_spec(
+    session: &LoginSession,
+    spec: login_flow::ControlEventSpec,
+) -> anyhow::Result<()> {
+    emit_control(&session.env.topic, spec.kind, spec.payload)
 }
 
-/// Result produced by a QR-login command.
-pub enum QrLoginOutcome {
-    /// The QR flow is still pending, failed terminally with an emitted error,
-    /// or refreshed the QR token for another wait attempt.
-    Pending,
-    /// Telegram accepted QR approval but requires the account's 2FA password.
-    AwaitingPassword(Client),
-    /// Telegram accepted QR approval and returned an authorized client.
-    Complete(Client),
+/// Terminal QR failure: drop the attempt (client + phase) like the old
+/// `QrLoginState` teardown did, then emit the error event.
+fn fail(session: &mut LoginSession, event: login_flow::ControlEventSpec) -> anyhow::Result<()> {
+    session.client = None;
+    session.phase = LoginPhase::Idle;
+    emit_control_spec(session, event)
+}
+
+/// Renders a classified bounded-call failure for QR error payloads.
+fn qr_err_text(err: LiveErr) -> String {
+    match err {
+        ErrClass::Timeout => QR_UNREACHABLE_MESSAGE.to_string(),
+        ErrClass::Transport(text) | ErrClass::Fatal(text) => text,
+        ErrClass::AuthRestart => "Telegram requested an auth restart".to_string(),
+        _ => "QR login failed".to_string(),
+    }
 }
 
 /// Starts QR login and emits either `login_qr`, `login_complete`, or
 /// `login_error`.
 pub async fn start(
-    env: &SkillEnv,
-    login_state: &mut LoginState,
-    state: &mut Option<QrLoginState>,
+    session: &mut LoginSession,
     api_id: Option<i32>,
     api_hash: Option<String>,
-) -> anyhow::Result<QrLoginOutcome> {
-    *state = None;
-    login_state.login_token = None;
-    login_state.password_token = None;
-    login_state.phone = None;
-    login_state.api_id = None;
-    login_state.api_hash = None;
-    let persisted = PersistedCredentials::load(&env.credentials_path()).unwrap_or_default();
+) -> anyhow::Result<()> {
+    session.phase = LoginPhase::Idle;
+    session.client = None;
+    let persisted = PersistedCredentials::load(&session.env.credentials_path()).unwrap_or_default();
     let (api_id, api_hash) = match resolve_api_credentials(api_id, api_hash, &persisted) {
         Ok(pair) => pair,
         Err(error) => {
             warn!(%error, "telegram qr credential resolution failed");
-            emit_control(
-                &env.topic,
-                "login_error",
-                json!({ "error": error.to_string(), "phase": "qr_credentials" }),
-            )?;
-            return Ok(QrLoginOutcome::Pending);
+            return emit_control_spec(
+                session,
+                login_flow::login_error_event(
+                    "qr_credentials",
+                    "qr_failed",
+                    false,
+                    error.to_string(),
+                ),
+            );
         }
     };
+    session.api_id = Some(api_id);
+    session.api_hash = Some(api_hash.clone());
 
     // `connect_qr_client` / `export_login_token` bound their own MTProto
-    // round-trips (see `QR_NETWORK_TIMEOUT`), so an unreachable Telegram surfaces
-    // here as a normal `Err` carrying the friendly message rather than hanging.
+    // round-trips (see `LOGIN_NETWORK_TIMEOUT`), so an unreachable Telegram
+    // surfaces here as a normal `Err` carrying the friendly message rather
+    // than hanging.
     let client = match connect_qr_client(api_id, api_hash.clone(), None).await {
         Ok(client) => client,
         Err(error) => {
             warn!(%error, "telegram qr connect failed");
-            emit_control(
-                &env.topic,
-                "login_error",
-                json!({ "error": format!("connect failed: {error:#}"), "phase": "qr_connect" }),
-            )?;
-            return Ok(QrLoginOutcome::Pending);
+            return emit_control_spec(
+                session,
+                login_flow::login_error_event(
+                    "qr_connect",
+                    "qr_failed",
+                    false,
+                    format!("connect failed: {error:#}"),
+                ),
+            );
         }
     };
 
@@ -116,129 +112,142 @@ pub async fn start(
         Ok(token) => token,
         Err(error) => {
             warn!(%error, "telegram qr export token failed");
-            emit_control(
-                &env.topic,
-                "login_error",
-                json!({ "error": format!("export login token failed: {error:#}"), "phase": "qr_export" }),
-            )?;
-            return Ok(QrLoginOutcome::Pending);
+            return emit_control_spec(
+                session,
+                login_flow::login_error_event(
+                    "qr_export",
+                    "qr_failed",
+                    false,
+                    format!("export login token failed: {error:#}"),
+                ),
+            );
         }
     };
 
-    let qr = QrLoginState {
-        client,
-        api_id,
-        api_hash,
-        dc_id: DEFAULT_DC_ID,
-        import_token_expired_refreshes: 0,
-    };
-    handle_login_token(env, login_state, state, qr, token).await
+    session.client = Some(client);
+    handle_login_token(session, DEFAULT_DC_ID, 0, token).await
 }
 
 /// Waits for approval of the active QR login. If the token expires before
-/// approval, this emits a refreshed `login_qr` and keeps the QR state alive.
-pub async fn wait(
-    env: &SkillEnv,
-    login_state: &mut LoginState,
-    state: &mut Option<QrLoginState>,
-    timeout_seconds: Option<u64>,
-) -> anyhow::Result<QrLoginOutcome> {
-    let Some(qr) = state.take() else {
-        emit_control(
-            &env.topic,
-            "login_error",
-            json!({
-                "error": "no QR login in progress; run telegram login-qr first",
-                "phase": "qr_wait"
-            }),
-        )?;
-        return Ok(QrLoginOutcome::Pending);
+/// approval, this emits a refreshed `login_qr` and keeps the QR phase alive.
+pub async fn wait(session: &mut LoginSession, timeout_seconds: Option<u64>) -> anyhow::Result<()> {
+    let (dc_id, refreshes) = match &session.phase {
+        LoginPhase::QrPending {
+            dc_id, refreshes, ..
+        } => (*dc_id, usize::from(*refreshes)),
+        other => {
+            let name = other.name();
+            return emit_control_spec(
+                session,
+                login_flow::wrong_phase_error("login_qr_wait", name),
+            );
+        }
     };
+    let Some(client) = session.client.clone() else {
+        return emit_control_spec(
+            session,
+            login_flow::wrong_phase_error("login_qr_wait", "no_client"),
+        );
+    };
+    let (Some(api_id), Some(api_hash)) = (session.api_id, session.api_hash.clone()) else {
+        return emit_control_spec(
+            session,
+            login_flow::wrong_phase_error("login_qr_wait", "no_credentials"),
+        );
+    };
+    // Mirror the old `state.take()`: the pending QR attempt is consumed here;
+    // the Token arm of `handle_login_token` re-arms `QrPending` whenever a
+    // fresh QR goes out.
+    session.phase = LoginPhase::Idle;
 
     let seconds = timeout_seconds.unwrap_or(DEFAULT_QR_WAIT_SECONDS).max(1);
     let deadline = Instant::now() + Duration::from_secs(seconds);
-    let qr = qr;
     loop {
-        match timeout_at(deadline, qr.client.next_raw_update()).await {
+        match timeout_at(deadline, client.next_raw_update()).await {
             Ok(Ok((tl::enums::Update::LoginToken, _))) => {
-                let token = match export_login_token(&qr.client, qr.api_id, &qr.api_hash).await {
+                let token = match export_login_token(&client, api_id, &api_hash).await {
                     Ok(token) => token,
                     Err(error) => {
                         warn!(%error, "telegram qr export after update failed");
-                        emit_control(
-                            &env.topic,
-                            "login_error",
-                            json!({
-                                "error": format!("export login token failed after approval update: {error:#}"),
-                                "phase": "qr_export_after_update"
-                            }),
-                        )?;
-                        return Ok(QrLoginOutcome::Pending);
+                        return fail(
+                            session,
+                            login_flow::login_error_event(
+                                "qr_export_after_update",
+                                "qr_failed",
+                                false,
+                                format!(
+                                    "export login token failed after approval update: {error:#}"
+                                ),
+                            ),
+                        );
                     }
                 };
-                return handle_login_token(env, login_state, state, qr, token).await;
+                return handle_login_token(session, dc_id, refreshes, token).await;
             }
             Ok(Ok((_update, _))) => continue,
             Ok(Err(error)) => {
                 warn!(%error, "telegram qr wait failed");
-                emit_control(
-                    &env.topic,
-                    "login_error",
-                    json!({ "error": format!("QR login wait failed: {error:#}"), "phase": "qr_wait" }),
-                )?;
-                return Ok(QrLoginOutcome::Pending);
+                return fail(
+                    session,
+                    login_flow::login_error_event(
+                        "qr_wait",
+                        "qr_failed",
+                        false,
+                        format!("QR login wait failed: {error:#}"),
+                    ),
+                );
             }
             Err(_) => {
-                let token = match export_login_token(&qr.client, qr.api_id, &qr.api_hash).await {
+                let token = match export_login_token(&client, api_id, &api_hash).await {
                     Ok(token) => token,
                     Err(error) => {
                         warn!(%error, "telegram qr refresh after timeout failed");
-                        emit_control(
-                            &env.topic,
-                            "login_error",
-                            json!({
-                                "error": format!("QR login timed out and refresh failed: {error:#}"),
-                                "phase": "qr_timeout"
-                            }),
-                        )?;
-                        return Ok(QrLoginOutcome::Pending);
+                        return fail(
+                            session,
+                            login_flow::login_error_event(
+                                "qr_timeout",
+                                "qr_failed",
+                                false,
+                                format!("QR login timed out and refresh failed: {error:#}"),
+                            ),
+                        );
                     }
                 };
-                return handle_login_token(env, login_state, state, qr, token).await;
+                return handle_login_token(session, dc_id, refreshes, token).await;
             }
         }
     }
 }
 
 async fn handle_login_token(
-    env: &SkillEnv,
-    login_state: &mut LoginState,
-    state: &mut Option<QrLoginState>,
-    mut qr: QrLoginState,
+    session: &mut LoginSession,
+    mut dc_id: i32,
+    mut refreshes: usize,
     mut token: tl::enums::auth::LoginToken,
-) -> anyhow::Result<QrLoginOutcome> {
+) -> anyhow::Result<()> {
+    let api_id = session.api_id.context("qr login missing api_id")?;
+    let api_hash = session
+        .api_hash
+        .clone()
+        .context("qr login missing api_hash")?;
     for _ in 0..MAX_QR_MIGRATIONS {
         match token {
             tl::enums::auth::LoginToken::Token(login_token) => {
-                emit_qr_token(env, &login_token, None)?;
-                *state = Some(qr);
-                return Ok(QrLoginOutcome::Pending);
+                emit_qr_token(&session.env, &login_token, None)?;
+                session.phase = LoginPhase::QrPending {
+                    dc_id,
+                    expires_at: login_token.expires,
+                    refreshes: refreshes as u8,
+                };
+                return Ok(());
             }
             tl::enums::auth::LoginToken::Success(success) => {
-                return complete_qr_login(
-                    env,
-                    qr.client,
-                    qr.api_id,
-                    qr.api_hash,
-                    qr.dc_id,
-                    success.authorization,
-                )
-                .await;
+                return complete_qr_login(session, dc_id, success.authorization).await;
             }
             tl::enums::auth::LoginToken::MigrateTo(migration) => {
                 let client = match connect_qr_client(
-                    qr.api_id,
-                    qr.api_hash.clone(),
+                    api_id,
+                    api_hash.clone(),
                     Some(migration.dc_id),
                 )
                 .await
@@ -246,19 +255,22 @@ async fn handle_login_token(
                     Ok(client) => client,
                     Err(error) => {
                         warn!(%error, dc_id = migration.dc_id, "telegram qr dc migration connect failed");
-                        emit_control(
-                            &env.topic,
-                            "login_error",
-                            json!({
-                                "error": format!("connect to Telegram DC {} failed: {error:#}", migration.dc_id),
-                                "phase": "qr_migrate"
-                            }),
-                        )?;
-                        return Ok(QrLoginOutcome::Pending);
+                        return fail(
+                            session,
+                            login_flow::login_error_event(
+                                "qr_migrate",
+                                "qr_failed",
+                                false,
+                                format!(
+                                    "connect to Telegram DC {} failed: {error:#}",
+                                    migration.dc_id
+                                ),
+                            ),
+                        );
                     }
                 };
                 let import_result = match timeout(
-                    QR_NETWORK_TIMEOUT,
+                    LOGIN_NETWORK_TIMEOUT,
                     client.invoke(&tl::functions::auth::ImportLoginToken {
                         token: migration.token,
                     }),
@@ -268,114 +280,108 @@ async fn handle_login_token(
                     Ok(result) => result,
                     Err(_elapsed) => {
                         warn!(
-                            timeout_secs = QR_NETWORK_TIMEOUT.as_secs(),
+                            timeout_secs = LOGIN_NETWORK_TIMEOUT.as_secs(),
                             dc_id = migration.dc_id,
                             "telegram qr import login token timed out"
                         );
-                        emit_control(
-                            &env.topic,
-                            "login_error",
-                            json!({ "error": QR_UNREACHABLE_MESSAGE, "phase": "qr_migrate_timeout" }),
-                        )?;
-                        return Ok(QrLoginOutcome::Pending);
+                        return fail(
+                            session,
+                            login_flow::login_error_event(
+                                "qr_migrate_timeout",
+                                "qr_failed",
+                                false,
+                                QR_UNREACHABLE_MESSAGE.to_string(),
+                            ),
+                        );
                     }
                 };
                 token = match import_result {
                     Ok(token) => token,
-                    Err(error) => {
-                        match classify_qr_import_invocation_error(
-                            &error,
-                            qr.import_token_expired_refreshes,
-                        ) {
-                            QrImportErrorAction::AwaitPassword => {
-                                return prepare_qr_password_challenge(
-                                    env,
-                                    login_state,
-                                    client,
-                                    qr.api_id,
-                                    qr.api_hash,
-                                )
-                                .await;
-                            }
-                            QrImportErrorAction::RefreshToken => {
-                                qr.import_token_expired_refreshes += 1;
-                                warn!(
-                                    %error,
-                                    dc_id = migration.dc_id,
-                                    refreshes = qr.import_token_expired_refreshes,
-                                    "telegram qr import login token expired; issuing a new QR token"
-                                );
-                                match export_login_token(&qr.client, qr.api_id, &qr.api_hash).await
-                                {
-                                    Ok(tl::enums::auth::LoginToken::Token(login_token)) => {
-                                        emit_qr_token(
-                                            env,
-                                            &login_token,
-                                            Some("auth_token_expired"),
-                                        )?;
-                                        *state = Some(qr);
-                                        return Ok(QrLoginOutcome::Pending);
-                                    }
-                                    Ok(next_token) => {
-                                        token = next_token;
-                                        continue;
-                                    }
-                                    Err(refresh_error) => {
-                                        warn!(
-                                            error = %refresh_error,
-                                            dc_id = migration.dc_id,
-                                            "telegram qr import-expiry refresh failed"
-                                        );
-                                        emit_control(
-                                            &env.topic,
-                                            "login_error",
-                                            json!({
-                                                "error": format!(
+                    Err(error) => match classify_qr_import_invocation_error(&error, refreshes) {
+                        QrImportErrorAction::AwaitPassword => {
+                            return prepare_qr_password_challenge(session, client).await;
+                        }
+                        QrImportErrorAction::RefreshToken => {
+                            refreshes += 1;
+                            warn!(
+                                %error,
+                                dc_id = migration.dc_id,
+                                refreshes,
+                                "telegram qr import login token expired; issuing a new QR token"
+                            );
+                            let refresh_client =
+                                session.client.clone().context("qr login missing client")?;
+                            match export_login_token(&refresh_client, api_id, &api_hash).await {
+                                Ok(tl::enums::auth::LoginToken::Token(login_token)) => {
+                                    emit_qr_token(
+                                        &session.env,
+                                        &login_token,
+                                        Some("auth_token_expired"),
+                                    )?;
+                                    session.phase = LoginPhase::QrPending {
+                                        dc_id,
+                                        expires_at: login_token.expires,
+                                        refreshes: refreshes as u8,
+                                    };
+                                    return Ok(());
+                                }
+                                Ok(next_token) => {
+                                    token = next_token;
+                                    continue;
+                                }
+                                Err(refresh_error) => {
+                                    warn!(
+                                        error = %refresh_error,
+                                        dc_id = migration.dc_id,
+                                        "telegram qr import-expiry refresh failed"
+                                    );
+                                    return fail(
+                                            session,
+                                            login_flow::login_error_event(
+                                                "qr_import_refresh",
+                                                "qr_failed",
+                                                false,
+                                                format!(
                                                     "import login token in Telegram DC {} expired, and refreshing the QR token failed: {refresh_error:#}",
                                                     migration.dc_id
                                                 ),
-                                                "phase": "qr_import_refresh"
-                                            }),
-                                        )?;
-                                        return Ok(QrLoginOutcome::Pending);
-                                    }
+                                            ),
+                                        );
                                 }
                             }
-                            QrImportErrorAction::Fail => {
-                                warn!(%error, dc_id = migration.dc_id, "telegram qr import login token failed");
-                                emit_control(
-                                    &env.topic,
-                                    "login_error",
-                                    json!({
-                                        "error": format!("import login token in Telegram DC {} failed: {error:#}", migration.dc_id),
-                                        "phase": "qr_import"
-                                    }),
-                                )?;
-                                return Ok(QrLoginOutcome::Pending);
-                            }
                         }
-                    }
+                        QrImportErrorAction::Fail => {
+                            warn!(%error, dc_id = migration.dc_id, "telegram qr import login token failed");
+                            return fail(
+                                session,
+                                login_flow::login_error_event(
+                                    "qr_import",
+                                    "qr_failed",
+                                    false,
+                                    format!(
+                                        "import login token in Telegram DC {} failed: {error:#}",
+                                        migration.dc_id
+                                    ),
+                                ),
+                            );
+                        }
+                    },
                 };
-                qr = QrLoginState {
-                    client,
-                    api_id: qr.api_id,
-                    api_hash: qr.api_hash,
-                    dc_id: migration.dc_id,
-                    import_token_expired_refreshes: qr.import_token_expired_refreshes,
-                };
+                session.client = Some(client);
+                dc_id = migration.dc_id;
             }
         }
     }
 
-    emit_control(
-        &env.topic,
-        "login_error",
-        json!({
-            "error": "Telegram QR login bounced through too many datacenters",
-            "phase": "qr_migrate"
-        }),
-    )?;
-    Ok(QrLoginOutcome::Pending)
+    fail(
+        session,
+        login_flow::login_error_event(
+            "qr_migrate",
+            "qr_failed",
+            false,
+            "Telegram QR login bounced through too many datacenters".to_string(),
+        ),
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -412,98 +418,92 @@ fn classify_qr_import_error(
 }
 
 async fn complete_qr_login(
-    env: &SkillEnv,
-    client: Client,
-    api_id: i32,
-    api_hash: String,
+    session: &mut LoginSession,
     dc_id: i32,
     authorization: tl::enums::auth::Authorization,
-) -> anyhow::Result<QrLoginOutcome> {
+) -> anyhow::Result<()> {
     let user = match authorization {
         tl::enums::auth::Authorization::Authorization(auth) => User::from_raw(auth.user),
         tl::enums::auth::Authorization::SignUpRequired(_) => {
-            emit_control(
-                &env.topic,
-                "login_error",
-                json!({
-                    "error": "Telegram QR login returned sign-up required; use an official Telegram app to create the account first",
-                    "phase": "qr_complete"
-                }),
-            )?;
-            return Ok(QrLoginOutcome::Pending);
+            return fail(
+                session,
+                login_flow::login_error_event(
+                    "qr_complete",
+                    "qr_failed",
+                    false,
+                    "Telegram QR login returned sign-up required; use an official Telegram app to create the account first"
+                        .to_string(),
+                ),
+            );
         }
     };
+    let client = session.client.clone().context("qr login missing client")?;
+    let api_id = session.api_id.context("qr login missing api_id")?;
+    let api_hash = session
+        .api_hash
+        .clone()
+        .context("qr login missing api_hash")?;
 
     client.session().set_user(user.id(), dc_id, user.is_bot());
-    login::save_session(env, &client)?;
-    persist_qr_credentials(env, api_id, api_hash.clone());
+    login::save_session(&session.env, &client)?;
+    persist_qr_credentials(&session.env, api_id, api_hash.clone());
 
-    let verified = reconnect_authorized_client(env, api_id, api_hash).await?;
-    let verified_user = verified.get_me().await?;
+    let verified = reconnect_authorized_client(&session.env, api_id, api_hash).await?;
+    let verified_user = login::bounded(verified.get_me()).await.map_err(|error| {
+        anyhow::anyhow!("fetch QR-verified Telegram profile: {}", qr_err_text(error))
+    })?;
     // Promote the staged session BEFORE `login_complete` goes out: parents
     // treat that event as terminal and may kill this process immediately
     // after reading it (agentenv/monorepo#551).
-    login::promote_completed_session(env)?;
-    emit_control(
-        &env.topic,
-        "login_complete",
-        json!({
-            "qr_login": true,
-            "user_id": verified_user.id(),
-            "first_name": verified_user.first_name(),
-        }),
-    )?;
+    login::promote_completed_session(&session.env)?;
+    session.client = Some(verified);
+    session.phase = LoginPhase::Authorized;
+    let user_data = login_flow::AuthorizedUser {
+        id: verified_user.id(),
+        first_name: Some(verified_user.first_name().to_string()),
+    };
+    emit_control_spec(session, login_flow::login_complete_event(&user_data, true))?;
     info!(user_id = verified_user.id(), "telegram qr login complete");
-    Ok(QrLoginOutcome::Complete(verified))
+    Ok(())
 }
 
 async fn prepare_qr_password_challenge(
-    env: &SkillEnv,
-    login_state: &mut LoginState,
+    session: &mut LoginSession,
     client: Client,
-    api_id: i32,
-    api_hash: String,
-) -> anyhow::Result<QrLoginOutcome> {
-    let password_token = match get_password_token(&client).await {
+) -> anyhow::Result<()> {
+    let password_token = match login::get_password_token(&client).await {
         Ok(token) => token,
         Err(error) => {
-            warn!(%error, "telegram qr password token fetch failed");
-            emit_control(
-                &env.topic,
-                "login_error",
-                json!({
-                    "error": format!("Telegram QR login requires 2FA, but password challenge setup failed: {error:#}"),
-                    "phase": "qr_password"
-                }),
-            )?;
-            return Ok(QrLoginOutcome::Pending);
+            let text = qr_err_text(error);
+            warn!(error = %text, "telegram qr password token fetch failed");
+            return fail(
+                session,
+                login_flow::login_error_event(
+                    "qr_password",
+                    "qr_failed",
+                    false,
+                    format!(
+                        "Telegram QR login requires 2FA, but password challenge setup failed: {text}"
+                    ),
+                ),
+            );
         }
     };
     let hint = password_token.hint().map(str::to_string);
-    login_state.login_token = None;
-    login_state.password_token = Some(password_token);
-    login_state.phone = None;
-    login_state.api_id = Some(api_id);
-    login_state.api_hash = Some(api_hash);
-    if let Err(error) = login::save_session(env, &client) {
+    if let Err(error) = login::save_session(&session.env, &client) {
         warn!(error = %error, "failed to persist telegram qr 2FA session");
     }
-    emit_control(
-        &env.topic,
-        "login_awaiting_password",
-        json!({
-            "qr_login": true,
-            "password_hint": hint,
-        }),
+    session.client = Some(client);
+    session.phase = LoginPhase::PasswordPending {
+        token: password_token,
+        hint: hint.clone(),
+    };
+    emit_control_spec(
+        session,
+        login_flow::awaiting_password_event(None, hint.as_deref(), true),
     )?;
     info!("telegram qr login requires 2FA password");
-    Ok(QrLoginOutcome::AwaitingPassword(client))
-}
-
-async fn get_password_token(client: &Client) -> Result<PasswordToken, InvocationError> {
-    let request = tl::functions::account::GetPassword {};
-    let password: tl::types::account::Password = client.invoke(&request).await?.into();
-    Ok(PasswordToken::new(password))
+    Ok(())
 }
 
 async fn connect_qr_client(
@@ -515,26 +515,14 @@ async fn connect_qr_client(
     if let Some(dc_id) = force_dc_id {
         session.set_user(0, dc_id, false);
     }
-    match timeout(
-        QR_NETWORK_TIMEOUT,
-        Client::connect(Config {
-            session,
-            api_id,
-            api_hash,
-            params: default_init_params(),
-        }),
-    )
+    login::bounded(Client::connect(Config {
+        session,
+        api_id,
+        api_hash,
+        params: default_init_params(),
+    }))
     .await
-    {
-        Ok(result) => result.context("connect Telegram QR login client"),
-        Err(_elapsed) => {
-            warn!(
-                timeout_secs = QR_NETWORK_TIMEOUT.as_secs(),
-                "telegram qr connect timed out"
-            );
-            anyhow::bail!("{QR_UNREACHABLE_MESSAGE}")
-        }
-    }
+    .map_err(|error| anyhow::anyhow!("{}", qr_err_text(error)))
 }
 
 async fn reconnect_authorized_client(
@@ -544,19 +532,28 @@ async fn reconnect_authorized_client(
 ) -> anyhow::Result<Client> {
     let session = Session::load_file_or_create(&env.session_path)
         .with_context(|| format!("load session file {}", env.session_path.display()))?;
-    let client = Client::connect(Config {
+    let client = login::bounded(Client::connect(Config {
         session,
         api_id,
         api_hash,
         params: default_init_params(),
-    })
+    }))
     .await
-    .context("reconnect authorized Telegram QR session")?;
-    if !client
-        .is_authorized()
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "reconnect authorized Telegram QR session: {}",
+            qr_err_text(error)
+        )
+    })?;
+    let authorized = login::bounded(client.is_authorized())
         .await
-        .context("verify Telegram QR session authorization")?
-    {
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "verify Telegram QR session authorization: {}",
+                qr_err_text(error)
+            )
+        })?;
+    if !authorized {
         anyhow::bail!("Telegram did not accept the QR-authorized session");
     }
     Ok(client)
@@ -567,25 +564,13 @@ async fn export_login_token(
     api_id: i32,
     api_hash: &str,
 ) -> anyhow::Result<tl::enums::auth::LoginToken> {
-    match timeout(
-        QR_NETWORK_TIMEOUT,
-        client.invoke(&tl::functions::auth::ExportLoginToken {
-            api_id,
-            api_hash: api_hash.to_string(),
-            except_ids: Vec::new(),
-        }),
-    )
+    login::bounded(client.invoke(&tl::functions::auth::ExportLoginToken {
+        api_id,
+        api_hash: api_hash.to_string(),
+        except_ids: Vec::new(),
+    }))
     .await
-    {
-        Ok(result) => result.context("export Telegram QR login token"),
-        Err(_elapsed) => {
-            warn!(
-                timeout_secs = QR_NETWORK_TIMEOUT.as_secs(),
-                "telegram qr export token timed out"
-            );
-            anyhow::bail!("{QR_UNREACHABLE_MESSAGE}")
-        }
-    }
+    .map_err(|error| anyhow::anyhow!("{}", qr_err_text(error)))
 }
 
 fn emit_qr_token(

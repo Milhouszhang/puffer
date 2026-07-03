@@ -18,11 +18,10 @@ export default defineConfig({
   // root cause (see AGENTS.md). Retries would mask exactly the slow rot
   // that killed 86 specs before the suite was gated.
   retries: 0,
-  // Playwright's CI default is a single worker, which made the suite the
-  // pipeline's long pole (8m vs 2m locally). GitHub's 4-vCPU runners handle
-  // two fine — specs are isolated per page/FakeDaemon. Locally keep the
-  // default (50% of cores).
-  workers: process.env.CI ? 2 : undefined,
+  // Measured on the 2-core GitHub runners: two workers gave zero speedup
+  // (8.7 vs 8.2 min — CPU-saturated) while widening click-race windows, so
+  // the suite keeps Playwright's one-worker CI default. Locally the default
+  // is 50% of cores. Re-benchmark before setting workers here.
   webServer: {
     command: `${nodeExecutable} ./node_modules/vite/bin/vite.js --host 127.0.0.1 --port ${serverPort}`,
     url: `${baseURL}/?skipOnboarding`,

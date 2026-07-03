@@ -26,6 +26,7 @@
     origin: ""
   });
   let saving = $state(false);
+  let showAddForm = $state(false);
   // Shared "an import is running" marker, also used for the .1pux button via the
   // `__1pux__` sentinel so only one import runs at a time.
   let importingSource = $state<string | null>(null);
@@ -130,6 +131,17 @@
     visibleSecretCount = Math.min(visibleSecretCount + SECRET_PAGE_SIZE, filteredSecrets.length);
   }
 
+  function openAddForm() {
+    showAddForm = true;
+    error = null;
+    saved = null;
+  }
+
+  function cancelAddForm() {
+    showAddForm = false;
+    form = { label: "", description: "", value: "", username: "", origin: "" };
+  }
+
   async function saveStoredSecret() {
     const label = form.label.trim();
     if (disabled || !label || !form.value) return;
@@ -146,6 +158,7 @@
       });
       form = { label: "", description: "", value: "", username: "", origin: "" };
       saved = `Saved ${label}`;
+      showAddForm = false;
       props.onRefresh();
     } catch (e) {
       error = (e as Error).message ?? String(e);
@@ -184,6 +197,7 @@
       if (errors.length > 0) {
         error = errors.join("; ");
       }
+      showAddForm = false;
       props.onRefresh();
     } catch (e) {
       error = (e as Error).message ?? String(e);
@@ -221,6 +235,7 @@
         skipped ? `, skipped ${skipped}` : ""
       }.`;
       if (errors.length > 0) error = errors.join("; ");
+      showAddForm = false;
       props.onRefresh();
     } catch (e) {
       error = (e as Error).message ?? String(e);
@@ -254,13 +269,20 @@
   </div>
 </div>
 
-<div class="pf-settings-row" style="align-items: start;">
+{#if showAddForm}
+<div class="pf-settings-row pf-secret-stacked">
   <div class="meta">
     <div class="label">Add secret</div>
     <div class="desc">Stored value is never rendered after save.</div>
   </div>
-  <div class="pf-mcp-form">
-    <div class="pf-mcp-form-grid">
+  <form
+    class="pf-secret-form"
+    onsubmit={(e) => {
+      e.preventDefault();
+      saveStoredSecret();
+    }}
+  >
+    <div class="pf-secret-form-grid">
       <label>
         Name
         <input
@@ -272,13 +294,15 @@
         />
       </label>
       <label>
-        Description
+        Value
         <input
           class="sc-input"
-          placeholder="What this secret is for"
-          value={form.description}
+          type="password"
+          autocomplete="off"
+          placeholder="Secret value"
+          value={form.value}
           disabled={disabled}
-          oninput={(e) => (form.description = (e.currentTarget as HTMLInputElement).value)}
+          oninput={(e) => (form.value = (e.currentTarget as HTMLInputElement).value)}
         />
       </label>
       <label>
@@ -301,63 +325,77 @@
           oninput={(e) => (form.origin = (e.currentTarget as HTMLInputElement).value)}
         />
       </label>
-      <label>
-        Value
-        <input
-          class="sc-input"
-          type="password"
-          autocomplete="off"
-          value={form.value}
+      <label class="pf-secret-field-wide">
+        Description
+        <textarea
+          class="sc-input pf-secret-description"
+          rows="2"
+          placeholder="What this secret is for"
+          value={form.description}
           disabled={disabled}
-          oninput={(e) => (form.value = (e.currentTarget as HTMLInputElement).value)}
-        />
+          oninput={(e) => (form.description = (e.currentTarget as HTMLTextAreaElement).value)}
+        ></textarea>
       </label>
     </div>
     <div class="pf-secrets-actions">
-      {#each importSources as src (src.id)}
-        <button
-          type="button"
-          class="sc-btn"
-          data-variant="outline"
-          data-size="sm"
-          disabled={disabled || !src.available}
-          title={src.available ? `Sync saved logins from ${src.label}` : `${src.label} not detected on this machine`}
-          onclick={() => importFromSource(src.id)}
-        >
-          <Icon name="key" size={12} />{importingSource === src.id
-            ? "Syncing..."
-            : src.id === "1password"
-              ? "Sync from 1Password"
-              : `Sync from ${src.label}`}
-        </button>
-      {/each}
       <button
         type="button"
         class="sc-btn"
         data-variant="outline"
         data-size="sm"
-        disabled={disabled}
-        title="Import a 1Password export file (File → Export → 1PUX in the app) — no 1Password CLI needed"
-        onclick={importOnePasswordExportFile}
+        disabled={saving}
+        onclick={cancelAddForm}
       >
-        <Icon name="key" size={12} />{importingSource === "__1pux__"
-          ? "Syncing..."
-          : "Import 1Password export (.1pux)"}
+        Cancel
       </button>
       <button
-        type="button"
+        type="submit"
         class="sc-btn"
         data-variant="default"
         data-size="sm"
         disabled={disabled || !form.label.trim() || !form.value}
-        onclick={saveStoredSecret}
       >
         <Icon name="plus" size={12} />{saving ? "Saving..." : "Save secret"}
       </button>
     </div>
-  </div>
+    <div class="pf-secrets-import">
+      <span class="pf-secrets-import-label">Or import existing credentials</span>
+      <div class="pf-secrets-import-buttons">
+        {#each importSources as src (src.id)}
+          <button
+            type="button"
+            class="sc-btn"
+            data-variant="outline"
+            data-size="sm"
+            disabled={disabled || !src.available}
+            title={src.available ? `Sync saved logins from ${src.label}` : `${src.label} not detected on this machine`}
+            onclick={() => importFromSource(src.id)}
+          >
+            <Icon name="key" size={12} />{importingSource === src.id
+              ? "Syncing..."
+              : src.id === "1password"
+                ? "Sync from 1Password"
+                : `Sync from ${src.label}`}
+          </button>
+        {/each}
+        <button
+          type="button"
+          class="sc-btn"
+          data-variant="outline"
+          data-size="sm"
+          disabled={disabled}
+          title="Import a 1Password export file (File → Export → 1PUX in the app) — no 1Password CLI needed"
+          onclick={importOnePasswordExportFile}
+        >
+          <Icon name="key" size={12} />{importingSource === "__1pux__"
+            ? "Syncing..."
+            : "Import 1Password export (.1pux)"}
+        </button>
+      </div>
+    </div>
+  </form>
 </div>
-
+{:else}
 <div class="pf-secret-list-toolbar">
   <label class="pf-secret-search">
     <Icon name="search" size={13} />
@@ -378,13 +416,16 @@
       </button>
     {/if}
   </label>
-  <div class="pf-secret-result-count">
-    {#if searchTerms.length > 0}
-      Showing {filteredSecrets.length} of {secrets.length}
-    {:else}
-      {secrets.length} stored secret{secrets.length === 1 ? "" : "s"}
-    {/if}
-  </div>
+  <button
+    type="button"
+    class="sc-btn"
+    data-variant="default"
+    data-size="sm"
+    disabled={disabled}
+    onclick={openAddForm}
+  >
+    <Icon name="plus" size={12} />Add secret
+  </button>
 </div>
 
 <div class="pf-mcp-list">
@@ -431,11 +472,104 @@
     <div class="pf-empty">No secrets match "{searchQuery.trim()}".</div>
   {/if}
 </div>
+{/if}
 
 <style>
+  .pf-secret-stacked {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+    gap: 12px;
+    border-bottom: 0;
+  }
+
+  .pf-path-list {
+    justify-self: end;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--muted-foreground);
+    text-align: right;
+    max-width: 340px;
+    min-width: 0;
+  }
+
+  .pf-path-label {
+    color: var(--muted-foreground);
+    display: block;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 10px;
+    font-family: var(--font-sans);
+  }
+
+  .pf-path-value {
+    color: var(--foreground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
+    max-width: 100%;
+    vertical-align: bottom;
+  }
+
+  .pf-secret-form {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .pf-secret-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    color: var(--muted-foreground);
+    font-size: 11.5px;
+  }
+
+  .pf-secret-form-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 12px;
+  }
+
+  .pf-secret-field-wide {
+    grid-column: 1 / -1;
+  }
+
+  .pf-secret-description {
+    resize: none;
+    height: auto;
+    min-height: 0;
+    line-height: 1.4;
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
   .pf-secrets-actions {
     display: flex;
     justify-content: flex-end;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .pf-secrets-import {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 4px;
+    padding-top: 12px;
+    border-top: 1px dashed var(--border);
+  }
+
+  .pf-secrets-import-label {
+    color: var(--muted-foreground);
+    font-size: 11.5px;
+  }
+
+  .pf-secrets-import-buttons {
+    display: flex;
     gap: 8px;
     flex-wrap: wrap;
   }
@@ -497,13 +631,6 @@
     color: var(--foreground);
   }
 
-  .pf-secret-result-count {
-    flex: 0 0 auto;
-    color: var(--muted-foreground);
-    font-size: 12px;
-    white-space: nowrap;
-  }
-
   .pf-secret-card {
     grid-template-columns: 32px minmax(0, 1fr) minmax(84px, 160px) auto;
   }
@@ -545,12 +672,20 @@
   }
 
   @media (max-width: 720px) {
-    .pf-secrets-actions {
-      justify-content: stretch;
+    .pf-secret-form-grid {
+      grid-template-columns: minmax(0, 1fr);
     }
 
-    .pf-secrets-actions .sc-btn {
+    .pf-secrets-actions,
+    .pf-secrets-import-buttons {
+      align-items: stretch;
+      flex-direction: column;
+    }
+
+    .pf-secrets-actions .sc-btn,
+    .pf-secrets-import-buttons .sc-btn {
       flex: 1;
+      width: 100%;
     }
 
     .pf-secret-list-toolbar {
@@ -561,10 +696,6 @@
     .pf-secret-search {
       max-width: none;
       width: 100%;
-    }
-
-    .pf-secret-result-count {
-      white-space: normal;
     }
 
     .pf-secret-card {

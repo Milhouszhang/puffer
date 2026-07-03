@@ -214,47 +214,10 @@ pub async fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        let Some(cmd) = handle_login_command(&mut session, cmd).await? else {
+            continue;
+        };
         match cmd {
-            SubscriberCommand::TelegramLoginStart {
-                phone,
-                api_id,
-                api_hash,
-            } => {
-                session.start(phone, api_id, api_hash).await?;
-            }
-            SubscriberCommand::TelegramQrLoginStart { api_id, api_hash } => {
-                qr_login::start(&mut session, api_id, api_hash).await?;
-            }
-            SubscriberCommand::TelegramQrLoginWait { timeout_seconds } => {
-                qr_login::wait(&mut session, timeout_seconds).await?;
-            }
-            SubscriberCommand::TelegramLoginSubmitCode { code } => {
-                session.submit_code(code).await?;
-            }
-            SubscriberCommand::TelegramLoginSubmitPassword { password } => {
-                session.submit_password(password).await?;
-            }
-            SubscriberCommand::TelegramImportTdata {
-                path,
-                passcode,
-                account_index,
-                key_file,
-            } => {
-                if let Some(imported) = import_and_connect(
-                    &env,
-                    TdataImportOptions {
-                        path,
-                        passcode,
-                        account_index,
-                        key_file,
-                    },
-                )
-                .await?
-                {
-                    session.client = Some(imported);
-                    session.phase = LoginPhase::Authorized;
-                }
-            }
             SubscriberCommand::TelegramAuthOk => {
                 // While parked offline the on-disk session is signed in and
                 // only the network was unreachable — answering ok:false would
@@ -321,6 +284,8 @@ pub async fn run() -> anyhow::Result<()> {
                 )?;
             }
             SubscriberCommand::Custom { op, args } => handle_login_custom(&env, op, args)?,
+            // Login commands were consumed by handle_login_command above.
+            _ => {}
         }
     }
 
@@ -368,54 +333,11 @@ pub async fn run() -> anyhow::Result<()> {
             info!("stdin closed before login finalized");
             return Ok(());
         };
+        let Some(cmd) = handle_login_command(&mut session, cmd).await? else {
+            authorized = session.is_authorized();
+            continue;
+        };
         match cmd {
-            SubscriberCommand::TelegramLoginSubmitCode { code } => {
-                session.submit_code(code).await?;
-                authorized = session.is_authorized();
-            }
-            SubscriberCommand::TelegramLoginSubmitPassword { password } => {
-                session.submit_password(password).await?;
-                authorized = session.is_authorized();
-            }
-            SubscriberCommand::TelegramLoginStart {
-                phone,
-                api_id,
-                api_hash,
-            } => {
-                // Operator restarted the flow; re-request the login code.
-                session.start(phone, api_id, api_hash).await?;
-                authorized = session.is_authorized();
-            }
-            SubscriberCommand::TelegramQrLoginStart { api_id, api_hash } => {
-                qr_login::start(&mut session, api_id, api_hash).await?;
-                authorized = session.is_authorized();
-            }
-            SubscriberCommand::TelegramQrLoginWait { timeout_seconds } => {
-                qr_login::wait(&mut session, timeout_seconds).await?;
-                authorized = session.is_authorized();
-            }
-            SubscriberCommand::TelegramImportTdata {
-                path,
-                passcode,
-                account_index,
-                key_file,
-            } => {
-                if let Some(imported) = import_and_connect(
-                    &env,
-                    TdataImportOptions {
-                        path,
-                        passcode,
-                        account_index,
-                        key_file,
-                    },
-                )
-                .await?
-                {
-                    session.client = Some(imported);
-                    session.phase = LoginPhase::Authorized;
-                }
-                authorized = session.is_authorized();
-            }
             SubscriberCommand::TelegramAuthOk => match session.client.as_ref() {
                 Some(client) => emit_auth_ok(&env, client).await?,
                 None => emit_control(
@@ -473,6 +395,8 @@ pub async fn run() -> anyhow::Result<()> {
                 )?;
             }
             SubscriberCommand::Custom { op, args } => handle_login_custom(&env, op, args)?,
+            // Login commands were consumed by handle_login_command above.
+            _ => {}
         }
     }
 }
@@ -893,15 +817,13 @@ fn persist_live_session_state(env: &SkillEnv, client: &Client) {
     }
 }
 
-/// Handles a stdin command received while the update loop is running.
-///
-/// Most login-related commands are unexpected here (login already succeeded)
-/// but we still accept them to support re-authentication without a restart.
-async fn handle_runtime_command(
-    env: &SkillEnv,
+/// Dispatches the six login-flow commands to the session; hands anything
+/// else back to the caller. All three command loops share this, so a login
+/// transition behaves identically regardless of which loop received it.
+async fn handle_login_command(
     session: &mut LoginSession,
     cmd: SubscriberCommand,
-) -> anyhow::Result<RuntimeCommandOutcome> {
+) -> anyhow::Result<Option<SubscriberCommand>> {
     match cmd {
         SubscriberCommand::TelegramLoginStart {
             phone,
@@ -909,9 +831,12 @@ async fn handle_runtime_command(
             api_hash,
         } => {
             session.start(phone, api_id, api_hash).await?;
-            if matches!(session.phase, LoginPhase::CodeSent { .. }) {
-                return Ok(RuntimeCommandOutcome::ReauthStarted);
-            }
+        }
+        SubscriberCommand::TelegramQrLoginStart { api_id, api_hash } => {
+            qr_login::start(session, api_id, api_hash).await?;
+        }
+        SubscriberCommand::TelegramQrLoginWait { timeout_seconds } => {
+            qr_login::wait(session, timeout_seconds).await?;
         }
         SubscriberCommand::TelegramLoginSubmitCode { code } => {
             session.submit_code(code).await?;
@@ -919,34 +844,15 @@ async fn handle_runtime_command(
         SubscriberCommand::TelegramLoginSubmitPassword { password } => {
             session.submit_password(password).await?;
         }
-        SubscriberCommand::TelegramQrLoginStart { api_id, api_hash } => {
-            qr_login::start(session, api_id, api_hash).await?;
-            match session.phase {
-                LoginPhase::Authorized => return Ok(RuntimeCommandOutcome::ClientReplaced),
-                LoginPhase::PasswordPending { .. } => {
-                    return Ok(RuntimeCommandOutcome::ReauthStarted)
-                }
-                _ => {}
-            }
-        }
-        SubscriberCommand::TelegramQrLoginWait { timeout_seconds } => {
-            qr_login::wait(session, timeout_seconds).await?;
-            match session.phase {
-                LoginPhase::Authorized => return Ok(RuntimeCommandOutcome::ClientReplaced),
-                LoginPhase::PasswordPending { .. } => {
-                    return Ok(RuntimeCommandOutcome::ReauthStarted)
-                }
-                _ => {}
-            }
-        }
         SubscriberCommand::TelegramImportTdata {
             path,
             passcode,
             account_index,
             key_file,
         } => {
+            let env = session.env.clone();
             if let Some(imported) = import_and_connect(
-                env,
+                &env,
                 TdataImportOptions {
                     path,
                     passcode,
@@ -958,9 +864,84 @@ async fn handle_runtime_command(
             {
                 session.client = Some(imported);
                 session.phase = LoginPhase::Authorized;
-                return Ok(RuntimeCommandOutcome::ClientReplaced);
             }
         }
+        other => return Ok(Some(other)),
+    }
+    Ok(None)
+}
+
+/// Which of the six login commands a runtime command was, for outcome mapping.
+#[derive(Clone, Copy, PartialEq)]
+enum LoginCommandKind {
+    Start,
+    QrStart,
+    QrWait,
+    SubmitCode,
+    SubmitPassword,
+    Import,
+}
+
+impl LoginCommandKind {
+    fn of(cmd: &SubscriberCommand) -> Option<Self> {
+        Some(match cmd {
+            SubscriberCommand::TelegramLoginStart { .. } => Self::Start,
+            SubscriberCommand::TelegramQrLoginStart { .. } => Self::QrStart,
+            SubscriberCommand::TelegramQrLoginWait { .. } => Self::QrWait,
+            SubscriberCommand::TelegramLoginSubmitCode { .. } => Self::SubmitCode,
+            SubscriberCommand::TelegramLoginSubmitPassword { .. } => Self::SubmitPassword,
+            SubscriberCommand::TelegramImportTdata { .. } => Self::Import,
+            _ => return None,
+        })
+    }
+}
+
+/// Maps a handled login command to the update loop's control-flow outcome,
+/// mirroring the per-arm behavior the loops had before `LoginSession`.
+fn runtime_login_outcome(
+    kind: LoginCommandKind,
+    pre_phase: &'static str,
+    session: &LoginSession,
+) -> RuntimeCommandOutcome {
+    match kind {
+        LoginCommandKind::Start if matches!(session.phase, LoginPhase::CodeSent { .. }) => {
+            RuntimeCommandOutcome::ReauthStarted
+        }
+        LoginCommandKind::QrStart | LoginCommandKind::QrWait => match session.phase {
+            // qr_login resets the phase on entry, so landing on `authorized`
+            // means THIS call completed the QR flow — except the wrong-phase
+            // reject in `wait`, which leaves the previous phase untouched.
+            LoginPhase::Authorized if pre_phase != "authorized" => {
+                RuntimeCommandOutcome::ClientReplaced
+            }
+            LoginPhase::PasswordPending { .. } => RuntimeCommandOutcome::ReauthStarted,
+            _ => RuntimeCommandOutcome::Continue,
+        },
+        // Import success replaces the client. A failed import while already
+        // authorized also lands here; the extra rehydration is harmless.
+        LoginCommandKind::Import if session.is_authorized() => {
+            RuntimeCommandOutcome::ClientReplaced
+        }
+        _ => RuntimeCommandOutcome::Continue,
+    }
+}
+
+/// Handles a stdin command received while the update loop is running.
+///
+/// Most login-related commands are unexpected here (login already succeeded)
+/// but we still accept them to support re-authentication without a restart.
+async fn handle_runtime_command(
+    env: &SkillEnv,
+    session: &mut LoginSession,
+    cmd: SubscriberCommand,
+) -> anyhow::Result<RuntimeCommandOutcome> {
+    let login_kind = LoginCommandKind::of(&cmd);
+    let pre_phase = session.phase.name();
+    let Some(cmd) = handle_login_command(session, cmd).await? else {
+        let kind = login_kind.expect("commands consumed by handle_login_command are login kinds");
+        return Ok(runtime_login_outcome(kind, pre_phase, session));
+    };
+    match cmd {
         SubscriberCommand::TelegramAuthOk => match session.client.as_ref() {
             Some(client) => emit_auth_ok(env, client).await?,
             None => emit_control(
@@ -1030,6 +1011,8 @@ async fn handle_runtime_command(
                 )?;
             }
         }
+        // Login commands were consumed by handle_login_command above.
+        _ => {}
     }
     Ok(RuntimeCommandOutcome::Continue)
 }

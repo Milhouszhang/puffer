@@ -717,7 +717,7 @@ export const mockSettingsSnapshot: SettingsSnapshot = {
     sshHosts: [],
     agentenv: {
       enabled: false,
-      apiUrl: "https://api.agentenv.io",
+      apiUrl: "https://agentenv.io",
       runnerHost: null,
       workspace: null,
       credentialSecretId: null,

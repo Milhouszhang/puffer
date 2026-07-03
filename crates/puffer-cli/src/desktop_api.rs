@@ -2256,7 +2256,7 @@ mod tests {
             ],
             agentenv: Some(SaveAgentEnvSettingsParams {
                 enabled: true,
-                api_url: " https://api.agentenv.io/ ".to_string(),
+                api_url: " https://agentenv.io/ ".to_string(),
                 runner_host: Some(" 93.115.25.198 ".to_string()),
                 workspace: Some(" wk_demo ".to_string()),
                 credential_secret_id: Some(" secret-agentenv ".to_string()),
@@ -2281,7 +2281,7 @@ mod tests {
 
         let agentenv = config.agentenv.expect("agentenv config");
         assert!(agentenv.enabled);
-        assert_eq!(agentenv.api_url, "https://api.agentenv.io");
+        assert_eq!(agentenv.api_url, "https://agentenv.io");
         assert_eq!(agentenv.runner_host.as_deref(), Some("93.115.25.198"));
         assert_eq!(agentenv.workspace.as_deref(), Some("wk_demo"));
         assert_eq!(

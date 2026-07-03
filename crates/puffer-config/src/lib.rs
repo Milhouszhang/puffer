@@ -460,7 +460,7 @@ fn default_remote_runner_wait_for_ready() -> bool {
 }
 
 fn default_agentenv_api_url() -> String {
-    "https://api.agentenv.io".to_string()
+    "https://agentenv.io".to_string()
 }
 
 fn default_agentenv_auth_method() -> String {

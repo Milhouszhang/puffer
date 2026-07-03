@@ -26,19 +26,45 @@ use crate::session_resume::{recoverable_live_update_error, try_resume_session, S
 use crate::state::SkillEnv;
 use crate::updates::{handle_live_update, spawn_live_update_task, LiveUpdateEvent};
 
-const LIVE_UPDATE_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const OFFLINE_RESUME_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
 const OFFLINE_RESUME_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 
 enum UpdateLoopExit {
     StdinClosed,
     ReauthStarted,
+    /// The live update stream was lost for a recoverable (network-class)
+    /// reason. `run()` re-enters the shared offline-parking login phase with
+    /// the bounded, jittered retry timer armed instead of killing the process.
+    WentOffline(String),
 }
 
 enum RuntimeCommandOutcome {
     Continue,
     ReauthStarted,
     ClientReplaced,
+}
+
+/// Single-flight guard for the fire-and-forget contact hydration task. A
+/// second `TelegramHydrateContacts` command is refused while one hydration is
+/// still running; a finished (or absent) handle means the slot is free, so it
+/// releases automatically when the spawned task completes.
+#[derive(Default)]
+pub(crate) struct HydrationSlot {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl HydrationSlot {
+    /// True when no hydration task is currently running.
+    fn is_idle(&self) -> bool {
+        self.handle
+            .as_ref()
+            .map_or(true, tokio::task::JoinHandle::is_finished)
+    }
+
+    /// Stores the spawned task handle; its completion frees the slot.
+    fn attach(&mut self, handle: tokio::task::JoinHandle<()>) {
+        self.handle = Some(handle);
+    }
 }
 
 enum OfflineResumeAttempt {
@@ -90,6 +116,194 @@ impl OfflineResumeState {
 /// Result state handed back by the spawned startup hydration task.
 type StartupHydrationState = (DeliveryCursor, NotificationMuteCache);
 
+/// What the login phase produced once an authorized client exists.
+struct LoginPhaseOutcome {
+    /// Server-time boundary of a recovered offline gap, threaded into the
+    /// update loop's monitoring boundary so post-gap messages still deliver.
+    recovered_offline_since_ms: Option<i64>,
+}
+
+/// Parks the subscriber (bounded jittered offline retries) and/or drives the
+/// login command flow until `session.client` is authorized, then returns.
+///
+/// Shared by startup and by the update loop's `WentOffline` re-entry, so a
+/// network drop after months of uptime re-parks on the exact same state
+/// machine that a cold start uses. Returns `Ok(None)` when stdin closed before
+/// login completed (the caller should exit cleanly).
+async fn login_phase(
+    env: &SkillEnv,
+    commands: &mut CommandStream,
+    session: &mut LoginSession,
+    mut offline_state: Option<OfflineResumeState>,
+    login_required_since: &mut SystemTime,
+) -> anyhow::Result<Option<LoginPhaseOutcome>> {
+    let mut recovered_offline_since_ms: Option<i64> = None;
+    while session.client.is_none() {
+        let cmd = if let Some(retry_at) = offline_state.as_ref().map(|state| state.next_retry_at) {
+            tokio::select! {
+                maybe = commands.next() => maybe?,
+                _ = tokio::time::sleep_until(retry_at) => {
+                    let state = offline_state
+                        .take()
+                        .expect("offline state exists for retry timer");
+                    match attempt_offline_resume(env, state).await? {
+                        OfflineResumeAttempt::Resumed {
+                            client: recovered,
+                            offline_since_ms,
+                        } => {
+                            recovered_offline_since_ms = Some(offline_since_ms);
+                            session.client = Some(recovered);
+                            session.phase = LoginPhase::Authorized;
+                        }
+                        OfflineResumeAttempt::AuthRequired => {
+                            // `login_required` was just emitted: restart the
+                            // promoted-session watermark from this moment.
+                            *login_required_since = SystemTime::now();
+                        }
+                        OfflineResumeAttempt::StillOffline(next_state) => {
+                            offline_state = Some(next_state);
+                        }
+                    }
+                    continue;
+                }
+            }
+        } else {
+            commands.next().await?
+        };
+        let Some(cmd) = cmd else {
+            info!("stdin closed before login completed");
+            return Ok(None);
+        };
+        // Business commands still trigger an immediate retry instead of
+        // waiting for the next timer tick, then answer on their own channel if
+        // Telegram remains offline.
+        if offline_state.is_some() && is_resume_retry_command(&cmd) {
+            let state = offline_state
+                .take()
+                .expect("offline state exists for retry command");
+            match attempt_offline_resume(env, state).await? {
+                OfflineResumeAttempt::Resumed {
+                    client: resumed,
+                    offline_since_ms,
+                } => {
+                    recovered_offline_since_ms = Some(offline_since_ms);
+                    session.client = Some(resumed);
+                    session.phase = LoginPhase::Authorized;
+                    let _ = handle_runtime_command(env, session, cmd).await?;
+                    continue;
+                }
+                OfflineResumeAttempt::AuthRequired => {}
+                OfflineResumeAttempt::StillOffline(next_state) => {
+                    emit_offline_command_error(env, &cmd, &next_state.detail)?;
+                    offline_state = Some(next_state);
+                    continue;
+                }
+            }
+        }
+        let Some(cmd) = handle_login_command(session, cmd).await? else {
+            continue;
+        };
+        match cmd {
+            SubscriberCommand::TelegramAuthOk => {
+                // While parked offline the on-disk session is signed in and
+                // only the network was unreachable — answering ok:false would
+                // degrade the connection as if the login were lost. Probes
+                // deliberately do NOT trigger a resume retry; the retry timer
+                // is owned by this state machine.
+                let offline = offline_state.is_some();
+                // An external `puffer connect` login may have promoted a fresh
+                // session while we were parked here (#752). Adopt it instead
+                // of answering a stale ok:false forever.
+                if !offline {
+                    if let Some(mtime) =
+                        session_file_changed_since(&env.session_path, *login_required_since)
+                    {
+                        // Advance the watermark first: if this resume fails
+                        // (file invalid), don't re-dial on every probe tick.
+                        *login_required_since = mtime;
+                        if let SessionResume::Resumed(resumed) = try_resume_session(env).await? {
+                            emit_control(
+                                &env.topic,
+                                "auth_ok",
+                                json!({ "ok": true, "authenticated": true, "offline": false }),
+                            )?;
+                            session.client = Some(resumed);
+                            session.phase = LoginPhase::Authorized;
+                            continue; // exits the login loop; update loop emits `ready`
+                        }
+                    }
+                }
+                emit_control(
+                    &env.topic,
+                    "auth_ok",
+                    json!({
+                        "ok": offline,
+                        "authenticated": offline,
+                        "offline": offline,
+                    }),
+                )?;
+            }
+            SubscriberCommand::TelegramListPeers { query, .. } => {
+                emit_control(
+                    &env.topic,
+                    "peer_list_error",
+                    json!({
+                        "error": "not authenticated yet; complete login before listing Telegram peers",
+                        "query": query,
+                    }),
+                )?;
+            }
+            SubscriberCommand::TelegramHydrateContacts { .. } => {
+                emit_contacts_auth_required(env)?;
+            }
+            SubscriberCommand::TelegramSearchMessages { peer, query, .. } => {
+                emit_control(
+                    &env.topic,
+                    "message_search_error",
+                    json!({
+                        "error": "not authenticated yet; complete login before searching Telegram messages",
+                        "peer": peer,
+                        "query": query,
+                    }),
+                )?;
+            }
+            SubscriberCommand::TelegramListMessages { peer, .. } => {
+                emit_control(
+                    &env.topic,
+                    "message_list_error",
+                    json!({
+                        "error": "not authenticated yet; complete login before listing Telegram messages",
+                        "peer": peer,
+                    }),
+                )?;
+            }
+            SubscriberCommand::SendMessage { peer, .. } => {
+                emit_control(
+                    &env.topic,
+                    "send_unsupported",
+                    json!({
+                        "error": "not authenticated yet; complete login before sending messages",
+                        "peer": peer,
+                    }),
+                )?;
+            }
+            SubscriberCommand::EmailConfigure { .. } => {
+                emit_control(
+                    &env.topic,
+                    "command_ignored",
+                    json!({"error": "telegram-user does not handle email configuration"}),
+                )?;
+            }
+            SubscriberCommand::Custom { op, args } => handle_login_custom(env, op, args)?,
+            // Login commands were consumed by handle_login_command above.
+            _ => {}
+        }
+    }
+    Ok(Some(LoginPhaseOutcome {
+        recovered_offline_since_ms,
+    }))
+}
+
 /// Runs the Telegram user subscriber until stdin closes or a fatal error
 /// occurs. The caller is expected to already be inside a Tokio runtime
 /// (the top-level `#[tokio::main]` in the puffer binary).
@@ -137,7 +351,6 @@ pub async fn run() -> anyhow::Result<()> {
     // stdin commands and the automatic retry timer so the Telegram client and
     // command stream still have a single owner.
     let mut offline_state: Option<OfflineResumeState> = None;
-    let mut recovered_offline_since_ms: Option<i64> = None;
     // Watermark for detecting a session promoted by an external `puffer
     // connect` login while we are parked in the login phase (#752).
     let mut login_required_since = SystemTime::now();
@@ -158,166 +371,20 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
-    // Login phase: if we don't have an authorized client yet, keep reading
-    // stdin commands until login completes or stdin closes.
-    while session.client.is_none() {
-        let cmd = if let Some(retry_at) = offline_state.as_ref().map(|state| state.next_retry_at) {
-            tokio::select! {
-                maybe = commands.next() => maybe?,
-                _ = tokio::time::sleep_until(retry_at) => {
-                    let state = offline_state
-                        .take()
-                        .expect("offline state exists for retry timer");
-                    match attempt_offline_resume(&env, state).await? {
-                        OfflineResumeAttempt::Resumed {
-                            client: recovered,
-                            offline_since_ms,
-                        } => {
-                            recovered_offline_since_ms = Some(offline_since_ms);
-                            session.client = Some(recovered);
-                            session.phase = LoginPhase::Authorized;
-                        }
-                        OfflineResumeAttempt::AuthRequired => {
-                            // `login_required` was just emitted: restart the
-                            // promoted-session watermark from this moment.
-                            login_required_since = SystemTime::now();
-                        }
-                        OfflineResumeAttempt::StillOffline(next_state) => {
-                            offline_state = Some(next_state);
-                        }
-                    }
-                    continue;
-                }
-            }
-        } else {
-            commands.next().await?
-        };
-        let Some(cmd) = cmd else {
-            info!("stdin closed before login completed");
-            return Ok(());
-        };
-        // Business commands still trigger an immediate retry instead of
-        // waiting for the next timer tick, then answer on their own channel if
-        // Telegram remains offline.
-        if offline_state.is_some() && is_resume_retry_command(&cmd) {
-            let state = offline_state
-                .take()
-                .expect("offline state exists for retry command");
-            match attempt_offline_resume(&env, state).await? {
-                OfflineResumeAttempt::Resumed {
-                    client: resumed,
-                    offline_since_ms,
-                } => {
-                    recovered_offline_since_ms = Some(offline_since_ms);
-                    session.client = Some(resumed);
-                    session.phase = LoginPhase::Authorized;
-                    let _ = handle_runtime_command(&env, &mut session, cmd).await?;
-                    continue;
-                }
-                OfflineResumeAttempt::AuthRequired => {}
-                OfflineResumeAttempt::StillOffline(next_state) => {
-                    emit_offline_command_error(&env, &cmd, &next_state.detail)?;
-                    offline_state = Some(next_state);
-                    continue;
-                }
-            }
-        }
-        let Some(cmd) = handle_login_command(&mut session, cmd).await? else {
-            continue;
-        };
-        match cmd {
-            SubscriberCommand::TelegramAuthOk => {
-                // While parked offline the on-disk session is signed in and
-                // only the network was unreachable — answering ok:false would
-                // degrade the connection as if the login were lost. Probes
-                // deliberately do NOT trigger a resume retry; the retry timer
-                // is owned by this state machine.
-                let offline = offline_state.is_some();
-                // An external `puffer connect` login may have promoted a fresh
-                // session while we were parked here (#752). Adopt it instead
-                // of answering a stale ok:false forever.
-                if !offline {
-                    if let Some(mtime) =
-                        session_file_changed_since(&env.session_path, login_required_since)
-                    {
-                        // Advance the watermark first: if this resume fails
-                        // (file invalid), don't re-dial on every probe tick.
-                        login_required_since = mtime;
-                        if let SessionResume::Resumed(resumed) = try_resume_session(&env).await? {
-                            emit_control(
-                                &env.topic,
-                                "auth_ok",
-                                json!({ "ok": true, "authenticated": true, "offline": false }),
-                            )?;
-                            session.client = Some(resumed);
-                            session.phase = LoginPhase::Authorized;
-                            continue; // exits the login loop; update loop emits `ready`
-                        }
-                    }
-                }
-                emit_control(
-                    &env.topic,
-                    "auth_ok",
-                    json!({
-                        "ok": offline,
-                        "authenticated": offline,
-                        "offline": offline,
-                    }),
-                )?;
-            }
-            SubscriberCommand::TelegramListPeers { query, .. } => {
-                emit_control(
-                    &env.topic,
-                    "peer_list_error",
-                    json!({
-                        "error": "not authenticated yet; complete login before listing Telegram peers",
-                        "query": query,
-                    }),
-                )?;
-            }
-            SubscriberCommand::TelegramSearchMessages { peer, query, .. } => {
-                emit_control(
-                    &env.topic,
-                    "message_search_error",
-                    json!({
-                        "error": "not authenticated yet; complete login before searching Telegram messages",
-                        "peer": peer,
-                        "query": query,
-                    }),
-                )?;
-            }
-            SubscriberCommand::TelegramListMessages { peer, .. } => {
-                emit_control(
-                    &env.topic,
-                    "message_list_error",
-                    json!({
-                        "error": "not authenticated yet; complete login before listing Telegram messages",
-                        "peer": peer,
-                    }),
-                )?;
-            }
-            SubscriberCommand::SendMessage { peer, .. } => {
-                emit_control(
-                    &env.topic,
-                    "send_unsupported",
-                    json!({
-                        "error": "not authenticated yet; complete login before sending messages",
-                        "peer": peer,
-                    }),
-                )?;
-            }
-            SubscriberCommand::EmailConfigure { .. } => {
-                emit_control(
-                    &env.topic,
-                    "command_ignored",
-                    json!({"error": "telegram-user does not handle email configuration"}),
-                )?;
-            }
-            SubscriberCommand::Custom { op, args } => handle_login_custom(&env, op, args)?,
-            // Login commands were consumed by handle_login_command above.
-            _ => {}
-        }
-    }
+    // Login phase: park offline / drive login until an authorized client
+    // exists, or stdin closes. Callable again after the update loop parks us.
+    let Some(outcome) = login_phase(
+        &env,
+        &mut commands,
+        &mut session,
+        offline_state,
+        &mut login_required_since,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let mut recovered_offline_since_ms = outcome.recovered_offline_since_ms;
 
     let mut delivery_cursor = DeliveryCursor::load(&env)?;
     let mut notification_mutes = NotificationMuteCache::default();
@@ -355,6 +422,29 @@ pub async fn run() -> anyhow::Result<()> {
                     authorized = false;
                     continue;
                 }
+                UpdateLoopExit::WentOffline(detail) => {
+                    // The live stream dropped for a network-class reason.
+                    // Clear the dead client so the shared login phase re-parks
+                    // on the bounded, jittered offline-resume timer instead of
+                    // killing the process.
+                    session.client = None;
+                    let state = OfflineResumeState::new(detail);
+                    emit_resume_offline(&env, &state)?;
+                    let Some(outcome) = login_phase(
+                        &env,
+                        &mut commands,
+                        &mut session,
+                        Some(state),
+                        &mut login_required_since,
+                    )
+                    .await?
+                    else {
+                        return Ok(());
+                    };
+                    recovered_offline_since_ms = outcome.recovered_offline_since_ms;
+                    authorized = session.is_authorized();
+                    continue;
+                }
             }
         }
 
@@ -385,6 +475,9 @@ pub async fn run() -> anyhow::Result<()> {
                         "query": query,
                     }),
                 )?;
+            }
+            SubscriberCommand::TelegramHydrateContacts { .. } => {
+                emit_contacts_auth_required(&env)?;
             }
             SubscriberCommand::TelegramSearchMessages { peer, query, .. } => {
                 emit_control(
@@ -491,44 +584,18 @@ async fn run_update_loop(
                     let recoverable = recoverable_live_update_error(&error);
                     crate::health::report_update_loop_error(env, &error, !recoverable);
                     if recoverable {
-                        warn!(%error, "recovering telegram live update stream");
-                        tokio::time::sleep(LIVE_UPDATE_RECOVERY_DELAY).await;
-                        if let SessionResume::Resumed(recovered) =
-                            try_resume_session(env).await?
-                        {
-                            session.client = Some(recovered.clone());
-                            client = recovered;
-                            reset_delivery_cursor_for_current_account(&client, delivery_cursor)
-                                .await?;
-                            if let Some(exit) = hydrate_startup_state_before_updates(
-                                env,
-                                commands,
-                                session,
-                                delivery_cursor,
-                                notification_mutes,
-                                live_since_ms,
-                            )
-                            .await?
-                            {
-                                return Ok(exit);
-                            }
-                            client = session
-                                .client
-                                .clone()
-                                .expect("update loop requires a client");
-                            persist_live_session_state(env, &client);
-                            emit_control(
-                                &env.topic,
-                                "ready",
-                                json!({ "resumed": true, "recovered": true }),
-                            )?;
-                            (live_updates, live_task) =
-                                spawn_live_update_task(env.clone(), client.clone());
-                            continue;
-                        }
+                        // #604: network-class loss. Park on the shared offline
+                        // state machine (bounded jittered retries) instead of a
+                        // single in-place resume that killed the process on
+                        // failure.
+                        warn!(%error, "telegram live update stream lost; parking offline");
+                        return Ok(UpdateLoopExit::WentOffline(error.to_string()));
                     }
-                    error!(%error, "next_update failed");
-                    return Err(anyhow::anyhow!("next_update: {error}"));
+                    // Auth-class loss: drop the dead client and fall back to the
+                    // login flow rather than terminating the subscriber.
+                    error!(%error, "telegram live update stream lost; reauthenticating");
+                    session.client = None;
+                    return Ok(UpdateLoopExit::ReauthStarted);
                 }
                 handle_live_update(
                     env,
@@ -746,6 +813,16 @@ async fn attempt_offline_resume(
     }
 }
 
+/// Answers a `TelegramHydrateContacts` request received while not authorized:
+/// hydration needs a live client, so the caller must complete login first.
+fn emit_contacts_auth_required(env: &SkillEnv) -> anyhow::Result<()> {
+    emit_control(
+        &env.topic,
+        "contacts_hydrated",
+        json!({ "ok": false, "state": "auth_required" }),
+    )
+}
+
 fn emit_resume_offline(env: &SkillEnv, state: &OfflineResumeState) -> anyhow::Result<()> {
     emit_control(
         &env.topic,
@@ -821,10 +898,22 @@ fn startup_monitoring_boundary(
     recovered_offline_since_ms.unwrap_or(default_live_since_ms)
 }
 
+/// Next offline-resume backoff with full jitter: the delay doubles (capped at
+/// [`OFFLINE_RESUME_RETRY_MAX_DELAY`]) then lands uniformly in `[doubled/2,
+/// doubled]`, so many subscribers reconnecting after the same outage spread
+/// their retries instead of stampeding. Uses `SystemTime` subsec nanos as a
+/// cheap entropy source (no `rand` dependency).
 fn next_offline_retry_delay(current: Duration) -> Duration {
-    current
+    let doubled = current
         .saturating_mul(2)
-        .min(OFFLINE_RESUME_RETRY_MAX_DELAY)
+        .min(OFFLINE_RESUME_RETRY_MAX_DELAY);
+    let half = doubled / 2;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let span_ms = half.as_millis().max(1) as u64;
+    half + Duration::from_millis(nanos % (span_ms + 1))
 }
 
 /// Stops an in-flight hydration task and waits for it to wind down so a
@@ -994,6 +1083,25 @@ async fn handle_runtime_command(
         } => {
             let client = runtime_client(session)?;
             handle_list_peers(env, &client, query, peer_kind, limit).await?;
+        }
+        SubscriberCommand::TelegramHydrateContacts { target } => {
+            if session.hydration.is_idle() {
+                // Acquire the client BEFORE spawning so a failure here leaves
+                // the slot untouched (nothing was attached — still idle).
+                let client = runtime_client(session)?;
+                let handle = tokio::spawn(crate::peer_cache::run_contact_hydration(
+                    env.clone(),
+                    client,
+                    target,
+                ));
+                session.hydration.attach(handle);
+            } else {
+                emit_control(
+                    &env.topic,
+                    "contacts_hydrated",
+                    json!({ "ok": false, "state": "hydrating" }),
+                )?;
+            }
         }
         SubscriberCommand::TelegramSearchMessages {
             peer,
@@ -1354,10 +1462,28 @@ fn import_payload(outcome: &TdataImportOutcome) -> serde_json::Value {
 mod tests {
     use super::{
         next_offline_retry_delay, runtime_login_outcome, session_file_changed_since,
-        startup_monitoring_boundary, verify_failure_login_error, LoginCommandKind,
+        startup_monitoring_boundary, verify_failure_login_error, HydrationSlot, LoginCommandKind,
         RuntimeCommandOutcome, VerifyFailure, OFFLINE_RESUME_RETRY_INITIAL_DELAY,
         OFFLINE_RESUME_RETRY_MAX_DELAY,
     };
+
+    #[tokio::test]
+    async fn hydrate_request_is_single_flight() {
+        let mut slot = HydrationSlot::default();
+        assert!(slot.is_idle()); // an empty slot accepts the first request
+
+        slot.attach(tokio::spawn(std::future::pending::<()>()));
+        assert!(!slot.is_idle()); // refused while the task is running
+
+        slot.handle.as_ref().expect("handle attached").abort();
+        for _ in 0..200 {
+            if slot.is_idle() {
+                return; // task completion frees the slot automatically
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("hydration slot never freed after task completion");
+    }
     use crate::login::LoginSession;
     use crate::login_flow::LoginPhase;
     use crate::state::SkillEnv;
@@ -1487,13 +1613,27 @@ mod tests {
 
     #[test]
     fn offline_retry_delay_backs_off_until_cap() {
-        assert_eq!(
-            next_offline_retry_delay(OFFLINE_RESUME_RETRY_INITIAL_DELAY),
-            Duration::from_secs(10)
-        );
-        assert_eq!(
-            next_offline_retry_delay(OFFLINE_RESUME_RETRY_MAX_DELAY),
-            OFFLINE_RESUME_RETRY_MAX_DELAY
+        // 5s → doubled 10s, then full-jitter into [5s, 10s].
+        let from_initial = next_offline_retry_delay(OFFLINE_RESUME_RETRY_INITIAL_DELAY);
+        assert!(from_initial >= Duration::from_secs(5));
+        assert!(from_initial <= Duration::from_secs(10));
+        // At the cap the jitter stays within [30s, 60s] and never exceeds it.
+        let from_max = next_offline_retry_delay(OFFLINE_RESUME_RETRY_MAX_DELAY);
+        assert!(from_max >= OFFLINE_RESUME_RETRY_MAX_DELAY / 2);
+        assert!(from_max <= OFFLINE_RESUME_RETRY_MAX_DELAY);
+    }
+
+    #[test]
+    fn offline_retry_delay_jitter_stays_in_bounds() {
+        for _ in 0..100 {
+            let next = next_offline_retry_delay(Duration::from_secs(10));
+            assert!(next >= Duration::from_secs(10)); // doubled lower bound = 20/2
+            assert!(next <= Duration::from_secs(20));
+        }
+        // cap still enforced
+        assert!(
+            next_offline_retry_delay(OFFLINE_RESUME_RETRY_MAX_DELAY)
+                <= OFFLINE_RESUME_RETRY_MAX_DELAY
         );
     }
 }

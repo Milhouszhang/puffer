@@ -5,7 +5,7 @@
 //! infinite `next_update` loop that emits ndjson message events.
 
 use anyhow::Context as _;
-use grammers_client::{session::Session, Client, Config};
+use grammers_client::{session::Session, Client};
 use puffer_subscriber_runtime::SubscriberCommand;
 use serde_json::json;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,13 +16,14 @@ use crate::commands::CommandStream;
 use crate::delivery::DeliveryCursor;
 use crate::events::emit_control;
 use crate::import::{import_tdata, TdataImportOptions, TdataImportOutcome};
-use crate::login;
+use crate::login::LoginSession;
+use crate::login_flow::LoginPhase;
 use crate::notifications::NotificationMuteCache;
 use crate::outbound::handle_send_message;
 use crate::peers::{handle_list_messages, handle_list_peers, handle_search_messages};
 use crate::qr_login;
 use crate::session_resume::{recoverable_live_update_error, try_resume_session, SessionResume};
-use crate::state::{default_init_params, LoginState, SkillEnv};
+use crate::state::SkillEnv;
 use crate::updates::{handle_live_update, spawn_live_update_task, LiveUpdateEvent};
 
 const LIVE_UPDATE_RECOVERY_DELAY: Duration = Duration::from_secs(1);
@@ -124,8 +125,7 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     let mut commands = CommandStream::new();
-    let mut login_state = LoginState::new();
-    let mut qr_state = None;
+    let mut session = LoginSession::new(env.clone());
 
     // Attempt to reuse a pre-authenticated session first. If the session file
     // holds a valid auth key we can go straight to the update loop without
@@ -138,26 +138,25 @@ pub async fn run() -> anyhow::Result<()> {
     // command stream still have a single owner.
     let mut offline_state: Option<OfflineResumeState> = None;
     let mut recovered_offline_since_ms: Option<i64> = None;
-    let mut client = match try_resume_session(&env).await? {
+    match try_resume_session(&env).await? {
         SessionResume::Resumed(c) => {
             emit_control(&env.topic, "ready", json!({ "resumed": true }))?;
-            Some(c)
+            session.client = Some(c);
+            session.phase = LoginPhase::Authorized;
         }
         SessionResume::AuthRequired => {
             emit_control(&env.topic, "login_required", json!({}))?;
-            None
         }
         SessionResume::Transient(detail) => {
             let state = OfflineResumeState::new(detail);
             emit_resume_offline(&env, &state)?;
             offline_state = Some(state);
-            None
         }
-    };
+    }
 
     // Login phase: if we don't have an authorized client yet, keep reading
     // stdin commands until login completes or stdin closes.
-    while client.as_ref().map(|_| false).unwrap_or(true) {
+    while session.client.is_none() {
         let cmd = if let Some(retry_at) = offline_state.as_ref().map(|state| state.next_retry_at) {
             tokio::select! {
                 maybe = commands.next() => maybe?,
@@ -171,7 +170,8 @@ pub async fn run() -> anyhow::Result<()> {
                             offline_since_ms,
                         } => {
                             recovered_offline_since_ms = Some(offline_since_ms);
-                            client = Some(recovered);
+                            session.client = Some(recovered);
+                            session.phase = LoginPhase::Authorized;
                         }
                         OfflineResumeAttempt::AuthRequired => {}
                         OfflineResumeAttempt::StillOffline(next_state) => {
@@ -197,19 +197,13 @@ pub async fn run() -> anyhow::Result<()> {
                 .expect("offline state exists for retry command");
             match attempt_offline_resume(&env, state).await? {
                 OfflineResumeAttempt::Resumed {
-                    client: mut resumed,
+                    client: resumed,
                     offline_since_ms,
                 } => {
                     recovered_offline_since_ms = Some(offline_since_ms);
-                    let _ = handle_runtime_command(
-                        &env,
-                        &mut resumed,
-                        &mut login_state,
-                        &mut qr_state,
-                        cmd,
-                    )
-                    .await?;
-                    client = Some(resumed);
+                    session.client = Some(resumed);
+                    session.phase = LoginPhase::Authorized;
+                    let _ = handle_runtime_command(&env, &mut session, cmd).await?;
                     continue;
                 }
                 OfflineResumeAttempt::AuthRequired => {}
@@ -225,30 +219,20 @@ pub async fn run() -> anyhow::Result<()> {
                 phone,
                 api_id,
                 api_hash,
-            } => match login::start(&env, &mut login_state, phone, api_id, api_hash).await? {
-                Some(c) => client = Some(c),
-                None => continue,
-            },
+            } => {
+                session.start(phone, api_id, api_hash).await?;
+            }
             SubscriberCommand::TelegramQrLoginStart { api_id, api_hash } => {
-                match qr_login::start(&env, &mut login_state, &mut qr_state, api_id, api_hash)
-                    .await?
-                {
-                    qr_login::QrLoginOutcome::Pending => {}
-                    qr_login::QrLoginOutcome::AwaitingPassword(qr_client)
-                    | qr_login::QrLoginOutcome::Complete(qr_client) => {
-                        client = Some(qr_client);
-                    }
-                }
+                qr_login::start(&mut session, api_id, api_hash).await?;
             }
             SubscriberCommand::TelegramQrLoginWait { timeout_seconds } => {
-                match qr_login::wait(&env, &mut login_state, &mut qr_state, timeout_seconds).await?
-                {
-                    qr_login::QrLoginOutcome::Pending => {}
-                    qr_login::QrLoginOutcome::AwaitingPassword(qr_client)
-                    | qr_login::QrLoginOutcome::Complete(qr_client) => {
-                        client = Some(qr_client);
-                    }
-                }
+                qr_login::wait(&mut session, timeout_seconds).await?;
+            }
+            SubscriberCommand::TelegramLoginSubmitCode { code } => {
+                session.submit_code(code).await?;
+            }
+            SubscriberCommand::TelegramLoginSubmitPassword { password } => {
+                session.submit_password(password).await?;
             }
             SubscriberCommand::TelegramImportTdata {
                 path,
@@ -267,18 +251,9 @@ pub async fn run() -> anyhow::Result<()> {
                 )
                 .await?
                 {
-                    client = Some(imported);
+                    session.client = Some(imported);
+                    session.phase = LoginPhase::Authorized;
                 }
-            }
-            SubscriberCommand::TelegramLoginSubmitCode { .. }
-            | SubscriberCommand::TelegramLoginSubmitPassword { .. } => {
-                emit_control(
-                    &env.topic,
-                    "login_error",
-                    json!({
-                        "error": "login not started; send telegram_login_start first"
-                    }),
-                )?;
             }
             SubscriberCommand::TelegramAuthOk => {
                 // While parked offline the on-disk session is signed in and
@@ -349,27 +324,31 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
-    let mut client = client.expect("client set after login phase");
     let mut delivery_cursor = DeliveryCursor::load(&env)?;
     let mut notification_mutes = NotificationMuteCache::default();
 
     // Drive the remaining login steps (code + optional 2FA) if needed, then
-    // enter the update loop. `client` may already be authorized when we
-    // resumed a session, in which case this loop is skipped on the first
-    // iteration via `is_authorized`.
-    let mut authorized = client
-        .is_authorized()
-        .await
-        .context("probe initial auth state")?;
+    // enter the update loop. The client may already be authorized when we
+    // resumed a session; the resume path sets the client without an explicit
+    // phase, so probe once and converge the phase.
+    let mut authorized = session.is_authorized()
+        || session
+            .client
+            .as_ref()
+            .expect("client set after login phase")
+            .is_authorized()
+            .await
+            .context("probe initial auth state")?;
+    if authorized {
+        session.phase = LoginPhase::Authorized;
+    }
 
     loop {
         if authorized {
             match run_update_loop(
                 &env,
                 &mut commands,
-                &mut client,
-                &mut login_state,
-                &mut qr_state,
+                &mut session,
                 &mut delivery_cursor,
                 &mut notification_mutes,
                 recovered_offline_since_ms.take(),
@@ -391,55 +370,29 @@ pub async fn run() -> anyhow::Result<()> {
         };
         match cmd {
             SubscriberCommand::TelegramLoginSubmitCode { code } => {
-                match submit_code_with_reconnect(&env, &mut client, &mut login_state, code).await? {
-                    login::CodeSubmitOutcome::Complete => authorized = true,
-                    login::CodeSubmitOutcome::AwaitingPassword
-                    | login::CodeSubmitOutcome::Failed
-                    | login::CodeSubmitOutcome::RetryableTransportError { .. } => {}
-                }
+                session.submit_code(code).await?;
+                authorized = session.is_authorized();
             }
             SubscriberCommand::TelegramLoginSubmitPassword { password } => {
-                if login::submit_password(&env, &mut login_state, &client, password).await? {
-                    authorized = true;
-                }
+                session.submit_password(password).await?;
+                authorized = session.is_authorized();
             }
             SubscriberCommand::TelegramLoginStart {
                 phone,
                 api_id,
                 api_hash,
             } => {
-                // Operator restarted the flow; re-request the login code on
-                // the same connection.
-                login::start(&env, &mut login_state, phone, api_id, api_hash).await?;
+                // Operator restarted the flow; re-request the login code.
+                session.start(phone, api_id, api_hash).await?;
+                authorized = session.is_authorized();
             }
             SubscriberCommand::TelegramQrLoginStart { api_id, api_hash } => {
-                match qr_login::start(&env, &mut login_state, &mut qr_state, api_id, api_hash)
-                    .await?
-                {
-                    qr_login::QrLoginOutcome::Pending => {}
-                    qr_login::QrLoginOutcome::AwaitingPassword(qr_client) => {
-                        client = qr_client;
-                        authorized = false;
-                    }
-                    qr_login::QrLoginOutcome::Complete(qr_client) => {
-                        client = qr_client;
-                        authorized = true;
-                    }
-                }
+                qr_login::start(&mut session, api_id, api_hash).await?;
+                authorized = session.is_authorized();
             }
             SubscriberCommand::TelegramQrLoginWait { timeout_seconds } => {
-                match qr_login::wait(&env, &mut login_state, &mut qr_state, timeout_seconds).await?
-                {
-                    qr_login::QrLoginOutcome::Pending => {}
-                    qr_login::QrLoginOutcome::AwaitingPassword(qr_client) => {
-                        client = qr_client;
-                        authorized = false;
-                    }
-                    qr_login::QrLoginOutcome::Complete(qr_client) => {
-                        client = qr_client;
-                        authorized = true;
-                    }
-                }
+                qr_login::wait(&mut session, timeout_seconds).await?;
+                authorized = session.is_authorized();
             }
             SubscriberCommand::TelegramImportTdata {
                 path,
@@ -458,13 +411,19 @@ pub async fn run() -> anyhow::Result<()> {
                 )
                 .await?
                 {
-                    client = imported;
-                    authorized = true;
+                    session.client = Some(imported);
+                    session.phase = LoginPhase::Authorized;
                 }
+                authorized = session.is_authorized();
             }
-            SubscriberCommand::TelegramAuthOk => {
-                emit_auth_ok(&env, &client).await?;
-            }
+            SubscriberCommand::TelegramAuthOk => match session.client.as_ref() {
+                Some(client) => emit_auth_ok(&env, client).await?,
+                None => emit_control(
+                    &env.topic,
+                    "auth_ok",
+                    json!({ "ok": false, "authenticated": false }),
+                )?,
+            },
             SubscriberCommand::TelegramListPeers { query, .. } => {
                 emit_control(
                     &env.topic,
@@ -524,26 +483,27 @@ pub async fn run() -> anyhow::Result<()> {
 async fn run_update_loop(
     env: &SkillEnv,
     commands: &mut CommandStream,
-    client: &mut Client,
-    login_state: &mut LoginState,
-    qr_state: &mut Option<qr_login::QrLoginState>,
+    session: &mut LoginSession,
     delivery_cursor: &mut DeliveryCursor,
     notification_mutes: &mut NotificationMuteCache,
     recovered_offline_since_ms: Option<i64>,
 ) -> anyhow::Result<UpdateLoopExit> {
+    // grammers `Client` is a cheap handle — clones share the connection.
+    let mut client = session
+        .client
+        .clone()
+        .expect("update loop requires a client");
     emit_control(&env.topic, "ready", json!({}))?;
     // Monitoring is promised from this moment on: messages dated after this
     // boundary must reach the triage pipeline even when they arrive while
     // startup hydration is still running (see hydrate_dialog_state).
     let live_since_ms =
         startup_monitoring_boundary(monitoring_live_since_ms(), recovered_offline_since_ms);
-    reset_delivery_cursor_for_current_account(client, delivery_cursor).await?;
+    reset_delivery_cursor_for_current_account(&client, delivery_cursor).await?;
     if let Some(exit) = hydrate_startup_state_before_updates(
         env,
         commands,
-        client,
-        login_state,
-        qr_state,
+        session,
         delivery_cursor,
         notification_mutes,
         live_since_ms,
@@ -552,7 +512,12 @@ async fn run_update_loop(
     {
         return Ok(exit);
     }
-    persist_live_session_state(env, client);
+    // Hydration may have replaced the client (e.g. a runtime tdata import).
+    client = session
+        .client
+        .clone()
+        .expect("update loop requires a client");
+    persist_live_session_state(env, &client);
     let (mut live_updates, mut live_task) = spawn_live_update_task(env.clone(), client.clone());
     info!("entering telegram update loop");
 
@@ -577,15 +542,14 @@ async fn run_update_loop(
                         if let SessionResume::Resumed(recovered) =
                             try_resume_session(env).await?
                         {
-                            *client = recovered;
-                            reset_delivery_cursor_for_current_account(client, delivery_cursor)
+                            session.client = Some(recovered.clone());
+                            client = recovered;
+                            reset_delivery_cursor_for_current_account(&client, delivery_cursor)
                                 .await?;
                             if let Some(exit) = hydrate_startup_state_before_updates(
                                 env,
                                 commands,
-                                client,
-                                login_state,
-                                qr_state,
+                                session,
                                 delivery_cursor,
                                 notification_mutes,
                                 live_since_ms,
@@ -594,7 +558,11 @@ async fn run_update_loop(
                             {
                                 return Ok(exit);
                             }
-                            persist_live_session_state(env, client);
+                            client = session
+                                .client
+                                .clone()
+                                .expect("update loop requires a client");
+                            persist_live_session_state(env, &client);
                             emit_control(
                                 &env.topic,
                                 "ready",
@@ -615,7 +583,7 @@ async fn run_update_loop(
                     update,
                 )
                 .await?;
-                persist_live_session_state(env, client);
+                persist_live_session_state(env, &client);
             }
             cmd = commands.next() => {
                 let Some(cmd) = cmd? else {
@@ -623,7 +591,7 @@ async fn run_update_loop(
                     live_task.abort();
                     return Ok(UpdateLoopExit::StdinClosed);
                 };
-                match handle_runtime_command(env, client, login_state, qr_state, cmd).await? {
+                match handle_runtime_command(env, session, cmd).await? {
                     RuntimeCommandOutcome::Continue => {}
                     RuntimeCommandOutcome::ReauthStarted => {
                         live_task.abort();
@@ -631,13 +599,15 @@ async fn run_update_loop(
                     }
                     RuntimeCommandOutcome::ClientReplaced => {
                         live_task.abort();
-                        reset_delivery_cursor_for_current_account(client, delivery_cursor).await?;
+                        client = session
+                            .client
+                            .clone()
+                            .expect("update loop requires a client");
+                        reset_delivery_cursor_for_current_account(&client, delivery_cursor).await?;
                         if let Some(exit) = hydrate_startup_state_before_updates(
                             env,
                             commands,
-                            client,
-                            login_state,
-                            qr_state,
+                            session,
                             delivery_cursor,
                             notification_mutes,
                             live_since_ms,
@@ -646,7 +616,11 @@ async fn run_update_loop(
                         {
                             return Ok(exit);
                         }
-                        persist_live_session_state(env, client);
+                        client = session
+                            .client
+                            .clone()
+                            .expect("update loop requires a client");
+                        persist_live_session_state(env, &client);
                         (live_updates, live_task) =
                             spawn_live_update_task(env.clone(), client.clone());
                     }
@@ -682,16 +656,18 @@ async fn reset_delivery_cursor_for_current_account(
 async fn hydrate_startup_state_before_updates(
     env: &SkillEnv,
     commands: &mut CommandStream,
-    client: &mut Client,
-    login_state: &mut LoginState,
-    qr_state: &mut Option<qr_login::QrLoginState>,
+    session: &mut LoginSession,
     delivery_cursor: &mut DeliveryCursor,
     notification_mutes: &mut NotificationMuteCache,
     live_since_ms: i64,
 ) -> anyhow::Result<Option<UpdateLoopExit>> {
+    let client = session
+        .client
+        .clone()
+        .expect("startup hydration requires a client");
     let mut hydration = spawn_startup_hydration(
         env,
-        client,
+        &client,
         delivery_cursor,
         notification_mutes,
         live_since_ms,
@@ -701,7 +677,7 @@ async fn hydrate_startup_state_before_updates(
             biased;
             cmd = commands.next() => match cmd? {
                 Some(cmd) => {
-                    match handle_runtime_command(env, client, login_state, qr_state, cmd).await? {
+                    match handle_runtime_command(env, session, cmd).await? {
                         RuntimeCommandOutcome::Continue => {}
                         RuntimeCommandOutcome::ReauthStarted => {
                             abort_startup_hydration(hydration).await;
@@ -714,12 +690,16 @@ async fn hydrate_startup_state_before_updates(
                             abort_startup_hydration(hydration).await;
                             *delivery_cursor = DeliveryCursor::load(env).unwrap_or_default();
                             *notification_mutes = NotificationMuteCache::default();
-                            reset_delivery_cursor_for_current_account(client, delivery_cursor)
+                            let client = session
+                                .client
+                                .clone()
+                                .expect("startup hydration requires a client");
+                            reset_delivery_cursor_for_current_account(&client, delivery_cursor)
                                 .await?;
                             info!("restarting telegram startup hydration for replaced client");
                             hydration = spawn_startup_hydration(
                                 env,
-                                client,
+                                &client,
                                 delivery_cursor,
                                 notification_mutes,
                                 live_since_ms,
@@ -913,72 +893,13 @@ fn persist_live_session_state(env: &SkillEnv, client: &Client) {
     }
 }
 
-async fn submit_code_with_reconnect(
-    env: &SkillEnv,
-    client: &mut Client,
-    login_state: &mut LoginState,
-    code: String,
-) -> anyhow::Result<login::CodeSubmitOutcome> {
-    let first = login::submit_code(env, login_state, client, code.clone()).await?;
-    let login::CodeSubmitOutcome::RetryableTransportError { error } = first else {
-        return Ok(first);
-    };
-
-    warn!(%error, "retrying telegram sign_in after reconnect");
-    match reconnect_login_client(env, login_state).await {
-        Ok(reconnected) => {
-            *client = reconnected;
-            login::submit_code(env, login_state, client, code).await
-        }
-        Err(reconnect_error) => {
-            login_state.clear_tokens();
-            emit_control(
-                &env.topic,
-                "login_error",
-                json!({
-                    "error": format!(
-                        "sign_in transport failed and reconnect failed: {reconnect_error}"
-                    ),
-                    "phase": "sign_in_reconnect"
-                }),
-            )?;
-            Ok(login::CodeSubmitOutcome::Failed)
-        }
-    }
-}
-
-async fn reconnect_login_client(
-    env: &SkillEnv,
-    login_state: &LoginState,
-) -> anyhow::Result<Client> {
-    let api_id = login_state
-        .api_id
-        .ok_or_else(|| anyhow::anyhow!("login attempt is missing api_id"))?;
-    let api_hash = login_state
-        .api_hash
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("login attempt is missing api_hash"))?;
-    let session = Session::load_file_or_create(&env.session_path)
-        .with_context(|| format!("load session file {}", env.session_path.display()))?;
-    Client::connect(Config {
-        session,
-        api_id,
-        api_hash,
-        params: default_init_params(),
-    })
-    .await
-    .context("reconnect telegram client for sign_in retry")
-}
-
 /// Handles a stdin command received while the update loop is running.
 ///
 /// Most login-related commands are unexpected here (login already succeeded)
 /// but we still accept them to support re-authentication without a restart.
 async fn handle_runtime_command(
     env: &SkillEnv,
-    client: &mut Client,
-    login_state: &mut LoginState,
-    qr_state: &mut Option<qr_login::QrLoginState>,
+    session: &mut LoginSession,
     cmd: SubscriberCommand,
 ) -> anyhow::Result<RuntimeCommandOutcome> {
     match cmd {
@@ -987,45 +908,35 @@ async fn handle_runtime_command(
             api_id,
             api_hash,
         } => {
-            *qr_state = None;
-            if let Some(login_client) =
-                login::start(env, login_state, phone, api_id, api_hash).await?
-            {
-                *client = login_client;
+            session.start(phone, api_id, api_hash).await?;
+            if matches!(session.phase, LoginPhase::CodeSent { .. }) {
                 return Ok(RuntimeCommandOutcome::ReauthStarted);
             }
         }
         SubscriberCommand::TelegramLoginSubmitCode { code } => {
-            submit_code_with_reconnect(env, client, login_state, code).await?;
+            session.submit_code(code).await?;
         }
         SubscriberCommand::TelegramLoginSubmitPassword { password } => {
-            login::submit_password(env, login_state, client, password).await?;
+            session.submit_password(password).await?;
         }
         SubscriberCommand::TelegramQrLoginStart { api_id, api_hash } => {
-            login_state.clear_tokens();
-            match qr_login::start(env, login_state, qr_state, api_id, api_hash).await? {
-                qr_login::QrLoginOutcome::Pending => {}
-                qr_login::QrLoginOutcome::AwaitingPassword(qr_client) => {
-                    *client = qr_client;
-                    return Ok(RuntimeCommandOutcome::ReauthStarted);
+            qr_login::start(session, api_id, api_hash).await?;
+            match session.phase {
+                LoginPhase::Authorized => return Ok(RuntimeCommandOutcome::ClientReplaced),
+                LoginPhase::PasswordPending { .. } => {
+                    return Ok(RuntimeCommandOutcome::ReauthStarted)
                 }
-                qr_login::QrLoginOutcome::Complete(qr_client) => {
-                    *client = qr_client;
-                    return Ok(RuntimeCommandOutcome::ClientReplaced);
-                }
+                _ => {}
             }
         }
         SubscriberCommand::TelegramQrLoginWait { timeout_seconds } => {
-            match qr_login::wait(env, login_state, qr_state, timeout_seconds).await? {
-                qr_login::QrLoginOutcome::Pending => {}
-                qr_login::QrLoginOutcome::AwaitingPassword(qr_client) => {
-                    *client = qr_client;
-                    return Ok(RuntimeCommandOutcome::ReauthStarted);
+            qr_login::wait(session, timeout_seconds).await?;
+            match session.phase {
+                LoginPhase::Authorized => return Ok(RuntimeCommandOutcome::ClientReplaced),
+                LoginPhase::PasswordPending { .. } => {
+                    return Ok(RuntimeCommandOutcome::ReauthStarted)
                 }
-                qr_login::QrLoginOutcome::Complete(qr_client) => {
-                    *client = qr_client;
-                    return Ok(RuntimeCommandOutcome::ClientReplaced);
-                }
+                _ => {}
             }
         }
         SubscriberCommand::TelegramImportTdata {
@@ -1045,19 +956,26 @@ async fn handle_runtime_command(
             )
             .await?
             {
-                *client = imported;
+                session.client = Some(imported);
+                session.phase = LoginPhase::Authorized;
                 return Ok(RuntimeCommandOutcome::ClientReplaced);
             }
         }
-        SubscriberCommand::TelegramAuthOk => {
-            emit_auth_ok(env, client).await?;
-        }
+        SubscriberCommand::TelegramAuthOk => match session.client.as_ref() {
+            Some(client) => emit_auth_ok(env, client).await?,
+            None => emit_control(
+                &env.topic,
+                "auth_ok",
+                json!({ "ok": false, "authenticated": false }),
+            )?,
+        },
         SubscriberCommand::TelegramListPeers {
             query,
             peer_kind,
             limit,
         } => {
-            handle_list_peers(env, client, query, peer_kind, limit).await?;
+            let client = runtime_client(session)?;
+            handle_list_peers(env, &client, query, peer_kind, limit).await?;
         }
         SubscriberCommand::TelegramSearchMessages {
             peer,
@@ -1066,7 +984,8 @@ async fn handle_runtime_command(
             context,
             succinct,
         } => {
-            handle_search_messages(env, client, peer, query, limit, context, succinct).await?;
+            let client = runtime_client(session)?;
+            handle_search_messages(env, &client, peer, query, limit, context, succinct).await?;
         }
         SubscriberCommand::TelegramListMessages {
             peer,
@@ -1076,8 +995,9 @@ async fn handle_runtime_command(
             scan_limit,
             succinct,
         } => {
+            let client = runtime_client(session)?;
             handle_list_messages(
-                env, client, peer, limit, before_id, sender, scan_limit, succinct,
+                env, &client, peer, limit, before_id, sender, scan_limit, succinct,
             )
             .await?;
         }
@@ -1088,7 +1008,8 @@ async fn handle_runtime_command(
             media,
             ..
         } => {
-            handle_send_message(env, client, peer, text, reply_to, media).await?;
+            let client = runtime_client(session)?;
+            handle_send_message(env, &client, peer, text, reply_to, media).await?;
         }
         SubscriberCommand::EmailConfigure { .. } => {
             emit_control(
@@ -1099,7 +1020,8 @@ async fn handle_runtime_command(
         }
         SubscriberCommand::Custom { op, args } => {
             if op == "telegram_act" {
-                handle_telegram_act(env, client, args).await?;
+                let client = runtime_client(session)?;
+                handle_telegram_act(env, &client, args).await?;
             } else {
                 emit_control(
                     &env.topic,
@@ -1110,6 +1032,15 @@ async fn handle_runtime_command(
         }
     }
     Ok(RuntimeCommandOutcome::Continue)
+}
+
+/// Business commands in the runtime loops always run against the session's
+/// live client handle; the update loop only runs with a client present.
+fn runtime_client(session: &LoginSession) -> anyhow::Result<Client> {
+    session
+        .client
+        .clone()
+        .context("runtime command requires a connected telegram client")
 }
 
 async fn emit_auth_ok(env: &SkillEnv, client: &Client) -> anyhow::Result<()> {

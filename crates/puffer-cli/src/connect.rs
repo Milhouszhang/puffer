@@ -33,10 +33,7 @@ use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
 use puffer_subscriber_email::{save_email_config, EmailConfig};
 use puffer_subscriber_runtime::Event;
-use puffer_subscriber_telegram_user::{
-    login_start, login_submit_code, login_submit_password, qr_login_start, qr_login_wait, Client,
-    CodeSubmitOutcome, LoginState, QrLoginOutcome, QrLoginState, SkillEnv,
-};
+use puffer_subscriber_telegram_user::{qr_start, qr_wait, LoginSession, SkillEnv};
 use puffer_subscriptions::{ConnectionRecord, ConnectionStore};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -160,9 +157,7 @@ fn finalize_login(env: &SkillEnv, paths: &ConfigPaths) -> Result<()> {
 }
 
 async fn telegram_repl_loop(env: SkillEnv, paths: ConfigPaths) -> Result<()> {
-    let mut state = LoginState::new();
-    let mut qr_state: Option<QrLoginState> = None;
-    let mut client: Option<Client> = None;
+    let mut session = LoginSession::new(env.clone());
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut line = String::new();
@@ -185,30 +180,18 @@ async fn telegram_repl_loop(env: SkillEnv, paths: ConfigPaths) -> Result<()> {
                 continue;
             }
         };
+        // The session emits `login_error` events itself for commands that do
+        // not fit the current phase (`wrong_phase_error`); the REPL only
+        // reports transport-level failures.
         match parsed {
             TelegramAction::LoginQr { api_id, api_hash } => {
-                client = None;
-                match qr_login_start(&env, &mut state, &mut qr_state, api_id, api_hash).await {
-                    Ok(QrLoginOutcome::Pending) => {}
-                    Ok(QrLoginOutcome::AwaitingPassword(c)) => client = Some(c),
-                    Ok(QrLoginOutcome::Complete(_c)) => {
-                        finalize_login(&env, &paths)?;
-                        break;
-                    }
-                    Err(err) => emit_local_error(&env.topic, &format!("login_qr error: {err}"))?,
+                if let Err(err) = qr_start(&mut session, api_id, api_hash).await {
+                    emit_local_error(&env.topic, &format!("login_qr error: {err}"))?;
                 }
             }
             TelegramAction::LoginQrWait { timeout_seconds } => {
-                match qr_login_wait(&env, &mut state, &mut qr_state, timeout_seconds).await {
-                    Ok(QrLoginOutcome::Pending) => {}
-                    Ok(QrLoginOutcome::AwaitingPassword(c)) => client = Some(c),
-                    Ok(QrLoginOutcome::Complete(_c)) => {
-                        finalize_login(&env, &paths)?;
-                        break;
-                    }
-                    Err(err) => {
-                        emit_local_error(&env.topic, &format!("login_qr_wait error: {err}"))?
-                    }
+                if let Err(err) = qr_wait(&mut session, timeout_seconds).await {
+                    emit_local_error(&env.topic, &format!("login_qr_wait error: {err}"))?;
                 }
             }
             TelegramAction::LoginStart {
@@ -216,52 +199,25 @@ async fn telegram_repl_loop(env: SkillEnv, paths: ConfigPaths) -> Result<()> {
                 api_id,
                 api_hash,
             } => {
-                qr_state = None;
-                match login_start(&env, &mut state, phone, api_id, api_hash).await {
-                    Ok(Some(c)) => client = Some(c),
-                    Ok(None) => client = None,
-                    Err(err) => emit_local_error(&env.topic, &format!("login_start error: {err}"))?,
+                if let Err(err) = session.start(phone, api_id, api_hash).await {
+                    emit_local_error(&env.topic, &format!("login_start error: {err}"))?;
                 }
             }
             TelegramAction::SubmitCode { code } => {
-                let Some(c) = client.as_ref() else {
-                    emit_local_error(&env.topic, "no active client; send login_start first")?;
-                    continue;
-                };
-                match login_submit_code(&env, &mut state, c, code).await {
-                    Ok(CodeSubmitOutcome::Complete) => {
-                        finalize_login(&env, &paths)?;
-                        break;
-                    }
-                    // The subscriber already emitted `login_awaiting_password`
-                    // / `login_error` / a retry hint on stdout for these
-                    // outcomes — keep the REPL alive so the caller can send
-                    // the next command (submit_password, or another
-                    // submit_code retry).
-                    Ok(CodeSubmitOutcome::AwaitingPassword)
-                    | Ok(CodeSubmitOutcome::Failed)
-                    | Ok(CodeSubmitOutcome::RetryableTransportError { .. }) => {}
-                    Err(err) => emit_local_error(&env.topic, &format!("submit_code error: {err}"))?,
+                if let Err(err) = session.submit_code(code).await {
+                    emit_local_error(&env.topic, &format!("submit_code error: {err}"))?;
                 }
             }
             TelegramAction::SubmitPassword { password } => {
-                let Some(c) = client.as_ref() else {
-                    emit_local_error(&env.topic, "no active client; send login_start first")?;
-                    continue;
-                };
-                match login_submit_password(&env, &mut state, c, password).await {
-                    Ok(true) => {
-                        finalize_login(&env, &paths)?;
-                        break;
-                    }
-                    // Subscriber emitted the matching control event already.
-                    Ok(false) => {}
-                    Err(err) => {
-                        emit_local_error(&env.topic, &format!("submit_password error: {err}"))?
-                    }
+                if let Err(err) = session.submit_password(password).await {
+                    emit_local_error(&env.topic, &format!("submit_password error: {err}"))?;
                 }
             }
             TelegramAction::Exit => break,
+        }
+        if session.is_authorized() {
+            finalize_login(&env, &paths)?;
+            break;
         }
     }
     // Abandoned/partial logins leave a staging session behind; drop it so it

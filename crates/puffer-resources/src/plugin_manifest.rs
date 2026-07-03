@@ -1,7 +1,7 @@
 //! Resolves installed Claude plugin resource roots from
 //! `~/.claude/plugins/installed_plugins.json` (schema version 2).
 //!
-//! Only the manifest decides which cached plugin versions are live —
+//! Only the manifest decides which cached plugin versions are live;
 //! stale directories under `plugins/cache` are never scanned.
 
 use std::collections::BTreeMap;
@@ -24,8 +24,9 @@ struct InstalledPluginEntry {
 
 /// Returns the resource root of every installed plugin entry.
 ///
-/// Missing manifest → empty (plugins are optional). Unreadable or
-/// unparsable manifest → empty plus one diagnostic; never an error.
+/// Missing manifest means empty (plugins are optional). An unreadable or
+/// unparsable manifest degrades to empty plus one diagnostic, never an
+/// error.
 pub(crate) fn installed_plugin_roots(
     claude_dir: &Path,
     diagnostics: &mut Vec<String>,

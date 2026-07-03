@@ -255,3 +255,14 @@ Spec-rot rules (distilled from the 2026-07 sweep that revived 86 dead specs):
   daemon method then fails the suite the day it ships instead of rotting.
 - Never pipe a test run through `tail`/`head` without `set -o pipefail`: the
   pipeline's exit code masked 77 failures as a green run once already.
+
+When the desktop-ui CI job goes red (root-cause it — never add retries,
+timeouts, or `.skip` to get back to green):
+
+1. Download the `playwright-test-results` artifact; each failure's
+   `error-context.md` carries the error, call log, and a page snapshot, and
+   CI-only failures also include a trace (`npx playwright show-trace <zip>`).
+2. Reproduce locally by title: `npx playwright test -g "<test name>"`.
+3. Decide which side broke: if the UI change is intentional, migrate the
+   spec's assertions to the new contract (and say so in the commit); if not,
+   the spec just caught a regression — fix the app.

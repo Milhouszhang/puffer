@@ -281,6 +281,10 @@
   let importBusyKey = $state<string | null>(null);
   // Active GitHub Copilot device-flow login (shown while the user authorizes).
   let copilotLogin = $state<{ userCode: string; verificationUri: string } | null>(null);
+  // Monotonic token for the in-flight auth attempt (PKCE OAuth or Copilot
+  // device flow). Canceling bumps it so a late result from an abandoned login
+  // is ignored — see cancelActiveLogin / handleOauthLogin.
+  let activeLoginGeneration = 0;
   let actionBusy = $state(false);
   let remoteOperation = $state<RemoteOperation | null>(null);
   let remoteBusy = $state(false);
@@ -1368,9 +1372,15 @@
     }
     authBusyProviderId = providerId;
     authError = null;
+    const generation = ++activeLoginGeneration;
     const wasOnboarding = onboarding;
     try {
-      settingsSnapshot = await loginWithOauth(providerId, remoteConnection);
+      const snapshot = await loginWithOauth(providerId, remoteConnection);
+      // The user may have dismissed the modal mid-flow (browser OAuth is a
+      // long, cancelable wait). If so, ignore the late result so a canceled
+      // login can't reconnect or clobber UI state.
+      if (generation !== activeLoginGeneration) return;
+      settingsSnapshot = snapshot;
       onboardingCompleted = hasAvailableAgentProvider(settingsSnapshot);
       onboarding = shouldShowOnboarding(settingsSnapshot);
       if (wasOnboarding && !onboarding) {
@@ -1379,10 +1389,13 @@
       statusMessage = `Connected to ${providerId}.`;
       await refreshGroups();
     } catch (error) {
+      if (generation !== activeLoginGeneration) return;
       authError = String(error);
       statusMessage = authError;
     } finally {
-      authBusyProviderId = null;
+      // Only clear the busy flag if we still own it; a cancel already cleared
+      // it and may have started a different attempt.
+      if (generation === activeLoginGeneration) authBusyProviderId = null;
     }
   }
 
@@ -1397,29 +1410,68 @@
     }
     authBusyProviderId = providerId;
     authError = null;
+    // Claim this attempt. Every await below re-checks the generation so a
+    // login the user canceled (which bumps the generation) can never re-arm
+    // the card, keep polling, apply a snapshot, or clobber a newer login's
+    // busy state — the same guard handleOauthLogin uses.
+    const generation = ++activeLoginGeneration;
     const wasOnboarding = onboarding;
     try {
       const start = await copilotLoginStart(remoteConnection);
+      if (generation !== activeLoginGeneration) return; // canceled during start
       copilotLogin = { userCode: start.userCode, verificationUri: start.verificationUri };
       // NOTE: auto window.open / clipboard don't work in the webview without a
       // user gesture — the device-code card exposes explicit Copy/Open buttons.
       statusMessage = `GitHub Copilot: enter code ${start.userCode} at ${start.verificationUri} to authorize.`;
       const deadlineMs = Date.now() + (start.expiresIn > 0 ? start.expiresIn : 900) * 1000;
       let intervalMs = Math.max(start.interval, 1) * 1000;
+      // Tolerate a few transient transport blips (esp. over a remote
+      // connection) without aborting the still-valid device code — but don't
+      // mask a persistent/terminal failure (e.g. the daemon can't write
+      // auth.json) behind the generic timeout: surface it after several
+      // consecutive rejections.
+      let consecutivePollErrors = 0;
+      const MAX_CONSECUTIVE_POLL_ERRORS = 4;
       while (Date.now() < deadlineMs) {
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
-        if (copilotLogin === null) return; // canceled elsewhere
-        const poll = await copilotLoginPoll(start.deviceCode, remoteConnection);
-        if (poll.status === "done" && poll.snapshot) {
-          settingsSnapshot = poll.snapshot;
-          onboardingCompleted = hasAvailableAgentProvider(settingsSnapshot);
-          onboarding = shouldShowOnboarding(settingsSnapshot);
-          if (wasOnboarding && !onboarding) {
-            tweaks = { ...tweaks, screen: "workspace" };
-          }
-          statusMessage = "Connected to GitHub Copilot.";
-          await refreshGroups();
+        if (generation !== activeLoginGeneration) return; // canceled while waiting
+        let poll: Awaited<ReturnType<typeof copilotLoginPoll>>;
+        try {
+          poll = await copilotLoginPoll(start.deviceCode, remoteConnection);
+          consecutivePollErrors = 0;
+        } catch (error) {
+          if (generation !== activeLoginGeneration) return;
+          consecutivePollErrors += 1;
+          if (consecutivePollErrors >= MAX_CONSECUTIVE_POLL_ERRORS) throw error;
+          continue;
+        }
+        if (generation !== activeLoginGeneration) return; // canceled mid-poll
+        if (poll.status === "done") {
+          // `done` means the daemon has persisted the credential, so the login
+          // has succeeded — commit that first. Applying the snapshot and
+          // refreshing groups is best-effort: a transient failure (including
+          // the fallback loadSettingsSnapshot when the daemon returned done
+          // without a snapshot) must NOT turn the success into a reported
+          // failure. The UI reconciles on the next refresh.
           copilotLogin = null;
+          statusMessage = "Connected to GitHub Copilot.";
+          try {
+            const snap = poll.snapshot ?? (await loadSettingsSnapshot(remoteConnection));
+            if (generation === activeLoginGeneration && snap) {
+              settingsSnapshot = snap;
+              onboardingCompleted = hasAvailableAgentProvider(settingsSnapshot);
+              onboarding = shouldShowOnboarding(settingsSnapshot);
+              if (wasOnboarding && !onboarding) {
+                tweaks = { ...tweaks, screen: "workspace" };
+              }
+            }
+            await refreshGroups();
+          } catch {
+            // Connected; snapshot/groups reconcile on the next settings refresh.
+            // (Triply-rare: daemon fresh build + daemon held-inputs build +
+            // this client fallback would all have to fail. If it happens during
+            // onboarding the screen advances on the next manual refresh.)
+          }
           return;
         }
         if (poll.status === "error") {
@@ -1431,12 +1483,41 @@
       }
       throw new Error("GitHub Copilot login timed out. Please try again.");
     } catch (error) {
+      if (generation !== activeLoginGeneration) return; // canceled — ignore late error
       authError = String(error);
       statusMessage = authError;
       copilotLogin = null;
     } finally {
-      authBusyProviderId = null;
+      // Only release the busy flag if we still own the active attempt; a cancel
+      // (or a newer login) already cleared it.
+      if (generation === activeLoginGeneration) authBusyProviderId = null;
     }
+  }
+
+  // Cancel whatever login is in flight — a PKCE OAuth wait (anthropic/openai)
+  // or a Copilot device-flow poll — when the user dismisses its modal. Bumping
+  // the generation makes the pending handler ignore its late result; clearing
+  // the busy flag frees the UI immediately so another provider can be connected
+  // without waiting out the OAuth/device-code timeout.
+  //
+  // This cancels the CLIENT wait only; the daemon RPC has no cancel channel, so
+  // an abandoned OpenAI/Codex OAuth keeps its callback listener on the fixed
+  // port 1455 until its ~180s wait expires. Connecting any OTHER provider works
+  // immediately (the point of cancel); only an immediate re-try of OpenAI/Codex
+  // itself may briefly fail to bind that port. Anthropic uses an ephemeral port
+  // and is unaffected. A full fix needs a daemon-side OAuth cancel (pre-existing
+  // shared flow, out of scope here).
+  function cancelActiveLogin() {
+    if (copilotLogin === null && authBusyProviderId === null) return;
+    activeLoginGeneration += 1;
+    copilotLogin = null;
+    authBusyProviderId = null;
+    statusMessage = "Login canceled.";
+    // NOTE: we deliberately do NOT auto-refresh settings here. A cancel that
+    // raced a backend completion (credential already persisted) is a rare edge
+    // that reconciles on the next natural settings view; a fire-and-forget
+    // refresh here runs under a different generation counter and could clobber
+    // a subsequently-started login's snapshot.
   }
 
   function normalizedProviderConnectionId(providerId: string): string {
@@ -4781,6 +4862,7 @@
             busyImportKey={importBusyKey}
             copilotLogin={copilotLogin}
             onLoginCopilot={(providerId) => void handleCopilotLogin(providerId)}
+            onCancelLogin={cancelActiveLogin}
             onLoginOauth={(providerId) => void handleOauthLogin(providerId)}
             onLoginApiKey={(providerId, apiKey, options) =>
               void handleApiKeyLogin(providerId, apiKey, options)}
@@ -4906,6 +4988,7 @@
               onLogout={(providerId) => void handleLogout(providerId)}
               copilotLogin={copilotLogin}
               onLoginCopilot={(providerId) => void handleCopilotLogin(providerId)}
+              onCancelLogin={cancelActiveLogin}
               onLoginOauth={(providerId) => void handleOauthLogin(providerId)}
               onApiKeyLogin={(providerId, apiKey, options) =>
                 void handleApiKeyLogin(providerId, apiKey, options)}

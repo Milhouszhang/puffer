@@ -33,11 +33,34 @@
   ];
 
   // Google and GitHub Copilot are real providers with backend descriptors
-  // (`resources/providers/google.yaml` / `github-copilot.yaml`), so they are
-  // surfaced from the registry instead of as UI-only entries here. Google uses
-  // its OpenAI-compatible Gemini endpoint (api_key); Copilot uses a GitHub
+  // (`resources/providers/google.yaml` / `github-copilot.yaml`) and normally
+  // come from the registry. They are ALSO listed here as fallback entries so
+  // they remain offerable when the registry catalog is empty (daemon down or
+  // the first render before it responds) — providerSettingsCatalog dedupes by
+  // id, so the registry entry supersedes these whenever it is present. Google
+  // uses its OpenAI-compatible Gemini endpoint (api_key); Copilot uses a GitHub
   // device-flow login + Copilot token exchange (see the OAuth section below).
   const EXTRA_SETUP_PROVIDERS: ProviderSummary[] = [
+    {
+      id: "github-copilot",
+      displayName: "GitHub Copilot",
+      baseUrl: "https://api.githubcopilot.com",
+      defaultApi: "openai-completions",
+      modelCount: 0,
+      authModes: ["oauth"],
+      sourceKind: "ui-setup",
+      sourcePath: null
+    },
+    {
+      id: "google",
+      displayName: "Google",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+      defaultApi: "openai-completions",
+      modelCount: 0,
+      authModes: ["api_key"],
+      sourceKind: "ui-setup",
+      sourcePath: null
+    },
     {
       id: "openrouter",
       displayName: "OpenRouter",
@@ -79,6 +102,7 @@
   export let busyImportKey: string | null = null;
   export let onLoginOauth: (providerId: string) => void = () => {};
   export let onLoginCopilot: (providerId: string) => void = () => {};
+  export let onCancelLogin: () => void = () => {};
   export let copilotLogin: { userCode: string; verificationUri: string } | null = null;
   export let onLoginApiKey: (
     providerId: string,
@@ -106,6 +130,9 @@
     onLoginCopilot(providerId);
   }
   async function openExternalUrl(url: string) {
+    // Only ever open http(s) — mirror the open_url command's allowlist so the
+    // window.open fallback can't be used to reach file:// / native handlers.
+    if (!/^https?:\/\//i.test(url)) return;
     // window.open is unreliable in the Tauri webview; use the opener command.
     try {
       const { invoke } = await import("@tauri-apps/api/core");
@@ -204,6 +231,12 @@
   }
 
   function closeProviderModal() {
+    // Dismissing the modal during an in-flight login (PKCE OAuth like Anthropic,
+    // or the Copilot device flow) must cancel it — otherwise the app stays
+    // "busy" and blocks connecting other providers until the OAuth / device-code
+    // timeout fires (up to ~90s). API-key submits are fast and not cancelable
+    // here, so leave those alone.
+    if ((copilotLogin || busyProviderId) && !pendingApiKeyProvider) onCancelLogin();
     activeProviderId = null;
   }
 

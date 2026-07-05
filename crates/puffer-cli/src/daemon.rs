@@ -2971,8 +2971,24 @@ fn handle_copilot_login_poll(state: &DaemonState, params: &Value) -> Result<Valu
             Ok(json!({ "status": "error", "error": err }))
         }
         crate::copilot_login::DeviceFlowPoll::Done(token) => {
-            let mut inputs = state.build_runtime_inputs()?;
+            // No discovery here: we only need auth_store to write the new
+            // credential (and the copilot entry would error anyway, since the
+            // credential isn't stored yet). The snapshot below runs its own
+            // fresh discovery — this avoids a second, useless network pass that
+            // could add seconds of latency to the login-complete response.
+            let mut inputs = state.build_runtime_inputs_without_discovery()?;
             let auth_path = state.paths.user_config_dir.join("auth.json");
+            // Reconnect (re-login without an explicit logout) issues a new
+            // GitHub token. Evict the OLD token's cached Copilot bearer so it
+            // isn't orphaned in the process cache (keyed by github token) with
+            // no future logout/401 to ever remove it.
+            if let Some(StoredCredential::OAuth(previous)) = inputs.auth_store.get("github-copilot")
+            {
+                let previous_token = previous.access_token.clone();
+                if previous_token != token {
+                    puffer_core::invalidate_copilot_bearer(&previous_token);
+                }
+            }
             set_stored_credential(
                 &mut inputs.auth_store,
                 "github-copilot".to_string(),
@@ -2988,18 +3004,47 @@ fn handle_copilot_login_poll(state: &DaemonState, params: &Value) -> Result<Valu
                 &inputs.auth_store,
                 "github-copilot",
             );
-            reload_daemon_config(state)?;
-            let fresh = state.build_runtime_inputs()?;
+            // A different Copilot account may have been connected before: its
+            // account-specific model list is cached under the account-agnostic
+            // "github-copilot" id, so drop it to force a re-discovery for THIS
+            // account (otherwise a lower-tier account is offered the previous
+            // account's models and hits model_not_supported at chat time).
+            puffer_provider_registry::invalidate_provider_discovery_cache("github-copilot");
             let config = state.config.lock().unwrap().clone();
-            let snapshot: SettingsSnapshotDto = desktop_api::load_settings_snapshot(
-                &state.paths,
-                &config,
-                &fresh.resources,
-                &fresh.providers,
-                &fresh.auth_store,
-                &fresh.session_store,
-            )?;
-            Ok(json!({ "status": "done", "snapshot": snapshot }))
+            // The credential is now persisted, so the login HAS succeeded.
+            // Build the snapshot WITHOUT discovery: it only needs to reflect the
+            // now-connected provider (from auth_store), and Copilot's model list
+            // is discovered lazily (list_provider_models / background) when the
+            // picker opens. Running full multi-provider network discovery here
+            // could exceed the login-poll RPC timeout, surfacing a saved login
+            // as a failure. Fall back to the already-held inputs if reload fails.
+            let snapshot: Option<SettingsSnapshotDto> = (|| {
+                reload_daemon_config(state)?;
+                let fresh = state.build_runtime_inputs_without_discovery()?;
+                desktop_api::load_settings_snapshot(
+                    &state.paths,
+                    &config,
+                    &fresh.resources,
+                    &fresh.providers,
+                    &fresh.auth_store,
+                    &fresh.session_store,
+                )
+            })()
+            .or_else(|_| {
+                desktop_api::load_settings_snapshot(
+                    &state.paths,
+                    &config,
+                    &inputs.resources,
+                    &inputs.providers,
+                    &inputs.auth_store,
+                    &inputs.session_store,
+                )
+            })
+            .ok();
+            match snapshot {
+                Some(snapshot) => Ok(json!({ "status": "done", "snapshot": snapshot })),
+                None => Ok(json!({ "status": "done" })),
+            }
         }
     }
 }
@@ -3070,9 +3115,27 @@ fn handle_logout_provider(state: &DaemonState, params: &Value) -> Result<Value> 
         .and_then(|v| v.as_str())
         .context("missing providerId")?;
     let provider_id = canonical_desktop_provider_id(requested_provider_id);
-    let mut inputs = state.build_runtime_inputs()?;
+    let mut inputs = state.build_runtime_inputs_without_discovery()?;
     let auth_path = state.paths.user_config_dir.join("auth.json");
+    // Capture the GitHub token before removing it so we can drop the exchanged
+    // Copilot bearer keyed by it (below) — otherwise a logged-out account's
+    // still-valid short-lived bearer lingers in the process cache until expiry.
+    let copilot_github_token = if provider_id == "github-copilot" {
+        match inputs.auth_store.get(&provider_id) {
+            Some(StoredCredential::OAuth(credential)) => Some(credential.access_token.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
     desktop_api::logout_provider(&mut inputs.auth_store, &auth_path, &provider_id)?;
+    // Drop this provider's cached discovery so a later re-login (possibly a
+    // different account, e.g. Copilot) re-discovers instead of serving the
+    // logged-out account's cached, account-specific model list.
+    puffer_provider_registry::invalidate_provider_discovery_cache(&provider_id);
+    if let Some(token) = copilot_github_token {
+        puffer_core::invalidate_copilot_bearer(&token);
+    }
     let fresh = state.build_runtime_inputs()?;
     let config = state.config.lock().unwrap().clone();
     let snapshot: SettingsSnapshotDto = desktop_api::load_settings_snapshot(

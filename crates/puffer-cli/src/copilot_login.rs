@@ -8,6 +8,7 @@
 //! Copilot bearer (see `puffer-core/runtime/copilot.rs`).
 
 use anyhow::{bail, Context, Result};
+use puffer_provider_registry::COPILOT_USER_AGENT;
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -50,7 +51,7 @@ pub(crate) fn start_device_flow() -> Result<DeviceFlowStart> {
     let response = client
         .post(DEVICE_CODE_URL)
         .header("Accept", "application/json")
-        .header("User-Agent", "GitHubCopilotChat/0.23.0")
+        .header("User-Agent", COPILOT_USER_AGENT)
         .form(&[("client_id", COPILOT_CLIENT_ID), ("scope", "read:user")])
         .send()
         .context("requesting GitHub device code")?;
@@ -65,7 +66,11 @@ pub(crate) fn start_device_flow() -> Result<DeviceFlowStart> {
         device_code: parsed.device_code,
         user_code: parsed.user_code,
         verification_uri: parsed.verification_uri,
-        interval: if parsed.interval == 0 { 5 } else { parsed.interval },
+        interval: if parsed.interval == 0 {
+            5
+        } else {
+            parsed.interval
+        },
         expires_in: parsed.expires_in,
     })
 }
@@ -92,28 +97,46 @@ pub(crate) fn poll_device_flow(device_code: &str) -> Result<DeviceFlowPoll> {
         error: Option<String>,
     }
     let client = http_client()?;
-    let response = client
+    // A single poll must not abort the whole login on a transient blip. Network
+    // errors and non-JSON/unknown bodies (e.g. a 5xx HTML error page from an
+    // infra hiccup) are treated as Pending so the caller keeps polling until the
+    // device code genuinely expires; only GitHub's documented terminal device-
+    // flow errors end the flow.
+    let response = match client
         .post(ACCESS_TOKEN_URL)
         .header("Accept", "application/json")
-        .header("User-Agent", "GitHubCopilotChat/0.23.0")
+        .header("User-Agent", COPILOT_USER_AGENT)
         .form(&[
             ("client_id", COPILOT_CLIENT_ID),
             ("device_code", device_code),
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ])
         .send()
-        .context("polling GitHub device-flow token")?;
+    {
+        Ok(response) => response,
+        Err(_) => return Ok(DeviceFlowPoll::Pending),
+    };
     let body = response.text().unwrap_or_default();
-    let parsed: Resp = serde_json::from_str(&body).unwrap_or(Resp {
-        access_token: None,
-        error: Some(body.clone()),
-    });
+    let Ok(parsed) = serde_json::from_str::<Resp>(&body) else {
+        return Ok(DeviceFlowPoll::Pending);
+    };
     if let Some(token) = parsed.access_token.filter(|t| !t.is_empty()) {
         return Ok(DeviceFlowPoll::Done(token));
     }
     match parsed.error.as_deref() {
+        // Keep polling.
         Some("authorization_pending") | None => Ok(DeviceFlowPoll::Pending),
         Some("slow_down") => Ok(DeviceFlowPoll::SlowDown),
-        Some(other) => Ok(DeviceFlowPoll::Failed(other.to_string())),
+        // GitHub's documented terminal device-flow errors.
+        Some(
+            err @ ("access_denied"
+            | "expired_token"
+            | "unsupported_grant_type"
+            | "incorrect_client_credentials"
+            | "incorrect_device_code"
+            | "device_flow_disabled"),
+        ) => Ok(DeviceFlowPoll::Failed(err.to_string())),
+        // Unknown error code — treat as transient rather than aborting.
+        Some(_) => Ok(DeviceFlowPoll::Pending),
     }
 }

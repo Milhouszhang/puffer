@@ -231,12 +231,19 @@
   }
 
   function closeProviderModal() {
-    // Dismissing the modal during an in-flight login (PKCE OAuth like Anthropic,
-    // or the Copilot device flow) must cancel it — otherwise the app stays
-    // "busy" and blocks connecting other providers until the OAuth / device-code
-    // timeout fires (up to ~90s). API-key submits are fast and not cancelable
-    // here, so leave those alone.
-    if ((copilotLogin || busyProviderId) && !pendingApiKeyProvider) onCancelLogin();
+    // Dismissing the modal during the Copilot device flow must cancel it —
+    // otherwise the app keeps polling GitHub (staying "busy" and blocking other
+    // providers) until the device code times out. Only the Copilot flow is
+    // canceled here: PKCE OAuth (e.g. Anthropic) is completed in the browser and
+    // intentionally keeps running if the modal is closed, and API-key submits are
+    // fast. `busyProviderId === "github-copilot"` also covers the brief window
+    // before the device code arrives (copilotLogin still null).
+    if (
+      (copilotLogin || busyProviderId === "github-copilot") &&
+      !pendingApiKeyProvider
+    ) {
+      onCancelLogin();
+    }
     activeProviderId = null;
   }
 

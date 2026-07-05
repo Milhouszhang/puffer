@@ -1,4 +1,5 @@
 use crate::auth::{AuthStore, StoredCredential};
+use crate::copilot_identity::{apply_copilot_client_identity, COPILOT_TOKEN_URL};
 use crate::input_capability::infer_input_modalities;
 use crate::model::{
     ModelCompat, ModelDescriptor, ModelDiscoveryConfig, ModelDiscoveryFormat,
@@ -10,41 +11,36 @@ use reqwest::blocking::RequestBuilder;
 use serde_json::Value;
 use std::time::Duration;
 
-const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
-
 /// Exchanges a stored GitHub token for a short-lived Copilot token plus the
 /// account-specific API endpoint (individual / business / enterprise), so model
 /// discovery hits the right `/models` host. Returns `None` on failure.
 ///
-/// NOTE: the header versions below matter — GitHub personalizes/gates parts of
-/// the Copilot API by client identity and `X-GitHub-Api-Version`, and changes
-/// this policy often (see `copilot_filter_selectable`). Versions mirror current
-/// third-party clients (Zed, codecompanion) as of 2026-07.
+/// The client-identity headers matter — GitHub personalizes/gates parts of the
+/// Copilot API by client identity and `X-GitHub-Api-Version` (see
+/// `copilot_filter_selectable`) — so they come from the single source in
+/// [`crate::copilot_identity`], shared with the runtime token exchange.
 fn copilot_discovery_bearer(github_token: &str) -> Option<(String, String)> {
     let client = Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .ok()?;
-    let response = client
+    let request = client
         .get(COPILOT_TOKEN_URL)
         .header("Authorization", format!("token {github_token}"))
-        .header("Accept", "application/json")
-        .header("User-Agent", "GitHubCopilotChat/0.31.0")
-        .header("Editor-Version", "vscode/1.104.0")
-        .header("Editor-Plugin-Version", "copilot-chat/0.31.0")
-        .header("Copilot-Integration-Id", "vscode-chat")
-        .header("X-GitHub-Api-Version", "2025-10-01")
-        .send()
-        .ok()?;
+        .header("Accept", "application/json");
+    let response = apply_copilot_client_identity(request).send().ok()?;
     if !response.status().is_success() {
         return None;
     }
     let value: Value = response.json().ok()?;
     let token = value.get("token").and_then(|t| t.as_str())?.to_string();
+    // Only trust an https endpoint before sending the Copilot bearer to it;
+    // fall back to the default host otherwise (mirrors copilot.rs).
     let api_url = value
         .get("endpoints")
         .and_then(|endpoints| endpoints.get("api"))
         .and_then(|api| api.as_str())
+        .filter(|api| api.starts_with("https://"))
         .unwrap_or("https://api.githubcopilot.com")
         .trim_end_matches('/')
         .to_string();
@@ -94,6 +90,22 @@ fn copilot_policy_ok(entry: &Value) -> bool {
 fn copilot_model_is_default_or_fallback(entry: &Value) -> bool {
     let flag = |key: &str| entry.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
     flag("is_chat_default") || flag("is_chat_fallback")
+}
+
+/// True for Copilot's internal / experimental models — routing helpers,
+/// compaction, IDE-internal — which are never user-selectable chat models even
+/// though some carry chat capabilities or default/fallback flags (e.g.
+/// `oswe-vscode-prime`, `mai-code-*`). Excluded from every displayed tier.
+fn copilot_model_is_internal(entry: &Value) -> bool {
+    let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    let vendor = entry
+        .get("vendor")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    vendor.eq_ignore_ascii_case("experimental")
+        || id.starts_with("mai-code")
+        || id == "oswe-vscode-prime"
+        || id == "trajectory-compaction"
 }
 
 const OPENAI_CODEX_ORIGINATOR: &str = "codex_cli_rs";
@@ -188,12 +200,6 @@ impl ModelDiscoveryClient {
         // returns `model_not_supported` at chat time. Narrow it to this
         // account's usable set via metadata only — see copilot_filter_selectable.
         if provider.id == "github-copilot" {
-            if std::env::var_os("PUFFER_COPILOT_DUMP").is_some() {
-                let _ = std::fs::write(
-                    "/tmp/copilot-models-raw.json",
-                    serde_json::to_string_pretty(&payload).unwrap_or_default(),
-                );
-            }
             if let Some((token, api_url)) = copilot_ctx {
                 self.copilot_filter_selectable(&mut payload, &api_url, &token, &provider.headers);
             }
@@ -235,7 +241,10 @@ impl ModelDiscoveryClient {
         token: &str,
         headers: &indexmap::IndexMap<String, String>,
     ) {
-        let Some(data) = payload.get_mut("data").and_then(|value| value.as_array_mut()) else {
+        let Some(data) = payload
+            .get_mut("data")
+            .and_then(|value| value.as_array_mut())
+        else {
             return;
         };
 
@@ -244,10 +253,18 @@ impl ModelDiscoveryClient {
         let strict = |entry: &Value| {
             copilot_model_is_chat(entry)
                 && copilot_policy_ok(entry)
+                && !copilot_model_is_internal(entry)
                 && (copilot_model_picker_enabled(entry)
                     || entry.get("id").and_then(|v| v.as_str()) == Some("gpt-4o-mini"))
         };
-        if data.iter().any(|entry| copilot_model_picker_enabled(entry)) {
+        // Tier 1 applies only to picker-capable (paid) plans: gate on a real
+        // model_picker_enabled entry, NOT on `strict` (which also matches the
+        // gpt-4o-mini safety net present in every catalog — that would make
+        // tier 1 always win and starve the tier-2 session lookup that Free/
+        // Student auto-only accounts depend on). Also require `strict` to yield
+        // something, so an all-gated picker plan falls through instead of
+        // returning an empty list.
+        if data.iter().any(copilot_model_picker_enabled) && data.iter().any(strict) {
             data.retain(strict);
             return;
         }
@@ -255,27 +272,49 @@ impl ModelDiscoveryClient {
         // 2. Auto-only SKU: the picker flags are all false by design. Ask the
         //    (unbilled) auto-mode session endpoint which models the backend is
         //    willing to serve this account.
+        //    INVARIANT: models offered from this session set are only usable if
+        //    the chat path attaches `Copilot-Session-Token`, which puffer-core's
+        //    copilot runtime does when `copilot_sku_is_auto_only` (token-envelope
+        //    sku) is true. Both this branch and that runtime check rely on the
+        //    same "free/student ⟺ picker-disabled ⟺ auto-only" correspondence
+        //    GitHub currently maintains; if a future SKU breaks it (e.g. a paid
+        //    account with picker disabled on every model), keep the two in sync
+        //    so the session set is never offered without the token being sent.
         if let Some(available) = self.copilot_session_available_models(api_url, token, headers) {
             if !available.is_empty() {
-                data.retain(|entry| {
+                let in_session = |entry: &Value| {
                     copilot_model_is_chat(entry)
+                        && !copilot_model_is_internal(entry)
                         && entry
                             .get("id")
                             .and_then(|v| v.as_str())
                             .map(|id| available.contains(id))
                             .unwrap_or(false)
-                });
-                if !data.is_empty() {
+                };
+                // Only narrow to the session set if it actually intersects the
+                // catalog; otherwise leave `data` intact so tier 3 can still run
+                // on the full list instead of an emptied one.
+                if data.iter().any(in_session) {
+                    data.retain(in_session);
                     return;
                 }
             }
         }
 
-        // 3. Last resort (session endpoint unreachable): the server-marked
-        //    default/fallback chat models — still queried per-account.
+        // 3. Last resort — reached when tier 1 found no picker model AND the
+        //    tier-2 session lookup was unavailable (a transient /models/session
+        //    outage on an auto-only account). Offer the server-marked
+        //    default/fallback chat models as a best-effort guess (excluding
+        //    internal ones). BEST-EFFORT ONLY: for an auto-only account the
+        //    session is the real source of truth for what's usable, and the
+        //    chat path attaches Copilot-Session-Token, so a model shown here
+        //    that the recovered session doesn't include will be rejected
+        //    (model_not_supported) until the next discovery/TTL re-runs tier 2.
+        //    There is no reliable list to show while the session is down.
         data.retain(|entry| {
             copilot_model_is_chat(entry)
                 && copilot_policy_ok(entry)
+                && !copilot_model_is_internal(entry)
                 && copilot_model_is_default_or_fallback(entry)
         });
     }
@@ -305,12 +344,6 @@ impl ModelDiscoveryClient {
             return None;
         }
         let value: Value = response.json().ok()?;
-        if std::env::var_os("PUFFER_COPILOT_DUMP").is_some() {
-            let _ = std::fs::write(
-                "/tmp/copilot-session-raw.json",
-                serde_json::to_string_pretty(&value).unwrap_or_default(),
-            );
-        }
         let models = value
             .get("available_models")?
             .as_array()?
@@ -318,10 +351,7 @@ impl ModelDiscoveryClient {
             .filter_map(|entry| match entry {
                 // Observed as plain id strings; tolerate object entries too.
                 Value::String(id) => Some(id.clone()),
-                Value::Object(_) => entry
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
+                Value::Object(_) => entry.get("id").and_then(|v| v.as_str()).map(String::from),
                 _ => None,
             })
             .collect();

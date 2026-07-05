@@ -29,6 +29,11 @@ discovery:
 # `X-GitHub-Api-Version`, and reshuffles Copilot plan/model policy often (three
 # plan/billing changes in 2026 H1 alone) — bump these when Copilot responses
 # start misbehaving. Versions mirror current clients as of 2026-07.
+# IMPORTANT: the OAuth device-flow / token-exchange / session-mint / discovery
+# requests send these same versions from the constants in
+# crates/puffer-provider-registry/src/copilot_identity.rs. Keep this descriptor
+# and those constants identical — the `yaml_headers_match_constants` test fails
+# if they drift.
 headers:
   Copilot-Integration-Id: vscode-chat
   Editor-Version: vscode/1.104.0

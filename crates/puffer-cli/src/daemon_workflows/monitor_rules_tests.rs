@@ -10,6 +10,7 @@ use serde_json::json;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 struct TestManager {
     _runtime: tokio::runtime::Runtime,
@@ -85,6 +86,21 @@ fn config_paths_with_bundled_resources(root: &Path) -> ConfigPaths {
         user_config_dir: root.join("home").join(".puffer"),
         builtin_resources_dir: repo_root.join("resources"),
     }
+}
+
+fn wait_for_has_consumer(manager: &SubscriptionManager, connection_slug: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if manager
+            .connection_store()
+            .get(connection_slug)
+            .is_some_and(|connection| connection.has_consumer)
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
 }
 
 #[test]
@@ -183,6 +199,88 @@ fn add_include_rule_persists_filter_without_touching_other_monitor() {
         .unwrap();
     assert!(other.filter.is_none());
     assert!(other.ignore_filters.is_empty());
+}
+
+#[test]
+fn add_rule_refreshes_connection_consumers_in_background() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let paths = ConfigPaths::discover(tempdir.path());
+    let manager = test_manager();
+    let connection_slug = "rule-add-background-refresh";
+    let _ = manager
+        .connection_store()
+        .create(ConnectionRecord::authenticated(
+            connection_slug,
+            "telegram-login",
+            "Telegram",
+        ));
+    manager
+        .store()
+        .upsert(monitor_binding(
+            &format!("monitor-{connection_slug}"),
+            connection_slug,
+        ))
+        .unwrap();
+    assert!(
+        !manager
+            .connection_store()
+            .get(connection_slug)
+            .unwrap()
+            .has_consumer
+    );
+
+    handle_monitor_rule_add(
+        &paths,
+        &json!({
+            "connection_slug": connection_slug,
+            "mode": "exclude",
+            "keywords": ["noise"]
+        }),
+    )
+    .unwrap();
+
+    assert!(wait_for_has_consumer(manager.as_ref(), connection_slug));
+}
+
+#[test]
+fn delete_rule_refreshes_connection_consumers_in_background() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let paths = ConfigPaths::discover(tempdir.path());
+    let manager = test_manager();
+    let connection_slug = "rule-delete-background-refresh";
+    let rule = FilterSpec::Tagged(TaggedFilterSpec::Regex {
+        pattern: "noise".to_string(),
+        case_insensitive: true,
+    });
+    let mut binding = monitor_binding(&format!("monitor-{connection_slug}"), connection_slug);
+    binding.ignore_filters.push(rule.clone());
+    let _ = manager
+        .connection_store()
+        .create(ConnectionRecord::authenticated(
+            connection_slug,
+            "telegram-login",
+            "Telegram",
+        ));
+    manager.store().upsert(binding).unwrap();
+    assert!(
+        !manager
+            .connection_store()
+            .get(connection_slug)
+            .unwrap()
+            .has_consumer
+    );
+
+    handle_monitor_rule_delete(
+        &paths,
+        &json!({
+            "connection_slug": connection_slug,
+            "mode": "exclude",
+            "rule": serde_json::to_value(rule).unwrap()
+        }),
+    )
+    .unwrap();
+
+    assert!(wait_for_has_consumer(manager.as_ref(), connection_slug));
 }
 
 #[test]

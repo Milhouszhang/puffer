@@ -1393,21 +1393,21 @@ async fn dispatch_request(
             .await;
         }
 
-        "list_grouped_sessions" => respond!(handle_list_grouped_sessions(&state)),
+        "list_grouped_sessions" => respond!(detached!(|s| handle_list_grouped_sessions(&s))),
         "list_grouped_sessions_page" => {
             respond!(detached!(|s, p| handle_list_grouped_sessions_page(&s, &p)))
         }
-        "load_desktop_pins" => respond!(handle_load_desktop_pins(&state)),
-        "set_desktop_pin" => respond!(handle_set_desktop_pin(&state, &params)),
-        "load_file_tabs" => respond!(handle_load_file_tabs(&state, &params)),
-        "save_file_tabs" => respond!(handle_save_file_tabs(&state, &params)),
-        "load_session_detail" => respond!(handle_load_session_detail(&state, &params)),
-        "rename_session" => respond!(handle_rename_session(&state, &params)),
-        "delete_session" => respond!(handle_delete_session(&state, &params)),
-        "set_session_tags" => respond!(handle_set_session_tags(&state, &params)),
-        "delete_project" => respond!(handle_delete_project(&state, &params)),
-        "set_project_tags" => respond!(handle_set_project_tags(&state, &params)),
-        "refresh_repo_status" => respond!(handle_refresh_repo_status(&state, &params)),
+        "load_desktop_pins" => respond!(detached!(|s| handle_load_desktop_pins(&s))),
+        "set_desktop_pin" => respond!(detached!(|s, p| handle_set_desktop_pin(&s, &p))),
+        "load_file_tabs" => respond!(detached!(|s, p| handle_load_file_tabs(&s, &p))),
+        "save_file_tabs" => respond!(detached!(|s, p| handle_save_file_tabs(&s, &p))),
+        "load_session_detail" => respond!(detached!(|s, p| handle_load_session_detail(&s, &p))),
+        "rename_session" => respond!(detached!(|s, p| handle_rename_session(&s, &p))),
+        "delete_session" => respond!(detached!(|s, p| handle_delete_session(&s, &p))),
+        "set_session_tags" => respond!(detached!(|s, p| handle_set_session_tags(&s, &p))),
+        "delete_project" => respond!(detached!(|s, p| handle_delete_project(&s, &p))),
+        "set_project_tags" => respond!(detached!(|s, p| handle_set_project_tags(&s, &p))),
+        "refresh_repo_status" => respond!(detached!(|s, p| handle_refresh_repo_status(&s, &p))),
         "load_settings_snapshot" => respond!(detached!(|s| handle_load_settings_snapshot(&s))),
         "login_with_api_key" => {
             respond!(detached!(|s, p| handle_login_with_api_key(&s, &p)))
@@ -1657,42 +1657,42 @@ async fn dispatch_request(
         "workflow_open_ui" => respond!(detached!(|s| {
             crate::daemon_workflow_runtime::handle_workflow_open_ui(&s)
         })),
-        "workflow_binding_create" => respond!(
-            crate::daemon_workflows::handle_workflow_binding_create(&state.paths, &params)
-        ),
-        "monitor_create" | "task_monitor_create" => respond!(
-            crate::daemon_workflows::handle_monitor_create(&state.paths, &params)
-        ),
-        "monitor_task_ignore" | "task_monitor_ignore" => respond!(
-            crate::daemon_workflows::handle_monitor_task_ignore(&state.paths, &params)
-        ),
-        "monitor_rule_add" | "task_monitor_rule_add" => respond!(
-            crate::daemon_workflows::handle_monitor_rule_add(&state.paths, &params)
-        ),
-        "monitor_rule_delete" | "task_monitor_rule_delete" => respond!(
-            crate::daemon_workflows::handle_monitor_rule_delete(&state.paths, &params)
-        ),
-        "monitor_task_complete" | "task_monitor_complete" => respond!(
-            crate::daemon_workflows::handle_monitor_task_complete(&state.paths, &params)
-        ),
-        "monitor_reply_send" | "task_monitor_reply_send" => respond!(
-            crate::daemon_workflows::handle_monitor_reply_send(&state.paths, &params)
-        ),
-        "monitor_action_execute" | "task_monitor_action_execute" => respond!(
-            crate::daemon_workflows::handle_monitor_action_execute(&state.paths, &params)
-        ),
-        "connector_action_execute" => respond!(
-            crate::daemon_workflows::handle_connector_action_execute(&state.paths, &params)
-        ),
-        "monitor_memory_save" | "task_monitor_memory_save" => respond!(
-            crate::daemon_workflows::handle_monitor_memory_save(&state.paths, &params)
-        ),
-        "monitor_history_list" | "task_monitor_history_list" => respond!(
-            crate::daemon_workflows::handle_monitor_history_list(&state.paths, &params)
-        ),
-        "monitor_trace_list" | "task_monitor_trace_list" => respond!(
-            crate::daemon_workflows::handle_monitor_trace_list(&state.paths, &params)
-        ),
+        "workflow_binding_create" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_binding_create(s.config_paths(), &p)
+        })),
+        "monitor_create" | "task_monitor_create" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_create(s.config_paths(), &p)
+        })),
+        "monitor_task_ignore" | "task_monitor_ignore" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_task_ignore(s.config_paths(), &p)
+        })),
+        "monitor_rule_add" | "task_monitor_rule_add" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_rule_add(s.config_paths(), &p)
+        })),
+        "monitor_rule_delete" | "task_monitor_rule_delete" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_rule_delete(s.config_paths(), &p)
+        })),
+        "monitor_task_complete" | "task_monitor_complete" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_task_complete(s.config_paths(), &p)
+        })),
+        "monitor_reply_send" | "task_monitor_reply_send" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_reply_send(s.config_paths(), &p)
+        })),
+        "monitor_action_execute" | "task_monitor_action_execute" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_action_execute(s.config_paths(), &p)
+        })),
+        "connector_action_execute" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_connector_action_execute(s.config_paths(), &p)
+        })),
+        "monitor_memory_save" | "task_monitor_memory_save" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_memory_save(s.config_paths(), &p)
+        })),
+        "monitor_history_list" | "task_monitor_history_list" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_history_list(s.config_paths(), &p)
+        })),
+        "monitor_trace_list" | "task_monitor_trace_list" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_trace_list(s.config_paths(), &p)
+        })),
         "telegram_diagnostics_export" | "task_telegram_diagnostics_export" => respond!(
             crate::daemon_workflows::handle_telegram_diagnostics_export(&state.paths, &params)
         ),

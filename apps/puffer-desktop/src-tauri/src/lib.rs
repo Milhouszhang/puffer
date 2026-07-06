@@ -1,4 +1,6 @@
+mod agentenv_auth;
 mod backend;
+mod badge;
 mod browser;
 mod browser_debug;
 mod cef_host;
@@ -42,6 +44,7 @@ const REGISTERED_TAURI_COMMANDS: &[&str] = &[
     "merge_pull_request",
     "load_settings_snapshot",
     "login_with_oauth",
+    "login_with_agentenv",
     "login_with_api_key",
     "logout_provider",
     "list_external_credentials",
@@ -74,6 +77,7 @@ const REGISTERED_TAURI_COMMANDS: &[&str] = &[
     "browser_cef_native_history",
     "browser_cef_native_close",
     "browser_cef_native_hide",
+    "badge_bump",
 ];
 
 fn backend_call(
@@ -198,6 +202,12 @@ fn login_with_oauth(
         "login_with_oauth",
         json!({ "providerId": provider_id }),
     )
+}
+
+#[tauri::command]
+fn login_with_agentenv(app: AppHandle, state: State<'_, SharedBackend>) -> Result<Value, String> {
+    agentenv_auth::login_with_agentenv().map_err(|error| error.to_string())?;
+    backend_call(app, state, "load_settings_snapshot", json!({}))
 }
 
 #[tauri::command]
@@ -465,7 +475,11 @@ fn video_dir_for_cwd(cwd: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(all(target_os = "macos", puffer_desktop_cef_native))]
-fn spawn_cef_native_warmup(app_handle: AppHandle, smoke_url: Option<String>, prewarm_targets: usize) {
+fn spawn_cef_native_warmup(
+    app_handle: AppHandle,
+    smoke_url: Option<String>,
+    prewarm_targets: usize,
+) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use tauri::Manager;
@@ -558,6 +572,8 @@ pub fn run() {
         })
         .manage(backend)
         .manage(launcher)
+        .manage(std::sync::Mutex::new(badge::BadgeState::default()))
+        .on_window_event(badge::handle_window_event)
         .invoke_handler(tauri::generate_handler![
             backend_request,
             list_grouped_sessions,
@@ -567,6 +583,7 @@ pub fn run() {
             merge_pull_request,
             load_settings_snapshot,
             login_with_oauth,
+            login_with_agentenv,
             login_with_api_key,
             logout_provider,
             list_external_credentials,
@@ -599,6 +616,7 @@ pub fn run() {
             cef_host::browser_cef_native_history,
             cef_host::browser_cef_native_close,
             cef_host::browser_cef_native_hide,
+            badge::badge_bump,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Corbina desktop");

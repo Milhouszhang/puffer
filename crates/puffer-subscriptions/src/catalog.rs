@@ -1163,7 +1163,7 @@ fn telegram_specific_actions() -> Vec<ConnectorActionDefinition> {
         telegram_action_definition(
             "react",
             "React to a Telegram message",
-            "external_message_interaction",
+            "external_reaction",
             "React to an external Telegram message",
             telegram_message_action_schema(),
         ),
@@ -1316,7 +1316,10 @@ mod catalog_tests {
     #[test]
     fn slack_browser_template_registered_with_three_acts() {
         let t = builtin_connector_templates();
-        let slack = t.iter().find(|c| c.slug == "slack-browser").expect("slack-browser template present");
+        let slack = t
+            .iter()
+            .find(|c| c.slug == "slack-browser")
+            .expect("slack-browser template present");
         assert_eq!(slack.binary, "puffer __subscriber slack-browser");
         let sub = slack.subscriber.as_ref().expect("subscriber template");
         assert_eq!(sub.manifest_slug, "slack-browser");

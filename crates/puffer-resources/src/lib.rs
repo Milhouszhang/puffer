@@ -1,5 +1,6 @@
 mod loader;
 mod model;
+mod plugin_manifest;
 
 use std::collections::BTreeSet;
 

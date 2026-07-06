@@ -1,9 +1,18 @@
 import { expect, test, type Page } from "@playwright/test";
 import { FakeDaemon } from "./support/fakeDaemon";
 
+async function advanceOnboardingToProviderStep(page: Page) {
+  await page.getByRole("button", { name: /Local \/ bring your own/ }).click();
+  await page.getByRole("button", { name: "Next" }).click();
+  await expect(page.getByRole("heading", { name: "Pick your agent provider" })).toBeVisible();
+}
+
 async function openProviderSetup(page: Page, providerName: string) {
   const displayName = providerName === "Codex" ? "OpenAI" : providerName;
-  const card = page.locator(".provider-card").filter({ hasText: displayName }).last();
+  const card = page
+    .locator(".provider-card")
+    .filter({ has: page.getByRole("heading", { name: displayName, exact: true }) })
+    .last();
   await card.getByRole("button", { name: "Add connect" }).click();
   return page.getByRole("dialog", { name: `Connect ${displayName}` });
 }
@@ -18,6 +27,8 @@ test("empty provider registry still offers built-in setup options", async ({ pag
   const daemon = new FakeDaemon({ auth: [], providers: [] });
   await daemon.install(page);
   await daemon.open(page, { forceOnboarding: true, skipOnboarding: false });
+
+  await advanceOnboardingToProviderStep(page);
 
   await expect(page.getByText("Provider registry is empty.")).toBeVisible();
   await expect(page.getByText("No providers are registered in this workspace.")).toHaveCount(0);
@@ -44,6 +55,8 @@ test("provider cards describe model families instead of model counts", async ({ 
   await daemon.install(page);
   await daemon.open(page, { forceOnboarding: true, skipOnboarding: false });
 
+  await advanceOnboardingToProviderStep(page);
+
   const googleCard = page.locator(".provider-card").filter({ hasText: "Google" }).last();
   await expect(googleCard).toContainText("Gemini models for quick, structured responses.");
   await expect(googleCard).not.toContainText(/\b\d+ models?\b/);
@@ -61,6 +74,8 @@ test("custom provider modal saves base URL and API key", async ({ page }) => {
   const daemon = new FakeDaemon({ auth: [], providers: [] });
   await daemon.install(page);
   await daemon.open(page, { forceOnboarding: true, skipOnboarding: false });
+
+  await advanceOnboardingToProviderStep(page);
 
   const customCard = page.locator(".provider-card").filter({ hasText: "Custom provider" });
   await customCard.getByRole("button", { name: "Add connect" }).click();
@@ -891,7 +906,14 @@ test("providers page marks connected and disconnected providers", async ({ page 
   expect(logout.params).toMatchObject({ providerId: "openrouter" });
   await expect(page.getByRole("dialog", { name: /Connect OpenRouter/ })).toHaveCount(0);
   await expect(connectedOpenRouterCard).toHaveCount(0);
-  await expect(openRouterCard.getByRole("button", { name: "Add connect" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Set up Puffer Code" })).toBeVisible();
+  await advanceOnboardingToProviderStep(page);
+  await expect(
+    page
+      .locator(".provider-card")
+      .filter({ has: page.getByRole("heading", { name: "OpenRouter", exact: true }) })
+      .getByRole("button", { name: "Add connect" })
+  ).toBeVisible();
 });
 
 test("providers page offers auth-free local providers for default routing", async ({ page }) => {
@@ -1440,11 +1462,29 @@ test("provider refresh controls are disabled while credentials are busy", async 
 });
 
 test("settings auth uses the configured daemon when Tauri globals exist", async ({ page }) => {
-  await page.addInitScript(() => {
-    (window as unknown as { __TAURI__?: unknown; __TAURI_INTERNALS__?: unknown }).__TAURI__ = {};
-    (window as unknown as { __TAURI__?: unknown; __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
-  });
   const daemon = new FakeDaemon({ auth: [] });
+  await page.addInitScript((daemonUrl) => {
+    const win = window as unknown as {
+      __TAURI__?: unknown;
+      __TAURI_INTERNALS__?: {
+        invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+      };
+    };
+    win.__TAURI__ = {};
+    win.__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "ensure_local_daemon") {
+          return {
+            url: daemonUrl,
+            token: "test",
+            protocolVersion: "2025-01-01",
+            workspaceRoot: "/tmp/puffer"
+          };
+        }
+        return null;
+      }
+    };
+  }, daemon.url);
   await daemon.install(page);
   await daemon.open(page, { allowUnauthenticatedWorkspace: true });
 
@@ -1724,6 +1764,14 @@ test("Secrets settings save and import without rendering raw secret values", asy
   const pane = page.locator(".pf-settings-pane");
   await expect(pane.locator(".label").filter({ hasText: "Secret store" })).toBeVisible();
 
+  // The add form is hidden until "Add secret" is clicked; cancel returns to the list.
+  await expect(pane.getByRole("button", { name: "Save secret" })).toHaveCount(0);
+  await pane.getByRole("button", { name: "Add secret" }).click();
+  await expect(pane.getByPlaceholder("Search secrets")).toHaveCount(0);
+  await pane.getByRole("button", { name: "Cancel" }).click();
+  await expect(pane.getByPlaceholder("Search secrets")).toBeVisible();
+
+  await pane.getByRole("button", { name: "Add secret" }).click();
   await pane.getByRole("textbox", { name: "Name", exact: true }).fill("Build token");
   await pane.getByLabel("Description").fill("CI deployment token");
   await pane.getByLabel("Username").fill("ci");
@@ -1740,8 +1788,10 @@ test("Secrets settings save and import without rendering raw secret values", asy
     value: "super-secret-token"
   });
   await expect(page.getByText("super-secret-token")).toHaveCount(0);
+  // A successful save closes the form and shows the stored list again.
   await expect(pane.locator(".pf-mcp-card").filter({ hasText: "Build token" })).toBeVisible();
 
+  await pane.getByRole("button", { name: "Add secret" }).click();
   await pane.getByRole("button", { name: "Sync from Chrome" }).click();
   await daemon.waitForRequest("import_browser_secrets");
   await expect(

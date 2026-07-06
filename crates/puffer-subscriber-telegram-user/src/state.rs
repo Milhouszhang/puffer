@@ -1,14 +1,8 @@
-//! Process-wide mutable state for the Telegram subscriber.
-//!
-//! The subscriber holds at most one active login attempt at a time. While
-//! waiting for a code or 2FA password, the in-flight [`LoginToken`] or
-//! [`PasswordToken`] must be retained in memory so the corresponding
-//! "submit" command can complete the flow.
+//! Process-wide configuration for the Telegram subscriber.
 
 use std::path::PathBuf;
 
 use anyhow::Context;
-use grammers_client::types::{LoginToken, PasswordToken};
 use serde::{Deserialize, Serialize};
 
 /// Public Telegram Desktop app id used when the operator does not provide a
@@ -168,6 +162,33 @@ pub fn resolve_api_credentials(
     Ok((DEFAULT_API_ID, DEFAULT_API_HASH.to_string()))
 }
 
+/// grammers requires a `socks5://` URL; reject http/empty/other schemes.
+/// `socks5h://` (DNS-via-proxy variant) is normalized to `socks5://` so that
+/// operators who configure the system-wide ALL_PROXY with the `h` suffix are
+/// not silently dropped — grammers handles remote DNS resolution internally.
+fn normalize_telegram_proxy(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if let Some(rest) = value.strip_prefix("socks5h://") {
+        return Some(format!("socks5://{rest}"));
+    }
+    value.starts_with("socks5://").then(|| value.to_string())
+}
+
+/// Resolves the Telegram SOCKS5 proxy from the environment. An explicit
+/// `PUFFER_TELEGRAM_PROXY` wins; otherwise fall back to the de-facto
+/// `ALL_PROXY`/`all_proxy`. The first value that is a valid `socks5://` URL is
+/// used; non-socks5 values are skipped (so an HTTP `ALL_PROXY` is ignored).
+fn telegram_proxy_url() -> Option<String> {
+    for key in ["PUFFER_TELEGRAM_PROXY", "ALL_PROXY", "all_proxy"] {
+        if let Ok(value) = std::env::var(key) {
+            if let Some(url) = normalize_telegram_proxy(&value) {
+                return Some(url);
+            }
+        }
+    }
+    None
+}
+
 /// Returns default Telegram client identity metadata to match the built-in API
 /// credential pair.
 pub fn default_init_params() -> grammers_client::InitParams {
@@ -179,6 +200,7 @@ pub fn default_init_params() -> grammers_client::InitParams {
         system_lang_code: "en".to_string(),
         catch_up: false,
         update_queue_limit: None,
+        proxy_url: telegram_proxy_url(),
         ..Default::default()
     }
 }
@@ -190,47 +212,30 @@ fn nonempty(value: Option<String>) -> Option<String> {
     })
 }
 
-/// Transient state carried between login-flow commands.
-///
-/// Once a login has completed successfully both fields are cleared. While a
-/// code request is pending, [`Self::login_token`] is populated. While a 2FA
-/// password is pending, [`Self::password_token`] is populated.
-#[derive(Default)]
-pub struct LoginState {
-    /// Token returned by `request_login_code`, consumed by `sign_in`.
-    pub login_token: Option<LoginToken>,
-    /// Token returned by `sign_in` when 2FA is required, consumed by
-    /// `check_password`.
-    pub password_token: Option<PasswordToken>,
-    /// Phone number currently being signed in with, retained so outbound
-    /// events can echo it back to the operator.
-    pub phone: Option<String>,
-    /// Telegram API id used for the current attempt. Needed because sign-in
-    /// happens after `request_login_code` on a previously-connected client.
-    pub api_id: Option<i32>,
-    /// Telegram API hash used for the current attempt.
-    pub api_hash: Option<String>,
-}
-
-impl LoginState {
-    /// Constructs an empty [`LoginState`].
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Clears the login-token / password-token fields after a successful or
-    /// terminally-failed login attempt. Credentials (api id/hash/phone) are
-    /// preserved so a subsequent retry can reuse them without re-sending
-    /// `TelegramLoginStart`.
-    pub fn clear_tokens(&mut self) {
-        self.login_token = None;
-        self.password_token = None;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_telegram_proxy_accepts_socks5_and_normalizes_socks5h() {
+        assert_eq!(
+            normalize_telegram_proxy("socks5://127.0.0.1:7890"),
+            Some("socks5://127.0.0.1:7890".to_string())
+        );
+        // trims surrounding whitespace
+        assert_eq!(
+            normalize_telegram_proxy("  socks5://h:1  "),
+            Some("socks5://h:1".to_string())
+        );
+        // socks5h:// (DNS-via-proxy) is normalized to socks5:// for grammers
+        assert_eq!(
+            normalize_telegram_proxy("socks5h://h:1"),
+            Some("socks5://h:1".to_string())
+        );
+        assert_eq!(normalize_telegram_proxy("http://127.0.0.1:7890"), None);
+        assert_eq!(normalize_telegram_proxy("127.0.0.1:7890"), None);
+        assert_eq!(normalize_telegram_proxy(""), None);
+    }
 
     #[test]
     fn resolve_api_credentials_uses_hardcoded_default_without_config() {

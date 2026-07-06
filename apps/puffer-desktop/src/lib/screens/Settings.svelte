@@ -96,6 +96,9 @@
     onRunRemoteBash: (command: string) => void;
     onReadRemoteFile: (path: string) => void;
     onWriteRemoteFile: (path: string, contents: string) => void;
+    // Surfaces a transient app-level toast (the status strip). Used to ping the
+    // connector setup outcome so success/failure is never silently dropped.
+    onStatus?: (message: string) => void;
   };
 
   let props: Props = $props();
@@ -689,6 +692,14 @@
         "Check the daemon stderr for [telegram-connect] details."
       ].join(" ");
     }
+    if (
+      lower.includes("reach telegram") ||
+      lower.includes("network/proxy") ||
+      lower.includes("connect timed out") ||
+      lower.includes("timed out waiting for subscriber")
+    ) {
+      return `Couldn't reach Telegram — check your network or proxy settings. Telegram needs a SOCKS5 proxy (e.g. socks5://127.0.0.1:7890); HTTP proxies won't work. Detail: ${error}`;
+    }
     return error;
   }
 
@@ -724,7 +735,9 @@
       connectorCreateOpen = false;
       connectorQuestionRequest = null;
       connectorQuestionAnswers = {};
-      connectorSaved = `Connector setup finished for ${connectorConnectionSlug.trim()}.`;
+      const finishedFor = connectorConnectionSlug.trim();
+      connectorSaved = `Connector setup finished for ${finishedFor}.`;
+      props.onStatus?.(finishedFor ? `✓ Connector connected: ${finishedFor}` : "✓ Connector connected");
       // Show the group-picker wizard for lark-browser / feishu-browser connectors
       const finishedConnectorSlug = connectorSetupSlug;
       connectorSetupSlug = null;
@@ -744,8 +757,12 @@
         connectorCancelledTurnIds.delete(event.turnId);
         return;
       }
-      connectorError = connectorSetupErrorMessage(event.error);
+      const message = connectorSetupErrorMessage(event.error);
+      connectorError = message;
       connectorSaved = null;
+      // Toast is a single-line ping; the full message (incl. the SOCKS5 hint)
+      // stays in the persistent connectorError note below the connector list.
+      props.onStatus?.(`✗ Connector setup failed: ${message}`);
       connectorSetupSlug = null;
     }
   }
@@ -787,6 +804,7 @@
   async function submitConnectorAnswers() {
     if (!connectorQuestionRequest || !connectorAnswersComplete()) return;
     connectorCreating = true;
+    connectorError = null;
     connectorSaved = "Continuing connector setup...";
     try {
       await resolveUserQuestion(
@@ -2405,40 +2423,46 @@
                   <div class="title">{connection.slug}</div>
                   <div class="desc">{connection.description || connection.connector_slug}</div>
                 </div>
-                <span class:ready={connection.state === "active" || connection.state === "authenticated"} class="pf-status-pill">
-                  {connection.state}
-                </span>
-                <span class="pf-connector-source">{connection.connector_slug}</span>
-                <button
-                  type="button"
-                  class="sc-btn"
-                  data-variant="outline"
-                  data-size="sm"
-                  aria-label={connection.state === "active"
-                    ? `Stop monitoring ${connection.slug}`
-                    : `Start monitoring ${connection.slug}`}
-                  disabled={!daemonReachable || connectorMonitoring !== null || connection.state === "pending"}
-                  aria-busy={connectorMonitoring === connection.slug}
-                  onclick={() => void toggleConnectionMonitor(connection.slug, connection.state === "active")}
-                >
-                  <Icon name="eye" size={12} />{connectorMonitoring === connection.slug
-                    ? "Working..."
-                    : connection.state === "active"
-                      ? "Stop monitoring"
-                      : "Start monitoring"}
-                </button>
-                <button
-                  type="button"
-                  class="sc-btn"
-                  data-variant="outline"
-                  data-size="sm"
-                  aria-label={`Remove connection ${connection.slug}`}
-                  disabled={!daemonReachable || connectorDeleting !== null}
-                  aria-busy={connectorDeleting === connection.slug}
-                  onclick={() => void removeConnectorConnection(connection.slug)}
-                >
-                  <Icon name="x" size={12} />{connectorDeleting === connection.slug ? "Removing..." : "Remove"}
-                </button>
+                <div class="pf-connection-side">
+                  <div class="pf-connection-meta">
+                    <span class:ready={connection.state === "active" || connection.state === "authenticated"} class="pf-status-pill">
+                      {connection.state}
+                    </span>
+                    <span class="pf-connector-source">{connection.connector_slug}</span>
+                  </div>
+                  <div class="pf-connection-actions">
+                    <button
+                      type="button"
+                      class="sc-btn"
+                      data-variant="outline"
+                      data-size="sm"
+                      aria-label={`Remove connection ${connection.slug}`}
+                      disabled={!daemonReachable || connectorDeleting !== null}
+                      aria-busy={connectorDeleting === connection.slug}
+                      onclick={() => void removeConnectorConnection(connection.slug)}
+                    >
+                      <Icon name="x" size={12} />{connectorDeleting === connection.slug ? "Removing..." : "Remove"}
+                    </button>
+                    <button
+                      type="button"
+                      class="sc-btn"
+                      data-variant="outline"
+                      data-size="sm"
+                      aria-label={connection.state === "active"
+                        ? `Stop monitoring ${connection.slug}`
+                        : `Start monitoring ${connection.slug}`}
+                      disabled={!daemonReachable || connectorMonitoring !== null || connection.state === "pending"}
+                      aria-busy={connectorMonitoring === connection.slug}
+                      onclick={() => void toggleConnectionMonitor(connection.slug, connection.state === "active")}
+                    >
+                      <Icon name="eye" size={12} />{connectorMonitoring === connection.slug
+                        ? "Working..."
+                        : connection.state === "active"
+                          ? "Stop monitoring"
+                          : "Start monitoring"}
+                    </button>
+                  </div>
+                </div>
               </div>
             {/each}
             {#if !connectorLoading && connections.length === 0}

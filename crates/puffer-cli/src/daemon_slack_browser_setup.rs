@@ -47,10 +47,7 @@ pub(crate) fn execute_slack_browser_setup(
     cancel: CancelToken,
 ) -> Result<String> {
     let connection_slug = parse_setup_target(&connect_args)?;
-    let session_id = format!(
-        "slack-browser-setup-{}",
-        safe_session_part(&turn_id)
-    );
+    let session_id = format!("slack-browser-setup-{}", safe_session_part(&turn_id));
     let mut flow = SetupFlow {
         state,
         channel,
@@ -147,10 +144,7 @@ impl SetupFlow {
                 }),
             )
             .context("evaluate Slack login marker")?;
-            let result_str = value
-                .get("value")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
+            let result_str = value.get("value").and_then(Value::as_str).unwrap_or("{}");
             let result: Value = serde_json::from_str(result_str).unwrap_or(Value::Null);
             let logged_in = result
                 .get("loggedIn")
@@ -320,7 +314,10 @@ mod tests {
 
     #[test]
     fn parse_target_defaults_to_slug() {
-        assert_eq!(parse_setup_target("slack-browser").unwrap(), "slack-browser");
+        assert_eq!(
+            parse_setup_target("slack-browser").unwrap(),
+            "slack-browser"
+        );
         assert_eq!(parse_setup_target("slack-browser my-ws").unwrap(), "my-ws");
         assert!(parse_setup_target("slack-browser a b").is_err());
     }
@@ -339,13 +336,7 @@ mod tests {
             extract_team_id("https://app.slack.com/client/T0123ABCD/C456"),
             "T0123ABCD"
         );
-        assert_eq!(
-            extract_team_id("https://app.slack.com/signin"),
-            ""
-        );
-        assert_eq!(
-            extract_team_id(""),
-            ""
-        );
+        assert_eq!(extract_team_id("https://app.slack.com/signin"), "");
+        assert_eq!(extract_team_id(""), "");
     }
 }

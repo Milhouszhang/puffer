@@ -372,7 +372,8 @@ pub(crate) fn execute_parallel_bash_with_media_broker(
     args: Value,
     media_ctx: &super::internal_tool_permissions::MediaCapabilityContext<'_>,
 ) -> Result<ToolExecutionResult> {
-    let mut handler = |request: bash_internal_permissions::InternalToolBrokerRequest| match request {
+    let mut handler = |request: bash_internal_permissions::InternalToolBrokerRequest| {
+        match request {
         bash_internal_permissions::InternalToolBrokerRequest::Execution(req) => {
             bash_internal_permissions::InternalToolBrokerResponse::Execution(
                 super::internal_tool_permissions::execute_media_internal_tool(media_ctx, cwd, req),
@@ -385,6 +386,7 @@ pub(crate) fn execute_parallel_bash_with_media_broker(
                 ),
             )
         }
+    }
     };
     let execution = bash::execute_from_value_with_internal_permissions(
         cwd,
@@ -975,15 +977,6 @@ fn execute_workflow_tool_with_media_context(
         "McpToolCall" => workflow::mcp_tool_call::execute_mcp_tool_call(state, cwd, input),
         "McpStatus" => workflow::mcp_status::execute_mcp_status(state, cwd, input),
         "ModalAction" => workflow::modal_action::execute_modal_action(state, cwd, input),
-        "MonitorActionDraft" => {
-            workflow::monitor_action_draft::execute_monitor_action_draft(state, cwd, input)
-        }
-        "MonitorReplyDraft" => {
-            workflow::monitor_reply_draft::execute_monitor_reply_draft(state, cwd, input)
-        }
-        "MonitorReplySend" => {
-            workflow::monitor_reply_send::execute_monitor_reply_send(state, cwd, input)
-        }
         "NativeMcpAction" => {
             workflow::native_mcp_action::execute_native_mcp_action(state, cwd, input)
         }
@@ -1057,9 +1050,7 @@ fn execute_workflow_tool_with_media_context(
         "TelegramLoginQrWait" => {
             workflow::telegram_login::execute_telegram_login_qr_wait(cwd, input)
         }
-        "TelegramLoginStart" => {
-            workflow::telegram_login::execute_telegram_login_start(cwd, input)
-        }
+        "TelegramLoginStart" => workflow::telegram_login::execute_telegram_login_start(cwd, input),
         "TelegramLoginSubmitCode" => {
             workflow::telegram_login::execute_telegram_login_submit_code(cwd, input)
         }

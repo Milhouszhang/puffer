@@ -270,9 +270,15 @@ fn startup_bypass_includes_local_read_only_commands() {
 #[test]
 fn queued_startup_diff_runs_before_missing_auth_onboarding() {
     let tempdir = tempdir().unwrap();
+    // Keep the git worktree that `/diff` inspects (the cwd) in a subdir so the
+    // isolated `user_config_dir` (`tempdir/.puffer-user`) and workspace config
+    // dir land OUTSIDE it. Otherwise the persisted user config and session
+    // writes show up as untracked files and the tree no longer reads as clean.
+    let repo = tempdir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
     std::process::Command::new("git")
         .arg("-C")
-        .arg(tempdir.path())
+        .arg(&repo)
         .arg("init")
         .arg("-q")
         .status()
@@ -281,10 +287,8 @@ fn queued_startup_diff_runs_before_missing_auth_onboarding() {
     ensure_workspace_dirs(&paths).unwrap();
     save_user_config(&paths, &PufferConfig::default()).unwrap();
     let session_store = SessionStore::from_paths(&paths).unwrap();
-    let session = session_store
-        .create_session(tempdir.path().to_path_buf())
-        .unwrap();
-    let mut state = sample_state(session, tempdir.path());
+    let session = session_store.create_session(repo.clone()).unwrap();
+    let mut state = sample_state(session, &repo);
     state.current_provider = Some("anthropic".to_string());
     state.current_model = Some("anthropic/claude-sonnet-4-5".to_string());
     let mut resources = LoadedResources::default();
@@ -1073,9 +1077,20 @@ fn poll_pending_submit_syncs_project_memory_review_turns_back_to_main_state() {
 
 #[test]
 fn slash_plan_with_arguments_starts_async_turn_after_local_handling() {
+    // The queued-argument path runs through `submit_queued_prompt_if_ready`
+    // → `onboarding::initial_overlay`, which resolves `ConfigPaths::discover`
+    // from the cwd internally. Hold the shared home lock with `PUFFER_HOME`
+    // cleared so that resolution deterministically uses the tempdir isolation
+    // rule instead of racing with a concurrent test's `PUFFER_HOME`.
+    let _home = crate::test_env::ScopedPufferHome::unset();
     let tempdir = tempdir().unwrap();
     let paths = ConfigPaths::discover(tempdir.path());
     ensure_workspace_dirs(&paths).unwrap();
+    // Persist a user config so onboarding's `has_user_config()` gate is
+    // satisfied. Without it the isolated `user_config_dir` has no config.toml
+    // and `submit_queued_prompt_if_ready` opens the theme picker instead of
+    // submitting the queued `/plan` argument.
+    save_user_config(&paths, &PufferConfig::default()).unwrap();
     let session_store = SessionStore::from_paths(&paths).unwrap();
     let session = session_store
         .create_session(tempdir.path().to_path_buf())

@@ -22,15 +22,15 @@ use uuid::Uuid;
 use crate::cli_args::DesktopApiCommand;
 use crate::desktop_activity::session_activity_status;
 use crate::desktop_api_types::{
-    AgentDiffDto, AgentDiffEntryDto, AgentDiffFileDto, AuthProviderStatusDto,
-    BrowserCaptchaSettingsDto, BrowserCaptchaSolverDto, BrowserExtensionDto, BrowserSettingsDto,
-    ChatAttachmentDto, ChatAttachmentSourceDto, DiffSummaryDto, DivergenceReportDto,
-    ExternalCredentialDto, FolderGroupDto, MediaGenerationSettingsDto, MediaSettingsDto,
-    NetworkProxySettingsDto, ProviderSummaryDto, RepoActionResultDto, RepoPullRequestDto,
-    RepoStatusDto, ResourceCountsDto, SanitizedProxyEndpointDto, SecretSourceDto, SecretSummaryDto,
-    SecretsSettingsDto, SessionDetailDto, SessionGroupsPageDto, SessionListItemDto,
-    SettingsConfigDto, SettingsSessionSummaryDto, SettingsSnapshotDto, TimelineItemDto,
-    AgentEnvSandboxDefaultsDto, AgentEnvSettingsDto, RemoteSettingsDto, SshHostSettingsDto,
+    AgentDiffDto, AgentDiffEntryDto, AgentDiffFileDto, AgentEnvSandboxDefaultsDto,
+    AgentEnvSettingsDto, AuthProviderStatusDto, BrowserCaptchaSettingsDto, BrowserCaptchaSolverDto,
+    BrowserExtensionDto, BrowserSettingsDto, ChatAttachmentDto, ChatAttachmentSourceDto,
+    DiffSummaryDto, DivergenceReportDto, ExternalCredentialDto, FolderGroupDto,
+    MediaGenerationSettingsDto, MediaSettingsDto, NetworkProxySettingsDto, ProviderSummaryDto,
+    RemoteSettingsDto, RepoActionResultDto, RepoPullRequestDto, RepoStatusDto, ResourceCountsDto,
+    SanitizedProxyEndpointDto, SecretSourceDto, SecretSummaryDto, SecretsSettingsDto,
+    SessionDetailDto, SessionGroupsPageDto, SessionListItemDto, SettingsConfigDto,
+    SettingsSessionSummaryDto, SettingsSnapshotDto, SshHostSettingsDto, TimelineItemDto,
     WorkflowBackendOptionDto, WorkflowBackendSettingsDto,
 };
 
@@ -2256,7 +2256,7 @@ mod tests {
             ],
             agentenv: Some(SaveAgentEnvSettingsParams {
                 enabled: true,
-                api_url: " https://api.agentenv.io/ ".to_string(),
+                api_url: " https://agentenv.io/ ".to_string(),
                 runner_host: Some(" 93.115.25.198 ".to_string()),
                 workspace: Some(" wk_demo ".to_string()),
                 credential_secret_id: Some(" secret-agentenv ".to_string()),
@@ -2281,7 +2281,7 @@ mod tests {
 
         let agentenv = config.agentenv.expect("agentenv config");
         assert!(agentenv.enabled);
-        assert_eq!(agentenv.api_url, "https://api.agentenv.io");
+        assert_eq!(agentenv.api_url, "https://agentenv.io");
         assert_eq!(agentenv.runner_host.as_deref(), Some("93.115.25.198"));
         assert_eq!(agentenv.workspace.as_deref(), Some("wk_demo"));
         assert_eq!(

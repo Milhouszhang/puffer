@@ -118,11 +118,8 @@ fn slack_send_message(
                 .unwrap_or("unknown")
         );
     }
-    let result = evaluate_slack_script(
-        env,
-        handshake_ref,
-        &slack_send_message_script(&fields.text),
-    )?;
+    let result =
+        evaluate_slack_script(env, handshake_ref, &slack_send_message_script(&fields.text))?;
     if !result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
         anyhow::bail!(
             "slack-browser send_message failed for channel `{}`: {}",
@@ -241,7 +238,11 @@ fn slack_react(
                 .unwrap_or("unknown")
         );
     }
-    if !result.get("picked").and_then(Value::as_bool).unwrap_or(false) {
+    if !result
+        .get("picked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         anyhow::bail!(
             "slack react: emoji picker did not open or emoji not placed (ts={}, emoji={})",
             fields.message_ts,
@@ -310,8 +311,8 @@ fn evaluate_slack_script(
 /// Returns `{ok: true}` immediately after triggering navigation; the caller
 /// should then issue its act script in a subsequent evaluate call.
 fn slack_navigate_script(config: &SlackBrowserConfig, channel_id: &str) -> String {
-    let team_id_json =
-        serde_json::to_string(&config.team_id).unwrap_or_else(|_| format!("\"{}\"", config.team_id));
+    let team_id_json = serde_json::to_string(&config.team_id)
+        .unwrap_or_else(|_| format!("\"{}\"", config.team_id));
     let channel_id_json =
         serde_json::to_string(channel_id).unwrap_or_else(|_| format!("\"{channel_id}\""));
     format!(
@@ -504,7 +505,8 @@ mod act_tests {
 
     #[test]
     fn react_valid_with_defaults() {
-        let f = react_fields(&json!({"channel_id": "C1", "message_id": "1718000000.000100"})).unwrap();
+        let f =
+            react_fields(&json!({"channel_id": "C1", "message_id": "1718000000.000100"})).unwrap();
         assert_eq!(f.channel_id, "C1");
         assert_eq!(f.message_ts, "1718000000.000100");
         assert_eq!(f.emoji, "👍");
@@ -512,7 +514,9 @@ mod act_tests {
 
     #[test]
     fn react_accepts_ts_alias_and_reaction_alias() {
-        let f = react_fields(&json!({"channel": "C2", "ts": "1718000000.000200", "reaction": "🎉"})).unwrap();
+        let f =
+            react_fields(&json!({"channel": "C2", "ts": "1718000000.000200", "reaction": "🎉"}))
+                .unwrap();
         assert_eq!(f.channel_id, "C2");
         assert_eq!(f.message_ts, "1718000000.000200");
         assert_eq!(f.emoji, "🎉");

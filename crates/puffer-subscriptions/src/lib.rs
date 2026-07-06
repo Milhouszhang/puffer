@@ -29,6 +29,9 @@ mod event_schema;
 mod history;
 mod manager;
 mod monitor_trace;
+pub mod outbound_audit;
+pub mod outbound_gate;
+pub mod outbound_store;
 mod protocol;
 mod proxy;
 mod router;
@@ -73,8 +76,8 @@ pub use event_schema::{
     EventFieldRule, EventFieldType, EventFieldValue, EventOperator, EventSchema, EventTextField,
 };
 pub use history::{
-    now_ms, WorkflowActionLog, WorkflowBindingRun, WorkflowBindingRunStatus, WorkflowHistoryStore,
-    WorkflowHistoryStoreError,
+    now_ms, RunFinishedObserver, WorkflowActionLog, WorkflowBindingRun, WorkflowBindingRunStatus,
+    WorkflowHistoryStore, WorkflowHistoryStoreError,
 };
 pub use manager::{
     ConnectionAuthChecker, ConnectionAuthStatus, SubscriptionManager, SubscriptionManagerBuilder,
@@ -82,6 +85,19 @@ pub use manager::{
 pub use monitor_trace::{
     MonitorTraceIdentity, MonitorTraceMessage, MonitorTraceStage, MonitorTraceStageStatus,
     MonitorTraceStatus, MonitorTraceStore, MonitorTraceStoreError,
+};
+pub use outbound_audit::{
+    append_gate_audit, AuditEntry, AUDIT_DECISION_ALLOWED_RULE, AUDIT_DECISION_APPROVED_SEND,
+    AUDIT_DECISION_CANCELLED, AUDIT_DECISION_DRAFT_REQUIRED, AUDIT_DECISION_EXPIRED,
+};
+// `evaluate` is intentionally NOT re-exported at the crate root: every caller
+// spells it `outbound_gate::evaluate` to keep the single-gate invariant grep-able.
+pub use outbound_gate::{
+    action_requires_human_review, effective_action_permission, GateDecision, SendOrigin,
+};
+pub use outbound_store::{
+    NewOutboundDraft, OutboundAction, OutboundOrigin, OutboundStore, RecipientSource,
+    DUPLICATE_RISK_ACK_REQUIRED, OUTBOUND_ACTION_EXPIRED, TERMINAL_OUTBOUND_ACTION,
 };
 pub use protocol::{
     ConnectorActionRequest, ConnectorActionResponse, ConnectorSubscribeCommand,

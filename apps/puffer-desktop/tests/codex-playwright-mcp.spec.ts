@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { expect, test } from "@playwright/test";
 
@@ -11,7 +11,19 @@ const codexPlaywrightConfig = [
   'mcp_servers.playwright.args=["--yes","@playwright/mcp@latest","--headless"]'
 ];
 
+// This spec drives the real codex CLI; runners without it (e.g. ubuntu CI)
+// self-exclude, mirroring the PUFFER_SKIP_TMUX_TESTS convention.
+function codexCliAvailable(): boolean {
+  try {
+    execFileSync("codex", ["--version"], { stdio: "ignore", timeout: 10_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 test("Codex resolves the built-in Playwright MCP server", async () => {
+  test.skip(!codexCliAvailable(), "codex CLI is not installed on this runner");
   test.setTimeout(60_000);
   const { stdout } = await execFileAsync("codex", ["mcp", "list", ...codexPlaywrightConfig], {
     timeout: 60_000

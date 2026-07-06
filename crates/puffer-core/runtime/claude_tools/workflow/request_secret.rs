@@ -246,15 +246,19 @@ fn create_secret(
         | PermissionPromptAction::AllowAllSession => {}
         PermissionPromptAction::Deny => bail!("permission denied by user"),
     }
-    let summary = put_secret(&vault, write_policy, SecretUpsert {
-        id: parsed.id,
-        label,
-        description: parsed.description,
-        value,
-        username: parsed.username,
-        origin: parsed.origin,
-        source: "agent".to_string(),
-    })?;
+    let summary = put_secret(
+        &vault,
+        write_policy,
+        SecretUpsert {
+            id: parsed.id,
+            label,
+            description: parsed.description,
+            value,
+            username: parsed.username,
+            origin: parsed.origin,
+            source: "agent".to_string(),
+        },
+    )?;
     Ok(serde_json::to_string_pretty(&json!({
         "secret": secret_summary_json(summary),
         "created": true,
@@ -284,15 +288,19 @@ fn collect_secret(
     })
     .context("RequestSecret collect requires an active user question prompt")?;
     let value = collect_secret_answer(&response, &question)?;
-    let summary = put_secret(&vault, write_policy, SecretUpsert {
-        id: parsed.id,
-        label,
-        description: parsed.description,
-        value: value.clone(),
-        username: parsed.username,
-        origin: parsed.origin,
-        source: "agent".to_string(),
-    })?;
+    let summary = put_secret(
+        &vault,
+        write_policy,
+        SecretUpsert {
+            id: parsed.id,
+            label,
+            description: parsed.description,
+            value: value.clone(),
+            username: parsed.username,
+            origin: parsed.origin,
+            source: "agent".to_string(),
+        },
+    )?;
     let token = register_masked_secret(state, value)?;
     Ok(serde_json::to_string_pretty(&json!({
         "secret": token,
@@ -821,7 +829,10 @@ mod tests {
             |_| PermissionPromptAction::Deny,
             || execute_request_secret(&mut state, dir.path(), json!({"label": "Beta"})),
         );
-        assert!(beta_denied.is_err(), "ungranted secret must require approval");
+        assert!(
+            beta_denied.is_err(),
+            "ungranted secret must require approval"
+        );
 
         // Allow-all then covers Beta without a further prompt.
         with_permission_prompt_handler(
@@ -953,8 +964,11 @@ mod tests {
             })
             .unwrap();
 
-        let response =
-            call_internal_request_secret(&mut state, dir.path(), json!({"action": "search", "query": "production"}));
+        let response = call_internal_request_secret(
+            &mut state,
+            dir.path(),
+            json!({"action": "search", "query": "production"}),
+        );
 
         assert!(response.success, "reason: {:?}", response.reason);
         let output = response.output.unwrap_or_default();
@@ -975,7 +989,10 @@ mod tests {
 
         let response = with_user_question_prompt_handler(
             |request| {
-                let question = request.questions[0]["question"].as_str().unwrap().to_string();
+                let question = request.questions[0]["question"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
                 UserQuestionPromptResponse {
                     answers: serde_json::Map::from_iter([(question, json!("collected-raw-value"))]),
                     annotations: serde_json::Map::new(),
@@ -996,7 +1013,10 @@ mod tests {
         assert!(!output.contains("collected-raw-value"));
         // The value is actually persisted and retrievable.
         assert_eq!(
-            open_test_vault(dir.path()).reveal("Collected").unwrap().value,
+            open_test_vault(dir.path())
+                .reveal("Collected")
+                .unwrap()
+                .value,
             "collected-raw-value"
         );
     }
@@ -1029,7 +1049,10 @@ mod tests {
             },
         );
         assert!(first.success, "reason: {:?}", first.reason);
-        assert_eq!(open_test_vault(dir.path()).reveal("Mailbox").unwrap().value, "first-value");
+        assert_eq!(
+            open_test_vault(dir.path()).reveal("Mailbox").unwrap().value,
+            "first-value"
+        );
 
         // A second collect under the same name is refused; the value is unchanged.
         let second = with_user_question_prompt_handler(
@@ -1049,7 +1072,10 @@ mod tests {
             },
         );
         assert!(!second.success, "collect overwrite by name must be refused");
-        assert_eq!(open_test_vault(dir.path()).reveal("Mailbox").unwrap().value, "first-value");
+        assert_eq!(
+            open_test_vault(dir.path()).reveal("Mailbox").unwrap().value,
+            "first-value"
+        );
     }
 
     // Security (Fix A): writes over the internal path are insert-only. A child can
@@ -1074,7 +1100,10 @@ mod tests {
             },
         );
         assert!(first.success, "reason: {:?}", first.reason);
-        assert_eq!(open_test_vault(dir.path()).reveal("Token").unwrap().value, "value-1");
+        assert_eq!(
+            open_test_vault(dir.path()).reveal("Token").unwrap().value,
+            "value-1"
+        );
 
         // A second create reusing the same label is refused, value unchanged.
         let token2 = register_masked_secret(&state, "value-2".to_string()).unwrap();
@@ -1089,7 +1118,10 @@ mod tests {
             },
         );
         assert!(!second.success, "overwrite by label must be refused");
-        assert_eq!(open_test_vault(dir.path()).reveal("Token").unwrap().value, "value-1");
+        assert_eq!(
+            open_test_vault(dir.path()).reveal("Token").unwrap().value,
+            "value-1"
+        );
 
         // An injected id targeting an existing secret is also refused.
         let victim = open_test_vault(dir.path())
@@ -1115,6 +1147,9 @@ mod tests {
             },
         );
         assert!(!third.success, "overwrite by injected id must be refused");
-        assert_eq!(open_test_vault(dir.path()).reveal("Victim").unwrap().value, "victim-value");
+        assert_eq!(
+            open_test_vault(dir.path()).reveal("Victim").unwrap().value,
+            "victim-value"
+        );
     }
 }

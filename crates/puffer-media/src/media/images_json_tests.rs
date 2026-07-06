@@ -139,8 +139,14 @@ fn to_body_grouped_emits_nested_count_and_suppresses_n() {
         field: "max_images".to_string(),
         parent: Some("sequential_image_generation_options".to_string()),
     };
-    let body = ImagesJsonRequest::new("seedream-4-5", "three portraits", parameters, 6, Some(recipe))
-        .to_body();
+    let body = ImagesJsonRequest::new(
+        "seedream-4-5",
+        "three portraits",
+        parameters,
+        6,
+        Some(recipe),
+    )
+    .to_body();
 
     assert_eq!(
         body["sequential_image_generation_options"]["max_images"],
@@ -187,7 +193,10 @@ fn error_chain_surfaces_underlying_transport_cause() {
     let message = error_chain(&Outer(Inner));
 
     // Top-level reqwest-style message is kept, AND the real cause is appended.
-    assert!(message.contains("error sending request for url"), "{message}");
+    assert!(
+        message.contains("error sending request for url"),
+        "{message}"
+    );
     assert!(
         message.contains("connection closed before message completed"),
         "{message}"
@@ -843,32 +852,14 @@ fn url_response_is_downloaded_before_success() {
 
 #[test]
 fn missing_image_data_returns_stable_error() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let address = listener.local_addr().expect("address");
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("request");
-        let body = json!({"data": [{}]}).to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).expect("response");
-    });
-    let registry = registry_with_provider(format!("http://{address}"));
-    let service_dir = tempdir().expect("tempdir");
-
-    let error = ImagesJsonAdapter::new()
-        .expect("adapter")
-        .execute(
-            &registry,
-            &auth_store(),
-            &MediaGenerationService::new(service_dir.path()),
-            request(),
-        )
+    // A response whose only image item carries neither `b64_json` nor `url`
+    // must fail with a stable message. Exercise the response parser directly:
+    // routing this through a real one-shot socket server added CI-flaky network
+    // I/O (an intermittent "send image generation request" connect error under
+    // load) without testing anything beyond the parse the adapter already runs.
+    let error = image_outputs_from_response(&Client::new(), &json!({"data": [{}]}), 1)
         .expect_err("missing image data should fail");
 
-    server.join().expect("server");
     assert_eq!(
         error.to_string(),
         "image generation response did not contain an image"

@@ -880,6 +880,21 @@ export async function loginWithOauth(
   });
 }
 
+export async function loginWithAgentEnv(): Promise<SettingsSnapshot> {
+  if (canReachDaemon()) {
+    const client = await ensureLocalDaemonClient();
+    return client.request<BackendSettingsSnapshot>(
+      "login_with_agentenv",
+      {},
+      { timeoutMs: 180_000 }
+    );
+  }
+  if (!canInvokeTauri()) {
+    return mockSettingsSnapshot;
+  }
+  return invoke<BackendSettingsSnapshot>("login_with_agentenv");
+}
+
 export async function loginWithApiKey(
   providerId: string,
   apiKey: string,
@@ -1213,6 +1228,30 @@ export async function subscribeTelegramRelationships(
 ): Promise<() => void> {
   const client = await ensureLocalDaemonClient();
   return client.on("telegram:relationships", handler);
+}
+
+/** Subscribe to workflow/task run completions (Completed or Failed) pushed by
+ *  the daemon on the non-replay `workflow-run:finished` channel. Returns an
+ *  unsubscribe function. */
+export async function subscribeWorkflowRunFinished(
+  handler: (event: { slug: string; runId: string; status: string }) => void
+): Promise<() => void> {
+  const client = await ensureLocalDaemonClient();
+  return client.on("workflow-run:finished", (payload) => {
+    handler(payload as { slug: string; runId: string; status: string });
+  });
+}
+
+/** Subscribe to `contacts:updated` — emitted when a subscriber finishes (or
+ *  attempts) hydrating a connector's contacts, so the contacts screen can
+ *  refetch without polling. Returns an unsubscribe function. */
+export async function subscribeContactsUpdated(
+  handler: (event: { connection: string; ok: boolean }) => void
+): Promise<() => void> {
+  const client = await ensureLocalDaemonClient();
+  return client.on("contacts:updated", (payload) => {
+    handler(payload as { connection: string; ok: boolean });
+  });
 }
 
 /** Rank the top-5 Telegram contacts by recent chat frequency and analyze each
@@ -1785,19 +1824,48 @@ export async function saveMonitorMemory(connectionSlug: string, content: string)
   });
 }
 
-/** Execute a human-approved outbound connector action draft. */
-export async function executeConnectorActionDraft(params: {
-  draftId: string;
+/** Execute a human-approved outbound action. */
+export async function executeOutboundAction(params: {
+  actionId: string;
   version: number;
   approvedMessage: string;
   clientRequestId: string;
-}): Promise<{ status: string; draftId: string; receipt?: unknown }> {
+}): Promise<{ status: string; actionId: string; receipt?: unknown }> {
   const client = await ensureLocalDaemonClient();
-  return client.request<{ status: string; draftId: string; receipt?: unknown }>("connector_action_execute", {
-    draft_id: params.draftId,
+  return client.request<{ status: string; actionId: string; receipt?: unknown }>("outbound_action_execute", {
+    action_id: params.actionId,
     version: params.version,
     approved_message: params.approvedMessage,
     client_request_id: params.clientRequestId
+  });
+}
+
+/** Read the persisted status for an outbound action. */
+export async function outboundActionStatus(params: {
+  actionId: string;
+  version: number;
+}): Promise<{ status: string; actionId: string; version: number; error?: unknown; receipt?: unknown }> {
+  const client = await ensureLocalDaemonClient();
+  return client.request<{ status: string; actionId: string; version: number; error?: unknown; receipt?: unknown }>(
+    "outbound_action_status",
+    {
+      action_id: params.actionId,
+      version: params.version
+    }
+  );
+}
+
+/** Cancel a pending outbound action. */
+export async function cancelOutboundAction(params: {
+  actionId: string;
+  version: number;
+  reason?: string;
+}): Promise<{ status: string; actionId: string }> {
+  const client = await ensureLocalDaemonClient();
+  return client.request<{ status: string; actionId: string }>("outbound_action_cancel", {
+    action_id: params.actionId,
+    version: params.version,
+    reason: params.reason?.trim() || undefined
   });
 }
 

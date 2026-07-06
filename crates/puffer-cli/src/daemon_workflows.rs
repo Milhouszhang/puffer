@@ -5,13 +5,10 @@ mod binding_delete;
 #[cfg(test)]
 mod binding_snapshot_tests;
 mod connection_delete;
-mod connector_action_execute;
-mod monitor_action_execute;
 mod monitor_create;
 mod monitor_history;
 mod monitor_ignore_result;
 mod monitor_memory;
-mod monitor_reply_send;
 mod monitor_rules;
 mod monitor_self_gate;
 #[cfg(test)]
@@ -19,6 +16,7 @@ mod monitor_snapshot_tests;
 mod monitor_task_complete;
 mod monitor_task_ignore;
 mod monitor_trace;
+mod outbound_action;
 mod planned;
 mod runtime;
 mod snapshot_json;
@@ -30,17 +28,17 @@ mod telegram_diagnostics_export_tests;
 pub(crate) use binding_create::handle_workflow_binding_create;
 pub(crate) use binding_delete::handle_workflow_binding_delete;
 pub(crate) use connection_delete::handle_workflow_connection_delete;
-pub(crate) use connector_action_execute::handle_connector_action_execute;
-pub(crate) use monitor_action_execute::handle_monitor_action_execute;
 pub(crate) use monitor_create::handle_monitor_create;
 pub(crate) use monitor_history::handle_monitor_history_list;
 pub(crate) use monitor_memory::handle_monitor_memory_save;
-pub(crate) use monitor_reply_send::handle_monitor_reply_send;
 pub(crate) use monitor_rules::{handle_monitor_rule_add, handle_monitor_rule_delete};
 pub(crate) use monitor_self_gate::MonitorSelfGate;
 pub(crate) use monitor_task_complete::handle_monitor_task_complete;
 pub(crate) use monitor_task_ignore::handle_monitor_task_ignore;
 pub(crate) use monitor_trace::handle_monitor_trace_list;
+pub(crate) use outbound_action::{
+    handle_outbound_action_cancel, handle_outbound_action_execute, handle_outbound_action_status,
+};
 pub(crate) use runtime::{
     handle_workflow_create, handle_workflow_deploy, handle_workflow_execute,
     handle_workflow_execute_in_memory, handle_workflow_get_execution,
@@ -447,10 +445,25 @@ fn load_monitor_tasks(paths: &ConfigPaths) -> Result<Vec<Value>> {
         .with_context(|| format!("invalid monitor task store {}", path.display()))?;
     let telegram_peer_avatars = crate::daemon_contacts::cached_telegram_peer_avatars(paths);
     let telegram_peer_names = crate::daemon_contacts::cached_telegram_peer_names(paths);
+    let mut errors = Vec::new();
+    // Degrade gracefully like `task_snapshot::add_task_context`: a failure to
+    // load the outbound store must not blank the whole monitor feed. Carry the
+    // error, render tasks with a null `outboundAction`.
+    let outbound_store = task_snapshot::outbound_store(paths, &mut errors);
+    for error in &errors {
+        eprintln!("monitor feed: outbound action store unavailable: {error}");
+    }
     Ok(store
         .tasks
         .into_iter()
-        .map(|task| monitor_task_json(task, &telegram_peer_avatars, &telegram_peer_names))
+        .map(|task| {
+            monitor_task_json(
+                task,
+                &telegram_peer_avatars,
+                &telegram_peer_names,
+                outbound_store.as_ref(),
+            )
+        })
         .collect())
 }
 
@@ -466,6 +479,7 @@ fn monitor_task_json(
     task: MonitorTaskSnapshotRecord,
     telegram_peer_avatars: &HashMap<String, String>,
     telegram_peer_names: &HashMap<String, String>,
+    outbound_store: Option<&puffer_subscriptions::OutboundStore>,
 ) -> Value {
     json!({
         "task_id": task.task_id,
@@ -495,10 +509,6 @@ fn monitor_task_json(
             &["monitor"],
             &[]
         ),
-        // Human-gated reply review state. `monitor_tasks[]` is what bobo's
-        // Home feed renders, so the pending draft must surface HERE — adding
-        // it only to `task_snapshot::task_json` (the `tasks[]` array) leaves
-        // the Review-draft UI unreachable.
         "source_context": task_snapshot::monitor_source_context_with_sender_identity(
             &task.metadata,
             telegram_peer_avatars,
@@ -516,16 +526,7 @@ fn monitor_task_json(
             &["monitor_task_gate", "monitorTaskGate"],
             &["task_gate", "taskGate"]
         ),
-        "pending_action": task_snapshot::metadata_value(
-            &task.metadata,
-            &["pending_action", "pendingAction"],
-            &["pending_action", "pendingAction"]
-        ),
-        "pending_reply": task_snapshot::metadata_value(
-            &task.metadata,
-            &["pending_reply", "pendingReply"],
-            &["reply", "draft"]
-        ),
+        "outboundAction": task_snapshot::outbound_action_for_metadata(outbound_store, &task.metadata),
         "started_at_ms": task.started_at_ms,
         "updated_at_ms": task.updated_at_ms,
     })
@@ -644,7 +645,31 @@ fn subscriber_manifest_roots(paths: &ConfigPaths) -> SubscriberManifestRoots {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use puffer_subscriptions::ConnectionState;
+    use puffer_subscriptions::{
+        ConnectionState, NewOutboundDraft, OutboundOrigin, OutboundStore, RecipientSource,
+    };
+
+    fn create_outbound_action(paths: &ConfigPaths, task_id: &str, message: &str) -> String {
+        OutboundStore::load(paths.user_config_dir.join("outbound_actions.json"))
+            .unwrap()
+            .create_draft(NewOutboundDraft {
+                connector_slug: "telegram-login".to_string(),
+                connection_slug: "telegram-user".to_string(),
+                action: "send_message".to_string(),
+                input: json!({ "chat_id": "42", "message": message }),
+                recipient_stable_id: "telegram:42".to_string(),
+                recipient_source: RecipientSource::Stamped,
+                message: message.to_string(),
+                origin: OutboundOrigin {
+                    session_id: "session-1".to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    task_id: Some(task_id.to_string()),
+                },
+                ttl_ms: None,
+            })
+            .unwrap()
+            .id
+    }
 
     #[test]
     fn trigger_ready_connection_snapshot_includes_monitor_command() {
@@ -702,6 +727,8 @@ mod tests {
     fn workflow_snapshot_includes_monitor_tasks() {
         let tempdir = tempfile::tempdir().unwrap();
         let paths = ConfigPaths::discover(tempdir.path());
+        let outbound_action_id =
+            create_outbound_action(&paths, "monitor-1", "Deployment finished an hour ago.");
         let task_path = monitor_tasks_path(&paths);
         std::fs::create_dir_all(task_path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -732,6 +759,7 @@ mod tests {
                             "source_text": "回调失败率刚升到 18%，16:00 前给结论。",
                             "source_message_id": 6836,
                             "completion_policy": "human_gated_reply",
+                            "outbound_action_id": outbound_action_id,
                             "source_state": {
                                 "telegram": {
                                     "read": true,
@@ -742,12 +770,6 @@ mod tests {
                                 "decision": "create_read",
                                 "read": true,
                                 "replied": false
-                            },
-                            "pending_reply": {
-                                "id": "draft-monitor-1-1",
-                                "status": "draft_ready",
-                                "version": 1,
-                                "agent_draft_text": "Deployment finished an hour ago."
                             }
                         },
                         "started_at_ms": 10,
@@ -767,14 +789,7 @@ mod tests {
                                     "actionName": "Send",
                                     "actionPrompt": "Send the approved Telegram reply."
                                 }
-                            ],
-                            "pending_action": {
-                                "id": "telegram-action-1",
-                                "type": "telegram_reply_draft_intent",
-                                "status": "sent",
-                                "version": 4,
-                                "agent_draft_text": "Thanks, sent."
-                            }
+                            ]
                         },
                         "started_at_ms": 30,
                         "updated_at_ms": 40
@@ -816,15 +831,15 @@ mod tests {
         assert_eq!(tasks[0]["source_state"]["telegram"]["read"], true);
         assert_eq!(tasks[0]["source_state"]["telegram"]["label"], "已读");
         assert_eq!(tasks[0]["monitor_task_gate"]["decision"], "create_read");
-        assert_eq!(tasks[0]["pending_reply"]["id"], "draft-monitor-1-1");
-        assert_eq!(tasks[0]["pending_reply"]["status"], "draft_ready");
-        assert_eq!(tasks[0]["pending_reply"]["version"], 1);
+        assert_eq!(tasks[0]["outboundAction"]["id"], outbound_action_id);
+        assert_eq!(tasks[0]["outboundAction"]["status"], "draft_ready");
+        assert_eq!(tasks[0]["outboundAction"]["version"], 1);
         assert_eq!(
-            tasks[0]["pending_reply"]["agent_draft_text"],
+            tasks[0]["outboundAction"]["message"],
             "Deployment finished an hour ago."
         );
         assert_eq!(tasks[1]["task_id"], "monitor-sent");
-        assert_eq!(tasks[1]["pending_action"]["status"], "sent");
+        assert!(tasks[1]["outboundAction"].is_null());
         assert!(tasks[1]["actions"].as_array().unwrap().is_empty());
         assert_eq!(snapshot["monitor_task_error"], Value::Null);
     }
@@ -951,13 +966,6 @@ mod tests {
                                     "type": "gmail_reply_draft",
                                     "approval": "draft_then_create_gmail_draft"
                                 }
-                            },
-                            "pending_action": {
-                                "id": "draft-monitor-gmail-1-1",
-                                "type": "gmail_reply_draft",
-                                "status": "draft_ready",
-                                "version": 1,
-                                "agent_draft_text": "How about Tuesday afternoon?"
                             }
                         },
                         "started_at_ms": 10,
@@ -987,14 +995,9 @@ mod tests {
             monitor_tasks[0]["source_context"]["sender"]["email"],
             "fuxiangyu@example.com"
         );
-        assert_eq!(
-            monitor_tasks[0]["pending_action"]["type"],
-            "gmail_reply_draft"
-        );
-
         assert_eq!(task_row["monitor"]["kind"], "gmail.reply");
         assert_eq!(task_row["source_context"]["kind"], "gmail_message");
-        assert_eq!(task_row["pending_action"]["type"], "gmail_reply_draft");
+        assert!(task_row["outboundAction"].is_null());
     }
 
     #[test]

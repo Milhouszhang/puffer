@@ -22,15 +22,15 @@ mod daemon_files;
 mod daemon_fs_watch;
 mod daemon_gcal_browser_setup;
 mod daemon_gmail_browser_setup;
+mod daemon_lambda_skills;
 #[path = "daemon_lark_browser_setup.rs"]
 mod daemon_lark_browser_setup;
-mod daemon_slack_browser_setup;
-mod daemon_lambda_skills;
 mod daemon_local_model;
 mod daemon_lsp;
 mod daemon_pty;
 mod daemon_secrets;
 mod daemon_singleton;
+mod daemon_slack_browser_setup;
 mod daemon_telegram_ranking;
 mod daemon_title;
 mod daemon_turn_recovery;
@@ -49,24 +49,25 @@ mod gmail_browser;
 mod gmail_browser_log;
 mod heartbeat;
 mod internal_tools;
-mod lark_connector;
 #[path = "lark_browser.rs"]
 mod lark_browser;
 #[path = "lark_browser_script.rs"]
 mod lark_browser_script;
-mod slack_browser;
-#[path = "slack_browser_script.rs"]
-mod slack_browser_script;
+mod lark_connector;
 mod media_internal_tools;
 mod non_interactive;
 mod project_metadata;
 mod resource_fs;
 mod runner_selection;
+mod slack_browser;
+#[path = "slack_browser_script.rs"]
+mod slack_browser_script;
 mod subscriber_tool_args;
 mod subscriber_tools;
 mod subscriptions;
 #[cfg(unix)]
 mod wechat_connector;
+mod workflow_run_events;
 mod workflow_runtime;
 mod workflow_runtime_helpers;
 mod workflows;
@@ -156,6 +157,13 @@ fn run_main() -> Result<()> {
     let paths = ConfigPaths::discover(&cwd);
     ensure_workspace_dirs(&paths)?;
     let config = load_config(&paths)?;
+    // Apply proxy env vars (ALL_PROXY/HTTP(S)_PROXY/NO_PROXY) BEFORE any
+    // background thread or runtime spawns below (provider discovery, heartbeat,
+    // workflow runtime, subscriptions::install). Those threads build their own
+    // reqwest clients which snapshot the process env at construction; setting
+    // the vars here — at the single-threaded startup point — avoids a data race
+    // with `env::set_var` and guarantees first-launch requests are proxied.
+    crate::daemon::apply_proxy_env_at_startup(&config.network.proxy);
     let auth_path = paths.user_config_dir.join("auth.json");
     let mut auth_store = AuthStore::load(&auth_path)?;
     let mut resources = load_resources(&paths, &puffer_runner_local::LocalToolRunner::new())?;
@@ -262,7 +270,12 @@ fn run_main() -> Result<()> {
         None
     };
     let _subscription_runtime = if install_subscription_manager {
-        match subscriptions::install(&paths, &auth_store, anthropic_base.as_deref()) {
+        match subscriptions::install(
+            &paths,
+            &auth_store,
+            anthropic_base.as_deref(),
+            config.network.proxy.clone(),
+        ) {
             Ok(rt) => Some(rt),
             Err(error) => {
                 eprintln!("subscription manager failed to start: {error:#}");

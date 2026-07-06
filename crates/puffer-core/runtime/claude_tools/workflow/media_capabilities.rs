@@ -26,8 +26,12 @@ pub(crate) fn execute_media_capabilities(
         "video" => "video",
         other => bail!("unsupported media kind `{other}` (expected image or video)"),
     };
-    let views =
-        list_exact_media_capabilities_with_cache(providers, auth_store, Some(kind), discovery_cache);
+    let views = list_exact_media_capabilities_with_cache(
+        providers,
+        auth_store,
+        Some(kind),
+        discovery_cache,
+    );
     Ok(media_capabilities_json(kind, views))
 }
 
@@ -57,7 +61,12 @@ mod tests {
     use puffer_media::MediaCapabilityView;
     use serde_json::Value;
 
-    fn view(provider: &str, model: &str, status: &str, supports_image_set: bool) -> MediaCapabilityView {
+    fn view(
+        provider: &str,
+        model: &str,
+        status: &str,
+        supports_image_set: bool,
+    ) -> MediaCapabilityView {
         MediaCapabilityView {
             provider_id: provider.to_string(),
             provider_display_name: format!("{provider} display"),

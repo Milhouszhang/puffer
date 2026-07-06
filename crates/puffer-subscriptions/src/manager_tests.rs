@@ -333,6 +333,73 @@ fn manager_test_event_with_payload(envelope_id: &str, text: &str, payload: Value
     }
 }
 
+fn control_health_envelope(kind: &str, payload: Value) -> EventEnvelope {
+    EventEnvelope {
+        envelope_id: kind.into(),
+        subscriber_id: "telegram-user".into(),
+        received_at_ms: 1_700_000_000_000,
+        event: Event {
+            topic: "telegram-user".into(),
+            kind: kind.into(),
+            control: true,
+            dedup_key: None,
+            text: String::new(),
+            payload,
+        },
+    }
+}
+
+#[test]
+fn resume_failed_auth_maps_to_auth_required() {
+    let envelope = control_health_envelope(
+        "resume_failed",
+        json!({ "class": "auth", "reason": "session_expired", "detail": "bad key" }),
+    );
+    let health = health_from_control_event(&envelope).expect("auth resume_failed maps to health");
+    assert_eq!(health.status, ConnectionHealthStatus::AuthRequired);
+    assert_eq!(health.detail.as_deref(), Some("bad key"));
+}
+
+#[test]
+fn resume_failed_network_maps_to_retrying() {
+    let envelope = control_health_envelope(
+        "resume_failed",
+        json!({ "class": "network", "detail": "connect timeout" }),
+    );
+    let health =
+        health_from_control_event(&envelope).expect("network resume_failed maps to health");
+    assert_eq!(health.status, ConnectionHealthStatus::Retrying);
+}
+
+#[test]
+fn resume_failed_benign_is_ignored() {
+    let envelope = control_health_envelope("resume_failed", json!({ "class": "none" }));
+    assert!(health_from_control_event(&envelope).is_none());
+}
+
+#[test]
+fn update_loop_error_auth_maps_to_auth_required() {
+    let envelope = control_health_envelope(
+        "update_loop_error",
+        json!({ "class": "auth", "error": "AUTH_KEY_UNREGISTERED" }),
+    );
+    let health =
+        health_from_control_event(&envelope).expect("auth update_loop_error maps to health");
+    assert_eq!(health.status, ConnectionHealthStatus::AuthRequired);
+    assert_eq!(health.detail.as_deref(), Some("AUTH_KEY_UNREGISTERED"));
+}
+
+#[test]
+fn update_loop_error_other_maps_to_retrying() {
+    let envelope = control_health_envelope(
+        "update_loop_error",
+        json!({ "class": "other", "error": "weird stream stop" }),
+    );
+    let health =
+        health_from_control_event(&envelope).expect("other update_loop_error maps to health");
+    assert_eq!(health.status, ConnectionHealthStatus::Retrying);
+}
+
 #[test]
 fn start_subscriber_allows_immediate_control_command() {
     let temp = tempdir().unwrap();
@@ -546,6 +613,70 @@ fn control_health_event_marks_connection_degraded_and_ready_restores_active() {
         recovered.health.as_ref().map(|health| health.status),
         Some(ConnectionHealthStatus::Ok)
     );
+
+    manager.shutdown();
+}
+
+#[test]
+fn login_complete_clears_degraded_health() {
+    let temp = tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let manager = SubscriptionManagerBuilder::new(temp.path().join("subscriptions.json"))
+        .build(runtime.handle().clone())
+        .unwrap();
+    manager
+        .connection_store()
+        .create(ConnectionRecord {
+            state: ConnectionState::Degraded,
+            auth_failure_notified: true,
+            health: Some(ConnectionHealth {
+                status: ConnectionHealthStatus::AuthRequired,
+                reason: Some("login_required".into()),
+                detail: None,
+                updated_at_ms: 1_700_000_000_000,
+                next_retry_at_ms: None,
+            }),
+            ..ConnectionRecord::authenticated(
+                "telegram-user",
+                "telegram-login",
+                "Personal Telegram",
+            )
+        })
+        .unwrap();
+
+    manager.bus().publish(EventEnvelope {
+        envelope_id: "login-complete".into(),
+        subscriber_id: "telegram-user".into(),
+        received_at_ms: 1_700_000_020_000,
+        event: Event {
+            topic: "telegram-user".into(),
+            kind: "login_complete".into(),
+            control: true,
+            dedup_key: None,
+            text: String::new(),
+            payload: json!({ "user_id": 42, "first_name": "Ann" }),
+        },
+    });
+    runtime.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(50)).await });
+
+    let connection = manager.connection_store().get("telegram-user").unwrap();
+    assert_eq!(connection.state, ConnectionState::Authenticated);
+    assert_eq!(
+        connection.health.as_ref().map(|health| health.status),
+        Some(ConnectionHealthStatus::Ok)
+    );
+    assert_eq!(
+        connection
+            .health
+            .as_ref()
+            .and_then(|health| health.reason.clone()),
+        Some("login_complete".to_string())
+    );
+    assert!(!connection.auth_failure_notified);
 
     manager.shutdown();
 }
@@ -1060,4 +1191,192 @@ fn read_subscribe_commands(path: &Path) -> Vec<Value> {
     raw.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect()
+}
+
+fn run_finished_test_binding() -> WorkflowBindingSpec {
+    WorkflowBindingSpec {
+        slug: "demo".into(),
+        description: "demo".into(),
+        connection_slug: "telegram-user".into(),
+        connector_slug: Some("telegram-login".into()),
+        status: WorkflowBindingStatus::Enabled,
+        filter: None,
+        ignore_filters: Vec::new(),
+        contact_ids: Vec::new(),
+        classify_prompt: None,
+        classify_model: None,
+        action: ActionSpec::RunWorkflow {
+            workflow_id: "native".into(),
+        },
+        created_at_ms: 0,
+    }
+}
+
+fn run_finished_test_envelope() -> EventEnvelope {
+    EventEnvelope {
+        envelope_id: "env".into(),
+        subscriber_id: "telegram-user".into(),
+        received_at_ms: 1,
+        event: Event {
+            topic: "telegram-user".into(),
+            kind: "message".into(),
+            control: false,
+            dedup_key: Some("d".into()),
+            text: "gm".into(),
+            payload: json!({"from":"Tony"}),
+        },
+    }
+}
+
+fn run_finished_test_action_result(success: bool) -> ActionResult {
+    ActionResult {
+        success,
+        summary: "s".into(),
+        usage: None,
+        turn_started_at_ms: None,
+        turn_ended_at_ms: None,
+        triage_decisions: Vec::new(),
+    }
+}
+
+#[test]
+fn builder_attaches_run_finished_observer_to_history_store() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let count = std::sync::Arc::new(AtomicUsize::new(0));
+    let c2 = count.clone();
+
+    let manager = crate::SubscriptionManagerBuilder::new(temp.path().join("subscriptions.json"))
+        .with_run_finished_observer(std::sync::Arc::new(move |_run| {
+            c2.fetch_add(1, Ordering::SeqCst);
+        }))
+        .build(runtime.handle().clone())
+        .unwrap();
+
+    manager
+        .history_store()
+        .append_action_result(
+            &run_finished_test_binding(),
+            &run_finished_test_envelope(),
+            &crate::spec::ActionSpec::RunWorkflow {
+                workflow_id: "native".into(),
+            },
+            &run_finished_test_action_result(true),
+            1,
+            2,
+        )
+        .unwrap();
+
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn manager_injects_proxy_env_into_supervisor_config() {
+    use puffer_config::{ProxyConfig, ProxyEndpoint, ProxyScheme};
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let manager = SubscriptionManagerBuilder::new(dir.path().join("subs.json"))
+        .build(runtime.handle().clone())
+        .unwrap();
+    manager.set_proxy_config(ProxyConfig {
+        enabled: true,
+        selected: Some("p".into()),
+        bypass: vec![],
+        proxies: vec![ProxyEndpoint {
+            id: "p".into(),
+            scheme: ProxyScheme::Socks5,
+            host: "127.0.0.1".into(),
+            port: 7890,
+            username: None,
+            password: None,
+        }],
+    });
+    let cfg = manager.supervisor_config_with_proxy();
+    assert!(
+        cfg.env_set
+            .iter()
+            .any(|(k, v)| k == "ALL_PROXY" && v == "socks5://127.0.0.1:7890"),
+        "expected ALL_PROXY=socks5://127.0.0.1:7890 in env_set, got {:?}",
+        cfg.env_set
+    );
+    assert!(cfg.env_unset.is_empty());
+    manager.shutdown();
+}
+
+#[test]
+fn respawn_proxy_sensitive_restarts_running_telegram() {
+    let temp = tempdir().unwrap();
+    let subscriber_dir = temp.path().join("subscriber");
+    std::fs::create_dir_all(&subscriber_dir).unwrap();
+    std::fs::write(
+        subscriber_dir.join("manifest.toml"),
+        r#"manifest_version = 1
+id = "telegram-user"
+kind = "subscriber"
+topic = "telegram-user"
+
+[run]
+cmd = ["sh", "run.sh"]
+"#,
+    )
+    .unwrap();
+    // Use a blocking (infinite-loop) script so child.wait() would never return
+    // without an abort.  This proves that SubscriberHandle::shutdown aborts the
+    // supervisor task, causing kill_on_drop to reap the child, and the respawn
+    // does not deadlock.
+    std::fs::write(
+        subscriber_dir.join("run.sh"),
+        "while true; do sleep 0.2; done\n",
+    )
+    .unwrap();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    let manager = SubscriptionManagerBuilder::new(temp.path().join("subscriptions.json"))
+        .build(runtime.handle().clone())
+        .unwrap();
+    let manifest = Manifest::load(&subscriber_dir).unwrap();
+
+    manager.start_subscriber(manifest).unwrap();
+    assert!(
+        manager
+            .subscriber_ids()
+            .contains(&"telegram-user".to_string()),
+        "telegram-user should be registered after start_subscriber"
+    );
+
+    // respawn_proxy_sensitive_subscribers is sync (uses block_on_manager_handle
+    // internally). Move manager into a dedicated thread and use recv_timeout so
+    // a hang is detected within 10 s rather than blocking the test suite forever.
+    // Both the post-respawn assertion and shutdown are done inside the thread so
+    // we don't need manager to outlive it.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(anyhow::Result<()>, bool)>(0);
+    std::thread::spawn(move || {
+        let result = manager.respawn_proxy_sensitive_subscribers();
+        let contains = manager
+            .subscriber_ids()
+            .contains(&"telegram-user".to_string());
+        tx.send((result, contains)).ok();
+        manager.shutdown();
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok((result, contains)) => {
+            result.unwrap();
+            assert!(
+                contains,
+                "telegram-user should still be registered after respawn"
+            );
+        }
+        Err(_) => panic!(
+            "respawn_proxy_sensitive_subscribers hung for >10 s with a blocking child — deadlock not fixed"
+        ),
+    }
 }

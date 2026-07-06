@@ -1028,7 +1028,9 @@ test("Files tab PDF limit badge and zoom controls stay obvious in narrow light p
   await page.setViewportSize({ width: 820, height: 540 });
   await daemon.open(page);
 
-  await page.getByRole("button", { name: /^Browser regression\b/ }).first().click();
+  // At this width the sidebar collapses to icons, so open the session from
+  // the workspace board card instead.
+  await page.getByRole("button", { name: /^Open session Browser regression/ }).first().click();
   await openFilesPanel(page);
   await page.addStyleTag({
     content: ".pf-files-pane .tree { width: 360px; }"

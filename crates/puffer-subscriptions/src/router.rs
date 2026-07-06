@@ -163,6 +163,7 @@ pub(crate) fn process_envelope_result_with_monitor_digest(
                 continue;
             }
             result.matched = true;
+            record_self_dispatch(trace_store, &spec, envelope);
             dispatch_one_matched_envelope(
                 &spec,
                 envelope,
@@ -581,6 +582,7 @@ pub(crate) fn process_envelope_batch_result_with_monitor_digest(
                     continue;
                 }
                 result.matched = true;
+                record_self_dispatch(trace_store, &spec, envelope);
                 dispatch_one_matched_envelope(
                     &spec,
                     envelope,
@@ -1208,6 +1210,21 @@ fn record_self_gate_skip(
     );
 }
 
+fn record_self_dispatch(
+    trace_store: Option<&MonitorTraceStore>,
+    spec: &WorkflowBindingSpec,
+    envelope: &EventEnvelope,
+) {
+    record_router_trace(
+        trace_store,
+        spec,
+        envelope,
+        "router_self_dispatch_open_task",
+        "subscription_router",
+        "Outgoing/self message dispatched for completion detection (open task).",
+    );
+}
+
 fn record_monitor_router_outcome(
     history_store: Option<&WorkflowHistoryStore>,
     spec: &WorkflowBindingSpec,
@@ -1346,11 +1363,14 @@ fn payload_bool(payload: &Value, key: &str) -> bool {
     payload.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
-/// Whether an event is the user's own self/outgoing message. The telegram path
-/// carries `payload.is_outgoing == true`; a future connector may instead tag the
-/// event kind as [`SELF_MESSAGE_KIND`].
+/// Whether an event is the user's own self/outgoing message. Three signals:
+/// the connector may tag the kind as [`SELF_MESSAGE_KIND`], set the grammers
+/// `out` bit (`is_outgoing`), or stamp the sender-identity backstop
+/// `sender_is_self` (survives delivery paths that lose the out bit, #756).
 fn event_is_self(event: &puffer_subscriber_runtime::Event) -> bool {
-    event.kind == SELF_MESSAGE_KIND || payload_bool(&event.payload, "is_outgoing")
+    event.kind == SELF_MESSAGE_KIND
+        || payload_bool(&event.payload, "is_outgoing")
+        || payload_bool(&event.payload, "sender_is_self")
 }
 
 /// Free-standing helper used by tests and by future explicit "test this

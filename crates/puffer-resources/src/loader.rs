@@ -44,9 +44,10 @@ static BUILTIN_RESOURCES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../reso
 pub fn load_resources(paths: &ConfigPaths, runner: &dyn ToolRunner) -> Result<LoadedResources> {
     let mut loaded = LoadedResources::default();
     apply_embedded_resources(&mut loaded)?;
+    let external_skills = load_external_codex_claude_skills(paths, &mut loaded.diagnostics);
     merge_by_id(
         &mut loaded.skills,
-        load_external_codex_claude_skills(paths)?,
+        external_skills,
         |item| MergeKey::simple(item.value.name.clone()),
         "skill",
         &mut loaded.diagnostics,
@@ -835,71 +836,143 @@ fn load_skill_dir(
     Ok(items)
 }
 
-fn load_external_codex_claude_skills(paths: &ConfigPaths) -> Result<Vec<LoadedItem<SkillSpec>>> {
+/// Imports the user's Claude Code / Codex skills and commands from
+/// deterministic roots so they appear in the command palette.
+///
+/// External files are third-party-owned: any unreadable or unparsable
+/// file is skipped with a diagnostic, never an error -- puffer must not
+/// fail to start because of someone else's file.
+fn load_external_codex_claude_skills(
+    paths: &ConfigPaths,
+    diagnostics: &mut Vec<String>,
+) -> Vec<LoadedItem<SkillSpec>> {
     let mut items = Vec::new();
-    for (root, kind) in external_codex_claude_roots(paths) {
-        if !root.is_dir() {
-            continue;
-        }
-        collect_external_codex_claude_skills(&root, kind, &mut items)
-            .with_context(|| format!("failed to load external commands from {}", root.display()))?;
+    for root in external_resource_roots(paths, diagnostics) {
+        collect_external_skills_dir(&root.skills_dir, root.kind, &mut items, diagnostics);
+        collect_external_commands_dir(&root.commands_dir, root.kind, &mut items, diagnostics);
     }
-    Ok(items)
+    items
 }
 
-fn external_codex_claude_roots(paths: &ConfigPaths) -> Vec<(PathBuf, SourceKind)> {
+struct ExternalResourceRoot {
+    skills_dir: PathBuf,
+    commands_dir: PathBuf,
+    kind: SourceKind,
+}
+
+impl ExternalResourceRoot {
+    /// Claude-style roots keep commands under `commands/`; Codex-style
+    /// roots keep them under `prompts/`. Skills always live in `skills/`.
+    fn new(base: &Path, commands_subdir: &str, kind: SourceKind) -> Self {
+        Self {
+            skills_dir: base.join("skills"),
+            commands_dir: base.join(commands_subdir),
+            kind,
+        }
+    }
+}
+
+/// Fixed discovery roots, lowest merge priority first; `merge_by_id`
+/// lets later entries override earlier ones on name collision.
+fn external_resource_roots(
+    paths: &ConfigPaths,
+    diagnostics: &mut Vec<String>,
+) -> Vec<ExternalResourceRoot> {
     let mut roots = Vec::new();
     if let Some(home) = paths.user_config_dir.parent() {
-        roots.push((home.join(".claude"), SourceKind::User));
-        roots.push((home.join(".codex"), SourceKind::User));
+        let claude = home.join(".claude");
+        for plugin_root in crate::plugin_manifest::installed_plugin_roots(&claude, diagnostics) {
+            roots.push(ExternalResourceRoot::new(
+                &plugin_root,
+                "commands",
+                SourceKind::User,
+            ));
+        }
+        roots.push(ExternalResourceRoot::new(
+            &claude,
+            "commands",
+            SourceKind::User,
+        ));
+        roots.push(ExternalResourceRoot::new(
+            &home.join(".codex"),
+            "prompts",
+            SourceKind::User,
+        ));
     }
-    roots.push((paths.workspace_root.join(".claude"), SourceKind::Workspace));
-    roots.push((paths.workspace_root.join(".codex"), SourceKind::Workspace));
+    roots.push(ExternalResourceRoot::new(
+        &paths.workspace_root.join(".claude"),
+        "commands",
+        SourceKind::Workspace,
+    ));
+    roots.push(ExternalResourceRoot::new(
+        &paths.workspace_root.join(".codex"),
+        "prompts",
+        SourceKind::Workspace,
+    ));
     roots
 }
 
-fn collect_external_codex_claude_skills(
+/// Scans one external skills root exactly one level deep:
+/// `<dir>/<name>/SKILL.md`, matching Claude Code's skill layout.
+fn collect_external_skills_dir(
     dir: &Path,
     kind: SourceKind,
     items: &mut Vec<LoadedItem<SkillSpec>>,
-) -> Result<()> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to list {}", dir.display()))
+    diagnostics: &mut Vec<String>,
+) {
+    for (entry_path, file_type) in external_dir_entries(dir, diagnostics) {
+        // Symlinked skill directories are fine here: this scan never
+        // recurses, so following a link cannot cycle.
+        let is_dir = file_type.is_dir() || (file_type.is_symlink() && entry_path.is_dir());
+        if !is_dir {
+            continue;
         }
-    };
-    let mut entries = entries
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to read entries from {}", dir.display()))?;
-    entries.sort_by_key(|entry| entry.path());
-
-    let is_commands_dir = dir.file_name().and_then(|name| name.to_str()) == Some("commands");
-
-    for entry in entries {
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("failed to stat {}", entry.path().display()))?;
-        let path = entry.path();
-        if file_type.is_dir() {
-            if should_skip_external_resource_dir(&path) {
-                continue;
-            }
-            collect_external_codex_claude_skills(&path, kind, items)?;
-        } else if file_type.is_file() && is_commands_dir && is_external_command_file(&path) {
-            if let Some(item) = load_external_command_file(&path, kind)? {
-                items.push(item);
-            }
-        } else if file_type.is_file() && is_external_skill_file(&path) {
-            if let Some(item) = load_external_skill_file(&path, kind)? {
-                items.push(item);
-            }
+        let skill_path = entry_path.join("SKILL.md");
+        if !skill_path.is_file() {
+            continue;
         }
+        push_or_diagnose(
+            load_external_skill_file(&skill_path, kind),
+            "skill",
+            &skill_path,
+            items,
+            diagnostics,
+        );
     }
-    Ok(())
 }
 
+/// Scans one external commands root. Subdirectories nest freely (Claude
+/// Code allows nested commands) but recursion never leaves this root:
+/// junk directories are skipped and symlinked directories are not
+/// followed, so a symlink cycle cannot recurse forever.
+fn collect_external_commands_dir(
+    dir: &Path,
+    kind: SourceKind,
+    items: &mut Vec<LoadedItem<SkillSpec>>,
+    diagnostics: &mut Vec<String>,
+) {
+    for (entry_path, file_type) in external_dir_entries(dir, diagnostics) {
+        if file_type.is_dir() {
+            if should_skip_external_resource_dir(&entry_path) {
+                continue;
+            }
+            collect_external_commands_dir(&entry_path, kind, items, diagnostics);
+        } else if is_external_command_file(&entry_path)
+            && (file_type.is_file() || (file_type.is_symlink() && entry_path.is_file()))
+        {
+            push_or_diagnose(
+                load_external_command_file(&entry_path, kind),
+                "command",
+                &entry_path,
+                items,
+                diagnostics,
+            );
+        }
+    }
+}
+
+/// Junk directories that never hold user commands; recursing into them
+/// wastes startup time and imports stray markdown as commands.
 fn should_skip_external_resource_dir(path: &Path) -> bool {
     let name = path
         .file_name()
@@ -911,6 +984,54 @@ fn should_skip_external_resource_dir(path: &Path) -> bool {
     )
 }
 
+/// Pushes a loaded external item, recording a skip diagnostic on read or
+/// parse failure; empty files are dropped silently.
+fn push_or_diagnose(
+    result: Result<Option<LoadedItem<SkillSpec>>>,
+    label: &str,
+    path: &Path,
+    items: &mut Vec<LoadedItem<SkillSpec>>,
+    diagnostics: &mut Vec<String>,
+) {
+    match result {
+        Ok(Some(item)) => items.push(item),
+        Ok(None) => {}
+        Err(error) => diagnostics.push(format!(
+            "skipped external {label} {}: {error:#}",
+            path.display()
+        )),
+    }
+}
+
+/// Lists a directory sorted by path, pairing each entry with the file
+/// type reported by the directory itself (symlinks are not followed, so
+/// callers can recurse without cycling). Missing directory means empty
+/// (external roots are optional); any other failure degrades to a
+/// diagnostic.
+fn external_dir_entries(dir: &Path, diagnostics: &mut Vec<String>) -> Vec<(PathBuf, fs::FileType)> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            diagnostics.push(format!("skipped external dir {}: {error}", dir.display()));
+            return Vec::new();
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry_info = entry.and_then(|entry| Ok((entry.path(), entry.file_type()?)));
+        match entry_info {
+            Ok(info) => paths.push(info),
+            Err(error) => diagnostics.push(format!(
+                "skipped external entry in {}: {error}",
+                dir.display()
+            )),
+        }
+    }
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
+    paths
+}
+
 fn is_external_command_file(path: &Path) -> bool {
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -919,17 +1040,6 @@ fn is_external_command_file(path: &Path) -> bool {
         return false;
     }
     matches!(path.extension().and_then(|ext| ext.to_str()), Some("md"))
-}
-
-fn is_external_skill_file(path: &Path) -> bool {
-    if path.file_name().and_then(|name| name.to_str()) != Some("SKILL.md") {
-        return false;
-    }
-    path.parent()
-        .and_then(Path::parent)
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        == Some("skills")
 }
 
 fn load_external_command_file(
@@ -1808,14 +1918,23 @@ media:
         assert!(!default_skill.requires_action);
     }
 
+    /// Workspace/home pair used by the external-discovery tests below.
+    fn external_test_paths(root: &Path, home: &Path) -> ConfigPaths {
+        ConfigPaths {
+            workspace_root: root.to_path_buf(),
+            workspace_config_dir: root.join(".puffer"),
+            user_config_dir: home.join(".puffer"),
+            builtin_resources_dir: root.join("resources"),
+        }
+    }
+
     #[test]
     fn load_resources_imports_codex_and_claude_commands_as_skills() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("workspace");
         let home = temp.path().join("home");
 
-        let claude_command_dir =
-            home.join(".claude/plugins/marketplaces/example/plugins/review/commands");
+        let claude_command_dir = home.join(".claude/commands/review");
         fs::create_dir_all(&claude_command_dir).unwrap();
         fs::write(
             claude_command_dir.join("code-review.md"),
@@ -1828,8 +1947,7 @@ media:
         )
         .unwrap();
 
-        let codex_skill_dir =
-            home.join(".codex/.tmp/plugins/plugins/superpowers/skills/brainstorming");
+        let codex_skill_dir = home.join(".codex/skills/brainstorming");
         fs::create_dir_all(&codex_skill_dir).unwrap();
         fs::write(
             codex_skill_dir.join("SKILL.md"),
@@ -1837,23 +1955,19 @@ media:
         )
         .unwrap();
 
-        let workspace_command_dir = root.join(".codex/plugins/example/commands");
-        fs::create_dir_all(&workspace_command_dir).unwrap();
+        let workspace_prompt_dir = root.join(".codex/prompts");
+        fs::create_dir_all(&workspace_prompt_dir).unwrap();
         fs::write(
-            workspace_command_dir.join("ship-it.md"),
+            workspace_prompt_dir.join("ship-it.md"),
             "# /ship-it\nShip the current branch with $ARGUMENTS.\n",
         )
         .unwrap();
 
-        let paths = ConfigPaths {
-            workspace_root: root.clone(),
-            workspace_config_dir: root.join(".puffer"),
-            user_config_dir: home.join(".puffer"),
-            builtin_resources_dir: root.join("resources"),
-        };
+        let paths = external_test_paths(&root, &home);
         let loaded = load_resources(&paths, &FsTestRunner).unwrap();
 
-        let code_review = skill_by_name(&loaded, "code-review").expect("Claude command imports");
+        let code_review =
+            skill_by_name(&loaded, "code-review").expect("nested Claude command imports");
         assert_eq!(code_review.value.description, "Code review a pull request");
         assert_eq!(code_review.value.allowed_tools, vec!["Read", "Grep"]);
         assert_eq!(code_review.value.argument_hint.as_deref(), Some("<pr-url>"));
@@ -1866,11 +1980,203 @@ media:
         );
         assert!(brainstorming.value.content.contains("Think broadly"));
 
-        let ship_it = skill_by_name(&loaded, "ship-it").expect("workspace command imports");
+        let ship_it = skill_by_name(&loaded, "ship-it").expect("workspace codex prompt imports");
         assert_eq!(ship_it.value.description, "ship-it");
         assert_eq!(ship_it.source_info.kind, SourceKind::Workspace);
 
         assert!(skill_by_name(&loaded, "_conventions").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_scan_survives_symlink_cycles_and_skips_junk_dirs() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let home = temp.path().join("home");
+
+        let commands = home.join(".claude/commands");
+        fs::create_dir_all(&commands).unwrap();
+        fs::write(commands.join("real.md"), "# /real\nRun $ARGUMENTS.\n").unwrap();
+        // A symlink cycle must not recurse forever, and vendored trees
+        // must not pollute the palette with stray markdown.
+        std::os::unix::fs::symlink(&commands, commands.join("loop")).unwrap();
+        fs::create_dir_all(commands.join("node_modules/pkg")).unwrap();
+        fs::write(
+            commands.join("node_modules/pkg/README.md"),
+            "# readme\nVendored doc.\n",
+        )
+        .unwrap();
+
+        let paths = external_test_paths(&root, &home);
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+
+        assert!(skill_by_name(&loaded, "real").is_some());
+        assert!(skill_by_name(&loaded, "readme").is_none());
+        assert!(skill_by_name(&loaded, "README").is_none());
+    }
+
+    #[test]
+    fn bad_external_frontmatter_is_skipped_with_diagnostic() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let home = temp.path().join("home");
+
+        let skills = home.join(".claude/skills");
+        fs::create_dir_all(skills.join("broken")).unwrap();
+        // Unquoted description with a second `: ` -- invalid YAML, the
+        // exact shape that used to abort daemon startup.
+        fs::write(
+            skills.join("broken/SKILL.md"),
+            "---\ndescription: Verification loop for Django projects: migrations, linting\n---\nBody\n",
+        )
+        .unwrap();
+        fs::create_dir_all(skills.join("healthy")).unwrap();
+        fs::write(
+            skills.join("healthy/SKILL.md"),
+            "---\nname: healthy\ndescription: Works fine\n---\nBody\n",
+        )
+        .unwrap();
+
+        let paths = external_test_paths(&root, &home);
+        let loaded = load_resources(&paths, &FsTestRunner)
+            .expect("external files must never make load_resources fail");
+
+        assert!(skill_by_name(&loaded, "healthy").is_some());
+        assert!(skill_by_name(&loaded, "broken").is_none());
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|diag| diag.contains("SKILL.md")),
+            "expected a skip diagnostic, got: {:?}",
+            loaded.diagnostics
+        );
+    }
+
+    #[test]
+    fn plugin_cache_doc_copies_are_not_discovered() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let home = temp.path().join("home");
+
+        // Shaped like the ecc plugin's localized doc copies (including
+        // invalid YAML). Without a manifest entry pointing at it, the
+        // cache must be invisible -- not even a diagnostic.
+        let doc_skill =
+            home.join(".claude/plugins/cache/ecc/ecc/2.0.0/docs/ja-JP/skills/django-verification");
+        fs::create_dir_all(&doc_skill).unwrap();
+        fs::write(
+            doc_skill.join("SKILL.md"),
+            "---\nname: django-verification\ndescription: Verification loop for Django projects: migrations\n---\nBody\n",
+        )
+        .unwrap();
+
+        let paths = external_test_paths(&root, &home);
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+
+        assert!(skill_by_name(&loaded, "django-verification").is_none());
+        assert!(
+            loaded.diagnostics.is_empty(),
+            "unreferenced cache files must not produce diagnostics: {:?}",
+            loaded.diagnostics
+        );
+    }
+
+    #[test]
+    fn installed_plugin_skills_load_from_manifest_roots_only() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let home = temp.path().join("home");
+
+        let live = home.join(".claude/plugins/cache/market/ecc/2.0.0");
+        fs::create_dir_all(live.join("skills/rust-review")).unwrap();
+        fs::write(
+            live.join("skills/rust-review/SKILL.md"),
+            "---\nname: rust-review\ndescription: Review Rust code\n---\nBody\n",
+        )
+        .unwrap();
+        fs::create_dir_all(live.join("commands")).unwrap();
+        fs::write(
+            live.join("commands/ecc-review.md"),
+            "---\ndescription: Run the ecc review\n---\nReview.\n",
+        )
+        .unwrap();
+
+        // Stale cached version not referenced by the manifest.
+        let stale = home.join(".claude/plugins/cache/market/ecc/2.0.0-rc.1");
+        fs::create_dir_all(stale.join("skills/stale-skill")).unwrap();
+        fs::write(
+            stale.join("skills/stale-skill/SKILL.md"),
+            "---\nname: stale-skill\ndescription: Old version\n---\nBody\n",
+        )
+        .unwrap();
+
+        let manifest = serde_json::json!({
+            "version": 2,
+            "plugins": { "ecc@market": [{ "scope": "user", "installPath": live }] }
+        });
+        fs::write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            manifest.to_string(),
+        )
+        .unwrap();
+
+        let paths = external_test_paths(&root, &home);
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+
+        let plugin_skill =
+            skill_by_name(&loaded, "rust-review").expect("manifest plugin skill imports");
+        assert_eq!(plugin_skill.source_info.kind, SourceKind::User);
+        assert!(skill_by_name(&loaded, "ecc-review").is_some());
+        assert!(skill_by_name(&loaded, "stale-skill").is_none());
+    }
+
+    #[test]
+    fn merge_order_puffer_overrides_external_overrides_plugin() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let home = temp.path().join("home");
+
+        let write_skill = |dir: &Path, description: &str| {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: dupe\ndescription: {description}\n---\nBody\n"),
+            )
+            .unwrap();
+        };
+
+        let plugin_root = home.join(".claude/plugins/cache/market/p/1.0.0");
+        write_skill(&plugin_root.join("skills/dupe"), "from plugin");
+        let manifest = serde_json::json!({
+            "version": 2,
+            "plugins": { "p@market": [{ "scope": "user", "installPath": plugin_root }] }
+        });
+        fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+        fs::write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            manifest.to_string(),
+        )
+        .unwrap();
+
+        write_skill(&home.join(".claude/skills/dupe"), "from user claude");
+        // Workspace .puffer resources layer merges after all external
+        // sources, so it must win.
+        write_skill(
+            &root.join(".puffer/resources/skills/dupe"),
+            "from puffer workspace",
+        );
+
+        let paths = external_test_paths(&root, &home);
+        let loaded = load_resources(&paths, &FsTestRunner).unwrap();
+
+        let dupe = skill_by_name(&loaded, "dupe").expect("skill loads");
+        assert_eq!(dupe.value.description, "from puffer workspace");
+        assert!(
+            loaded.diagnostics.iter().any(|diag| diag.contains("dupe")),
+            "overrides should be recorded: {:?}",
+            loaded.diagnostics
+        );
     }
 
     #[test]

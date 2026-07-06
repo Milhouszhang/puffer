@@ -29,7 +29,11 @@ pub(crate) fn list_chats(
     handshake: &mut Option<crate::daemon::Handshake>,
 ) -> Result<serde_json::Value> {
     let handshake_ref = ensure_browser_daemon(config, handshake)?;
-    let result = evaluate_lark_script(env, handshake_ref, crate::lark_browser_script::LARK_FEED_SCRIPT)?;
+    let result = evaluate_lark_script(
+        env,
+        handshake_ref,
+        crate::lark_browser_script::LARK_FEED_SCRIPT,
+    )?;
     let rows = crate::lark_browser_script::parse_feed_rows(&result);
     Ok(feed_rows_to_chats_payload(&rows))
 }
@@ -38,7 +42,9 @@ pub(crate) fn list_chats(
 /// consumed by the frontend group-picker wizard.
 ///
 /// Pure and unit-tested.
-pub(crate) fn feed_rows_to_chats_payload(rows: &[crate::lark_browser_script::FeedRow]) -> serde_json::Value {
+pub(crate) fn feed_rows_to_chats_payload(
+    rows: &[crate::lark_browser_script::FeedRow],
+) -> serde_json::Value {
     serde_json::json!({
         "chats": rows.iter().map(|r| serde_json::json!({
             "chat_id": r.chat_id,
@@ -96,9 +102,7 @@ pub(crate) fn lark_list_chats_via_subscriber(
                 .to_string();
             anyhow::bail!("lark_browser_list_chats via {subscriber_id} failed: {error}")
         }
-        other => anyhow::bail!(
-            "lark_browser_list_chats returned unexpected event `{other}`"
-        ),
+        other => anyhow::bail!("lark_browser_list_chats returned unexpected event `{other}`"),
     }
 }
 
@@ -118,7 +122,11 @@ fn ensure_lark_subscriber_running(
     connection_slug: &str,
     subscriber_id: &str,
 ) -> Result<()> {
-    if manager.subscriber_ids().iter().any(|id| id == subscriber_id) {
+    if manager
+        .subscriber_ids()
+        .iter()
+        .any(|id| id == subscriber_id)
+    {
         return Ok(());
     }
     // Determine the connector slug from the connection record. When no record
@@ -145,9 +153,11 @@ fn ensure_lark_subscriber_running(
         .unwrap_or_else(|| {
             ConnectionRecord::authenticated(subscriber_id, &connector_slug, subscriber_id)
         });
-    if let Some(manifest) =
-        connection_subscriber_manifest(&lark_subscriber_manifest_roots(paths), &connection, &template)?
-    {
+    if let Some(manifest) = connection_subscriber_manifest(
+        &lark_subscriber_manifest_roots(paths),
+        &connection,
+        &template,
+    )? {
         manager.start_subscriber(manifest)?;
         return Ok(());
     }
@@ -161,11 +171,9 @@ fn lark_browser_fallback_manifest(
     connector_slug: &str,
     subscriber_id: &str,
 ) -> Result<puffer_subscriber_runtime::Manifest> {
-    let mut manifest = direct_subscriber_manifest(
-        &lark_subscriber_manifest_roots(paths),
-        connector_slug,
-    )?
-    .ok_or_else(|| anyhow::anyhow!("{connector_slug} subscriber manifest not found"))?;
+    let mut manifest =
+        direct_subscriber_manifest(&lark_subscriber_manifest_roots(paths), connector_slug)?
+            .ok_or_else(|| anyhow::anyhow!("{connector_slug} subscriber manifest not found"))?;
     // Derive the per-brand state root from the connector slug (mirrors Brand::state_root).
     let state_root = if connector_slug == super::CONNECTOR_SLUG_FEISHU {
         "feishu-browser-accounts"

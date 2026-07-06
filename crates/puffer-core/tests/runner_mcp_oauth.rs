@@ -33,8 +33,9 @@ use tempfile::TempDir;
 #[path = "mcp_stub/http_server.rs"]
 #[allow(dead_code)]
 mod http_server;
+// No #[allow(dead_code)] here: the included file carries its own inner
+// #![allow(dead_code)], and doubling it trips clippy's duplicated-attribute.
 #[path = "../../puffer-mcp-oauth/tests/oauth_stub_server.rs"]
-#[allow(dead_code)]
 mod oauth_stub;
 #[path = "mcp_stub/stub_server.rs"]
 #[allow(dead_code)]

@@ -141,7 +141,7 @@ style. Full design: `docs/architecture/monitor-pipeline.md`.
   approves the draft in the desktop UI; only then does the daemon send the Telegram reply / create
   the Gmail draft / RSVP the Calendar invite, via the `task_monitor_action_execute` RPC. Never push
   an outward effect from an agent turn (no connector send tool, no `MonitorReplySend`, no
-  `TaskUpdate status:completed` to force a send). `task_monitor_complete` refuses human-gated tasks.
+  `TaskUpdate status:completed` to force a send). `task_monitor_complete` refuses human-gated tasks, with one exception: `completed_via: "no_reply_needed"` records the human "reviewed, no reply needed" decision (with an audit entry and optional `reason`) instead of a send receipt (#676).
 - **`TaskCreate` skip is success, not failure.** A `{success:true, skipped:true, reason}` result
   means the server gate intentionally suppressed the task (already handled in Telegram, duplicate,
   untrusted source). Do not retry by mutating source metadata.
@@ -174,7 +174,22 @@ constraints:
 - Prefer incremental commits for small, coherent steps.
 - Create any additional git worktrees under the repo-local `.worktree/`
   directory.
-- Keep the workspace green with `cargo test --workspace`.
+- Keep the workspace green against the same gates CI enforces:
+  `cargo test --workspace` (or `cargo nextest run --workspace`),
+  `cargo fmt --all --check`, and
+  `cargo clippy --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious`.
+  `scripts/ci-gates.sh` runs every CI gate locally in three parallel lanes
+  (root workspace, src-tauri, desktop frontend); `--quick` skips the test
+  suites for a fast compile+lint pass.
+- After resolving merge/rebase conflicts, run
+  `cargo check --workspace --all-targets` BEFORE committing. Git only detects
+  textual conflicts; a rename or signature change merged from the other side
+  breaks code (including `#[cfg(test)]` code, which plain `cargo check`
+  skips) with no conflict marker. The lefthook hooks intentionally skip
+  merge/rebase commits, so nothing else catches this before push.
+- Hooks can reject a commit after printing unrelated output; confirm HEAD
+  actually advanced (`git commit ... && git log --oneline -1`) before
+  building on top of it or pushing.
 - When adding new features, wire tests in the same step where practical.
 - When updating a component, write a new update spec in that component's
   `specs/<component>/` folder. Do not overwrite prior numbered specs; use the
@@ -185,3 +200,69 @@ constraints:
   change.
 - If there is a conflict between fidelity and maintainability, document the
   gap in code comments or commit messages rather than silently diverging.
+
+## Agent-driven UI testing
+
+Route UI testing work by scenario:
+
+| Scenario | Tool | Deliverable |
+|---|---|---|
+| New-feature acceptance / flow exploration | agent-browser against the isolated `agent:app` instance | Exploration report + hardened `tests/*-ui.spec.ts` |
+| UI/UX visual review | agent-browser screenshots reviewed state by state; component-level via Storybook (`npm run storybook`, :6006) | Issue list + `toHaveScreenshot()` baselines in `tests/visual/*.spec.ts` |
+| Bug deep-dive (network/console/daemon protocol) | playwright-mcp (configured in `.mcp.json`) | Root cause + minimal reproduction spec |
+| Regression protection | `npm run test:desktop-ui` (CI, no agent) | Pass/fail |
+
+To launch the isolated app (from `apps/puffer-desktop/`):
+
+1. Build the daemon once: `cargo build -p puffer-cli` (the script fails fast if
+   `target/debug/puffer` is missing).
+2. Run `npm run agent:app`. Append `-- --provider real` to hit a real gateway;
+   that mode requires `RELAYDANCE_BASE_URL` and `RELAYDANCE_API_KEY`. The
+   default mock provider answers every prompt with a canned reply.
+3. Parse stdout: `AGENT_APP_URL=` is the ready-to-open app URL (any browser
+   tool works); `AGENT_APP_ROOT=` is the instance's temp directory.
+4. Stop with Ctrl-C/SIGTERM. The daemon, temp directory, and any self-started
+   Vite are cleaned up automatically; a Vite already running on 1420 is reused
+   and left untouched.
+
+Conventions:
+
+- Explore only through the isolated `agent:app` instance — it never touches
+  the user's dev data, and sharing the Vite on 1420 is safe.
+- Harden findings with role-based selectors (`getByRole` first), styled after
+  the existing `tests/*-ui.spec.ts`.
+- Count a finding as hardened only once `npm run test:desktop-ui` (functional)
+  or `npm run test:desktop-visual` (visual) passes.
+- Keep `tests/visual/` out of GitHub CI and run it on macOS only: screenshot
+  baselines are macOS-generated and diverge on the ubuntu CI runners.
+
+Spec-rot rules (distilled from the 2026-07 sweep that revived 86 dead specs):
+
+- No pixel or computed-style assertions (heights, radii, rgb colors) in
+  functional specs — they die on every restyle. Assert roles, labels, and
+  structural attributes; visual intent belongs in `tests/visual/`.
+- Match cards/rows by exact accessible heading, not `hasText` substrings: the
+  Custom provider card's "OpenAI-compatible" copy silently redirected six
+  specs to the wrong dialog for weeks.
+- No DOM-identity probes (tagging nodes and asserting the tag survives) —
+  row keying/grouping is an implementation detail that legitimately changes.
+  Assert user-visible invariants instead (one row per message, no duplicates).
+- Any `__TAURI_INTERNALS__` stub must answer `ensure_local_daemon` with the
+  FakeDaemon handshake — Tauri-mode startup resolves its daemon through that
+  invoke, and a throwing stub hangs every spec at the sidebar.
+- Mock daemons should reject unknown RPC methods loudly (the
+  StrictSubscriptionDaemon pattern), never answer with silent empties — a new
+  daemon method then fails the suite the day it ships instead of rotting.
+- Never pipe a test run through `tail`/`head` without `set -o pipefail`: the
+  pipeline's exit code masked 77 failures as a green run once already.
+
+When the desktop-ui CI job goes red (root-cause it — never add retries,
+timeouts, or `.skip` to get back to green):
+
+1. Download the `playwright-test-results` artifact; each failure's
+   `error-context.md` carries the error, call log, and a page snapshot, and
+   CI-only failures also include a trace (`npx playwright show-trace <zip>`).
+2. Reproduce locally by title: `npx playwright test -g "<test name>"`.
+3. Decide which side broke: if the UI change is intentional, migrate the
+   spec's assertions to the new contract (and say so in the commit); if not,
+   the spec just caught a regression — fix the app.

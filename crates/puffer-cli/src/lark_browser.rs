@@ -253,7 +253,12 @@ fn feed_fingerprint(preview: &str) -> String {
 }
 
 fn feed_dedup_key(conn: &str, row: &FeedRow) -> String {
-    format!("{}:{}:{}", conn, row.chat_id, feed_fingerprint(&row.preview))
+    format!(
+        "{}:{}:{}",
+        conn,
+        row.chat_id,
+        feed_fingerprint(&row.preview)
+    )
 }
 
 fn should_emit_feed(seen: &SeenState, key: &str) -> bool {
@@ -391,9 +396,7 @@ fn handle_command(
                 return Ok(());
             };
             match lark_browser_actions::handle_action(env, config, handshake, action, &input) {
-                Ok(payload) => {
-                    emit_control(&env.topic, "lark_browser_action_complete", payload)
-                }
+                Ok(payload) => emit_control(&env.topic, "lark_browser_action_complete", payload),
                 Err(error) => emit_control(
                     &env.topic,
                     "lark_browser_action_error",
@@ -424,20 +427,16 @@ fn handle_command(
                 ),
             }
         }
-        SubscriberCommand::Custom { op, .. } => {
-            emit_control(
-                &env.topic,
-                "command_ignored",
-                json!({ "op": op, "error": "unknown custom op" }),
-            )
-        }
-        _ => {
-            emit_control(
-                &env.topic,
-                "command_ignored",
-                json!({ "error": "lark-browser subscriber only handles lark_browser_act custom commands" }),
-            )
-        }
+        SubscriberCommand::Custom { op, .. } => emit_control(
+            &env.topic,
+            "command_ignored",
+            json!({ "op": op, "error": "unknown custom op" }),
+        ),
+        _ => emit_control(
+            &env.topic,
+            "command_ignored",
+            json!({ "error": "lark-browser subscriber only handles lark_browser_act custom commands" }),
+        ),
     }
 }
 
@@ -537,11 +536,7 @@ pub(crate) fn process_active_drain(
     let mut events = Vec::new();
 
     // Resolve the chat display name from the cache populated by feed polls.
-    let chat_name = seen
-        .names
-        .get(&active_chat_id)
-        .cloned()
-        .unwrap_or_default();
+    let chat_name = seen.names.get(&active_chat_id).cloned().unwrap_or_default();
 
     for msg in &msgs {
         let key = format!("{}:{}:{}", conn, active_chat_id, msg.id);
@@ -649,7 +644,10 @@ fn poll_once_feed(
             "script": LARK_OBSERVER_INSTALL_JS,
         }),
     ) {
-        eprintln!("lark-browser: active_pass_install_warn topic={} error={e:#} (continuing to feed pass)", env.topic);
+        eprintln!(
+            "lark-browser: active_pass_install_warn topic={} error={e:#} (continuing to feed pass)",
+            env.topic
+        );
     }
 
     // (2) Drain captured messages.
@@ -792,7 +790,10 @@ pub(crate) async fn run_subscriber() -> anyhow::Result<()> {
             }
             Err(error) => {
                 handshake = None;
-                eprintln!("lark-browser: poll_loop_error topic={} error={error:#}", env.topic);
+                eprintln!(
+                    "lark-browser: poll_loop_error topic={} error={error:#}",
+                    env.topic
+                );
                 emit_control(
                     &env.topic,
                     "poll_error",
@@ -897,8 +898,14 @@ mod emit_tests {
         let events = process_feed_poll(&parsed, "conn1", "lark-browser", "lark", &mut seen, "");
         // No events emitted, and seen.initialized stays false.
         assert!(events.is_empty(), "expected no events when not loaded");
-        assert!(!seen.initialized, "initialized must stay false when not loaded");
-        assert!(seen.seen.is_empty(), "seen set must stay empty when not loaded");
+        assert!(
+            !seen.initialized,
+            "initialized must stay false when not loaded"
+        );
+        assert!(
+            seen.seen.is_empty(),
+            "seen set must stay empty when not loaded"
+        );
     }
 
     #[test]
@@ -909,8 +916,14 @@ mod emit_tests {
         });
         let mut seen = SeenState::default();
         let events = process_feed_poll(&parsed, "conn1", "lark-browser", "lark", &mut seen, "");
-        assert!(events.is_empty(), "expected no events when loaded key missing");
-        assert!(!seen.initialized, "initialized must stay false when loaded key missing");
+        assert!(
+            events.is_empty(),
+            "expected no events when loaded key missing"
+        );
+        assert!(
+            !seen.initialized,
+            "initialized must stay false when loaded key missing"
+        );
     }
 
     #[test]
@@ -924,8 +937,14 @@ mod emit_tests {
         let mut seen = SeenState::default();
         let events = process_feed_poll(&parsed, "conn1", "lark-browser", "lark", &mut seen, "");
         // First loaded poll: seeds but emits nothing (pre-init).
-        assert!(events.is_empty(), "first loaded poll should seed only, not emit");
-        assert!(seen.initialized, "initialized must be true after a loaded poll");
+        assert!(
+            events.is_empty(),
+            "first loaded poll should seed only, not emit"
+        );
+        assert!(
+            seen.initialized,
+            "initialized must be true after a loaded poll"
+        );
         assert_eq!(seen.seen.len(), 1, "seen must contain the seeded key");
     }
 
@@ -942,7 +961,11 @@ mod emit_tests {
             names: std::collections::BTreeMap::new(),
         };
         let events = process_feed_poll(&parsed, "conn1", "lark-browser", "lark", &mut seen, "");
-        assert_eq!(events.len(), 1, "post-init poll with new row should emit one event");
+        assert_eq!(
+            events.len(),
+            1,
+            "post-init poll with new row should emit one event"
+        );
         assert_eq!(events[0].payload["chat_id"], "99");
         assert_eq!(events[0].payload["chat_name"], "Bob");
     }
@@ -995,7 +1018,11 @@ mod emit_tests {
             names: std::collections::BTreeMap::new(),
         };
         let events = process_feed_poll(&parsed, "conn1", "lark-browser", "lark", &mut seen, "");
-        assert_eq!(events.len(), 2, "all feed rows should emit when active_chat_id is empty");
+        assert_eq!(
+            events.len(),
+            2,
+            "all feed rows should emit when active_chat_id is empty"
+        );
     }
 
     // --- process_active_drain pure helper tests ---
@@ -1005,13 +1032,15 @@ mod emit_tests {
         // Empty items list → no events, no init flip.
         let parsed = serde_json::json!({"chat_id": "CHAT1", "items": []});
         let mut seen = SeenState::default();
-        let (chat_id, events) = process_active_drain(
-            &parsed, "conn1", "lark-browser", "lark", &mut seen,
-        );
+        let (chat_id, events) =
+            process_active_drain(&parsed, "conn1", "lark-browser", "lark", &mut seen);
         assert_eq!(chat_id, "CHAT1");
         assert!(events.is_empty(), "no events for empty drain");
         // initialized stays false because no msgs to seed
-        assert!(!seen.initialized, "initialized should not flip on empty drain");
+        assert!(
+            !seen.initialized,
+            "initialized should not flip on empty drain"
+        );
     }
 
     #[test]
@@ -1021,9 +1050,8 @@ mod emit_tests {
             {"id": "7652607780750119026", "dir": "out", "text": "hi"}
         ]});
         let mut seen = SeenState::default();
-        let (chat_id, events) = process_active_drain(
-            &parsed, "conn1", "lark-browser", "lark", &mut seen,
-        );
+        let (chat_id, events) =
+            process_active_drain(&parsed, "conn1", "lark-browser", "lark", &mut seen);
         assert!(chat_id.is_empty());
         assert!(events.is_empty());
         assert!(!seen.initialized);
@@ -1037,12 +1065,14 @@ mod emit_tests {
             "items": [{"id": "7652607780750119026", "dir": "in", "text": "hello"}]
         });
         let mut seen = SeenState::default();
-        let (chat_id, events) = process_active_drain(
-            &parsed, "conn1", "lark-browser", "lark", &mut seen,
-        );
+        let (chat_id, events) =
+            process_active_drain(&parsed, "conn1", "lark-browser", "lark", &mut seen);
         assert_eq!(chat_id, "CHAT1");
         assert!(events.is_empty(), "first poll must seed only, not emit");
-        assert!(seen.initialized, "initialized must flip after first drain with msgs");
+        assert!(
+            seen.initialized,
+            "initialized must flip after first drain with msgs"
+        );
         assert!(
             seen.seen.contains("conn1:CHAT1:7652607780750119026"),
             "key must be seeded"
@@ -1062,9 +1092,8 @@ mod emit_tests {
             seen: std::collections::BTreeSet::new(),
             names: std::collections::BTreeMap::new(),
         };
-        let (chat_id, events) = process_active_drain(
-            &parsed, "conn1", "lark-browser", "lark", &mut seen,
-        );
+        let (chat_id, events) =
+            process_active_drain(&parsed, "conn1", "lark-browser", "lark", &mut seen);
         assert_eq!(chat_id, "CHAT1");
         assert_eq!(events.len(), 1, "new snowflake post-init must emit");
         assert_eq!(events[0].payload["chat_id"], "CHAT1");
@@ -1082,9 +1111,13 @@ mod emit_tests {
         });
         let mut seen = SeenState::default();
         // First poll seeds only (not initialized yet).
-        let _events = process_feed_poll(&feed_parsed, "conn1", "lark-browser", "lark", &mut seen, "");
+        let _events =
+            process_feed_poll(&feed_parsed, "conn1", "lark-browser", "lark", &mut seen, "");
         // After feed poll the name is cached regardless of init state.
-        assert_eq!(seen.names.get("CHAT1").map(String::as_str), Some("Engineering Team"));
+        assert_eq!(
+            seen.names.get("CHAT1").map(String::as_str),
+            Some("Engineering Team")
+        );
 
         // Second poll after init: active drain emits with resolved chat_name.
         let active_parsed = serde_json::json!({
@@ -1092,12 +1125,13 @@ mod emit_tests {
             "items": [{"id": "7652607883305029745", "dir": "in", "text": "ship it"}]
         });
         // seen.initialized is now true from the feed poll.
-        let (_chat_id, events) = process_active_drain(
-            &active_parsed, "conn1", "lark-browser", "lark", &mut seen,
-        );
+        let (_chat_id, events) =
+            process_active_drain(&active_parsed, "conn1", "lark-browser", "lark", &mut seen);
         assert_eq!(events.len(), 1, "active drain should emit after init");
-        assert_eq!(events[0].payload["chat_name"], "Engineering Team",
-            "active drain must resolve chat_name from the names cache");
+        assert_eq!(
+            events[0].payload["chat_name"], "Engineering Team",
+            "active drain must resolve chat_name from the names cache"
+        );
         assert_eq!(events[0].payload["chat_id"], "CHAT1");
     }
 
@@ -1116,9 +1150,8 @@ mod emit_tests {
             seen: std::collections::BTreeSet::new(),
             names: std::collections::BTreeMap::new(),
         };
-        let (_chat_id, events) = process_active_drain(
-            &parsed, "conn1", "lark-browser", "lark", &mut seen,
-        );
+        let (_chat_id, events) =
+            process_active_drain(&parsed, "conn1", "lark-browser", "lark", &mut seen);
         assert_eq!(events.len(), 1, "only snowflake id should emit");
         assert_eq!(events[0].payload["source"], "active");
     }
@@ -1159,7 +1192,9 @@ mod config_tests {
             "lark state dir must live under user_config_dir, got {}",
             dir.display()
         );
-        let loaded = load_config_from_dir(&dir).unwrap().expect("config must exist");
+        let loaded = load_config_from_dir(&dir)
+            .unwrap()
+            .expect("config must exist");
         assert_eq!(loaded.brand, "lark-browser");
         assert_eq!(loaded.connection, "myconn");
         // workspace_root must round-trip so the subscriber connects to the right
@@ -1176,7 +1211,13 @@ mod config_tests {
     fn save_and_load_config_round_trip_feishu() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
-        save_config(&paths, std::path::Path::new("/workspace/ws"), Brand::Feishu, "myconn").unwrap();
+        save_config(
+            &paths,
+            std::path::Path::new("/workspace/ws"),
+            Brand::Feishu,
+            "myconn",
+        )
+        .unwrap();
 
         let dir = state_dir(&paths, Brand::Feishu, "myconn");
         assert!(
@@ -1189,7 +1230,9 @@ mod config_tests {
             "feishu state dir must live under user_config_dir, got {}",
             dir.display()
         );
-        let loaded = load_config_from_dir(&dir).unwrap().expect("config must exist");
+        let loaded = load_config_from_dir(&dir)
+            .unwrap()
+            .expect("config must exist");
         assert_eq!(loaded.brand, "feishu-browser");
         assert_eq!(loaded.connection, "myconn");
         assert_eq!(
@@ -1223,7 +1266,10 @@ mod tests {
 
     #[test]
     fn brand_web_url_and_platform() {
-        assert_eq!(Brand::Lark.web_url(), "https://web.larksuite.com/messenger/");
+        assert_eq!(
+            Brand::Lark.web_url(),
+            "https://web.larksuite.com/messenger/"
+        );
         assert_eq!(Brand::Feishu.web_url(), "https://web.feishu.cn/messenger/");
         assert_eq!(Brand::Lark.platform(), "lark-browser");
         assert_eq!(Brand::Feishu.platform(), "feishu-browser");
@@ -1267,7 +1313,10 @@ mod tests {
         let key2 = feed_dedup_key("my-conn", &r);
         assert_eq!(key, key2);
         // different preview → different key
-        let r2 = FeedRow { preview: "world".into(), ..r };
+        let r2 = FeedRow {
+            preview: "world".into(),
+            ..r
+        };
         let key3 = feed_dedup_key("my-conn", &r2);
         assert_ne!(key, key3);
     }

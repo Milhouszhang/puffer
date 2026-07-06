@@ -37,7 +37,11 @@ impl MediaPermissionSnapshot {
     /// Promotes each media kind the batch demands to `Allow` when `authorize`
     /// approves it. `authorize(tool_id)` is the injected permission check
     /// (`true` = approved). Pure aside from the injected closure.
-    fn authorize_media_batch(&mut self, commands: &[&str], mut authorize: impl FnMut(&str) -> bool) {
+    fn authorize_media_batch(
+        &mut self,
+        commands: &[&str],
+        mut authorize: impl FnMut(&str) -> bool,
+    ) {
         let demand = batch_media_demand(commands, self);
         if demand.is_empty() {
             return;
@@ -71,9 +75,8 @@ pub(crate) struct MediaCapabilityContext<'a> {
     pub providers: &'a ProviderRegistry,
     pub auth_store: &'a AuthStore,
     pub discovery_cache: &'a ExactMediaDiscoveryCache,
-    pub process_store: Option<
-        &'a std::sync::Arc<std::sync::Mutex<crate::runtime::process_store::ProcessStore>>,
-    >,
+    pub process_store:
+        Option<&'a std::sync::Arc<std::sync::Mutex<crate::runtime::process_store::ProcessStore>>>,
 }
 
 /// Owned media-capability data captured from `AppState` before a parallel batch
@@ -223,7 +226,9 @@ pub(crate) fn execute_media_internal_tool(
     cwd: &std::path::Path,
     request: InternalToolExecutionRequest,
 ) -> InternalToolExecutionResponse {
-    use crate::runtime::claude_tools::workflow::{image_generation, media_capabilities, video_generation};
+    use crate::runtime::claude_tools::workflow::{
+        image_generation, media_capabilities, video_generation,
+    };
     let canonical = canonical_tool_name(&request.tool_id);
     match canonical.as_str() {
         "imagegeneration" => run_media_tool(ctx.permissions.image, &canonical, || {
@@ -414,14 +419,20 @@ fn redact_internal_execution_response(
     mut response: InternalToolExecutionResponse,
 ) -> InternalToolExecutionResponse {
     if let Some(output) = response.output.take() {
-        response.output = Some(crate::runtime::secrets::redact_known_secrets(state, &output));
+        response.output = Some(crate::runtime::secrets::redact_known_secrets(
+            state, &output,
+        ));
     }
     if let Some(reason) = response.reason.take() {
-        response.reason = Some(crate::runtime::secrets::redact_known_secrets(state, &reason));
+        response.reason = Some(crate::runtime::secrets::redact_known_secrets(
+            state, &reason,
+        ));
     }
     if let Some(diagnostic) = response.diagnostic.take() {
-        response.diagnostic =
-            Some(crate::runtime::secrets::redact_json_value(state, &diagnostic));
+        response.diagnostic = Some(crate::runtime::secrets::redact_json_value(
+            state,
+            &diagnostic,
+        ));
     }
     response
 }
@@ -884,8 +895,18 @@ mod tests {
         // Regression for issue #723: the parallel-batch broker used to bail on every
         // non-media internal tool. An Allowed telegram call must now route to its
         // handler instead of returning the "not available in a parallel batch"
-        // guidance. With no subscription runtime in a unit test the handler then
-        // fails — but on the subscriber-manager path, proving it routed.
+        // guidance. Routing is proven by a *handler-side* failure — the telegram
+        // handler loads its subscriber manifest (and, if found, talks to the
+        // process-global subscription manager) — as opposed to the broker's
+        // parallel-batch refusal.
+        //
+        // We deliberately accept either handler error: with an empty tempdir the
+        // manifest lookup fails first ("subscriber manifest not found"); where a
+        // manifest is discoverable it reaches the manager and reports
+        // "subscription runtime is not running". Asserting only the latter is a
+        // trap: it forces the manifest to resolve, and the handler then blocks on
+        // the manager channel whenever an earlier test has installed a real
+        // manager into the `OnceLock` — hanging the whole suite.
         let dir = tempdir().unwrap();
         let response = execute_subscriber_internal_tool(
             SubscriberPermissionSnapshot {
@@ -905,8 +926,9 @@ mod tests {
             "allowed telegram should route to its handler, got: {reason}"
         );
         assert!(
-            reason.contains("subscription runtime is not running"),
-            "expected the subscriber-manager error (proves it routed), got: {reason}"
+            reason.contains("subscriber manifest not found")
+                || reason.contains("subscription runtime is not running"),
+            "expected a telegram subscriber-handler error (proves it routed), got: {reason}"
         );
     }
 
@@ -1358,7 +1380,10 @@ mod tests {
             },
         );
         assert!(!resp.success);
-        assert!(resp.reason.unwrap().contains("not available in a parallel batch"));
+        assert!(resp
+            .reason
+            .unwrap()
+            .contains("not available in a parallel batch"));
     }
 
     fn snapshot_all_ask() -> MediaPermissionSnapshot {
@@ -1422,7 +1447,11 @@ mod tests {
         let mut perms = snapshot_all_ask();
         perms.authorize_media_batch(&["imagegen '{}'"], |_| true);
         assert_eq!(perms.image, ToolPermissionBehavior::Allow);
-        assert_eq!(perms.video, ToolPermissionBehavior::Ask, "video not demanded → unchanged");
+        assert_eq!(
+            perms.video,
+            ToolPermissionBehavior::Ask,
+            "video not demanded → unchanged"
+        );
     }
 
     #[test]

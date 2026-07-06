@@ -1,0 +1,72 @@
+# lefthook — local git hooks for fast pre-commit / pre-push feedback.
+#
+# One-time setup:
+#   brew install lefthook      # or: cargo install lefthook
+#   lefthook install           # writes .git/hooks/*
+#
+# Emergency bypass:  git commit --no-verify  /  git push --no-verify
+#
+# Design goal (minimal intrusion): hooks only scan the files YOU changed, so
+# pre-existing formatting drift elsewhere in the tree never blocks your commit.
+# The authoritative, full-tree gate lives in CI (.github/workflows/ci.yml).
+
+pre-commit:
+  parallel: true
+  # Skip while completing a merge/rebase: the staged set then includes files
+  # you never hand-edited, so file-scoped format/type checks would flag other
+  # people's drift and block the merge (mirrors the pre-push clippy skip).
+  skip:
+    - merge
+    - rebase
+  commands:
+    # Format-check only the staged Rust files — fast, file-scoped.
+    rustfmt:
+      glob: "*.rs"
+      run: rustfmt --edition 2021 --check {staged_files}
+    # Type-check the Svelte/TS desktop app when its sources are touched.
+    svelte-check:
+      root: "apps/puffer-desktop/"
+      glob: "apps/puffer-desktop/**/*.{ts,svelte}"
+      run: npm run check
+
+pre-push:
+  parallel: true
+  commands:
+    # Compiles the workspace (hard-fails on real build errors) and surfaces
+    # clippy lints. Denies the same groups as CI (`correctness` is deny by
+    # default; `suspicious` is added to match) so a push that would fail the
+    # CI clippy gate fails here first. Still NOT `-D warnings`: ordinary
+    # style/pedantic warnings stay informational and don't block the push.
+    #
+    # Quarantine guard: apps with LSFileQuarantineEnabled (e.g. Sourcetree)
+    # taint every file their child processes create with com.apple.quarantine,
+    # so cargo's freshly built build scripts get SIGKILLed by Gatekeeper and
+    # the tainted target/ then breaks TERMINAL builds too. Detect such an
+    # ancestor (or actual taint via a probe file) and refuse to compile —
+    # push from a terminal instead; CI still gates either way.
+    clippy:
+      glob: "*.rs"
+      skip:
+        - merge
+        - rebase
+      run: |
+        if [ "$(uname)" = "Darwin" ]; then
+          pid=$$
+          while [ "$pid" -gt 1 ] 2>/dev/null; do
+            case "$(ps -o comm= -p "$pid" 2>/dev/null)" in
+              *Sourcetree*|*SourceTree*) quarantined=1; break ;;
+            esac
+            pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || break
+            [ -n "$pid" ] || break
+          done
+          probe=$(mktemp "${TMPDIR:-/tmp}/lefthook-qtn-probe.XXXXXX")
+          xattr "$probe" 2>/dev/null | grep -q com.apple.quarantine && quarantined=1
+          rm -f "$probe"
+          if [ -n "$quarantined" ]; then
+            echo "clippy skipped: this push runs inside a quarantine-tainting app (e.g. Sourcetree)." >&2
+            echo "Building here would poison target/ and Gatekeeper would SIGKILL build scripts." >&2
+            echo "Push Rust changes from a terminal to get the local clippy gate; CI gates regardless." >&2
+            exit 0
+          fi
+        fi
+        cargo clippy --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious

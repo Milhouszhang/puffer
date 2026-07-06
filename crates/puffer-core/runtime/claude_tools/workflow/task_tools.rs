@@ -17,9 +17,7 @@ use super::task_runtime::{
 use crate::{AppState, MonitorSourceStampContext, MonitorTaskCreateGateContext};
 use anyhow::{anyhow, bail, Context, Result};
 use puffer_subscriptions::{MonitorTraceIdentity, MonitorTraceStage, MonitorTraceStore};
-use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -307,7 +305,7 @@ pub(super) fn execute_task_update(
                 parsed.task_id
             );
         }
-        if monitor_task_is_human_gated(task) && !state.monitor_triage_turn {
+        if monitor_task_requires_human_approval(task) && !state.monitor_triage_turn {
             bail!(
                 "monitor task `{}` must be completed through its monitor action after human approval",
                 parsed.task_id
@@ -437,428 +435,6 @@ pub(super) fn execute_task_update(
         "statusChange": status_change,
         "verificationNudgeNeeded": verification_nudge_needed,
         "note": verification_nudge_needed.then_some(VERIFICATION_NUDGE),
-    }))?)
-}
-
-#[derive(Debug, Deserialize)]
-struct MonitorReplySendInput {
-    #[serde(rename = "taskId")]
-    task_id: String,
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MonitorReplyDraftInput {
-    #[serde(rename = "taskId")]
-    task_id: String,
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MonitorActionDraftInput {
-    #[serde(rename = "taskId")]
-    task_id: String,
-    message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MonitorReplyTarget {
-    connector_slug: String,
-    connection_slug: String,
-    chat_id: String,
-}
-
-/// Sends a monitor-task reply to the task's recorded source target, then
-/// completes the monitor task with a delivery receipt.
-pub(super) fn execute_monitor_reply_send(
-    state: &mut AppState,
-    cwd: &Path,
-    input: Value,
-) -> Result<String> {
-    let parsed: MonitorReplySendInput =
-        serde_json::from_value(input).context("invalid MonitorReplySend input")?;
-    let message = parsed.message.trim();
-    if message.is_empty() {
-        bail!("MonitorReplySend message cannot be empty");
-    }
-    let store_cwd = state.session.cwd.clone();
-    let task = load_monitor_task(store_cwd.as_path(), &parsed.task_id)?
-        .ok_or_else(|| anyhow!("monitor task `{}` not found", parsed.task_id))?;
-    if monitor_task_is_human_gated(&task) {
-        append_monitor_reply_audit_to_store(
-            store_cwd.as_path(),
-            &parsed.task_id,
-            "send_rejected",
-            json!({"reason": "requires_human_approval"}),
-        )?;
-        bail!(
-            "monitor task `{}` requires human approval; use the Bobo review flow",
-            parsed.task_id
-        );
-    }
-    if let Some(receipt) = monitor_reply_receipt(&task.metadata) {
-        return Ok(serde_json::to_string_pretty(&json!({
-            "success": true,
-            "taskId": parsed.task_id,
-            "alreadySent": true,
-            "status": task.status,
-            "receipt": receipt,
-        }))?);
-    }
-    if monitor_reply_terminal_status(&task.status) {
-        bail!(
-            "monitor task `{}` is already {}; not sending monitor reply",
-            parsed.task_id,
-            task.status
-        );
-    }
-    let target = monitor_reply_target(&task)?;
-    let connector_input = monitor_reply_connector_act_input(&target, message);
-    let raw = super::connector_tools::execute_connector_act(state, cwd, connector_input)?;
-    let connector_output: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!(raw));
-    let mut store = load_store::<TaskStore>(&monitor_tasks_path(store_cwd.as_path()))?;
-    let Some(task) = store
-        .tasks
-        .iter_mut()
-        .find(|task| task.task_id == parsed.task_id)
-    else {
-        bail!("monitor task `{}` not found after send", parsed.task_id);
-    };
-    append_monitor_action_receipt(task, &target, &connector_output)?;
-    let previous_status = task.status.clone();
-    task.status = "completed".to_string();
-    task.process_id = None;
-    task.updated_at_ms = Some(now_ms());
-    save_store(&monitor_tasks_path(store_cwd.as_path()), &store)?;
-    Ok(serde_json::to_string_pretty(&json!({
-        "success": true,
-        "taskId": parsed.task_id,
-        "statusChange": {
-            "from": previous_status,
-            "to": "completed",
-        },
-        "sentTo": {
-            "type": "telegram_chat",
-            "chatId": target.chat_id,
-            "connectionSlug": target.connection_slug,
-            "connectorSlug": target.connector_slug,
-        },
-        "connectorOutput": connector_output,
-    }))?)
-}
-
-fn monitor_reply_terminal_status(status: &str) -> bool {
-    terminal_task_status(status) || matches!(status, "cancelled" | "canceled")
-}
-
-/// Saves a draft reply for a daemon-validated monitor action turn.
-pub(super) fn execute_monitor_reply_draft(
-    state: &mut AppState,
-    _cwd: &Path,
-    input: Value,
-) -> Result<String> {
-    let parsed: MonitorReplyDraftInput =
-        serde_json::from_value(input).context("invalid MonitorReplyDraft input")?;
-    let message = parsed.message.trim();
-    if message.is_empty() {
-        bail!("MonitorReplyDraft message cannot be empty");
-    }
-    let scope = state
-        .monitor_reply_scope
-        .clone()
-        .ok_or_else(|| anyhow!("MonitorReplyDraft requires a monitor reply scope"))?;
-    if parsed.task_id != scope.task_id {
-        bail!(
-            "MonitorReplyDraft taskId `{}` does not match scoped monitor task `{}`",
-            parsed.task_id,
-            scope.task_id
-        );
-    }
-
-    let store_cwd = state.session.cwd.clone();
-    let path = monitor_tasks_path(store_cwd.as_path());
-    let mut store = load_store::<TaskStore>(&path)?;
-    let Some(task) = store
-        .tasks
-        .iter_mut()
-        .find(|task| task.task_id == parsed.task_id)
-    else {
-        bail!("monitor task `{}` not found", parsed.task_id);
-    };
-    // Reject only TERMINAL states, mirroring monitor_reply_send. `in_progress`
-    // is a legitimate working state — the action agent drafting the reply (or
-    // a triage TaskUpdate) may have marked the task active; requiring exactly
-    // `pending` dead-ended the whole human-gated flow whenever that happened
-    // (agentenv/monorepo#619 follow-up).
-    if matches!(
-        task.status.as_str(),
-        "completed" | "cancelled" | "canceled" | "failed" | "stopped"
-    ) {
-        bail!(
-            "MonitorReplyDraft expected an open monitor task `{}`, got terminal status `{}`",
-            parsed.task_id,
-            task.status
-        );
-    }
-    if parse_monitor_contract(&task.metadata)?.is_some() {
-        bail!(
-            "MonitorReplyDraft does not support typed monitor tasks; use MonitorActionDraft for `{}`",
-            parsed.task_id
-        );
-    }
-    if !monitor_task_is_human_gated(task) {
-        bail!(
-            "MonitorReplyDraft expected a human-gated monitor task `{}`",
-            parsed.task_id
-        );
-    }
-    let source_context = monitor_source_context(&task.metadata)
-        .ok_or_else(|| anyhow!("monitor task `{}` has no source_context", parsed.task_id))?;
-    // Validate the target from the server-owned source context before saving a
-    // draft; the model never supplies recipient fields.
-    let target = monitor_reply_target(task)?;
-    let previous = task
-        .metadata
-        .get("pending_reply")
-        .and_then(Value::as_object)
-        .cloned();
-    if let Some(previous_status) = previous
-        .as_ref()
-        .and_then(|draft| draft.get("status"))
-        .and_then(Value::as_str)
-    {
-        if matches!(previous_status, "sending" | "sent") {
-            bail!("cannot supersede monitor reply draft in `{previous_status}` state");
-        }
-    }
-    let previous_version = previous
-        .as_ref()
-        .and_then(|draft| draft.get("version"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let now = now_rfc3339()?;
-    let draft_id = format!("draft-{}-{}", parsed.task_id, now_ms());
-    let version = previous_version + 1;
-    if let Some(previous) = previous {
-        append_monitor_reply_audit(
-            task,
-            "draft_superseded",
-            json!({"previousStatus": previous.get("status").cloned()}),
-        );
-    }
-    let source_hash = source_context_hash(&source_context)?;
-    task.metadata.insert(
-        "pending_reply".to_string(),
-        json!({
-            "id": draft_id,
-            "created_by": "MonitorReplyDraft",
-            "status": "draft_ready",
-            "version": version,
-            "agent_draft_text": message,
-            "created_at": now,
-            "updated_at": now,
-            "session_id": scope.session_id,
-            "turn_id": scope.turn_id,
-            "source_context_snapshot": source_context,
-            "source_context_hash": source_hash,
-            "approved_message": Value::Null,
-            "approved_by": Value::Null,
-            "approved_at": Value::Null,
-            "client_request_id": Value::Null,
-            "send_attempt_id": Value::Null,
-            "receipt": Value::Null,
-            "error": Value::Null,
-        }),
-    );
-    task.updated_at_ms = Some(now_ms());
-    append_monitor_reply_audit(
-        task,
-        "draft_created",
-        json!({
-            "draft_id": draft_id,
-            "version": version,
-            "session_id": scope.session_id,
-            "turn_id": scope.turn_id,
-            "source_context_hash": source_hash,
-            "chat_id": target.chat_id,
-        }),
-    );
-    save_store(&path, &store)?;
-
-    Ok(serde_json::to_string_pretty(&json!({
-        "success": true,
-        "taskId": parsed.task_id,
-        "draft": {
-            "id": draft_id,
-            "status": "draft_ready",
-            "version": version,
-        }
-    }))?)
-}
-
-/// Saves a typed pending action for a daemon-validated monitor action turn.
-pub(super) fn execute_monitor_action_draft(
-    state: &mut AppState,
-    _cwd: &Path,
-    input: Value,
-) -> Result<String> {
-    let parsed: MonitorActionDraftInput =
-        serde_json::from_value(input).context("invalid MonitorActionDraft input")?;
-    let message = parsed.message.trim();
-    if message.is_empty() {
-        bail!("MonitorActionDraft message cannot be empty");
-    }
-    let scope = state
-        .monitor_reply_scope
-        .clone()
-        .ok_or_else(|| anyhow!("MonitorActionDraft requires a monitor action scope"))?;
-    if parsed.task_id != scope.task_id {
-        bail!(
-            "MonitorActionDraft taskId `{}` does not match scoped monitor task `{}`",
-            parsed.task_id,
-            scope.task_id
-        );
-    }
-
-    let store_cwd = state.session.cwd.clone();
-    let path = monitor_tasks_path(store_cwd.as_path());
-    let mut store = load_store::<TaskStore>(&path)?;
-    let Some(task) = store
-        .tasks
-        .iter_mut()
-        .find(|task| task.task_id == parsed.task_id)
-    else {
-        bail!("monitor task `{}` not found", parsed.task_id);
-    };
-    if monitor_reply_terminal_status(task.status.as_str()) {
-        bail!(
-            "MonitorActionDraft expected an open monitor task `{}`, got terminal status `{}`",
-            parsed.task_id,
-            task.status
-        );
-    }
-    let Some(contract) = parse_monitor_contract(&task.metadata)? else {
-        bail!(
-            "MonitorActionDraft supports typed telegram.reply and gmail.reply monitor tasks only"
-        );
-    };
-    let (action_prefix, pending_action_type) = match contract.kind {
-        MonitorTaskKind::TelegramReply => {
-            if string_field_from_map(&contract.source, &["chat_id", "chatId"]).is_none() {
-                bail!(
-                    "MonitorActionDraft expected monitor task `{}` to have a Telegram chat_id",
-                    parsed.task_id
-                );
-            }
-            ("telegram", "telegram_reply_draft_intent")
-        }
-        MonitorTaskKind::GmailReply => {
-            if string_field_from_map(&contract.source, &["thread_id", "threadId"]).is_none() {
-                bail!(
-                    "MonitorActionDraft expected monitor task `{}` to have a Gmail thread_id",
-                    parsed.task_id
-                );
-            }
-            ("gmail", "gmail_reply_draft_intent")
-        }
-        other => bail!(
-            "MonitorActionDraft supports typed telegram.reply and gmail.reply monitor tasks only, got `{}`",
-            other.as_str()
-        ),
-    };
-    let monitor_hash = contract
-        .source_hash
-        .clone()
-        .context("MonitorActionDraft requires monitor.source_hash")?;
-
-    let previous = task
-        .metadata
-        .get("pending_action")
-        .and_then(Value::as_object)
-        .cloned();
-    if let Some(previous_status) = previous
-        .as_ref()
-        .and_then(|draft| draft.get("status"))
-        .and_then(Value::as_str)
-    {
-        if matches!(
-            previous_status,
-            "creating_draft"
-                | "opening_thread"
-                | "draft_created"
-                | "completed"
-                | "executing"
-                | "sending"
-                | "sent"
-        ) {
-            bail!("cannot supersede monitor pending action in `{previous_status}` state");
-        }
-    }
-    let previous_version = previous
-        .as_ref()
-        .and_then(|draft| draft.get("version"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let now = now_rfc3339()?;
-    let action_id = format!("action-{action_prefix}-{}-{}", parsed.task_id, now_ms());
-    let version = previous_version + 1;
-    if let Some(previous) = previous {
-        append_monitor_action_audit(
-            task,
-            "draft_superseded",
-            json!({"previousStatus": previous.get("status").cloned()}),
-        );
-    }
-    task.metadata.insert(
-        "pending_action".to_string(),
-        json!({
-            "id": action_id,
-            "type": pending_action_type,
-            "status": "draft_ready",
-            "version": version,
-            "agent_draft_text": message,
-            "created_by": "MonitorActionDraft",
-            "created_at": now,
-            "updated_at": now,
-            "session_id": scope.session_id,
-            "turn_id": scope.turn_id,
-            "monitor_snapshot": {
-                "schema_version": contract.schema_version,
-                "kind": contract.kind.as_str(),
-                "source": contract.source,
-                "action": contract.action,
-            },
-            "monitor_hash": monitor_hash,
-            "approved_message": Value::Null,
-            "approved_by": Value::Null,
-            "approved_at": Value::Null,
-            "client_request_id": Value::Null,
-            "receipt": Value::Null,
-            "error": Value::Null,
-        }),
-    );
-    task.updated_at_ms = Some(now_ms());
-    append_monitor_action_audit(
-        task,
-        "draft_created",
-        json!({
-            "action_id": action_id,
-            "version": version,
-            "session_id": scope.session_id,
-            "turn_id": scope.turn_id,
-            "monitor_hash": monitor_hash,
-        }),
-    );
-    save_store(&path, &store)?;
-
-    Ok(serde_json::to_string_pretty(&json!({
-        "success": true,
-        "taskId": parsed.task_id,
-        "pendingAction": {
-            "id": action_id,
-            "status": "draft_ready",
-            "version": version,
-        }
     }))?)
 }
 
@@ -1107,6 +683,7 @@ fn duplicate_monitor_task_skip(
     let candidate_subject = normalize_monitor_subject(subject);
     let candidate_envelopes = monitor_envelope_ids(metadata);
     let candidate_sources = monitor_source_message_ids(metadata);
+    let candidate_senders = monitor_sender_ids(metadata);
     for task in tasks {
         if !same_monitor_task_scope(metadata, &task.metadata) {
             continue;
@@ -1148,11 +725,28 @@ fn duplicate_monitor_task_skip(
         }
         if let Some(candidate_subject) = candidate_subject.as_deref() {
             if normalize_monitor_subject(&task.subject).as_deref() == Some(candidate_subject) {
-                return Some(monitor_task_skip_payload(
-                    "duplicate_monitor_task",
-                    Some(task.task_id.as_str()),
-                    None,
-                ));
+                // Same normalized subject, but distinct KNOWN senders are
+                // distinct requests (e.g. two people in a group asking the
+                // same thing) — each keeps its own task (agentenv/monorepo#655).
+                // The candidate folds only when every sender it is known to
+                // carry (one for single-source tasks, several for a
+                // mixed-sender burst) is already represented by the existing
+                // task. If either side has no known sender, keep the
+                // historical subject-only fold (DMs are 1:1; sender adds
+                // nothing there).
+                let existing_senders = monitor_sender_ids(&task.metadata);
+                let senders_differ = !candidate_senders.is_empty()
+                    && !existing_senders.is_empty()
+                    && !candidate_senders
+                        .iter()
+                        .all(|sender| existing_senders.contains(sender));
+                if !senders_differ {
+                    return Some(monitor_task_skip_payload(
+                        "duplicate_monitor_task",
+                        Some(task.task_id.as_str()),
+                        None,
+                    ));
+                }
             }
         }
     }
@@ -1305,6 +899,42 @@ fn monitor_source_message_ids(metadata: &Map<String, Value>) -> HashSet<i64> {
         }
     }
     ids
+}
+
+/// Sender identity for dedup: top-level `sender_id` (stamped on bursts and by
+/// the triage runner), falling back to the typed contract's `source.sender_id`
+/// (single-source tasks). Normalized to a string because the id arrives as a
+/// JSON number from the telegram subscriber but as a string in stamped forms.
+fn monitor_sender_id(metadata: &Map<String, Value>) -> Option<String> {
+    for key in ["sender_id", "senderId"] {
+        if let Some(value) = metadata.get(key).and_then(value_to_string) {
+            return Some(value);
+        }
+    }
+    parse_monitor_contract(metadata)
+        .ok()
+        .flatten()
+        .and_then(|contract| string_field_from_map(&contract.source, &["sender_id", "senderId"]))
+}
+
+/// All distinct sender identities a task is known to carry: the plural
+/// `sender_ids` stamp of a mixed-sender burst, or the single
+/// [`monitor_sender_id`]. Empty when no sender is known.
+fn monitor_sender_ids(metadata: &Map<String, Value>) -> Vec<String> {
+    if let Some(values) = metadata
+        .get("sender_ids")
+        .or_else(|| metadata.get("senderIds"))
+        .and_then(Value::as_array)
+    {
+        let ids = values
+            .iter()
+            .filter_map(value_to_string)
+            .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            return ids;
+        }
+    }
+    monitor_sender_id(metadata).into_iter().collect()
 }
 
 fn normalize_monitor_subject(subject: &str) -> Option<String> {
@@ -1584,12 +1214,7 @@ fn validate_monitor_task_metadata(metadata: &Map<String, Value>) -> Result<()> {
             bail!("monitor task metadata cannot include ignore filter field `{key}`");
         }
     }
-    for key in [
-        "pending_reply",
-        "pendingReply",
-        "monitor_reply_events",
-        "monitorReplyEvents",
-    ] {
+    for key in ["monitor_reply_events", "monitorReplyEvents"] {
         if metadata.contains_key(key) {
             bail!("monitor task metadata cannot include reserved field `{key}`");
         }
@@ -1662,18 +1287,30 @@ fn stamp_shared_monitor_source_identity(
     metadata: &mut Map<String, Value>,
     stamps: &[MonitorSourceStampContext],
 ) {
-    if let Some(chat_id) = uniform_stamp_i64(stamps, &["chat_id", "chatId"]) {
+    if let Some(chat_id) = uniform_stamp(stamps, &["chat_id", "chatId"], value_i64_field) {
         metadata.insert("chat_id".to_string(), Value::from(chat_id));
     }
-    if let Some(sender_id) = uniform_stamp_i64(stamps, &["sender_id", "senderId"]) {
+    if let Some(sender_id) = uniform_stamp(stamps, &["sender_id", "senderId"], value_i64_field) {
         metadata.insert("sender_id".to_string(), Value::from(sender_id));
+    } else {
+        // Mixed senders in one burst: stamp the distinct set so the
+        // subject-dedup leg can tell a known multi-sender burst apart from a
+        // sender-less record instead of folding it into one person's task
+        // (agentenv/monorepo#655).
+        let mut sender_ids = stamps
+            .iter()
+            .filter_map(|stamp| value_i64_field(&stamp.payload, &["sender_id", "senderId"]))
+            .collect::<Vec<_>>();
+        sender_ids.sort_unstable();
+        sender_ids.dedup();
+        if sender_ids.len() >= 2 {
+            metadata.insert(
+                "sender_ids".to_string(),
+                Value::Array(sender_ids.into_iter().map(Value::from).collect()),
+            );
+        }
     }
-    let mut source_message_ids = stamps
-        .iter()
-        .filter_map(source_message_id_from_stamp)
-        .collect::<Vec<_>>();
-    source_message_ids.sort_unstable();
-    source_message_ids.dedup();
+    let source_message_ids = sorted_source_message_ids(stamps);
     if !source_message_ids.is_empty() {
         metadata.insert(
             "source_message_ids".to_string(),
@@ -1682,16 +1319,21 @@ fn stamp_shared_monitor_source_identity(
     }
 }
 
-/// Returns the i64 value for `keys` iff every stamp's payload has it and they all
-/// agree; otherwise `None` (the field is not uniform across the batch, so there is
-/// no single authoritative value to stamp — e.g. a genuinely cross-chat review).
-fn uniform_stamp_i64(stamps: &[MonitorSourceStampContext], keys: &[&str]) -> Option<i64> {
-    let mut agreed: Option<i64> = None;
+/// Returns the extracted value for `keys` iff every stamp's payload has it and
+/// they all agree; otherwise `None` (the field is not uniform across the batch,
+/// so there is no single authoritative value to stamp — e.g. a genuinely
+/// cross-chat review). `extract` is `value_i64_field`/`value_string_field`.
+fn uniform_stamp<T: PartialEq>(
+    stamps: &[MonitorSourceStampContext],
+    keys: &[&str],
+    extract: impl Fn(&Value, &[&str]) -> Option<T>,
+) -> Option<T> {
+    let mut agreed: Option<T> = None;
     for stamp in stamps {
-        let value = value_i64_field(&stamp.payload, keys)?;
-        match agreed {
+        let value = extract(&stamp.payload, keys)?;
+        match &agreed {
             None => agreed = Some(value),
-            Some(existing) if existing == value => {}
+            Some(existing) if *existing == value => {}
             Some(_) => return None,
         }
     }
@@ -1703,10 +1345,6 @@ fn reject_llm_written_typed_monitor_fields(metadata: &Map<String, Value>) -> Res
         "monitor",
         "source_context",
         "sourceContext",
-        "pending_action",
-        "pendingAction",
-        "pending_reply",
-        "pendingReply",
         "completion_policy",
         "completionPolicy",
         "delivery_target",
@@ -1786,9 +1424,6 @@ fn apply_stamped_monitor_contract(
     metadata.insert("monitor".to_string(), Value::Object(monitor));
     stamp_legacy_monitor_scope_fields(metadata, &contract);
     normalize_monitor_task_metadata(metadata)?;
-    if matches!(&contract.kind, MonitorTaskKind::CalendarRsvp) {
-        insert_calendar_pending_action(metadata)?;
-    }
     Ok(())
 }
 
@@ -1863,38 +1498,6 @@ fn stamp_source_value_as_metadata(
         return;
     }
     metadata.insert(metadata_key.to_string(), value.clone());
-}
-
-fn insert_calendar_pending_action(metadata: &mut Map<String, Value>) -> Result<()> {
-    let contract = parse_monitor_contract(metadata)?
-        .context("calendar pending action requires typed monitor contract")?;
-    let monitor_hash = monitor_contract_hash(&contract)?;
-    metadata.insert(
-        "pending_action".to_string(),
-        json!({
-            "id": format!("action-calendar-{}", now_ms()),
-            "type": "calendar_rsvp",
-            "status": "awaiting_confirmation",
-            "version": 1,
-            "proposed_response": Value::Null,
-            "created_by": "server",
-            "monitor_snapshot": {
-                "schema_version": contract.schema_version,
-                "kind": contract.kind.as_str(),
-                "source": contract.source,
-                "action": contract.action,
-            },
-            "monitor_hash": monitor_hash,
-            "approved_response": Value::Null,
-            "approved_by": Value::Null,
-            "approved_at": Value::Null,
-            "client_request_id": Value::Null,
-            "attempt_id": Value::Null,
-            "receipt": Value::Null,
-            "error": Value::Null,
-        }),
-    );
-    Ok(())
 }
 
 fn typed_contract_from_stamp(stamp: &MonitorSourceStampContext) -> MonitorContract {
@@ -2190,6 +1793,24 @@ fn generic_review_contract_from_stamps(stamps: &[MonitorSourceStampContext]) -> 
             Value::String(first.connection_slug.clone()),
         );
     }
+    // Uniform chat identity keeps a same-chat burst deliverable: the reply
+    // layer resolves its chat-level target from the contract source, exactly
+    // like a single-source telegram task (agentenv/monorepo#761, #722).
+    if let Some(chat_id) = uniform_stamp(stamps, &["chat_id", "chatId"], value_i64_field) {
+        source.insert("chat_id".to_string(), Value::from(chat_id));
+        if let Some(chat_kind) =
+            uniform_stamp(stamps, &["chat_kind", "chatKind"], value_string_field)
+        {
+            source.insert("chat_kind".to_string(), Value::String(chat_kind));
+        }
+    }
+    let source_message_ids = sorted_source_message_ids(stamps);
+    if !source_message_ids.is_empty() {
+        source.insert(
+            "source_message_ids".to_string(),
+            Value::Array(source_message_ids.into_iter().map(Value::from).collect()),
+        );
+    }
     source.insert(
         "envelope_ids".to_string(),
         Value::Array(
@@ -2222,6 +1843,17 @@ fn generic_review_contract_from_stamps(stamps: &[MonitorSourceStampContext]) -> 
 
 fn required_gmail_source_present(source: &Map<String, Value>) -> bool {
     string_field_from_map(source, &["thread_id", "threadId"]).is_some()
+}
+
+/// Distinct per-message ids across a stamp batch, sorted for stable output.
+fn sorted_source_message_ids(stamps: &[MonitorSourceStampContext]) -> Vec<i64> {
+    let mut ids = stamps
+        .iter()
+        .filter_map(source_message_id_from_stamp)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 fn source_message_id_from_stamp(stamp: &MonitorSourceStampContext) -> Option<i64> {
@@ -2400,8 +2032,6 @@ fn reserved_monitor_metadata_keys(key: &str) -> Option<&'static [&'static str]> 
         "chat_kind" | "chatKind" => Some(&["chat_kind", "chatKind"]),
         "sender_id" | "senderId" => Some(&["sender_id", "senderId"]),
         "sender_username" | "senderUsername" => Some(&["sender_username", "senderUsername"]),
-        "pending_reply" | "pendingReply" => Some(&["pending_reply", "pendingReply"]),
-        "pending_action" | "pendingAction" => Some(&["pending_action", "pendingAction"]),
         "monitor_reply_events" | "monitorReplyEvents" => {
             Some(&["monitor_reply_events", "monitorReplyEvents"])
         }
@@ -2574,7 +2204,7 @@ fn monitor_actions_require_reply(metadata: &Map<String, Value>) -> bool {
     })
 }
 
-fn monitor_task_is_human_gated(task: &StoredTask) -> bool {
+fn monitor_task_requires_human_approval(task: &StoredTask) -> bool {
     if !is_monitor_task_metadata(&task.metadata) {
         return false;
     }
@@ -2582,7 +2212,6 @@ fn monitor_task_is_human_gated(task: &StoredTask) -> bool {
     monitor_completion_policy(&task.metadata, source_context.as_ref())
         .as_ref()
         .is_some_and(completion_policy_requires_human_approval)
-        || monitor_task_has_telegram_delivery_target(&task.metadata, source_context.as_ref())
 }
 
 fn monitor_task_is_typed_executable(task: &StoredTask) -> bool {
@@ -2608,28 +2237,6 @@ fn completion_policy_requires_human_approval(policy: &Value) -> bool {
             .unwrap_or(false)
 }
 
-fn monitor_task_has_telegram_delivery_target(
-    metadata: &Map<String, Value>,
-    source_context: Option<&Value>,
-) -> bool {
-    source_context
-        .and_then(|context| {
-            let connector_slug = string_field(context, &["connector_slug", "connectorSlug"])
-                .or_else(|| {
-                    metadata_string(metadata, &["monitor_connector", "monitorConnector"])
-                })?;
-            connector_slug.contains("telegram").then_some(context)
-        })
-        .and_then(|context| {
-            source_context_delivery_target(context)
-                .and_then(|target| string_field(target, &["chat_id", "chatId"]))
-        })
-        .is_some()
-        || metadata_string(metadata, &["monitor_connector", "monitorConnector"])
-            .is_some_and(|connector| connector.contains("telegram"))
-            && metadata_string(metadata, &["chat_id", "chatId"]).is_some()
-}
-
 fn human_gated_completion_policy() -> Value {
     json!({
         "mode": "draft_then_approve",
@@ -2643,176 +2250,6 @@ fn metadata_marks_monitor_ignored(metadata: Option<&Map<String, Value>>) -> bool
         .and_then(|metadata| metadata.get("ignored"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
-}
-
-fn monitor_reply_receipt(metadata: &Map<String, Value>) -> Option<Value> {
-    metadata
-        .get("action_receipts")
-        .or_else(|| metadata.get("actionReceipts"))
-        .and_then(Value::as_array)
-        .and_then(|receipts| {
-            receipts
-                .iter()
-                .find(|receipt| {
-                    receipt
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .is_some_and(|kind| kind == "monitor_reply_send")
-                })
-                .cloned()
-        })
-}
-
-fn monitor_reply_target(task: &StoredTask) -> Result<MonitorReplyTarget> {
-    if !is_monitor_task_metadata(&task.metadata) {
-        bail!("task `{}` is not a monitor task", task.task_id);
-    }
-    let source_context = monitor_source_context(&task.metadata)
-        .ok_or_else(|| anyhow!("monitor task `{}` has no source_context", task.task_id))?;
-    let Some(context) = source_context.as_object() else {
-        bail!(
-            "monitor task `{}` source_context is not an object",
-            task.task_id
-        );
-    };
-    let connector_slug = string_field_from_map(context, &["connector_slug", "connectorSlug"])
-        .or_else(|| metadata_string(&task.metadata, &["monitor_connector", "monitorConnector"]))
-        .ok_or_else(|| anyhow!("monitor task `{}` has no connector slug", task.task_id))?;
-    if !connector_slug.contains("telegram") {
-        bail!("MonitorReplySend currently supports Telegram monitor tasks only");
-    }
-    let connection_slug = string_field_from_map(context, &["connection_slug", "connectionSlug"])
-        .or_else(|| metadata_string(&task.metadata, &["monitor_connection", "monitorConnection"]))
-        .unwrap_or_else(|| connector_slug.clone());
-    let delivery_target = context
-        .get("delivery_target")
-        .or_else(|| context.get("deliveryTarget"))
-        .ok_or_else(|| anyhow!("monitor task `{}` has no delivery target", task.task_id))?;
-    let Some(delivery_target) = delivery_target.as_object() else {
-        bail!(
-            "monitor task `{}` delivery target is not an object",
-            task.task_id
-        );
-    };
-    let target_type = string_field_from_map(delivery_target, &["type"]);
-    if target_type.as_deref() != Some("telegram_chat") {
-        bail!(
-            "MonitorReplySend expected telegram_chat delivery target, got {}",
-            target_type.unwrap_or_else(|| "<missing>".to_string())
-        );
-    }
-    let chat_id = string_field_from_map(delivery_target, &["chat_id", "chatId"])
-        .ok_or_else(|| anyhow!("monitor task `{}` has no Telegram chat_id", task.task_id))?;
-    Ok(MonitorReplyTarget {
-        connector_slug,
-        connection_slug,
-        chat_id,
-    })
-}
-
-fn monitor_reply_connector_act_input(target: &MonitorReplyTarget, message: &str) -> Value {
-    json!({
-        "connector_slug": target.connector_slug,
-        "connection_slug": target.connection_slug,
-        "action": "send_message",
-        "input": {
-            "connection_slug": target.connection_slug,
-            "connector_slug": target.connector_slug,
-            "chat_id": target.chat_id,
-            "message": message,
-        }
-    })
-}
-
-fn append_monitor_action_receipt(
-    task: &mut StoredTask,
-    target: &MonitorReplyTarget,
-    connector_output: &Value,
-) -> Result<()> {
-    let sent_at = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .context("failed to format monitor reply receipt timestamp")?;
-    let receipt = json!({
-        "kind": "monitor_reply_send",
-        "sent_at": sent_at,
-        "connector_slug": target.connector_slug,
-        "connection_slug": target.connection_slug,
-        "delivery_target": {
-            "type": "telegram_chat",
-            "chat_id": target.chat_id,
-        },
-        "connector_action": "send_message",
-        "connector_output": connector_output,
-    });
-    match task.metadata.get_mut("action_receipts") {
-        Some(Value::Array(receipts)) => receipts.push(receipt),
-        _ => {
-            task.metadata
-                .insert("action_receipts".to_string(), Value::Array(vec![receipt]));
-        }
-    }
-    Ok(())
-}
-
-fn now_rfc3339() -> Result<String> {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .context("failed to format monitor reply timestamp")
-}
-
-fn source_context_hash(source_context: &Value) -> Result<String> {
-    let raw = serde_json::to_vec(source_context).context("failed to encode source context")?;
-    Ok(format!("{:x}", Sha256::digest(raw)))
-}
-
-fn append_monitor_reply_audit(task: &mut StoredTask, event: &str, details: Value) {
-    let entry = json!({
-        "event": event,
-        "at": now_rfc3339().unwrap_or_else(|_| OffsetDateTime::now_utc().to_string()),
-        "details": details,
-    });
-    match task.metadata.get_mut("monitor_reply_events") {
-        Some(Value::Array(events)) => events.push(entry),
-        _ => {
-            task.metadata.insert(
-                "monitor_reply_events".to_string(),
-                Value::Array(vec![entry]),
-            );
-        }
-    }
-}
-
-fn append_monitor_action_audit(task: &mut StoredTask, event: &str, details: Value) {
-    let entry = json!({
-        "event": event,
-        "at": now_rfc3339().unwrap_or_else(|_| OffsetDateTime::now_utc().to_string()),
-        "details": details,
-    });
-    match task.metadata.get_mut("monitor_action_events") {
-        Some(Value::Array(events)) => events.push(entry),
-        _ => {
-            task.metadata.insert(
-                "monitor_action_events".to_string(),
-                Value::Array(vec![entry]),
-            );
-        }
-    }
-}
-
-fn append_monitor_reply_audit_to_store(
-    cwd: &Path,
-    task_id: &str,
-    event: &str,
-    details: Value,
-) -> Result<()> {
-    let path = monitor_tasks_path(cwd);
-    let mut store = load_store::<TaskStore>(&path)?;
-    if let Some(task) = store.tasks.iter_mut().find(|task| task.task_id == task_id) {
-        append_monitor_reply_audit(task, event, details);
-        task.updated_at_ms = Some(now_ms());
-        save_store(&path, &store)?;
-    }
-    Ok(())
 }
 
 fn monitor_actions(metadata: &Map<String, Value>) -> Vec<Value> {
@@ -3434,7 +2871,7 @@ mod tests {
     }
 
     #[test]
-    fn task_create_stamps_calendar_pending_action_from_current_source_envelope() {
+    fn task_create_stamps_calendar_contract_from_current_source_envelope() {
         let (mut state, tmp) = make_state();
         state.set_monitor_source_stamp_contexts(vec![crate::MonitorSourceStampContext {
             envelope_id: "env-calendar".to_string(),
@@ -3486,18 +2923,6 @@ mod tests {
         assert_eq!(
             metadata.pointer("/source_context/delivery_target/event_id"),
             Some(&json!("event-123"))
-        );
-        assert_eq!(
-            metadata.pointer("/pending_action/type"),
-            Some(&json!("calendar_rsvp"))
-        );
-        assert_eq!(
-            metadata.pointer("/pending_action/status"),
-            Some(&json!("awaiting_confirmation"))
-        );
-        assert_eq!(
-            metadata.pointer("/pending_action/monitor_hash"),
-            metadata.pointer("/monitor/source_hash")
         );
     }
 
@@ -3701,103 +3126,6 @@ mod tests {
                     {
                         "actionName": "Add reminder",
                         "actionPrompt": "Create a reminder from the deadline."
-                    }
-                ]
-            }),
-        )
-        .unwrap();
-        serde_json::from_str::<Value>(&raw).unwrap()["task"]["id"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    }
-
-    fn create_typed_telegram_monitor_task(state: &mut AppState, cwd: &Path) -> String {
-        let raw = execute_task_create(
-            state,
-            cwd,
-            json!({
-                "subject": "Reply to Alice about WLF latest",
-                "description": "Alice asked for the latest WLF update.",
-                "receivedAt": "2026-06-10T13:00:00Z",
-                "expiresAt": "2026-06-11T13:00:00Z",
-                "metadata": {
-                    "_monitor": true,
-                    "monitor_connection": "telegram-user",
-                    "monitor_connector": "telegram-login",
-                    "monitor_memory_path": "/tmp/telegram-user.md",
-                    "monitor": {
-                        "schema_version": 2,
-                        "kind": "telegram.reply",
-                        "source": {
-                            "connector_slug": "telegram-login",
-                            "connection_slug": "telegram-user",
-                            "chat_id": "8759047281",
-                            "chat_kind": "user",
-                            "message_id": 6836,
-                            "sender_id": "8759047281",
-                            "sender_username": "alice",
-                            "text": "What's the latest on WLF?"
-                        },
-                        "action": {
-                            "type": "telegram_reply_draft",
-                            "approval": "draft_then_send"
-                        }
-                    }
-                },
-                "actions": [
-                    {
-                        "actionName": "Draft reply",
-                        "actionPrompt": "Research the answer and draft a Telegram reply."
-                    }
-                ]
-            }),
-        )
-        .unwrap();
-        serde_json::from_str::<Value>(&raw).unwrap()["task"]["id"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    }
-
-    fn create_gmail_monitor_task(state: &mut AppState, cwd: &Path) -> String {
-        let raw = execute_task_create(
-            state,
-            cwd,
-            json!({
-                "subject": "Confirm next week's meeting",
-                "description": "Reply to the Gmail thread with available times.",
-                "receivedAt": "2026-06-10T13:00:00Z",
-                "expiresAt": "2026-06-11T13:00:00Z",
-                "metadata": {
-                    "_monitor": true,
-                    "monitor_connection": "gmail-browser",
-                    "monitor_connector": "gmail-browser",
-                    "monitor_memory_path": "/tmp/gmail-browser.md",
-                    "monitor": {
-                        "schema_version": 2,
-                        "kind": "gmail.reply",
-                        "source": {
-                            "connector_slug": "gmail-browser",
-                            "connection_slug": "gmail-browser",
-                            "account": "winterfell0614@gmail.com",
-                            "thread_id": "thread-123",
-                            "message_id": "message-123",
-                            "from": {
-                                "name": "Fu Xiangyu",
-                                "email": "fuxiangyu@example.com"
-                            }
-                        },
-                        "action": {
-                            "type": "gmail_reply_draft",
-                            "approval": "draft_then_create_gmail_draft"
-                        }
-                    }
-                },
-                "actions": [
-                    {
-                        "actionName": "Draft email",
-                        "actionPrompt": "Draft a reply to the Gmail sender."
                     }
                 ]
             }),
@@ -4275,6 +3603,143 @@ mod tests {
         (meta, subject.to_string())
     }
 
+    fn issue655_with_sender(
+        base: (Map<String, Value>, String),
+        sender_id: i64,
+    ) -> (Map<String, Value>, String) {
+        let (mut meta, subject) = base;
+        meta.insert("sender_id".into(), json!(sender_id));
+        (meta, subject)
+    }
+
+    fn issue655_existing_with_sender(subject: &str, sender_id: i64) -> StoredTask {
+        let mut task = issue625_existing(subject, "pending", None, false);
+        task.metadata.insert("sender_id".into(), json!(sender_id));
+        task
+    }
+
+    #[test]
+    fn issue_655_same_subject_different_senders_do_not_fold() {
+        // Two different people asking the same thing in one group are two
+        // distinct requests — the subject leg must not collapse them
+        // (agentenv/monorepo#655).
+        let original = issue655_existing_with_sender(
+            "Telegram: road test registration needs immediate decision",
+            42,
+        );
+        let (candidate, subject) = issue655_with_sender(
+            issue625_candidate(
+                "Telegram: road test registration needs immediate decision",
+                None,
+            ),
+            43,
+        );
+        assert!(
+            duplicate_monitor_task_skip(&[original], &candidate, &subject).is_none(),
+            "different senders with the same subject must each keep a task"
+        );
+    }
+
+    #[test]
+    fn issue_655_same_subject_same_sender_still_folds() {
+        let original = issue655_existing_with_sender(
+            "Telegram: road test registration needs immediate decision",
+            42,
+        );
+        let (candidate, subject) = issue655_with_sender(
+            issue625_candidate(
+                "Telegram: road test registration needs immediate decision",
+                None,
+            ),
+            42,
+        );
+        let v = duplicate_monitor_task_skip(&[original], &candidate, &subject)
+            .expect("same sender + same open subject still folds (#432)");
+        assert_eq!(v["reason"], "duplicate_monitor_task");
+    }
+
+    #[test]
+    fn issue_655_unknown_sender_keeps_historical_fold() {
+        // If either side lacks a sender (DMs, older records), behavior is
+        // unchanged: subject-only fold.
+        let original = issue625_existing(
+            "Telegram: road test registration needs immediate decision",
+            "pending",
+            None,
+            false,
+        );
+        let (candidate, subject) = issue655_with_sender(
+            issue625_candidate(
+                "Telegram: road test registration needs immediate decision",
+                None,
+            ),
+            43,
+        );
+        let v = duplicate_monitor_task_skip(&[original], &candidate, &subject)
+            .expect("unknown sender on one side keeps the historical fold");
+        assert_eq!(v["reason"], "duplicate_monitor_task");
+    }
+
+    #[test]
+    fn issue_655_mixed_sender_burst_stamps_sender_ids() {
+        // A burst whose stamps disagree on sender_id has no single sender to
+        // stamp, but the distinct set is recorded so dedup can tell a known
+        // multi-sender burst apart from a sender-less record.
+        let stamps = vec![
+            issue625_stamp("env-a", 8_689_648_954, 42, 6090),
+            issue625_stamp("env-b", 8_689_648_954, 43, 6091),
+        ];
+        let mut metadata = serde_json::Map::new();
+        stamp_shared_monitor_source_identity(&mut metadata, &stamps);
+        assert_eq!(metadata.get("sender_id"), None);
+        assert_eq!(metadata.get("sender_ids"), Some(&json!([42, 43])));
+    }
+
+    #[test]
+    fn issue_655_multi_sender_burst_does_not_fold_into_single_sender_task() {
+        // A consolidated burst carrying messages from Alice AND Bob must not
+        // be absorbed by Alice's pre-existing same-subject task — that would
+        // silently drop Bob's request (agentenv/monorepo#655).
+        let original = issue655_existing_with_sender(
+            "Telegram: road test registration needs immediate decision",
+            42,
+        );
+        let (mut candidate, subject) = issue625_candidate(
+            "Telegram: road test registration needs immediate decision",
+            None,
+        );
+        candidate.insert("sender_ids".into(), json!([42, 43]));
+        assert!(
+            duplicate_monitor_task_skip(&[original], &candidate, &subject).is_none(),
+            "a multi-sender burst must keep its own task"
+        );
+    }
+
+    #[test]
+    fn issue_655_single_sender_folds_into_burst_that_contains_them() {
+        // The converse: one more message from a sender already represented by
+        // an open multi-sender burst task is still a duplicate.
+        let mut original = issue625_existing(
+            "Telegram: road test registration needs immediate decision",
+            "pending",
+            None,
+            false,
+        );
+        original
+            .metadata
+            .insert("sender_ids".into(), json!([42, 43]));
+        let (candidate, subject) = issue655_with_sender(
+            issue625_candidate(
+                "Telegram: road test registration needs immediate decision",
+                None,
+            ),
+            42,
+        );
+        let v = duplicate_monitor_task_skip(&[original], &candidate, &subject)
+            .expect("a sender already in the burst still folds");
+        assert_eq!(v["reason"], "duplicate_monitor_task");
+    }
+
     #[test]
     fn issue_625_same_message_id_dedups_across_completion() {
         // The #625 fix: a reconnect/replay re-delivers the EXACT same Telegram message
@@ -4286,8 +3751,10 @@ mod tests {
             Some(6080),
             false,
         );
-        let (candidate, subject) =
-            issue625_candidate("Telegram: a re-paraphrased subject for the same message", Some(6080));
+        let (candidate, subject) = issue625_candidate(
+            "Telegram: a re-paraphrased subject for the same message",
+            Some(6080),
+        );
         let v = duplicate_monitor_task_skip(&[original], &candidate, &subject)
             .expect("same message id must dedup across completion");
         assert_eq!(v["reason"], "duplicate_source");
@@ -4411,6 +3878,46 @@ mod tests {
     }
 
     #[test]
+    fn issue_761_generic_review_contract_carries_uniform_chat_identity() {
+        // A same-chat burst must keep its chat identity inside the contract
+        // source so the source_context can render a delivery target
+        // (agentenv/monorepo#761). It is stamped verbatim as an i64, exactly
+        // like the single-source telegram contract; the renderer's
+        // string_field coerces numeric ids.
+        let stamps = vec![
+            issue625_stamp("env-a", 8_689_648_954, 42, 6090),
+            issue625_stamp("env-b", 8_689_648_954, 42, 6091),
+        ];
+        let contract = generic_review_contract_from_stamps(&stamps);
+        assert_eq!(
+            contract.source.get("chat_id"),
+            Some(&json!(8_689_648_954i64)),
+            "chat_id is stamped verbatim as an i64"
+        );
+        assert_eq!(
+            contract.source.get("source_message_ids"),
+            Some(&json!([6090, 6091]))
+        );
+    }
+
+    #[test]
+    fn issue_761_cross_chat_contract_has_no_chat_identity() {
+        // Non-uniform chat_id -> no single chat to deliver to -> no identity
+        // stamped; the task stays review-only.
+        let stamps = vec![
+            issue625_stamp("env-a", 111, 42, 6090),
+            issue625_stamp("env-b", 222, 42, 6091),
+        ];
+        let contract = generic_review_contract_from_stamps(&stamps);
+        assert_eq!(contract.source.get("chat_id"), None);
+        assert_eq!(
+            contract.source.get("source_message_ids"),
+            Some(&json!([6090, 6091])),
+            "per-message ids are kept for dedup/audit even cross-chat"
+        );
+    }
+
+    #[test]
     fn issue_625_generic_review_task_dedups_by_message_id() {
         // The goal of option (a): a consolidated generic.review task now carries
         // chat_id + source_message_ids, so a re-delivery of one of its messages dedups
@@ -4435,7 +3942,8 @@ mod tests {
         }))
         .expect("construct generic.review StoredTask");
         // A re-delivery of message 6090 (same chat) as a fresh single-source candidate.
-        let (candidate, subject) = issue625_candidate("Telegram: a re-paraphrased subject", Some(6090));
+        let (candidate, subject) =
+            issue625_candidate("Telegram: a re-paraphrased subject", Some(6090));
         let v = duplicate_monitor_task_skip(&[existing], &candidate, &subject)
             .expect("re-delivery of a message already in a generic.review task should dedup");
         assert_eq!(v["reason"], "duplicate_source");
@@ -4668,7 +4176,7 @@ mod tests {
     }
 
     #[test]
-    fn task_update_rejects_generic_completion_for_human_gated_monitor_task() {
+    fn task_update_rejects_generic_completion_for_completion_policy_monitor_task() {
         let (mut state, tmp) = make_state();
         let task_id = create_telegram_monitor_task(&mut state, tmp.path());
 
@@ -4680,7 +4188,7 @@ mod tests {
                 "status": "completed"
             }),
         )
-        .expect_err("human-gated monitor tasks need approval before completion");
+        .expect_err("completion-policy monitor tasks need approval before completion");
 
         assert!(error
             .to_string()
@@ -4688,11 +4196,11 @@ mod tests {
     }
 
     #[test]
-    fn task_update_rejects_completion_for_telegram_delivery_target_without_policy() {
+    fn task_update_allows_completion_for_telegram_delivery_target_without_policy() {
         let (mut state, tmp) = make_state();
         let task_id = create_telegram_non_reply_monitor_task(&mut state, tmp.path());
 
-        let error = execute_task_update(
+        execute_task_update(
             &mut state,
             tmp.path(),
             json!({
@@ -4700,130 +4208,10 @@ mod tests {
                 "status": "completed"
             }),
         )
-        .expect_err("Telegram delivery-target monitor tasks need approval before completion");
-
-        assert!(error
-            .to_string()
-            .contains("must be completed through its monitor action"));
-    }
-
-    #[test]
-    fn monitor_reply_send_uses_recorded_source_chat_only() {
-        let (mut state, tmp) = make_state();
-        let task_id = create_telegram_monitor_task(&mut state, tmp.path());
-        let task = load_monitor_task(tmp.path(), &task_id).unwrap().unwrap();
-
-        let target = monitor_reply_target(&task).unwrap();
-        let input = monitor_reply_connector_act_input(&target, "Acknowledged.");
-
-        assert_eq!(target.connection_slug, "telegram-user");
-        assert_eq!(target.connector_slug, "telegram-login");
-        assert_eq!(target.chat_id, "8759047281");
-        assert_eq!(input["connection_slug"], "telegram-user");
-        assert_eq!(input["connector_slug"], "telegram-login");
-        assert_eq!(input["action"], "send_message");
-        assert_eq!(input["input"]["chat_id"], "8759047281");
-        assert_eq!(input["input"]["message"], "Acknowledged.");
-        assert!(input["input"].get("to").is_none());
-        assert!(input["input"].get("target").is_none());
-    }
-
-    #[test]
-    fn monitor_reply_send_rejects_human_gated_monitor_tasks() {
-        let (mut state, tmp) = make_state();
-        let task_id = create_telegram_monitor_task(&mut state, tmp.path());
-
-        let error = execute_monitor_reply_send(
-            &mut state,
-            tmp.path(),
-            json!({
-                "taskId": task_id,
-                "message": "Acknowledged."
-            }),
-        )
-        .expect_err("human-gated monitor replies must not be sent by agent tools");
-
-        assert!(error.to_string().contains("requires human approval"));
-    }
-
-    #[test]
-    fn monitor_reply_send_rejects_telegram_delivery_target_without_policy() {
-        let (mut state, tmp) = make_state();
-        let task_id = create_telegram_non_reply_monitor_task(&mut state, tmp.path());
-
-        let error = execute_monitor_reply_send(
-            &mut state,
-            tmp.path(),
-            json!({
-                "taskId": task_id,
-                "message": "Acknowledged."
-            }),
-        )
-        .expect_err("Telegram delivery-target tasks must not be sent by agent tools");
-
-        assert!(error.to_string().contains("requires human approval"));
-    }
-
-    #[test]
-    fn monitor_reply_draft_requires_matching_monitor_reply_scope() {
-        let (mut state, tmp) = make_state();
-        let task_id = create_telegram_monitor_task(&mut state, tmp.path());
-
-        let error = execute_monitor_reply_draft(
-            &mut state,
-            tmp.path(),
-            json!({
-                "taskId": task_id,
-                "message": "Acknowledged."
-            }),
-        )
-        .expect_err("draft tool must be scoped to a monitor action turn");
-
-        assert!(error.to_string().contains("monitor reply scope"));
-    }
-
-    #[test]
-    fn monitor_reply_draft_saves_server_owned_source_snapshot() {
-        let (mut state, tmp) = make_state();
-        let task_id = create_telegram_monitor_task(&mut state, tmp.path());
-        state.set_monitor_reply_scope_for_turn(
-            task_id.clone(),
-            "session-1".to_string(),
-            "turn-1".to_string(),
-        );
-
-        execute_monitor_reply_draft(
-            &mut state,
-            tmp.path(),
-            json!({
-                "taskId": task_id,
-                "message": "Acknowledged."
-            }),
-        )
-        .unwrap();
+        .expect("delivery target alone is no longer a completion gate");
 
         let task = load_monitor_task(tmp.path(), &task_id).unwrap().unwrap();
-        let pending = task
-            .metadata
-            .get("pending_reply")
-            .and_then(Value::as_object)
-            .expect("draft metadata should be stored");
-
-        assert_eq!(
-            pending.get("status").and_then(Value::as_str),
-            Some("draft_ready")
-        );
-        assert_eq!(
-            pending.get("agent_draft_text").and_then(Value::as_str),
-            Some("Acknowledged.")
-        );
-        assert_eq!(
-            Value::Object(pending.clone())
-                .pointer("/source_context_snapshot/delivery_target/chat_id")
-                .and_then(Value::as_str),
-            Some("8759047281")
-        );
-        assert!(pending.get("source_context_hash").is_some());
+        assert_eq!(task.status, "completed");
     }
 
     #[test]
@@ -4839,260 +4227,8 @@ mod tests {
         assert_eq!(task.created_at_ms, task.updated_at_ms);
     }
 
-    #[test]
-    fn monitor_reply_draft_allows_in_progress_task() {
-        let (mut state, tmp) = make_state();
-        let task_id = create_telegram_monitor_task(&mut state, tmp.path());
-        execute_task_update(
-            &mut state,
-            tmp.path(),
-            json!({ "taskId": task_id, "status": "in_progress" }),
-        )
-        .unwrap();
-        assert_eq!(
-            load_monitor_task(tmp.path(), &task_id)
-                .unwrap()
-                .unwrap()
-                .status,
-            "in_progress"
-        );
-        state.set_monitor_reply_scope_for_turn(
-            task_id.clone(),
-            "session-1".to_string(),
-            "turn-1".to_string(),
-        );
-
-        execute_monitor_reply_draft(
-            &mut state,
-            tmp.path(),
-            json!({ "taskId": task_id, "message": "排查结论稍后给出。" }),
-        )
-        .unwrap();
-
-        let task = load_monitor_task(tmp.path(), &task_id).unwrap().unwrap();
-        let pending = task
-            .metadata
-            .get("pending_reply")
-            .and_then(Value::as_object)
-            .expect("in_progress tasks must accept drafts");
-        assert_eq!(
-            pending.get("status").and_then(Value::as_str),
-            Some("draft_ready")
-        );
-    }
-
-    #[test]
-    fn monitor_reply_draft_rejects_terminal_task() {
-        let (mut state, tmp) = make_state();
-        let task_id = create_telegram_monitor_task(&mut state, tmp.path());
-        // TaskUpdate itself refuses agent-driven completion of human-gated
-        // tasks, so build the terminal state directly in the store (the ignore
-        // flow and reply-completion writeback land tasks here).
-        let path = monitor_tasks_path(tmp.path());
-        let mut store = load_store::<TaskStore>(&path).unwrap();
-        store
-            .tasks
-            .iter_mut()
-            .find(|task| task.task_id == task_id)
-            .unwrap()
-            .status = "completed".to_string();
-        save_store(&path, &store).unwrap();
-        state.set_monitor_reply_scope_for_turn(
-            task_id.clone(),
-            "session-1".to_string(),
-            "turn-1".to_string(),
-        );
-
-        let error = execute_monitor_reply_draft(
-            &mut state,
-            tmp.path(),
-            json!({ "taskId": task_id, "message": "Too late." }),
-        )
-        .expect_err("terminal tasks must not accept drafts");
-
-        assert!(error.to_string().contains("terminal status"));
-    }
-
-    #[test]
-    fn monitor_reply_draft_rejects_typed_monitor_tasks() {
-        let (mut state, tmp) = make_state();
-        let task_id = create_typed_telegram_monitor_task(&mut state, tmp.path());
-        state.set_monitor_reply_scope_for_turn(
-            task_id.clone(),
-            "session-1".to_string(),
-            "turn-1".to_string(),
-        );
-
-        let error = execute_monitor_reply_draft(
-            &mut state,
-            tmp.path(),
-            json!({
-                "taskId": task_id,
-                "message": "Acknowledged."
-            }),
-        )
-        .expect_err("legacy reply draft tool must reject typed tasks");
-
-        assert!(error.to_string().contains("use MonitorActionDraft"));
-    }
-
-    #[test]
-    fn monitor_action_draft_requires_matching_monitor_action_scope() {
-        let (mut state, tmp) = make_state();
-        let task_id = create_gmail_monitor_task(&mut state, tmp.path());
-
-        let error = execute_monitor_action_draft(
-            &mut state,
-            tmp.path(),
-            json!({
-                "taskId": task_id,
-                "message": "Thanks, next Tuesday afternoon works for me."
-            }),
-        )
-        .expect_err("draft tool must be scoped to a typed monitor action turn");
-
-        assert!(error.to_string().contains("monitor action scope"));
-    }
-
-    #[test]
-    fn monitor_action_draft_saves_gmail_pending_action() {
-        let (mut state, tmp) = make_state();
-        let task_id = create_gmail_monitor_task(&mut state, tmp.path());
-        state.set_monitor_reply_scope_for_turn(
-            task_id.clone(),
-            "session-1".to_string(),
-            "turn-1".to_string(),
-        );
-
-        execute_monitor_action_draft(
-            &mut state,
-            tmp.path(),
-            json!({
-                "taskId": task_id,
-                "message": "Thanks, next Tuesday afternoon works for me."
-            }),
-        )
-        .unwrap();
-
-        let task = load_monitor_task(tmp.path(), &task_id).unwrap().unwrap();
-        let metadata = Value::Object(task.metadata.clone());
-        let pending = task
-            .metadata
-            .get("pending_action")
-            .and_then(Value::as_object)
-            .expect("typed pending action should be stored");
-
-        assert_eq!(
-            pending.get("type").and_then(Value::as_str),
-            Some("gmail_reply_draft_intent")
-        );
-        assert_eq!(
-            pending.get("status").and_then(Value::as_str),
-            Some("draft_ready")
-        );
-        assert_eq!(
-            pending.get("agent_draft_text").and_then(Value::as_str),
-            Some("Thanks, next Tuesday afternoon works for me.")
-        );
-        assert_eq!(
-            pending.get("monitor_hash"),
-            metadata.pointer("/monitor/source_hash")
-        );
-        assert_eq!(
-            Value::Object(pending.clone())
-                .pointer("/monitor_snapshot/kind")
-                .and_then(Value::as_str),
-            Some("gmail.reply")
-        );
-    }
-
-    #[test]
-    fn monitor_action_draft_saves_typed_telegram_pending_action() {
-        let (mut state, tmp) = make_state();
-        let task_id = create_typed_telegram_monitor_task(&mut state, tmp.path());
-        state.set_monitor_reply_scope_for_turn(
-            task_id.clone(),
-            "session-1".to_string(),
-            "turn-1".to_string(),
-        );
-
-        execute_monitor_action_draft(
-            &mut state,
-            tmp.path(),
-            json!({
-                "taskId": task_id,
-                "message": "WLF is emphasizing USD1 adoption and regulatory positioning."
-            }),
-        )
-        .unwrap();
-
-        let task = load_monitor_task(tmp.path(), &task_id).unwrap().unwrap();
-        let metadata = Value::Object(task.metadata.clone());
-        let pending = task
-            .metadata
-            .get("pending_action")
-            .and_then(Value::as_object)
-            .expect("typed pending action should be stored");
-
-        assert_eq!(
-            pending.get("type").and_then(Value::as_str),
-            Some("telegram_reply_draft_intent")
-        );
-        assert_eq!(
-            pending.get("status").and_then(Value::as_str),
-            Some("draft_ready")
-        );
-        assert_eq!(
-            pending.get("agent_draft_text").and_then(Value::as_str),
-            Some("WLF is emphasizing USD1 adoption and regulatory positioning.")
-        );
-        assert_eq!(
-            pending.get("monitor_hash"),
-            metadata.pointer("/monitor/source_hash")
-        );
-        assert_eq!(
-            Value::Object(pending.clone())
-                .pointer("/monitor_snapshot/kind")
-                .and_then(Value::as_str),
-            Some("telegram.reply")
-        );
-    }
-
-    #[test]
-    fn monitor_reply_send_rejects_tasks_without_stable_delivery_target() {
-        let (mut state, tmp) = make_state();
-        let raw = execute_task_create(
-            &mut state,
-            tmp.path(),
-            json!({
-                "subject": "Reply to message without source",
-                "description": "Missing Telegram chat id.",
-                "receivedAt": "2026-06-10T13:00:00Z",
-                "expiresAt": "2026-06-11T13:00:00Z",
-                "metadata": {
-                    "_monitor": true,
-                    "monitor_connection": "telegram-user",
-                    "monitor_connector": "telegram-login"
-                }
-            }),
-        )
-        .unwrap();
-        let task_id = serde_json::from_str::<Value>(&raw)
-            .unwrap()
-            .pointer("/task/id")
-            .and_then(Value::as_str)
-            .unwrap()
-            .to_string();
-        let task = load_monitor_task(tmp.path(), &task_id).unwrap().unwrap();
-
-        let error = monitor_reply_target(&task).expect_err("missing chat_id must be rejected");
-
-        assert!(error.to_string().contains("has no source_context"));
-    }
-
-    /// Creates a plain (non-human-gated) monitor task — no telegram connector,
-    /// no reply action, no delivery target — so `monitor_task_is_human_gated`
-    /// returns false and `TaskUpdate` is allowed to complete it directly.
+    /// Creates a plain monitor task without a completion policy that requires
+    /// human approval, so `TaskUpdate` is allowed to complete it directly.
     fn create_plain_monitor_task(state: &mut AppState, cwd: &Path) -> String {
         let raw = execute_task_create(
             state,
@@ -5123,11 +4259,11 @@ mod tests {
         let (mut state, tmp) = make_state();
         let task_id = create_plain_monitor_task(&mut state, tmp.path());
 
-        // Confirm the task is NOT human-gated before we proceed
+        // Confirm the task is NOT gated by completion policy before we proceed
         let task = load_monitor_task(tmp.path(), &task_id).unwrap().unwrap();
         assert!(
-            !monitor_task_is_human_gated(&task),
-            "test setup: task should not be human-gated"
+            !monitor_task_requires_human_approval(&task),
+            "test setup: task should not be gated by completion policy"
         );
 
         // WHEN execute_task_update completes it with completed_via in metadata
@@ -5190,16 +4326,16 @@ mod tests {
     }
 
     #[test]
-    fn triage_turn_completes_human_gated_monitor_task() {
-        // GIVEN a human-gated telegram monitor task (telegram connector + chat_id)
+    fn triage_turn_completes_completion_policy_monitor_task() {
+        // GIVEN a monitor task whose completion policy requires approval.
         let (mut state, tmp) = make_state();
         let task_id = create_telegram_monitor_task(&mut state, tmp.path());
 
-        // Confirm it IS human-gated
+        // Confirm it IS gated by completion policy.
         let task = load_monitor_task(tmp.path(), &task_id).unwrap().unwrap();
         assert!(
-            monitor_task_is_human_gated(&task),
-            "test setup: task should be human-gated"
+            monitor_task_requires_human_approval(&task),
+            "test setup: task should be gated by completion policy"
         );
 
         // AND a state that is running inside a monitor triage turn
@@ -5214,7 +4350,7 @@ mod tests {
                 "status": "completed"
             }),
         )
-        .expect("triage turn must be allowed to complete a human-gated monitor task");
+        .expect("triage turn must be allowed to complete a policy-gated monitor task");
 
         // THEN it persists status=completed with completed_via stamped
         let path = monitor_tasks_path(tmp.path());
@@ -5232,8 +4368,8 @@ mod tests {
     }
 
     #[test]
-    fn task_update_still_refuses_human_gated_monitor_completion() {
-        // GIVEN a human-gated monitor task (telegram connector + chat_id triggers the gate)
+    fn task_update_still_refuses_completion_policy_monitor_completion() {
+        // GIVEN a monitor task whose completion policy requires approval.
         let (mut state, tmp) = make_state();
         let task_id = create_telegram_monitor_task(&mut state, tmp.path());
 
@@ -5243,11 +4379,11 @@ mod tests {
             "test setup: a non-triage caller must keep monitor_triage_turn = false"
         );
 
-        // Confirm it IS human-gated
+        // Confirm it IS gated by completion policy.
         let task = load_monitor_task(tmp.path(), &task_id).unwrap().unwrap();
         assert!(
-            monitor_task_is_human_gated(&task),
-            "test setup: task should be human-gated"
+            monitor_task_requires_human_approval(&task),
+            "test setup: task should be gated by completion policy"
         );
 
         // WHEN execute_task_update tries status: completed
@@ -5259,7 +4395,7 @@ mod tests {
                 "status": "completed"
             }),
         )
-        .expect_err("human-gated monitor tasks must not be completable by agent");
+        .expect_err("policy-gated monitor tasks must not be completable by agent");
 
         // THEN it errors with the expected message
         assert!(

@@ -608,8 +608,7 @@ pub(crate) fn run_streaming_loop(
                 {
                     let before_len = items.len();
                     let compacted = {
-                        let summary_fn =
-                            |old: &str, mid: &str| session.generate_summary(old, mid);
+                        let summary_fn = |old: &str, mid: &str| session.generate_summary(old, mid);
                         force_compact_conversation_with(
                             &mut items,
                             inputs.provider,

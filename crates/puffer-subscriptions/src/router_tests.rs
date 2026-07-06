@@ -47,6 +47,14 @@ mod tests {
         }
     }
 
+    /// Test double: reports success for every dispatch.
+    struct OkDispatcher;
+    impl ActionDispatcher for OkDispatcher {
+        fn dispatch(&self, _action: &ActionSpec, _envelope: &EventEnvelope) -> ActionResult {
+            ActionResult::success("ok")
+        }
+    }
+
     fn monitor_binding_with_classify_prompt() -> WorkflowBindingSpec {
         WorkflowBindingSpec {
             slug: "monitor-telegram-user".into(),
@@ -223,7 +231,10 @@ mod tests {
             &gate,
         );
 
-        assert!(result.matched, "monitor binding may handle the self message");
+        assert!(
+            result.matched,
+            "monitor binding may handle the self message"
+        );
         assert_eq!(result.acted, 1);
         assert_eq!(result.failed, 0);
         assert_eq!(
@@ -1437,14 +1448,6 @@ mod tests {
 
     #[test]
     fn contact_filters_suppress_unlisted_contacts() {
-        struct OkDispatcher;
-
-        impl ActionDispatcher for OkDispatcher {
-            fn dispatch(&self, _action: &ActionSpec, _envelope: &EventEnvelope) -> ActionResult {
-                ActionResult::success("ok")
-            }
-        }
-
         let dir = tempdir().unwrap();
         let store = WorkflowBindingStore::load(dir.path().join("bindings.json")).unwrap();
         store
@@ -1668,12 +1671,6 @@ mod tests {
         // BuiltinActionDispatcher, whose ForwardMessage fails with no outbound
         // configured — which incidentally tested the buggy "failed run blocks
         // forever" behavior. Dedup-on-replay is about successfully-handled events.)
-        struct OkDispatcher;
-        impl ActionDispatcher for OkDispatcher {
-            fn dispatch(&self, _action: &ActionSpec, _envelope: &EventEnvelope) -> ActionResult {
-                ActionResult::success("forwarded")
-            }
-        }
         let dispatcher: Arc<dyn ActionDispatcher> = Arc::new(OkDispatcher);
         let classifier: Arc<dyn Classifier> = Arc::new(NullClassifier);
         let history_store = WorkflowHistoryStore::load(dir.path().join("history.json")).unwrap();
@@ -2055,7 +2052,10 @@ mod tests {
                 contact_ids: Vec::new(),
                 classify_prompt: None,
                 classify_model: None,
-                action: ActionSpec::TriageAgent { prompt: "triage".into(), model: None },
+                action: ActionSpec::TriageAgent {
+                    prompt: "triage".into(),
+                    model: None,
+                },
                 created_at_ms: 0,
             })
             .unwrap();
@@ -2076,9 +2076,18 @@ mod tests {
             },
         };
         let denied = process_envelope_result(
-            &envelope, &store, Some(&history_store), &dispatcher, &classifier, None, &drop_all_gate(),
+            &envelope,
+            &store,
+            Some(&history_store),
+            &dispatcher,
+            &classifier,
+            None,
+            &drop_all_gate(),
         );
-        assert!(!denied.matched, "no positive selector => denied before triage");
+        assert!(
+            !denied.matched,
+            "no positive selector => denied before triage"
+        );
         let hist = history_store.list();
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0].action_log[0].action, "monitor_lark_default_deny");
@@ -2095,12 +2104,17 @@ mod tests {
                 connection_slug: "lark-browser".into(),
                 connector_slug: Some("lark-browser".into()),
                 status: WorkflowBindingStatus::Enabled,
-                filter: Some(FilterSpec::Json(serde_json::json!({"chat_id":"7649938091766976625"}))),
+                filter: Some(FilterSpec::Json(
+                    serde_json::json!({"chat_id":"7649938091766976625"}),
+                )),
                 ignore_filters: Vec::new(),
                 contact_ids: Vec::new(),
                 classify_prompt: None,
                 classify_model: None,
-                action: ActionSpec::TriageAgent { prompt: "triage".into(), model: None },
+                action: ActionSpec::TriageAgent {
+                    prompt: "triage".into(),
+                    model: None,
+                },
                 created_at_ms: 0,
             })
             .unwrap();
@@ -2120,9 +2134,18 @@ mod tests {
             },
         };
         let passed = process_envelope_result(
-            &envelope, &store, None, &dispatcher, &classifier, None, &drop_all_gate(),
+            &envelope,
+            &store,
+            None,
+            &dispatcher,
+            &classifier,
+            None,
+            &drop_all_gate(),
         );
-        assert!(passed.matched, "positive selector => passes the guard (chat_id matches)");
+        assert!(
+            passed.matched,
+            "positive selector => passes the guard (chat_id matches)"
+        );
     }
 
     #[test]
@@ -2141,7 +2164,10 @@ mod tests {
                 contact_ids: Vec::new(),
                 classify_prompt: None,
                 classify_model: None,
-                action: ActionSpec::TriageAgent { prompt: "triage".into(), model: None },
+                action: ActionSpec::TriageAgent {
+                    prompt: "triage".into(),
+                    model: None,
+                },
                 created_at_ms: 0,
             })
             .unwrap();
@@ -2161,8 +2187,261 @@ mod tests {
             },
         };
         let passed = process_envelope_result(
-            &envelope, &store, None, &dispatcher, &classifier, None, &drop_all_gate(),
+            &envelope,
+            &store,
+            None,
+            &dispatcher,
+            &classifier,
+            None,
+            &drop_all_gate(),
         );
-        assert!(passed.matched, "non-lark topic must NOT be denied by the lark guard");
+        assert!(
+            passed.matched,
+            "non-lark topic must NOT be denied by the lark guard"
+        );
+    }
+
+    #[test]
+    fn sender_is_self_only_event_never_reaches_non_monitor_binding() {
+        // #756 regression: a self-authored message whose grammers `out` bit was
+        // lost (is_outgoing absent) must still be treated as self and must not
+        // dispatch a non-monitor (e.g. auto-reply connector_act) binding.
+        let dir = tempdir().unwrap();
+        let store = WorkflowBindingStore::load(dir.path().join("bindings.json")).unwrap();
+        store.create(auto_reply_binding()).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dispatcher: Arc<dyn ActionDispatcher> = Arc::new(CountingDispatcher {
+            calls: calls.clone(),
+        });
+        let classifier: Arc<dyn Classifier> = Arc::new(NullClassifier);
+        // Gate returning true: proves the non-monitor skip is structural, not
+        // dependent on the gate verdict.
+        let gate: Arc<dyn SelfMessageGate> = Arc::new(AllowAllSelfGate);
+
+        let envelope = EventEnvelope {
+            envelope_id: "env-self-1".into(),
+            subscriber_id: "telegram-user".into(),
+            received_at_ms: 0,
+            event: Event {
+                topic: "telegram-user".into(),
+                kind: "message".into(),
+                control: false,
+                dedup_key: None,
+                text: "my own message".into(),
+                // NOTE: no is_outgoing — only the Task-1 dual-signal field.
+                payload: serde_json::json!({ "sender_is_self": true, "chat_id": 42 }),
+            },
+        };
+
+        let result = process_envelope_result(
+            &envelope,
+            &store,
+            None,
+            &dispatcher,
+            &classifier,
+            None,
+            &gate,
+        );
+
+        assert!(
+            !result.matched,
+            "self event must not match non-monitor binding"
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn inbound_events_are_not_diverted_by_falsy_sender_is_self() {
+        // Negative guard for #756: `sender_is_self: false`, the key absent,
+        // and a non-bool `"true"` (payload_bool is bool-only) must all flow
+        // through normal dispatch even with the default drop-all self gate —
+        // otherwise genuine inbound mail would silently vanish from triage.
+        let dir = tempdir().unwrap();
+        let store = WorkflowBindingStore::load(dir.path().join("bindings.json")).unwrap();
+        store.create(auto_reply_binding()).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dispatcher: Arc<dyn ActionDispatcher> = Arc::new(CountingDispatcher {
+            calls: calls.clone(),
+        });
+        let classifier: Arc<dyn Classifier> = Arc::new(NullClassifier);
+        let payloads = [
+            serde_json::json!({ "sender_is_self": false, "chat_id": 42 }),
+            serde_json::json!({ "chat_id": 42 }),
+            serde_json::json!({ "sender_is_self": "true", "chat_id": 42 }),
+        ];
+        for (index, payload) in payloads.into_iter().enumerate() {
+            let envelope = EventEnvelope {
+                envelope_id: format!("env-inbound-{index}"),
+                subscriber_id: "telegram-user".into(),
+                received_at_ms: 0,
+                event: Event {
+                    topic: "telegram-user".into(),
+                    kind: "message".into(),
+                    control: false,
+                    dedup_key: None,
+                    text: "hello from a contact".into(),
+                    payload,
+                },
+            };
+            let result = process_envelope_result(
+                &envelope,
+                &store,
+                None,
+                &dispatcher,
+                &classifier,
+                None,
+                &drop_all_gate(),
+            );
+            assert!(result.matched, "inbound variant {index} must match");
+        }
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            3,
+            "all inbound variants dispatched"
+        );
+    }
+
+    #[test]
+    fn self_burst_of_five_is_fully_gated_across_mixed_signals() {
+        // #766 test-matrix row "自发连发 5 条全拦": a burst of five
+        // self-authored messages — three carrying the grammers out bit and
+        // two where the bit was lost and only the sender_is_self backstop
+        // remains — must ALL be gate-skipped on the batch path: dispatcher
+        // never runs, nothing fails, and each envelope records the
+        // router_self_gate_skipped trace stage (the #756 regression was
+        // "only the first message gets skipped").
+        let dir = tempdir().unwrap();
+        let store = WorkflowBindingStore::load(dir.path().join("bindings.json")).unwrap();
+        store
+            .create(monitor_binding_with_classify_prompt())
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dispatcher: Arc<dyn ActionDispatcher> = Arc::new(CountingDispatcher {
+            calls: calls.clone(),
+        });
+        let classifier: Arc<dyn Classifier> = Arc::new(PanicClassifier);
+        let gate = drop_all_gate();
+        let trace_path = dir.path().join("monitor-trace.json");
+        let trace_store = crate::monitor_trace::MonitorTraceStore::load(&trace_path).unwrap();
+
+        let envelopes: Vec<EventEnvelope> = (0..5)
+            .map(|index| {
+                let payload = if index < 3 {
+                    serde_json::json!({ "is_outgoing": true, "chat_id": 42 })
+                } else {
+                    // Out bit lost in delivery: only the identity backstop.
+                    serde_json::json!({ "sender_is_self": true, "chat_id": 42 })
+                };
+                EventEnvelope {
+                    envelope_id: format!("env-burst-{index}"),
+                    subscriber_id: "telegram-user".into(),
+                    received_at_ms: 0,
+                    event: Event {
+                        topic: "telegram-user".into(),
+                        kind: "message".into(),
+                        control: false,
+                        dedup_key: None,
+                        text: format!("my own message {index}"),
+                        payload,
+                    },
+                }
+            })
+            .collect();
+
+        let result = process_envelope_batch_result_with_monitor_digest(
+            &envelopes,
+            &store,
+            None,
+            &dispatcher,
+            &classifier,
+            &gate,
+            None,
+            Some(&trace_store),
+            None,
+        );
+
+        assert!(!result.matched, "no self message may match");
+        assert_eq!(result.acted, 0);
+        assert_eq!(result.failed, 0, "no Failed runs from a self burst");
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            0,
+            "dispatcher must never run for a self burst"
+        );
+        let raw = std::fs::read_to_string(&trace_path).unwrap();
+        assert_eq!(
+            raw.matches("router_self_gate_skipped").count(),
+            5,
+            "every message in the burst records the gate-skip stage"
+        );
+    }
+
+    #[test]
+    fn self_dispatch_with_open_task_records_trace_stage() {
+        let dir = tempdir().unwrap();
+        let store = WorkflowBindingStore::load(dir.path().join("bindings.json")).unwrap();
+        let mut binding = monitor_binding_with_classify_prompt();
+        binding.classify_prompt = None;
+        store.create(binding).unwrap();
+
+        let dispatcher: Arc<dyn ActionDispatcher> = Arc::new(OkDispatcher);
+        let classifier: Arc<dyn Classifier> = Arc::new(NullClassifier);
+        let gate: Arc<dyn SelfMessageGate> = Arc::new(AllowAllSelfGate);
+        let trace_path = dir.path().join("monitor-trace.json");
+        let trace_store = crate::monitor_trace::MonitorTraceStore::load(&trace_path).unwrap();
+
+        let envelope = EventEnvelope {
+            envelope_id: "env-self-trace".into(),
+            subscriber_id: "telegram-user".into(),
+            received_at_ms: 0,
+            event: Event {
+                topic: "telegram-user".into(),
+                kind: "message".into(),
+                control: false,
+                dedup_key: None,
+                text: "done, just sent it".into(),
+                payload: serde_json::json!({ "sender_is_self": true, "chat_id": 42 }),
+            },
+        };
+
+        // Single-envelope path.
+        process_envelope_result_with_monitor_digest(
+            &envelope,
+            &store,
+            None,
+            &dispatcher,
+            &classifier,
+            &gate,
+            None,
+            Some(&trace_store),
+            None,
+        );
+        let raw = std::fs::read_to_string(&trace_path).unwrap();
+        assert!(
+            raw.contains("router_self_dispatch_open_task"),
+            "single path must record stage"
+        );
+
+        // Batch path.
+        let trace_path2 = dir.path().join("monitor-trace-batch.json");
+        let trace_store2 = crate::monitor_trace::MonitorTraceStore::load(&trace_path2).unwrap();
+        process_envelope_batch_result_with_monitor_digest(
+            std::slice::from_ref(&envelope),
+            &store,
+            None,
+            &dispatcher,
+            &classifier,
+            &gate,
+            None,
+            Some(&trace_store2),
+            None,
+        );
+        let raw2 = std::fs::read_to_string(&trace_path2).unwrap();
+        assert!(
+            raw2.contains("router_self_dispatch_open_task"),
+            "batch path must record stage"
+        );
     }
 }

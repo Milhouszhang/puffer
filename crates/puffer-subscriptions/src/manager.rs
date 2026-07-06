@@ -22,6 +22,7 @@ use crate::router::{MonitorDigestQueue, SubscriptionRouter};
 use crate::self_gate::{DropAllSelfGate, SelfMessageGate};
 use crate::store::SubscriptionStore;
 use anyhow::Result;
+use puffer_config::{proxy_env_block, ProxyConfig};
 use puffer_subscriber_runtime::{
     CommandSender, EventBus, EventEnvelope, Manifest, SubscriberCommand, SubscriberHandle,
     SubscriberSupervisor, SupervisorConfig,
@@ -96,6 +97,7 @@ pub struct SubscriptionManagerBuilder {
     self_gate: Arc<dyn SelfMessageGate>,
     auth_checker: Option<Arc<dyn ConnectionAuthChecker>>,
     monitor_digest_interval: Duration,
+    run_finished_observer: Option<crate::history::RunFinishedObserver>,
 }
 
 impl SubscriptionManagerBuilder {
@@ -139,6 +141,7 @@ impl SubscriptionManagerBuilder {
             self_gate: Arc::new(DropAllSelfGate),
             auth_checker: None,
             monitor_digest_interval: monitor_digest_interval_from_env(),
+            run_finished_observer: None,
         }
     }
 
@@ -208,12 +211,28 @@ impl SubscriptionManagerBuilder {
         self
     }
 
+    /// Observer fired when a workflow run reaches a terminal status. Forwarded
+    /// to the history store built in `build`.
+    pub fn with_run_finished_observer(
+        mut self,
+        observer: crate::history::RunFinishedObserver,
+    ) -> Self {
+        self.run_finished_observer = Some(observer);
+        self
+    }
+
     /// Loads the store and spawns the router on the supplied Tokio runtime.
     pub fn build(self, handle: Handle) -> Result<SubscriptionManager> {
         let store = Arc::new(SubscriptionStore::load(&self.store_path)?);
         let connector_store = Arc::new(ConnectorCatalogStore::load(&self.connector_store_path)?);
         let connection_store = Arc::new(ConnectionStore::load(&self.connection_store_path)?);
-        let history_store = Arc::new(WorkflowHistoryStore::load(&self.history_store_path)?);
+        let history_store = Arc::new({
+            let store = WorkflowHistoryStore::load(&self.history_store_path)?;
+            match self.run_finished_observer {
+                Some(observer) => store.with_run_finished_observer(observer),
+                None => store,
+            }
+        });
         let monitor_trace_store =
             Arc::new(MonitorTraceStore::load(&self.monitor_trace_store_path)?);
         // Root cause D: reclaim runs left `Running` by a previous process (crash/kill
@@ -284,6 +303,7 @@ impl SubscriptionManagerBuilder {
             subscribers: Mutex::new(HashMap::new()),
             connector_streams: Mutex::new(HashMap::new()),
             command_wait_locks: Mutex::new(HashMap::new()),
+            proxy_config: Mutex::new(ProxyConfig::default()),
         };
         manager.refresh_connection_consumers()?;
         Ok(manager)
@@ -320,6 +340,9 @@ pub struct SubscriptionManager {
     subscribers: Mutex<HashMap<String, SubscriberHandle>>,
     connector_streams: Mutex<HashMap<String, ConnectorStreamHandle>>,
     command_wait_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Proxy configuration injected into every subscriber child spawn. Updated
+    /// at runtime via `set_proxy_config`; never touches the process env.
+    proxy_config: Mutex<ProxyConfig>,
 }
 
 impl SubscriptionManager {
@@ -750,11 +773,53 @@ impl SubscriptionManager {
             "starting subscriber"
         );
         let bus = self.bus.clone();
+        let supervisor_config = self.supervisor_config_with_proxy();
         let handle = block_on_manager_handle(&self.handle, async move {
-            SubscriberSupervisor::spawn(manifest, bus, SupervisorConfig::default()).await
+            SubscriberSupervisor::spawn(manifest, bus, supervisor_config).await
         })?;
         guard.insert(id.clone(), handle);
         Ok(id)
+    }
+
+    /// Updates the proxy config used for future child spawns. Called by the
+    /// daemon on startup and whenever proxy settings are saved.
+    pub fn set_proxy_config(&self, proxy: ProxyConfig) {
+        *self.proxy_config.lock().unwrap() = proxy;
+    }
+
+    fn supervisor_config_with_proxy(&self) -> SupervisorConfig {
+        let block = proxy_env_block(&self.proxy_config.lock().unwrap());
+        SupervisorConfig {
+            env_set: block.set,
+            env_unset: block.unset,
+            ..SupervisorConfig::default()
+        }
+    }
+
+    /// Respawns subscribers whose egress is proxy-sensitive (currently the
+    /// Telegram MTProto subscriber) so a proxy change takes effect without an
+    /// app restart. Other transports pick the change up via the startup env or
+    /// (browser) their own launch args.
+    pub fn respawn_proxy_sensitive_subscribers(&self) -> Result<()> {
+        const PROXY_SENSITIVE: &[&str] = &["telegram-user"];
+        for id in PROXY_SENSITIVE {
+            let (handle, manifest) = {
+                let mut guard = self.subscribers.lock().unwrap();
+                match guard.remove(*id) {
+                    Some(handle) => {
+                        let manifest = handle.manifest.clone();
+                        (handle, manifest)
+                    }
+                    None => continue, // not running; nothing to respawn
+                }
+            };
+            block_on_manager_handle(&self.handle, async move {
+                handle.shutdown().await;
+                Ok(())
+            })?;
+            self.start_subscriber(manifest)?;
+        }
+        Ok(())
     }
 
     /// Sends a control command to the named subscriber. Returns an error
@@ -976,6 +1041,53 @@ fn health_from_control_event(envelope: &EventEnvelope) -> Option<ConnectionHealt
             updated_at_ms: envelope.received_at_ms,
             next_retry_at_ms: None,
         }),
+        "login_complete" => Some(ConnectionHealth {
+            status: ConnectionHealthStatus::Ok,
+            reason: Some("login_complete".into()),
+            detail: None,
+            updated_at_ms: envelope.received_at_ms,
+            next_retry_at_ms: None,
+        }),
+        // #604: a session resume that failed for auth/network reasons must
+        // degrade the connection immediately instead of waiting for a probe.
+        // Scoped to auth/network only: benign first-login classes (none/config)
+        // are covered by the `login_required` path and must not false-degrade.
+        "resume_failed" => match payload.get("class").and_then(serde_json::Value::as_str) {
+            Some("auth") => Some(ConnectionHealth {
+                status: ConnectionHealthStatus::AuthRequired,
+                reason: string_payload(payload, "reason").or_else(|| Some("resume_failed".into())),
+                detail: string_payload(payload, "detail"),
+                updated_at_ms: envelope.received_at_ms,
+                next_retry_at_ms: None,
+            }),
+            Some("network") => Some(ConnectionHealth {
+                status: ConnectionHealthStatus::Retrying,
+                reason: Some("resume_failed".into()),
+                detail: string_payload(payload, "detail"),
+                updated_at_ms: envelope.received_at_ms,
+                next_retry_at_ms: None,
+            }),
+            _ => None,
+        },
+        // #604: the live update stream terminating is an instant degrade —
+        // auth-class needs re-login, anything else is a retrying network drop.
+        "update_loop_error" => match payload.get("class").and_then(serde_json::Value::as_str) {
+            Some("auth") => Some(ConnectionHealth {
+                status: ConnectionHealthStatus::AuthRequired,
+                reason: Some("update_loop_error".into()),
+                detail: string_payload(payload, "error"),
+                updated_at_ms: envelope.received_at_ms,
+                next_retry_at_ms: None,
+            }),
+            Some(_) => Some(ConnectionHealth {
+                status: ConnectionHealthStatus::Retrying,
+                reason: Some("update_loop_error".into()),
+                detail: string_payload(payload, "error"),
+                updated_at_ms: envelope.received_at_ms,
+                next_retry_at_ms: None,
+            }),
+            None => None,
+        },
         _ => None,
     }
 }

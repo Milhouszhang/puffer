@@ -16,7 +16,7 @@ mod slack_connector_actions;
 mod telegram_connector_actions;
 
 use anyhow::{Context, Result};
-use puffer_config::ConfigPaths;
+use puffer_config::{ConfigPaths, ProxyConfig};
 use puffer_core::install_subscription_manager;
 use puffer_provider_registry::{AuthStore, StoredCredential};
 use puffer_subscriber_runtime::{
@@ -44,13 +44,14 @@ use self::gcal_connector_actions::{
 use self::slack_connector_actions::{
     is_slack_action, is_slack_connector, run_slack_action, SlackConnectionAuthChecker,
 };
+pub(crate) use self::telegram_connector_actions::telegram_subscriber_id;
+#[cfg(test)]
+use self::telegram_connector_actions::validate_telegram_connection_slug;
 use self::telegram_connector_actions::{
     is_telegram_action, is_telegram_connector, telegram_action_via_subscriber,
     telegram_subscriber_for_action, telegram_subscriber_for_platform,
     TelegramConnectionAuthChecker,
 };
-#[cfg(test)]
-use self::telegram_connector_actions::{telegram_subscriber_id, validate_telegram_connection_slug};
 use sha2::{Digest, Sha256};
 
 const SUBSCRIBER_ACTION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -118,6 +119,7 @@ pub(crate) fn install(
     paths: &ConfigPaths,
     auth_store: &AuthStore,
     anthropic_base_url: Option<&str>,
+    proxy_config: ProxyConfig,
 ) -> Result<SubscriptionRuntime> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -138,6 +140,8 @@ pub(crate) fn install(
     builder = builder.with_self_gate(Arc::new(crate::daemon_workflows::MonitorSelfGate::new(
         paths.clone(),
     )));
+    builder = builder
+        .with_run_finished_observer(crate::workflow_run_events::workflow_run_finished_observer());
     let manager = Arc::new(
         builder
             .build(handle)
@@ -155,6 +159,12 @@ pub(crate) fn install(
         paths: paths.clone(),
     }))
     .context("failed to install connector action executor")?;
+
+    // Apply the startup proxy config before autostart so the first-launched
+    // telegram-user child inherits the correct env block immediately, without
+    // waiting for a later set_proxy_config call from the daemon or a
+    // save-settings round-trip.
+    manager.set_proxy_config(proxy_config);
 
     autostart_subscribers(&manager, paths);
     let auth_stop = Arc::new(AtomicBool::new(false));
@@ -1120,6 +1130,29 @@ fn connection_has_instantiated_subscriber(
         return false;
     };
     find_subscriber_manifest(&subscriber_manifest_roots(paths), &subscriber.manifest_slug).is_some()
+}
+
+/// Starts the subscriber backing a connection so the daemon can dispatch
+/// on-demand control commands (e.g. contact-book hydration). Unlike the auth
+/// monitor this does not gate on `has_consumer`: contacts are read on demand
+/// even when no workflow is currently consuming the stream. Idempotent — a
+/// no-op when the subscriber is already running or the connection lacks a
+/// subscriber template.
+pub(crate) fn ensure_subscriber_for_contacts(
+    manager: &SubscriptionManager,
+    paths: &ConfigPaths,
+    slug: &str,
+) -> Result<()> {
+    let Some(connection) = manager.connection_store().get(slug) else {
+        return Ok(());
+    };
+    let Some(template) = manager.connector_store().get(&connection.connector_slug) else {
+        return Ok(());
+    };
+    if template.subscriber.is_none() {
+        return Ok(());
+    }
+    start_connection_subscriber(manager, paths, &connection, &template)
 }
 
 fn start_connection_subscriber(

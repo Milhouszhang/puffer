@@ -1,7 +1,7 @@
 <script lang="ts">
   import "../../design/settings.css";
 
-  import { saveRemoteSettings, saveSecret } from "../../api/desktop";
+  import { loginWithAgentEnv, saveRemoteSettings, saveSecret } from "../../api/desktop";
   import Icon from "../../design/Icon.svelte";
   import type {
     AgentEnvSettings,
@@ -27,7 +27,7 @@
 
   const defaultAgentEnv: AgentEnvSettings = {
     enabled: false,
-    apiUrl: "https://api.agentenv.io",
+    apiUrl: "https://agentenv.io",
     runnerHost: null,
     workspace: null,
     credentialSecretId: null,
@@ -44,9 +44,9 @@
       maxLifetimeSeconds: null
     }
   };
-
   let lastSnapshotKey = $state("");
   let saving = $state(false);
+  let agentenvConnecting = $state(false);
   let error = $state<string | null>(null);
   let saved = $state<string | null>(null);
   let defaultTarget = $state<string | null>(null);
@@ -138,6 +138,22 @@
     };
   }
 
+  async function openAgentEnvLogin() {
+    if (agentenvConnecting) return;
+    agentenvConnecting = true;
+    error = null;
+    saved = null;
+    try {
+      const snapshot = await loginWithAgentEnv();
+      saved = "AgentEnv connected.";
+      props.onSaved(snapshot);
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    } finally {
+      agentenvConnecting = false;
+    }
+  }
+
   function addSshHost() {
     const id = `ssh-${Date.now().toString(36)}`;
     sshHosts = [
@@ -187,7 +203,7 @@
         sshHosts: savedSshHosts,
         agentenv: {
           enabled: agentenv.enabled,
-          apiUrl: normalize(agentenv.apiUrl) ?? "https://api.agentenv.io",
+          apiUrl: normalize(agentenv.apiUrl) ?? "https://agentenv.io",
           runnerHost: normalize(agentenv.runnerHost),
           workspace: validateAgentEnvWorkspace(normalize(agentenv.workspace)),
           credentialSecretId,
@@ -236,122 +252,42 @@
       <h3>{onboarding ? "AgentEnv account" : "AgentEnv account"}</h3>
       <p>
         {onboarding
-          ? "Paste a credential to use AgentEnv for remote execution. Everything else can stay on defaults."
+          ? "Sign in to AgentEnv for remote execution, or skip this step and connect later from Settings."
           : "Use an existing AgentEnv Cloud account. The credential is stored as a Puffer secret."}
       </p>
     </div>
-    <label class="pf-switch">
-      <input
-        type="checkbox"
-        checked={agentenv.enabled}
-        disabled={disabled}
-        onchange={(e) => (agentenv = { ...agentenv, enabled: (e.currentTarget as HTMLInputElement).checked })}
-      />
-      Enabled
-    </label>
+    {#if !onboarding}
+      <label class="pf-switch">
+        <input
+          type="checkbox"
+          checked={agentenv.enabled}
+          disabled={disabled}
+          onchange={(e) => (agentenv = { ...agentenv, enabled: (e.currentTarget as HTMLInputElement).checked })}
+        />
+        Enabled
+      </label>
+    {/if}
   </div>
 
   {#if onboarding}
-    <div class="pf-agentenv-quick">
-      <label>
-        Credential
-        <input
-          class="sc-input"
-          type="password"
-          value={agentenvCredentialDraft}
-          disabled={disabled}
-          placeholder={agentenv.hasCredential ? "Stored secret configured" : "Paste API key or access token"}
-          oninput={(e) => (agentenvCredentialDraft = (e.currentTarget as HTMLInputElement).value)}
-        />
-      </label>
-      <label>
-        API URL
-        <input
-          class="sc-input"
-          value={agentenv.apiUrl}
-          disabled={disabled}
-          placeholder="https://api.agentenv.io"
-          oninput={(e) => (agentenv = { ...agentenv, apiUrl: (e.currentTarget as HTMLInputElement).value })}
-        />
-      </label>
-    </div>
-
-    <details class="pf-advanced-settings">
-      <summary>Advanced AgentEnv settings</summary>
-      <div class="pf-form-grid">
-        <label>
-          Workspace ID
-          <input
-            class="sc-input"
-            value={agentenv.workspace ?? ""}
-            disabled={disabled}
-            placeholder="Optional full workspace UUID"
-            oninput={(e) => (agentenv = { ...agentenv, workspace: (e.currentTarget as HTMLInputElement).value })}
-          />
-        </label>
-        <label>
-          Runner host
-          <input
-            class="sc-input"
-            value={agentenv.runnerHost ?? ""}
-            disabled={disabled}
-            placeholder="Optional"
-            oninput={(e) => (agentenv = { ...agentenv, runnerHost: (e.currentTarget as HTMLInputElement).value })}
-          />
-        </label>
-        <label>
-          Auth method
-          <select
-            class="sc-input"
-            value={agentenv.authMethod}
-            disabled={disabled}
-            onchange={(e) =>
-              (agentenv = {
-                ...agentenv,
-                authMethod: (e.currentTarget as HTMLSelectElement).value as "api_key" | "access_token"
-              })}
-          >
-            <option value="api_key">API key</option>
-            <option value="access_token">Access token</option>
-          </select>
-        </label>
-        <label>
-          Sandbox size
-          <select
-            class="sc-input"
-            value={agentenv.defaults.sandboxType}
-            disabled={disabled}
-            onchange={(e) => updateAgentEnvDefaults({ sandboxType: (e.currentTarget as HTMLSelectElement).value })}
-          >
-            <option value="micro">micro</option>
-            <option value="small">small</option>
-            <option value="medium">medium</option>
-            <option value="large">large</option>
-            <option value="xl">xl</option>
-          </select>
-        </label>
-        <label>
-          Image
-          <input
-            class="sc-input"
-            value={agentenv.defaults.image}
-            disabled={disabled}
-            placeholder="python:3.11-slim"
-            oninput={(e) => updateAgentEnvDefaults({ image: (e.currentTarget as HTMLInputElement).value })}
-          />
-        </label>
-        <label>
-          Region
-          <input
-            class="sc-input"
-            value={agentenv.defaults.region ?? ""}
-            disabled={disabled}
-            placeholder="Optional"
-            oninput={(e) => updateAgentEnvDefaults({ region: (e.currentTarget as HTMLInputElement).value })}
-          />
-        </label>
+    <div class="pf-agentenv-login">
+      <div class="pf-agentenv-login-icon" aria-hidden="true">
+        <Icon name="external" size={18} />
       </div>
-    </details>
+      <div>
+        <strong>{agentenv.hasCredential ? "AgentEnv is already configured" : "Sign in with AgentEnv"}</strong>
+        <span>
+          {agentenv.hasCredential
+            ? "Your saved AgentEnv credential will stay available after onboarding."
+            : "This opens AgentEnv in your browser and stores the returned access token as a Puffer secret."}
+        </span>
+      </div>
+      <div class="pf-agentenv-login-actions">
+        <button type="button" class="sc-btn" data-variant="default" disabled={agentenvConnecting} onclick={openAgentEnvLogin}>
+          <Icon name="external" size={13} />{agentenvConnecting ? "Connecting..." : "Connect AgentEnv"}
+        </button>
+      </div>
+    </div>
   {:else}
     <div class="pf-form-grid">
       <label>
@@ -360,7 +296,7 @@
           class="sc-input"
           value={agentenv.apiUrl}
           disabled={disabled}
-          placeholder="https://api.agentenv.io"
+          placeholder="https://agentenv.io"
           oninput={(e) => (agentenv = { ...agentenv, apiUrl: (e.currentTarget as HTMLInputElement).value })}
         />
       </label>
@@ -524,14 +460,16 @@
   </section>
 {/if}
 
-<div class="pf-settings-actions">
-  <button type="button" class="sc-btn" data-variant="outline" disabled={disabled} onclick={props.onRefresh}>
-    <Icon name="refresh" size={13} />Refresh
-  </button>
-  <button type="button" class="sc-btn" data-variant="default" disabled={disabled} onclick={saveSettings}>
-    <Icon name="check" size={13} />{saving ? "Saving..." : onboarding ? "Save AgentEnv" : "Save remote settings"}
-  </button>
-</div>
+{#if !onboarding}
+  <div class="pf-settings-actions">
+    <button type="button" class="sc-btn" data-variant="outline" disabled={disabled} onclick={props.onRefresh}>
+      <Icon name="refresh" size={13} />Refresh
+    </button>
+    <button type="button" class="sc-btn" data-variant="default" disabled={disabled} onclick={saveSettings}>
+      <Icon name="check" size={13} />{saving ? "Saving..." : "Save remote settings"}
+    </button>
+  </div>
+{/if}
 
 <style>
   .pf-card {
@@ -570,12 +508,6 @@
     gap: 12px;
   }
 
-  .pf-agentenv-quick {
-    display: grid;
-    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
-    gap: 12px;
-  }
-
   .pf-form-grid label {
     display: grid;
     gap: 6px;
@@ -583,28 +515,49 @@
     color: var(--pf-muted, var(--muted-foreground));
   }
 
-  .pf-agentenv-quick label {
+  .pf-agentenv-login {
     display: grid;
-    gap: 6px;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    border: 1px solid var(--pf-border, var(--border));
+    border-radius: 8px;
+    padding: 12px;
+    background: color-mix(in oklab, var(--puffer-accent) 5%, var(--pf-surface, var(--background)));
+  }
+
+  .pf-agentenv-login-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    color: var(--puffer-accent);
+    background: color-mix(in oklab, var(--puffer-accent) 12%, transparent);
+  }
+
+  .pf-agentenv-login strong,
+  .pf-agentenv-login span {
+    display: block;
+  }
+
+  .pf-agentenv-login strong {
+    font-size: 13px;
+  }
+
+  .pf-agentenv-login span {
+    margin-top: 3px;
     color: var(--pf-muted, var(--muted-foreground));
     font-size: 12px;
+    line-height: 1.4;
   }
 
-  .pf-advanced-settings {
-    border-top: 1px solid var(--pf-border, var(--border));
-    padding-top: 12px;
-  }
-
-  .pf-advanced-settings summary {
-    width: fit-content;
-    cursor: pointer;
-    color: var(--pf-muted, var(--muted-foreground));
-    font-size: 12px;
-    font-weight: 600;
-  }
-
-  .pf-advanced-settings .pf-form-grid {
-    margin-top: 12px;
+  .pf-agentenv-login-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    flex-wrap: wrap;
   }
 
   .pf-switch {
@@ -622,7 +575,7 @@
   }
 
   @media (max-width: 760px) {
-    .pf-agentenv-quick {
+    .pf-agentenv-login {
       grid-template-columns: 1fr;
     }
   }

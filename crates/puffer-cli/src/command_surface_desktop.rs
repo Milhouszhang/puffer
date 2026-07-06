@@ -254,7 +254,9 @@ mod tests {
             import_claude_desktop_mcp_servers_from_file(&paths, ResourceScope::User, &config_path)
                 .unwrap();
 
-        let written = paths.user_config_dir.join("resources/mcp_servers/docs.yaml");
+        let written = paths
+            .user_config_dir
+            .join("resources/mcp_servers/docs.yaml");
         assert!(written.exists());
         assert!(message.contains(&paths.user_config_dir.display().to_string()));
     }

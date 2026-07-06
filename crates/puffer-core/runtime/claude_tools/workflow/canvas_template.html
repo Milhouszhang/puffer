@@ -101,9 +101,10 @@ const BRIDGE=__BRIDGE__; // {url, token, sessionId} | null — lets actions cont
 const E=(t,c,h)=>{const n=document.createElement(t);if(c)n.className=c;if(h!=null)n.innerHTML=h;return n};
 const CANVAS_ID=(BRIDGE&&BRIDGE.canvasId)||spec.canvasId||'';
 const STATE={values:{}};
-function initialValue(n){if(n.value!==undefined)return n.value;if(n.type==='toggle')return false;if(n.type==='multiSelect')return [];if(n.type==='slider')return n.min||0;if(n.type==='textInput')return '';const o=(n.options||[])[0];return o?(o.id||o.label||null):null}
+function initialValue(n){if(n.value!==undefined)return n.value;if(n.type==='toggle')return false;if(n.type==='multiSelect')return [];if(n.type==='slider')return n.min||0;if(n.type==='textInput'||n.type==='textarea')return '';if(n.type==='editableTable')return Array.isArray(n.rows)?n.rows:[];if(n.type==='mediaPicker')return n.multi?[]:null;const o=(n.options||[])[0];return o?(o.id||o.label||null):null}
 function optionId(o){return S(o.id!==undefined?o.id:o.label)}
-function initState(n){if(!n)return;if(Array.isArray(n)){n.forEach(initState);return}if(typeof n==='object'){if(n.id&&['toggle','singleSelect','multiSelect','slider','barSelect','textInput'].includes(n.type))STATE.values[n.id]=initialValue(n);if(n.children)initState(n.children);if(n.body)initState(n.body)}}
+// keep in sync with interactive_node_type() in canvas.rs
+function initState(n){if(!n)return;if(Array.isArray(n)){n.forEach(initState);return}if(typeof n==='object'){if(n.id&&['toggle','singleSelect','multiSelect','slider','barSelect','textInput','textarea','editableTable','mediaPicker','dependentSelect'].includes(n.type))STATE.values[n.id]=initialValue(n);if(n.children)initState(n.children);if(n.body)initState(n.body)}}
 let stateTimer=null;
 function setCanvasValue(id,value){if(!id)return;STATE.values[id]=value;if(stateTimer)clearTimeout(stateTimer);stateTimer=setTimeout(()=>sendCanvasPatch({[id]:value}),120)}
 function sendCanvasPatch(patch){
@@ -143,7 +144,7 @@ function fireAction(node,ac){
 }
 // coerce any value the model might emit into readable text (never [object Object])
 const S=v=>{if(v==null)return '';if(typeof v==='string')return v;if(Array.isArray(v))return v.map(S).join('\n');if(typeof v==='object'){for(const k of ['code','diff','text','value','content','body']){if(typeof v[k]==='string')return v[k]}try{return JSON.stringify(v,null,1)}catch(e){return ''}}return String(v)};
-const esc=s=>S(s).replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));
+const esc=s=>S(s).replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
 const diff=t=>esc(t).split('\n').map(l=>l[0]==='+'?`<span class="add">${l}</span>`:l[0]==='-'?`<span class="del">${l}</span>`:l).join('');
 // tolerant location: accept {path|file|location, line}; skip empties
 const locText=l=>{if(typeof l==='string')return l;const p=l.path||l.file||l.location||l.name||'';const ln=(l.line!=null)?':'+l.line:'';return (p+ln)||''};
@@ -178,6 +179,12 @@ const COMP={
  barSelect:n=>selectControl(n,false),
  slider:n=>{const c=E('div','control');if(n.label)c.append(E('div','ctl-label',esc(n.label)));const row=E('div','slider');const input=E('input');input.type='range';input.min=n.min??0;input.max=n.max??100;input.step=n.step??1;input.value=STATE.values[n.id]??input.min;const val=E('span',null,esc(input.value));input.oninput=()=>{val.textContent=input.value;setCanvasValue(n.id,Number(input.value))};row.append(input);row.append(val);c.append(row);if(n.help)c.append(E('div','ctl-help',esc(n.help)));return c},
  textInput:n=>{const c=E('label','control');if(n.label)c.append(E('span','ctl-label',esc(n.label)));const input=E('input','text-input');input.type='text';input.placeholder=n.placeholder||'';input.value=STATE.values[n.id]||'';input.oninput=()=>setCanvasValue(n.id,input.value);c.append(input);if(n.help)c.append(E('span','ctl-help',esc(n.help)));return c},
+ textarea:n=>{const c=E('label','control');if(n.label)c.append(E('span','ctl-label',esc(n.label)));const ta=E('textarea','text-input');ta.rows=n.rows||4;ta.style.height='auto';ta.style.padding='6px 8px';ta.placeholder=n.placeholder||'';ta.value=STATE.values[n.id]||'';ta.oninput=()=>setCanvasValue(n.id,ta.value);c.append(ta);return c},
+ // desktop-only inputs degrade gracefully here instead of "[unknown component]"
+ dependentSelect:n=>selectControl({...n,options:(n.options||[]).map(o=>({id:o.id,label:(o.label||o.id||'')+(o.group?' — '+o.group:'')}))},false),
+ editableTable:n=>{const c=E('div','control');if(n.label)c.append(E('div','ctl-label',esc(n.label)));c.append(COMP.table({columns:n.columns,rows:STATE.values[n.id]||n.rows||[]}));c.append(E('div','ctl-help','Editable in Puffer Desktop; shown read-only here.'));return c},
+ mediaPicker:n=>{const c=E('div','control');(n.items||[]).forEach(it=>{const line=(it.url?`<a href="${esc(it.url)}" target="_blank" rel="noopener">${esc(it.label||it.id)}</a>`:esc(it.label||it.id))+(it.description?` — ${esc(it.description)}`:'');c.append(E('div','text',line))});c.append(E('div','ctl-help','Media selection requires Puffer Desktop; items listed for reference.'));return c},
+ mediaModelSelect:()=>E('div','control','<div class="ctl-help">Media model selection requires Puffer Desktop.</div>'),
  heatmap:n=>{const w=E('div','heat');const t=E('table');const hr=E('tr');hr.append(E('th'));(n.columns||[]).forEach(c=>hr.append(E('th',null,esc(c))));t.append(hr);(n.rows||[]).forEach(r=>{const tr=E('tr');tr.append(E('td','rl',esc(r.label)));(r.cells||[]).forEach(cell=>{const v=typeof cell==='object'?cell.v:cell;const td=E('td','cell');td.dataset.v=v;if(cell&&cell.note)td.title=cell.note;tr.append(td)});t.append(tr)});w.append(t);return w},
 };
 function selectControl(n,multi){

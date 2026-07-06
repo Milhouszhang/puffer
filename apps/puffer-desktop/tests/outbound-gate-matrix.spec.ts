@@ -270,10 +270,59 @@ test("uncertain status: card shows the uncertain warning and is not left idle", 
   );
   // Not left in the pristine idle state that would imply a safe re-send.
   await expect(card).toHaveAttribute("data-state", "uncertain");
-  // Approve is blocked until the duplicate risk is resolved; cancel stays
-  // available (the server allows cancelling an uncertain action).
-  await expect(card.locator(".pf-connector-draft-send")).toBeDisabled();
+  // Normal approve is replaced by an explicit duplicate-risk acknowledgement.
+  await expect(card.locator(".pf-connector-draft-send")).toBeEnabled();
+  await expect(card.locator(".pf-connector-draft-send")).toContainText(
+    "Confirm no duplicate & retry"
+  );
   await expect(card.locator(".pf-connector-draft-cancel")).toBeEnabled();
+});
+
+test("uncertain status: ack retry confirms risk, refetches version, and executes with duplicate_risk_ack", async ({
+  page
+}) => {
+  const sessionId = "session-outbound-ack-retry";
+  const daemon = daemonWithSession(sessionId);
+  daemon.seedOutboundAction("oa-ack-retry-1", { status: "uncertain", version: 7 });
+  await daemon.install(page);
+  await daemon.open(page);
+  await openSession(page, /session-outbound-ack-retry/);
+
+  streamDrafts(daemon, sessionId, "turn-ack-retry", [
+    draftInvocation({
+      draftId: "oa-ack-retry-1",
+      status: "uncertain",
+      version: 1,
+      message: "Retry after checking."
+    })
+  ]);
+
+  const card = page.locator(".pf-connector-draft");
+  await expect(card).toHaveAttribute("data-state", "uncertain");
+
+  page.once("dialog", async (dialog) => {
+    expect(dialog.message()).toContain("previous send outcome is unknown");
+    expect(dialog.message()).toContain("confirmed the message was not delivered");
+    await dialog.accept();
+  });
+
+  const statusPromise = daemon.waitForRequest(
+    "outbound_action_status",
+    (request) => request.params.action_id === "oa-ack-retry-1"
+  );
+  const executePromise = daemon.waitForRequest(
+    "outbound_action_execute",
+    (request) => request.params.action_id === "oa-ack-retry-1"
+  );
+
+  await card.locator(".pf-connector-draft-send").click();
+  await statusPromise;
+  const executeRequest = await executePromise;
+
+  expect(executeRequest.params.version).toBe(7);
+  expect(executeRequest.params.duplicate_risk_ack).toBe(true);
+  expect(executeRequest.params.approved_message).toBe("Retry after checking.");
+  await expect(card).toHaveAttribute("data-state", "sent");
 });
 
 test("stamped recipient renders without the model-chosen badge", async ({ page }) => {

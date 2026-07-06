@@ -1830,14 +1830,19 @@ export async function executeOutboundAction(params: {
   version: number;
   approvedMessage: string;
   clientRequestId: string;
+  duplicateRiskAck?: boolean;
 }): Promise<{ status: string; actionId: string; receipt?: unknown }> {
   const client = await ensureLocalDaemonClient();
-  return client.request<{ status: string; actionId: string; receipt?: unknown }>("outbound_action_execute", {
+  const payload: Record<string, unknown> = {
     action_id: params.actionId,
     version: params.version,
     approved_message: params.approvedMessage,
     client_request_id: params.clientRequestId
-  });
+  };
+  if (params.duplicateRiskAck === true) {
+    payload.duplicate_risk_ack = true;
+  }
+  return client.request<{ status: string; actionId: string; receipt?: unknown }>("outbound_action_execute", payload);
 }
 
 /** Read the persisted status for an outbound action. */

@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 import {
   classifyOutboundSendError,
   connectorDraftStateForStatus,
+  DUPLICATE_RISK_ACK_COPY,
   UNCERTAIN_SEND_MESSAGE
 } from "./connectorDraftStatus";
 
@@ -57,6 +58,11 @@ test("routes duplicate-risk rejection to the uncertain warning state", () => {
     error: UNCERTAIN_SEND_MESSAGE,
     refresh: false
   });
+});
+
+test("duplicate-risk confirmation copy names the unknown send outcome", () => {
+  expect(DUPLICATE_RISK_ACK_COPY).toContain("previous send outcome is unknown");
+  expect(DUPLICATE_RISK_ACK_COPY).toContain("confirmed the message was not delivered");
 });
 
 test("routes version mismatch to a refresh-from-truth state", () => {

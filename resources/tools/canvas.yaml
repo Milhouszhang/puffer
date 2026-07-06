@@ -21,15 +21,49 @@ description: |-
              heatmap{columns,rows:[{label,cells:[0-4]}]}
   - Input:   toggle{id,label,value?}
              singleSelect{id,label,options:[{id,label}],value?}
+             dependentSelect{id,dependsOn,options:[{id,label,group}],value?}
              multiSelect{id,label,options:[{id,label}],value?:string[]}
              barSelect{id,label,options:[{id,label}],value?}
              slider{id,label,min?,max?,step?,value?}
              textInput{id,label,placeholder?,value?}
+             textarea{id,label?,placeholder?,rows?,value?}
+             editableTable{id,columns,rows,label?}
+             mediaPicker{id,items:[{id,kind?,url?,artifactId?,label?}],multi?}
   - Rich:    finding{severity,title,status?,locations?,body?,evidence?,
                      actions?:[{id,label,intent?}]}
              diff{text} · code{text} · callout{tone,title,body}
   tone: "crit" | "high" | "ok" | "info"  ·  severity: critical|high|medium|low|info
   intent (on actions): "fix" | "test" | "explain"
+
+  GEOMETRY — design for the space the page actually gets. In Puffer Desktop the
+  Canvas renders inline in the chat column: about 800px wide, ~760px of usable
+  content. The browser fallback page is wider (max 1180px). Practical rules:
+  - grid{min} is the minimum card width in px (default 190). Use 190–240 for
+    small stat/choice cards, 300+ for cards holding text or controls; at ~760px
+    three 240px columns is the realistic maximum.
+  - columns fits 2–3 equal blocks (each ≥180px wide); never more than 3.
+  - code/diff blocks scroll after ~260px of height — quote the relevant lines,
+    not whole files.
+  - The page has no height limit; it grows. Lead with the densest summary
+    (metrics or one callout) so the first screenful carries the conclusion.
+
+  EXAMPLE — a complete minimal spec (findings plus one interactive follow-up):
+  { "title": "Audit · payment flow", "meta": ["3 files", "+92 −14"],
+    "summary": "One high-risk issue; fix before release.",
+    "body": [
+      { "type": "metrics", "items": [
+        { "value": "1", "label": "high", "tone": "high" },
+        { "value": "2", "label": "info" } ] },
+      { "type": "section", "title": "Findings", "children": [
+        { "type": "finding", "severity": "high",
+          "title": "Retry loop double-charges on timeout",
+          "locations": [{ "path": "src/pay.rs", "line": 210 }],
+          "evidence": "- charge(order)\n+ charge_idempotent(order, key)",
+          "actions": [{ "id": "fix-retry", "label": "Suggest change", "intent": "fix" }] } ] },
+      { "type": "section", "title": "Scope the fix", "children": [
+        { "type": "singleSelect", "id": "fix-scope", "label": "Apply to",
+          "options": [ { "id": "retry", "label": "Retry path only" },
+                       { "id": "all", "label": "All charge sites" } ] } ] } ] }
 
   Compose what fits the task — do not force every result into the same shape.
   Prefer information density over decoration.
@@ -42,12 +76,14 @@ description: |-
   (carrying the finding's context) without the user typing — so a finding with no
   action is a missed entry point. Do not emit decorative nodes with no evidence.
 
-  In Puffer Desktop, Canvas renders inline inside the chat. The HTML fallback is
-  still written under .puffer/canvas/ for non-inline hosts. Interactive nodes
-  write typed values into .puffer/canvas/<canvasId>.state.json.
-  Use CanvasState after the user interacts with a Canvas to read selected
-  toggles, choices, sliders, and text values. Every interactive node MUST have a
-  stable `id`; that id becomes the key in CanvasState.values.
+  INTERACTION — how user input comes back to you. Every interactive node MUST
+  have a stable `id`; edits are saved automatically under that id in
+  .puffer/canvas/<canvasId>.state.json. In Puffer Desktop the Canvas renders
+  inline in the chat with a Submit button: pressing it (or a finding action)
+  sends you a message naming the canvasId — call CanvasState then, briefly
+  confirm the values, and continue from them. NEVER ask the user to copy or
+  re-type values shown in a Canvas. The HTML fallback under .puffer/canvas/
+  serves non-inline hosts; there editableTable/mediaPicker degrade to read-only.
 
   PROACTIVELY OFFERING CANVAS — when a final answer is long and structured
   (multiple findings/sections, a review/dashboard/report, lots of code/diff),
@@ -97,7 +133,7 @@ input_schema:
         properties:
           type:
             type: string
-            description: Component type (section, grid, card, metrics, table, bar, heatmap, toggle, singleSelect, multiSelect, barSelect, slider, textInput, finding, diff, code, callout, text, heading, badge, kv, columns, divider).
+            description: Component type (section, grid, card, columns, divider, heading, text, badge, metrics, kv, table, bar, heatmap, toggle, singleSelect, dependentSelect, multiSelect, barSelect, slider, textInput, textarea, editableTable, mediaPicker, finding, diff, code, callout).
         required: [type]
         additionalProperties: true
   additionalProperties: true

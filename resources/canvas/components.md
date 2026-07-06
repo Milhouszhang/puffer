@@ -14,6 +14,23 @@ density and evidence over decoration.
 
 ---
 
+## Geometry
+
+Design for the space the page actually gets.
+
+- **Puffer Desktop (primary)**: the Canvas renders inline in the chat column —
+  about 800px wide, ~760px of usable content. `grid{min}` defaults to 190px;
+  at ~760px, three 240px columns is the realistic maximum. `columns` blocks are
+  each ≥180px. `code`/`diff` blocks scroll after ~260px of height.
+- **HTML fallback** (`.puffer/canvas/*.html`, non-inline hosts): page shell up
+  to 1180px wide; `grid{min}` defaults to 220px. `editableTable` and
+  `mediaPicker` degrade to read-only there.
+- Neither surface limits page height — the page grows. Put the densest summary
+  (a `metrics` strip or one `callout`) first so the opening screenful carries
+  the conclusion.
+
+---
+
 ## Layout
 
 ### section
@@ -118,6 +135,7 @@ the key in `CanvasState.values`.
   of shots) before the agent acts on it.
 - avoid_when: read-only records → use `table`.
 - writes back: a 2D array (`rows`) reflecting the final edits and order.
+- surface: editable in Puffer Desktop; the HTML fallback shows it read-only.
 
 ### mediaPicker `{id,items:[{id,kind?,url?,artifactId?,label?,description?}],multi?,value?}`
 - purpose: pick from a grid of images or videos.
@@ -134,6 +152,7 @@ the key in `CanvasState.values`.
   clip whose poster is unavailable still opens to play. Each preview also shows
   that item's `description` (centered).
 - writes back: single → the chosen item `id`; multi → an array of selected ids.
+- surface: interactive in Puffer Desktop; the HTML fallback lists items read-only.
 
 ### mediaModelSelect `{}`
 - purpose: pick the image-gen and video-gen provider/model for a run.
@@ -168,3 +187,56 @@ the key in `CanvasState.values`.
 - Keep evidence next to the claim (diff inside the finding, not in a separate box).
 - Pick the component that fits the data: ranking → table/bar, part-of-whole →
   (not bar — say so in text), matrix → heatmap, issue-to-act-on → finding.
+
+---
+
+## Page templates (few-shot)
+
+Skeletons showing proven composition per task shape. Adapt the content; keep
+the structure discipline (summary first, evidence beside claims, one callout).
+A code-review skeleton lives in the `canvas-code-review` skill.
+
+### Research dashboard — compare options against criteria
+
+```json
+{
+  "title": "Embedding stores · evaluation",
+  "meta": ["4 candidates", "2026-07"],
+  "summary": "pgvector wins on ops fit; qdrant wins on raw recall at scale.",
+  "body": [
+    { "type": "callout", "tone": "info", "title": "Recommendation",
+      "body": "pgvector — one fewer system to run; recall gap only matters past ~50M vectors." },
+    { "type": "bar", "items": [
+      { "label": "pgvector", "value": 86 },
+      { "label": "qdrant", "value": 91 },
+      { "label": "milvus", "value": 83, "max": 100 } ] },
+    { "type": "heatmap", "columns": ["recall", "ops", "cost", "maturity"],
+      "rows": [
+        { "label": "pgvector", "cells": [2, 0, 0, 1] },
+        { "label": "qdrant",   "cells": [0, 2, 1, 2] } ] },
+    { "type": "section", "title": "Evidence", "children": [
+      { "type": "kv", "rows": [
+        ["benchmark", "ann-benchmarks glove-100, 2026-05 run"],
+        ["recall@10", "pgvector 0.94 · qdrant 0.97"] ] } ] }
+  ]
+}
+```
+
+### Parameter intake — collect choices before acting
+
+```json
+{
+  "title": "Release plan · confirm parameters",
+  "summary": "Adjust and Submit; I proceed with these values.",
+  "body": [
+    { "type": "section", "title": "Scope", "children": [
+      { "type": "toggle", "id": "include-migrations", "label": "Run DB migrations", "value": true },
+      { "type": "singleSelect", "id": "target-env", "label": "Environment",
+        "options": [ { "id": "staging", "label": "Staging" },
+                     { "id": "prod", "label": "Production" } ] },
+      { "type": "slider", "id": "canary-pct", "label": "Canary %", "min": 0, "max": 50, "value": 10 } ] },
+    { "type": "section", "title": "Notes", "children": [
+      { "type": "textarea", "id": "operator-notes", "label": "Anything I should know?", "rows": 3 } ] }
+  ]
+}
+```

@@ -92,6 +92,7 @@ impl ConnectorCatalogStore {
         template: ConnectorTemplate,
     ) -> Result<ConnectorTemplate, ConnectorCatalogStoreError> {
         validate_template(&template)?;
+        validate_permission_floor(&template)?;
         let mut guard = self.inner.lock().unwrap();
         guard
             .connectors
@@ -147,6 +148,43 @@ fn validate_template(template: &ConnectorTemplate) -> Result<(), ConnectorCatalo
         if action.permission.category.trim().is_empty() {
             return Err(ConnectorCatalogStoreError::Invalid(format!(
                 "connector action `{slug}` permission category must not be empty"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_permission_floor(
+    template: &ConnectorTemplate,
+) -> Result<(), ConnectorCatalogStoreError> {
+    let Some(builtin) = crate::catalog::builtin_connector_template(&template.slug) else {
+        return Ok(());
+    };
+    for (slug, builtin_action) in &builtin.actions {
+        // Only actions carrying an external side effect impose a floor.
+        if !builtin_action.permission.external_side_effect {
+            continue;
+        }
+        // Omitting the action is allowed (a template may trim capability, not
+        // weaken the contract).
+        let Some(user_action) = template.actions.get(slug) else {
+            continue;
+        };
+        // Single source of truth: the gate neutralizes any weakening by merging
+        // the builtin floor back in (`effective_action_permission`). If the
+        // effective permission the gate would enforce differs from what the
+        // template declares, the template tried to weaken it — reject upstream so
+        // the stored template matches what the gate honors.
+        let effective =
+            crate::outbound_gate::effective_action_permission(&template.slug, template, slug)
+                .expect("declared builtin action must resolve an effective permission");
+        let declared = &user_action.permission;
+        if effective.external_side_effect != declared.external_side_effect
+            || effective.category != declared.category
+        {
+            return Err(ConnectorCatalogStoreError::Invalid(format!(
+                "action `{slug}` must not weaken builtin permission (gate enforces category `{}`, external_side_effect `{}`)",
+                effective.category, effective.external_side_effect
             )));
         }
     }
@@ -218,5 +256,47 @@ mod tests {
 
         let reopened = ConnectorCatalogStore::load(temp.path().join("connectors.json")).unwrap();
         assert_eq!(reopened.get("email").unwrap().description, "Custom email");
+    }
+
+    #[test]
+    fn upsert_rejects_weakened_builtin_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConnectorCatalogStore::load(dir.path().join("connectors.json")).unwrap();
+        let mut weakened = crate::catalog::builtin_connector_template("telegram-login").unwrap();
+        let action = weakened.actions.get_mut("send_message").unwrap();
+        action.permission.category = "other".into();
+        action.permission.external_side_effect = false;
+        let error = store
+            .upsert(weakened)
+            .expect_err("weakening must be rejected");
+        assert!(error.to_string().contains("weaken"));
+    }
+
+    #[test]
+    fn upsert_rejects_interaction_downgraded_to_reaction() {
+        // `vote_poll` is a gated `external_message_interaction`. Relabeling it as
+        // `external_reaction` (the ungated whitelist category) would neutralize
+        // human review; the gate's floor merge forces the interaction category
+        // back, so upsert must reject the downgrade.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConnectorCatalogStore::load(dir.path().join("connectors.json")).unwrap();
+        let mut weakened = crate::catalog::builtin_connector_template("telegram-login").unwrap();
+        let action = weakened.actions.get_mut("vote_poll").unwrap();
+        action.permission.category = "external_reaction".into();
+        // external_side_effect stays true; only the category is downgraded.
+        let error = store
+            .upsert(weakened)
+            .expect_err("reaction downgrade must be rejected");
+        assert!(error.to_string().contains("weaken"));
+    }
+
+    #[test]
+    fn upsert_accepts_tightened_or_unrelated_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConnectorCatalogStore::load(dir.path().join("connectors.json")).unwrap();
+        // A custom connector whose slug matches no builtin is not floor-constrained.
+        let mut custom = crate::catalog::builtin_connector_template("telegram-login").unwrap();
+        custom.slug = "my-custom-thing".into();
+        store.upsert(custom).expect("custom slug is fine");
     }
 }

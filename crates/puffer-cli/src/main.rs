@@ -15,6 +15,8 @@ mod command_surface_desktop;
 mod connect;
 mod connectors;
 mod daemon;
+mod daemon_automation_runtime;
+mod daemon_automations;
 mod daemon_browser;
 mod daemon_browser_settings;
 mod daemon_contacts;

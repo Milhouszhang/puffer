@@ -317,6 +317,9 @@ fn default_binding_slug(connection_slug: &str, action: &ActionSpec) -> String {
         ActionSpec::RunWorkflow { workflow_id } => {
             format!("run-{connection_slug}-{}", slug_fragment(workflow_id))
         }
+        ActionSpec::RunAutomation { automation_id } => {
+            format!("run-{connection_slug}-{}", slug_fragment(automation_id))
+        }
         _ => format!(
             "binding-{connection_slug}-{}",
             slug_fragment(binding_action_type(action))
@@ -328,6 +331,9 @@ fn default_binding_description(connection_slug: &str, action: &ActionSpec) -> St
     match action {
         ActionSpec::RunWorkflow { workflow_id } => {
             format!("Run workflow {workflow_id} for {connection_slug} messages")
+        }
+        ActionSpec::RunAutomation { automation_id } => {
+            format!("Run automation {automation_id} for {connection_slug} messages")
         }
         ActionSpec::ConnectorAct {
             connector_slug,
@@ -358,6 +364,7 @@ fn binding_action_type(action: &ActionSpec) -> &'static str {
         ActionSpec::FileAppend { .. } => "file_append",
         ActionSpec::ForwardMessage { .. } => "forward_message",
         ActionSpec::RunWorkflow { .. } => "run_workflow",
+        ActionSpec::RunAutomation { .. } => "run_automation",
         ActionSpec::ConnectorAct { .. } => "connector_act",
         ActionSpec::ToolCall { .. } => "tool_call",
         ActionSpec::TriageAgent { .. } => "triage_agent",

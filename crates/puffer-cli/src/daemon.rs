@@ -33,6 +33,7 @@ use axum::{
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use indexmap::IndexMap;
+use puffer_automation::AutomationStore;
 use puffer_config::{
     ensure_workspace_dirs, load_config, save_user_config, ConfigPaths, MediaConfig,
     MediaGenerationConfig, ProxyConfig, ProxyEndpoint, ProxyScheme, PufferConfig,
@@ -480,6 +481,9 @@ pub(crate) struct DaemonState {
     pub(crate) browsers: Arc<BrowserRegistry>,
     /// Local model setup/status jobs used by the desktop MiniCPM card.
     pub(crate) local_models: crate::daemon_local_model::LocalModelInstaller,
+    /// User-facing Automation records. Shared by all Automation daemon RPCs so
+    /// store-level locking protects concurrent requests inside one daemon.
+    automations: Arc<AutomationStore>,
     disable_auto_title: bool,
     yolo: bool,
     media_discovery_cache: Arc<Mutex<Option<ExactMediaDiscoveryCache>>>,
@@ -520,6 +524,10 @@ impl DaemonState {
 
     pub(crate) fn config_paths(&self) -> &ConfigPaths {
         &self.paths
+    }
+
+    pub(crate) fn automation_store(&self) -> &AutomationStore {
+        self.automations.as_ref()
     }
 
     /// Returns a clone of the currently loaded daemon config.
@@ -772,6 +780,9 @@ impl DaemonState {
             browser_launch_settings_or_default(BrowserLaunchSettings::from_config(&paths, &config));
         let (events, _rx) = broadcast::channel::<ServerEnvelope>(256);
         let browser_profile_root = paths.user_config_dir.join("browser-profiles");
+        let automations = Arc::new(AutomationStore::load(
+            crate::daemon_automations::automation_store_path(&paths),
+        )?);
         let ptys = Arc::new(PtyRegistry::new());
         ptys.spawn_idle_pruner();
         Ok(Self {
@@ -790,6 +801,7 @@ impl DaemonState {
                 browser_launch_settings,
             )),
             local_models: crate::daemon_local_model::LocalModelInstaller::new(),
+            automations,
             disable_auto_title,
             yolo,
             media_discovery_cache: Arc::new(Mutex::new(None)),
@@ -1747,6 +1759,33 @@ async fn dispatch_request(
         })),
         "workflow_get_execution" => respond!(detached!(|s, p| {
             crate::daemon_workflows::handle_workflow_get_execution(s.config_paths(), &p)
+        })),
+        "automation_list" => respond!(detached!(|s| {
+            crate::daemon_automations::handle_automation_list(s.automation_store())
+        })),
+        "automation_get" => respond!(detached!(|s, p| {
+            crate::daemon_automations::handle_automation_get(s.automation_store(), &p)
+        })),
+        "automation_save" => respond!(detached!(|s, p| {
+            crate::daemon_automations::handle_automation_save(s.automation_store(), &p)
+        })),
+        "automation_delete" => respond!(detached!(|s, p| {
+            crate::daemon_automations::handle_automation_delete(s.automation_store(), &p)
+        })),
+        "automation_catalog" => respond!(detached!(|s| {
+            crate::daemon_automations::handle_automation_catalog(s.config_paths())
+        })),
+        "automation_compile_deploy" => respond!(detached!(|s, p| {
+            crate::daemon_automation_runtime::handle_automation_compile_deploy(&s, &p)
+        })),
+        "automation_sync_preview" => respond!(detached!(|s, p| {
+            crate::daemon_automation_runtime::handle_automation_sync_preview(&s, &p)
+        })),
+        "automation_run_preview" => respond!(detached!(|s, p| {
+            crate::daemon_automation_runtime::handle_automation_run_preview(&s, &p)
+        })),
+        "automation_run_history" => respond!(detached!(|s, p| {
+            crate::daemon_automation_runtime::handle_automation_run_history(&s, &p)
         })),
         "workflow_open_ui" => respond!(detached!(|s| {
             crate::daemon_workflow_runtime::handle_workflow_open_ui(&s)

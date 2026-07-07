@@ -1,4 +1,31 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+  import {
+    deleteAutomationRecord,
+    loadAutomationCatalog,
+    loadAutomationRunHistory,
+    listAutomations,
+    runAutomationPreview,
+    saveAutomationRecord,
+    syncAutomationPreview
+  } from "../api/desktop";
+  import type {
+    AutomationCatalogAction,
+    AutomationCatalogInput,
+    AutomationCatalogResult,
+    AutomationCatalogTrigger,
+    AutomationNodeRef,
+    AutomationRecordDto,
+    AutomationRunLocation,
+    AutomationRuntimeSyncResult,
+    AutomationRunHistoryRecord,
+    AutomationSpec,
+    AutomationSource,
+    AutomationStatus,
+    AutomationStepSpec,
+    SettingsSnapshot,
+    AutomationTriggerSpec
+  } from "../types";
   import "../design/chat.css";
   import Icon, { type IconName } from "../design/Icon.svelte";
 
@@ -20,6 +47,8 @@
     enabled?: boolean;
     owner?: string;
     history?: AutomationRun[];
+    revision?: number;
+    record?: AutomationRecordDto;
   };
 
   type AutomationRun = {
@@ -29,6 +58,9 @@
     started: string;
     duration: string;
     summary: string;
+    error?: string | null;
+    compiled?: boolean;
+    runtimeStatus?: string;
   };
 
   type AutomationStarter = {
@@ -47,6 +79,8 @@
     target?: string;
     actorPrefix?: string;
     actor?: string;
+    catalog?: AutomationCatalogTrigger;
+    config?: Record<string, string>;
   };
 
   type AutomationApp = {
@@ -64,6 +98,7 @@
     targetLabel?: string;
     targetOptions?: string[];
     defaultTarget?: string;
+    action?: AutomationCatalogAction;
   };
 
   type VisibleAutomationApp = AutomationApp & {
@@ -79,6 +114,7 @@
     targetLabel?: string;
     targetOptions: string[];
     target: string | null;
+    action?: AutomationCatalogAction;
   };
 
   type AutomationDraft = {
@@ -87,6 +123,13 @@
     trigger: AutomationTrigger | null;
     tools: SelectedAutomationTool[];
   };
+
+  type Props = {
+    settingsSnapshot?: SettingsSnapshot | null;
+    onOpenAutomationRuntimeSettings?: () => void;
+  };
+
+  let props: Props = $props();
 
   const blankAutomationName = "Untitled automation";
 
@@ -252,180 +295,6 @@
     leading: "Label changes in",
     target: "Select repos"
   };
-  const commonApps: AutomationApp[] = [
-    {
-      id: "github",
-      title: "GitHub",
-      description: "Pull requests, issues, and repository events.",
-      icon: "git",
-      capabilities: [
-        {
-          id: "watch-pull-requests",
-          title: "Watch Pull Requests",
-          description: "Read PR titles, diffs, status, and review activity."
-        },
-        {
-          id: "comment-on-pull-request",
-          title: "Comment on Pull Request",
-          description: "Prepare or post a pull request comment.",
-          targetLabel: "with",
-          targetOptions: ["Allow PR Approval", "Comment only", "Request changes"],
-          defaultTarget: "Allow PR Approval"
-        },
-        {
-          id: "update-commit-status",
-          title: "Update Commit Status",
-          description: "Set a commit status after the automation reviews a result.",
-          targetLabel: "as",
-          targetOptions: ["Pending", "Success", "Failure"],
-          defaultTarget: "Pending"
-        }
-      ]
-    },
-    {
-      id: "slack",
-      title: "Slack",
-      description: "Messages, channels, and team updates.",
-      icon: "logs",
-      capabilities: [
-        {
-          id: "read-slack-channels",
-          title: "Read Slack Channels",
-          description: "Use selected channels as context."
-        },
-        {
-          id: "send-to-slack",
-          title: "Send to Slack",
-          description: "Draft or send a message to a selected channel.",
-          targetLabel: "to",
-          targetOptions: ["#teams", "#engineering", "#release"],
-          defaultTarget: "#teams"
-        },
-        {
-          id: "reply-in-thread",
-          title: "Reply in Slack Thread",
-          description: "Draft a thread reply where the update came from.",
-          targetLabel: "to",
-          targetOptions: ["Original thread", "#teams", "#support"],
-          defaultTarget: "Original thread"
-        }
-      ]
-    },
-    {
-      id: "gmail",
-      title: "Gmail",
-      description: "Email threads, labels, and draft replies.",
-      icon: "edit",
-      capabilities: [
-        {
-          id: "read-gmail-threads",
-          title: "Read Gmail Threads",
-          description: "Use email threads as context."
-        },
-        {
-          id: "create-gmail-draft",
-          title: "Create Gmail Draft",
-          description: "Create a draft reply for review.",
-          targetLabel: "in",
-          targetOptions: ["Primary inbox", "Support inbox", "Sales inbox"],
-          defaultTarget: "Primary inbox"
-        },
-        {
-          id: "apply-gmail-label",
-          title: "Apply Gmail Label",
-          description: "Label a thread after the automation reviews it.",
-          targetLabel: "as",
-          targetOptions: ["Needs review", "Waiting", "Done"],
-          defaultTarget: "Needs review"
-        }
-      ]
-    },
-    {
-      id: "google-calendar",
-      title: "Google Calendar",
-      description: "Events, invites, and availability.",
-      icon: "clock",
-      capabilities: [
-        {
-          id: "read-calendar-events",
-          title: "Read Calendar Events",
-          description: "Use upcoming events and invite details as context."
-        },
-        {
-          id: "check-availability",
-          title: "Check Availability",
-          description: "Compare free time before drafting a response."
-        },
-        {
-          id: "draft-rsvp",
-          title: "Draft RSVP",
-          description: "Prepare an RSVP for review.",
-          targetLabel: "as",
-          targetOptions: ["Tentative", "Accept", "Decline"],
-          defaultTarget: "Tentative"
-        }
-      ]
-    },
-    {
-      id: "linear",
-      title: "Linear",
-      description: "Issues, projects, and triage queues.",
-      icon: "listTodo",
-      capabilities: [
-        {
-          id: "read-linear-issues",
-          title: "Read Linear Issues",
-          description: "Use issues and comments as context."
-        },
-        {
-          id: "create-linear-issue",
-          title: "Create Linear Issue",
-          description: "Create an issue from an approved draft.",
-          targetLabel: "in",
-          targetOptions: ["Triage", "Product", "Engineering"],
-          defaultTarget: "Triage"
-        },
-        {
-          id: "comment-on-linear",
-          title: "Comment on Linear Issue",
-          description: "Draft a comment on an existing issue.",
-          targetLabel: "with",
-          targetOptions: ["Internal note", "Public update"],
-          defaultTarget: "Internal note"
-        }
-      ]
-    },
-    {
-      id: "notion",
-      title: "Notion",
-      description: "Pages, docs, and team knowledge.",
-      icon: "file",
-      capabilities: [
-        {
-          id: "search-notion",
-          title: "Search Notion",
-          description: "Use selected pages and docs as context."
-        },
-        {
-          id: "create-notion-page",
-          title: "Create Notion Page",
-          description: "Draft a new page for review.",
-          targetLabel: "in",
-          targetOptions: ["Team wiki", "Project notes", "Runbooks"],
-          defaultTarget: "Team wiki"
-        },
-        {
-          id: "update-notion-page",
-          title: "Update Notion Page",
-          description: "Prepare an update to an existing page.",
-          targetLabel: "in",
-          targetOptions: ["Team wiki", "Project notes", "Runbooks"],
-          defaultTarget: "Team wiki"
-        }
-      ]
-    }
-  ];
-
   type AutomationLibraryTab = "your" | "templates";
   type AutomationDetailTab = "settings" | "history";
 
@@ -435,12 +304,20 @@
   let savedAutomations = $state<AutomationItem[]>([]);
   let savedAutomationSequence = $state(0);
   let savedRunSequence = $state(0);
+  let automationLoadError = $state<string | null>(null);
+  let automationCatalogError = $state<string | null>(null);
+  let automationSaving = $state(false);
+  let automationRunning = $state(false);
+  let triggerCatalog = $state<AutomationCatalogTrigger[]>([]);
+  let commonApps = $state<AutomationApp[]>([]);
   let userAutomations = $derived([...savedAutomations, ...baseUserAutomations]);
   let selectedAutomationId = $state<string | null>(null);
   let selectedAutomation = $derived(userAutomations.find((item) => item.id === selectedAutomationId) ?? null);
   let homePrompt = $state("");
   let automationName = $state(blankAutomationName);
   let automationPrompt = $state("");
+  let automationSource = $state<AutomationSource>({ type: "blank" });
+  let automationRunLocation = $state<AutomationRunLocation>(defaultAutomationRunLocation());
   let automationTrigger = $state<AutomationTrigger | null>(null);
   let selectedTools = $state<SelectedAutomationTool[]>([]);
   let automationEnabled = $state(true);
@@ -451,9 +328,51 @@
   let toolSearchQuery = $state("");
   let visibleToolApps = $derived(visibleAppsForSearch(toolSearchQuery));
 
+  function defaultAutomationRunLocation(): AutomationRunLocation {
+    return props.settingsSnapshot?.workflowBackend.mode ?? "local";
+  }
+
+  function openAutomationRuntimeSettings() {
+    props.onOpenAutomationRuntimeSettings?.();
+  }
+
+  onMount(() => {
+    void refreshAutomations();
+    void refreshAutomationCatalog();
+  });
+
+  async function refreshAutomations() {
+    try {
+      const snapshot = await listAutomations();
+      savedAutomations = snapshot.automations
+        .filter((record) => record.status !== "archived")
+        .map(automationItemFromRecord);
+      automationLoadError = null;
+    } catch (error) {
+      automationLoadError = errorMessage(error);
+    }
+  }
+
+  async function refreshAutomationCatalog() {
+    try {
+      const catalog = await loadAutomationCatalog();
+      triggerCatalog = catalog.triggers;
+      commonApps = appsFromCatalog(catalog);
+      automationCatalogError = [catalog.trigger_error, catalog.action_error]
+        .filter(Boolean)
+        .join(" | ") || null;
+    } catch (error) {
+      triggerCatalog = [];
+      commonApps = [];
+      automationCatalogError = errorMessage(error);
+    }
+  }
+
   function applyStarter(starter: AutomationStarter) {
     automationName = starter.name;
     automationPrompt = starter.prompt;
+    automationSource = { type: "template", template_id: starter.id };
+    automationRunLocation = defaultAutomationRunLocation();
     automationTrigger = copyTrigger(starter.trigger);
     selectedTools = [];
     automationEnabled = true;
@@ -468,6 +387,8 @@
   function openBlankAutomation(prompt = "") {
     automationName = blankAutomationName;
     automationPrompt = prompt.trim();
+    automationSource = { type: "blank" };
+    automationRunLocation = defaultAutomationRunLocation();
     automationTrigger = null;
     selectedTools = [];
     automationEnabled = true;
@@ -478,6 +399,126 @@
     editingToolId = null;
     toolSearchQuery = "";
     screenMode = "new";
+  }
+
+  function appsFromCatalog(catalog: AutomationCatalogResult): AutomationApp[] {
+    const groups = new Map<string, AutomationApp>();
+    for (const action of catalog.actions) {
+      if (action.kind === "agentenv_node") continue;
+      const appId = action.connector_slug ?? action.kind;
+      const title = appTitle(appId);
+      const group = groups.get(appId) ?? {
+        id: appId,
+        title,
+        description: "Connector actions and tools.",
+        icon: iconName(action.icon),
+        capabilities: []
+      };
+      group.capabilities.push({
+        id: action.id,
+        title: action.label,
+        description: actionSummary(action),
+        targetLabel: targetLabelForAction(action),
+        targetOptions: targetOptionsForAction(action),
+        defaultTarget: targetOptionsForAction(action)[0],
+        action
+      });
+      groups.set(appId, group);
+    }
+    return Array.from(groups.values()).sort((a, b) => a.title.localeCompare(b.title));
+  }
+
+  function appTitle(id: string): string {
+    if (id === "github") return "GitHub";
+    if (id === "gmail") return "Gmail";
+    if (id === "google-calendar" || id === "gcal-browser") return "Google Calendar";
+    return id
+      .split(/[-_]/)
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(" ");
+  }
+
+  function actionSummary(action: AutomationCatalogAction): string {
+    const connection = action.connection_state ? `Connection: ${connectionStateLabel(action.connection_state)}.` : "";
+    const permission = action.permission_summary ? ` ${action.permission_summary}` : "";
+    return `${action.summary || "Runtime action."} ${connection}${permission}`.trim();
+  }
+
+  function targetLabelForAction(action: AutomationCatalogAction): string | undefined {
+    if (action.external_side_effect) return "as";
+    if (action.connection_slug) return "via";
+    return undefined;
+  }
+
+  function targetOptionsForAction(action: AutomationCatalogAction): string[] {
+    if (action.action === "comment-on-pull-request") return ["Allow PR Approval", "Comment only", "Request changes"];
+    if (action.action === "send-to-slack") return ["#teams", "#engineering", "#release"];
+    if (action.action === "create-gmail-draft") return ["Primary inbox", "Support inbox", "Sales inbox"];
+    if (action.action === "draft-rsvp") return ["Tentative", "Accept", "Decline"];
+    if (action.external_side_effect) return ["Draft for review"];
+    if (action.connection_slug) return [action.connection_slug];
+    return [];
+  }
+
+  function iconName(value: string | null | undefined): IconName {
+    const allowed = new Set<IconName>(["bolt", "clock", "edit", "git", "listTodo", "logs", "rocket"]);
+    return allowed.has(value as IconName) ? (value as IconName) : "bolt";
+  }
+
+  function catalogTriggerById(id: string): AutomationCatalogTrigger | null {
+    return triggerCatalog.find((trigger) => trigger.id === id) ?? null;
+  }
+
+  function firstTriggerMatch(match: (trigger: AutomationCatalogTrigger) => boolean): AutomationTrigger | null {
+    const entry = triggerCatalog.find(match);
+    return entry ? triggerFromCatalog(entry) : null;
+  }
+
+  function defaultInputValues(inputs: AutomationCatalogInput[]): Record<string, string> {
+    return Object.fromEntries(
+      inputs.map((input) => [input.id, input.default == null ? "" : String(input.default)])
+    );
+  }
+
+  function triggerFromCatalog(entry: AutomationCatalogTrigger): AutomationTrigger {
+    const config = defaultInputValues(entry.required_inputs);
+    return {
+      icon: iconName(entry.icon),
+      leading: entry.label,
+      target: triggerTarget(entry, config),
+      actorPrefix: entry.connection_state ? "status" : undefined,
+      actor: entry.connection_state ? connectionStateLabel(entry.connection_state) : undefined,
+      catalog: entry,
+      config
+    };
+  }
+
+  function triggerTarget(entry: AutomationCatalogTrigger, config: Record<string, string>): string | undefined {
+    if (entry.kind === "schedule") {
+      if (config.mode === "cron") return config.cron || "Cron";
+      return config.time || "09:00";
+    }
+    return config.repo || config.source || entry.connection_slug || undefined;
+  }
+
+  function connectionStateLabel(state: string): string {
+    switch (state) {
+      case "active":
+      case "authenticated":
+      case "ready":
+        return "Ready";
+      case "degraded":
+        return "Needs repair";
+      case "disabled":
+        return "Disabled";
+      case "not_connected":
+      case "created":
+      case "authenticating":
+        return "Needs connection";
+      default:
+        return state.replace(/_/g, " ");
+    }
   }
 
   function appById(id: string): AutomationApp | null {
@@ -493,7 +534,8 @@
       title: capability.title,
       targetLabel: capability.targetLabel,
       targetOptions: capability.targetOptions ?? [],
-      target: capability.defaultTarget ?? capability.targetOptions?.[0] ?? null
+      target: capability.defaultTarget ?? capability.targetOptions?.[0] ?? null,
+      action: capability.action
     };
   }
 
@@ -511,7 +553,7 @@
   }
 
   function copyTrigger(trigger: AutomationTrigger | null): AutomationTrigger | null {
-    return trigger ? { ...trigger } : null;
+    return trigger ? { ...trigger, config: { ...(trigger.config ?? {}) } } : null;
   }
 
   function copySelectedTools(tools: SelectedAutomationTool[]): SelectedAutomationTool[] {
@@ -519,6 +561,343 @@
       ...tool,
       targetOptions: [...tool.targetOptions]
     }));
+  }
+
+  function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  function statusLabel(status: AutomationStatus): string {
+    if (status === "enabled") return "Active";
+    if (status === "archived") return "Archived";
+    return "Paused";
+  }
+
+  function iconForTrigger(trigger: AutomationTrigger | null): IconName {
+    return trigger?.icon ?? "bolt";
+  }
+
+  function triggerFromSpec(trigger: AutomationTriggerSpec | undefined): AutomationTrigger | null {
+    if (!trigger) return null;
+    if (trigger.type === "manual") {
+      return {
+        icon: "bolt",
+        leading: trigger.summary ?? "Manual run"
+      };
+    }
+    if (trigger.type === "agent_env_node") {
+      const target =
+        typeof trigger.node.config?.time === "string"
+          ? trigger.node.config.time
+          : typeof trigger.node.config?.target === "string"
+            ? trigger.node.config.target
+            : undefined;
+      const leading = triggerLeadingFromNode(trigger, target);
+      return {
+        icon: trigger.node.node_type.includes("schedule") ? "clock" : "bolt",
+        leading,
+        target,
+        config: stringifyConfig(trigger.node.config)
+      };
+    }
+    return {
+      icon: trigger.connector_slug?.includes("git") || trigger.connection_slug.includes("git") ? "git" : "bolt",
+      leading: trigger.summary ?? `When ${trigger.connection_slug} receives an event`,
+      target: trigger.connection_slug
+    };
+  }
+
+  function triggerLeadingFromNode(trigger: Extract<AutomationTriggerSpec, { type: "agent_env_node" }>, target: string | undefined): string {
+    if (trigger.node.node_type.includes("schedule")) {
+      if (trigger.summary && target && trigger.summary.endsWith(target)) {
+        return trigger.summary.slice(0, -target.length).trim();
+      }
+      if (trigger.node.name === "Schedule") return "Every day at";
+      if (trigger.node.name === "Cron schedule") return "Custom schedule";
+    }
+    return trigger.node.name || trigger.summary || trigger.node.node_type;
+  }
+
+  function toolFromStep(step: AutomationStepSpec): SelectedAutomationTool | null {
+    if (step.type !== "agent_env_node" || step.id === "agent") return null;
+    const connectorSlug = typeof step.node.config?.connector_slug === "string" ? step.node.config.connector_slug : null;
+    const connectorAction = typeof step.node.config?.action === "string" ? step.node.config.action : null;
+    if (connectorSlug && connectorAction) {
+      const tool = toolById(connectorSlug, `connector:${connectorSlug}:${connectorAction}`);
+      if (tool) return tool;
+    }
+    const [appId, capabilityId] = String(step.node.config?.tool_id ?? "").split(":");
+    if (!appId || !capabilityId) return null;
+    const tool = toolById(appId, capabilityId);
+    if (!tool) return null;
+    const target = typeof step.node.config?.target === "string" ? step.node.config.target : tool.target;
+    return { ...tool, target };
+  }
+
+  function stringifyConfig(config: Record<string, unknown> | undefined): Record<string, string> {
+    if (!config) return {};
+    return Object.fromEntries(
+      Object.entries(config)
+        .filter(([, value]) => value == null || ["string", "number", "boolean"].includes(typeof value))
+        .map(([key, value]) => [key, value == null ? "" : String(value)])
+    );
+  }
+
+  function automationItemFromRecord(record: AutomationRecordDto): AutomationItem {
+    const trigger = triggerFromSpec(record.spec.triggers[0]);
+    const tools = record.spec.flow.steps
+      .map(toolFromStep)
+      .filter((tool): tool is SelectedAutomationTool => tool !== null);
+    const title = record.spec.name.trim() || blankAutomationName;
+    const description = record.spec.description?.trim() || record.spec.instructions.trim() || "Ready to configure.";
+    return {
+      id: record.id,
+      title,
+      description,
+      status: statusLabel(record.status),
+      source: "Puffer",
+      updated: formatUpdated(record.updated_at_ms),
+      when: triggerSummary(trigger),
+      then: record.spec.instructions,
+      review: record.spec.review.human_approval_required
+        ? "You can review results before any action is sent."
+        : "Runs without a required review gate.",
+      recent: [`Revision ${record.revision}`, runtimeStatusLabel(record.runtime.status)],
+      icon: iconForTrigger(trigger),
+      prompt: record.spec.instructions,
+      trigger,
+      tools,
+      enabled: record.status === "enabled",
+      owner: "You",
+      history: [],
+      revision: record.revision,
+      record
+    };
+  }
+
+  function runtimeStatusLabel(status: string): string {
+    switch (status) {
+      case "draft_synced":
+        return "Runtime synced";
+      case "deployed":
+        return "Runtime deployed";
+      case "stale":
+        return "Runtime stale";
+      case "error":
+        return "Runtime error";
+      default:
+        return "Not compiled";
+    }
+  }
+
+  function formatUpdated(value: number): string {
+    if (!Number.isFinite(value) || value <= 0) return "Saved";
+    const delta = Date.now() - value;
+    if (delta < 60_000) return "Just now";
+    if (delta < 3_600_000) return `${Math.max(1, Math.round(delta / 60_000))} min ago`;
+    if (delta < 86_400_000) return `${Math.max(1, Math.round(delta / 3_600_000))} hr ago`;
+    return new Date(value).toLocaleDateString();
+  }
+
+  function slugifyAutomationName(name: string): string {
+    const base = name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48);
+    return base || "automation";
+  }
+
+  function nextAutomationId(name: string): string {
+    const nextSequence = savedAutomationSequence + 1;
+    savedAutomationSequence = nextSequence;
+    const base = slugifyAutomationName(name);
+    const candidate = `${base}-${Date.now().toString(36)}-${nextSequence.toString(36)}`;
+    return candidate.replace(/-+/g, "-");
+  }
+
+  function triggerSpecFromUi(trigger: AutomationTrigger | null): AutomationTriggerSpec {
+    const summary = triggerSummary(trigger);
+    if (!trigger) {
+      return {
+        type: "manual",
+        id: "manual",
+        summary: "Manual run"
+      };
+    }
+    if (trigger.catalog) {
+      const spec = JSON.parse(JSON.stringify(trigger.catalog.spec_template)) as AutomationTriggerSpec;
+      if (spec.type === "agent_env_node") {
+        spec.node = {
+          ...spec.node,
+          config: {
+            ...(spec.node.config ?? {}),
+            ...(trigger.config ?? {}),
+            target: trigger.target ?? trigger.config?.time ?? trigger.config?.cron ?? null
+          }
+        };
+        spec.summary = summary;
+      } else if (spec.type === "puffer_connection") {
+        const filter = trigger.config?.filter?.trim();
+        spec.summary = summary;
+        if (filter) {
+          spec.filter = { type: "regex", pattern: filter, case_insensitive: true };
+        }
+      } else if (spec.type === "manual") {
+        spec.summary = summary;
+      }
+      return spec;
+    }
+    if (trigger.icon === "git") {
+      return {
+        type: "puffer_connection",
+        id: "trigger-1",
+        connection_slug: "github",
+        connector_slug: "github",
+        summary
+      };
+    }
+    return {
+      type: "agent_env_node",
+      id: "trigger-1",
+      node: {
+        node_type: trigger.icon === "clock" ? "schedule" : "event",
+        name: trigger.leading,
+        trusted: true,
+        config: {
+          target: trigger.target ?? null,
+          actor: trigger.actor ?? null
+        }
+      },
+      summary
+    };
+  }
+
+  function stepIdFromTool(tool: SelectedAutomationTool, index: number): string {
+    return `tool-${index + 1}-${tool.id.replace(/[^a-zA-Z0-9_-]+/g, "-")}`;
+  }
+
+  function isGeneratedTrigger(trigger: AutomationTriggerSpec): boolean {
+    if (trigger.type === "manual") return true;
+    if (trigger.type === "agent_env_node") {
+      return trigger.id === "trigger-1" && ["schedule", "event"].includes(trigger.node.node_type);
+    }
+    return (
+      trigger.id === "trigger-1" &&
+      trigger.connection_slug === "github" &&
+      (trigger.connector_slug == null || trigger.connector_slug === "github") &&
+      trigger.filter == null &&
+      (trigger.ignore_filters == null || trigger.ignore_filters.length === 0) &&
+      (trigger.contact_ids == null || trigger.contact_ids.length === 0)
+    );
+  }
+
+  function isGeneratedStep(step: AutomationStepSpec, index: number): boolean {
+    if (step.type !== "agent_env_node") return false;
+    if (index === 0) return step.id === "agent" && step.node.node_type === "puffer_agent";
+    if (!["tool_capability", "puffer_connector_action"].includes(step.node.node_type)) return false;
+    return toolFromStep(step) !== null;
+  }
+
+  function isUiRoundTrippableSpec(spec: AutomationSpec): boolean {
+    return (
+      spec.triggers.length === 1 &&
+      isGeneratedTrigger(spec.triggers[0]) &&
+      spec.flow.steps.length > 0 &&
+      spec.flow.steps.every(isGeneratedStep)
+    );
+  }
+
+  function patchUnsupportedSpec(existing: AutomationSpec, title: string, description: string): AutomationSpec {
+    return {
+      ...existing,
+      name: title,
+      description,
+      instructions: description
+    };
+  }
+
+  function detailSpecForSave(selected: AutomationItem, title: string, description: string): AutomationSpec {
+    const existing = selected.record?.spec;
+    if (!existing) return automationSpecFromUi(title, description, automationSource);
+    if (!isUiRoundTrippableSpec(existing)) return patchUnsupportedSpec(existing, title, description);
+    return automationSpecFromUi(title, description, existing.source);
+  }
+
+  function automationSpecFromUi(
+    title: string,
+    description: string,
+    source: AutomationSource = automationSource
+  ): AutomationSpec {
+    return {
+      spec_version: 1,
+      name: title,
+      description,
+      source,
+      instructions: description,
+      run_location: automationRunLocation,
+      triggers: [triggerSpecFromUi(automationTrigger)],
+      flow: {
+        steps: [
+          {
+            type: "agent_env_node",
+            id: "agent",
+            node: {
+              node_type: "puffer_agent",
+              name: "Puffer agent",
+              trusted: true,
+              config: {}
+            },
+            summary: "Run the Automation instructions"
+          },
+          ...selectedTools.map((tool, index): AutomationStepSpec => ({
+            type: "agent_env_node",
+            id: stepIdFromTool(tool, index),
+            node: nodeRefForTool(tool),
+            summary: selectedToolLabel(tool)
+          }))
+        ]
+      },
+      review: {
+        human_approval_required: true
+      }
+    };
+  }
+
+  function nodeRefForTool(tool: SelectedAutomationTool): AutomationNodeRef {
+    if (tool.action?.node_ref) {
+      return {
+        ...tool.action.node_ref,
+        config: {
+          ...(tool.action.node_ref.config ?? {}),
+          tool_id: tool.id,
+          app_id: tool.appId,
+          capability: tool.title,
+          target: tool.target,
+          human_approval_required: Boolean(tool.action.external_side_effect)
+        }
+      };
+    }
+    return {
+      node_type: "tool_capability",
+      name: tool.title,
+      trusted: true,
+      config: {
+        tool_id: tool.id,
+        app_id: tool.appId,
+        capability: tool.title,
+        target: tool.target
+      }
+    };
+  }
+
+  function upsertAutomationRecord(record: AutomationRecordDto) {
+    const item = automationItemFromRecord(record);
+    savedAutomations = [
+      item,
+      ...savedAutomations.filter((candidate) => candidate.id !== record.id)
+    ];
+    selectedAutomationId = record.id;
   }
 
   function capabilityMatchesSearch(capability: AutomationCapability, query: string): boolean {
@@ -548,51 +927,56 @@
   function draftFromPrompt(prompt: string): AutomationDraft {
     const trimmedPrompt = prompt.trim();
     const lowerPrompt = trimmedPrompt.toLowerCase();
+    if (prefersManualLocalDraft(lowerPrompt)) {
+      return {
+        name: "Manual automation",
+        prompt: trimmedPrompt,
+        trigger: firstTriggerMatch((trigger) => trigger.kind === "manual" || trigger.id === "manual") ?? null,
+        tools: []
+      };
+    }
     if (/\bpr\b|pull request/.test(lowerPrompt)) {
       return {
         name: "PR review draft",
         prompt: trimmedPrompt,
-        trigger: prOpenedTrigger,
-        tools: toolsById([["github", "comment-on-pull-request"]])
+        trigger: firstTriggerMatch((trigger) => trigger.connector_slug?.includes("github") || /pull request|github/i.test(trigger.label)) ?? prOpenedTrigger,
+        tools: firstToolsByAction((action) => action.action === "comment-on-pull-request" || /comment on pull request/i.test(action.label), 1)
       };
     }
     if (/calendar|invite|rsvp|meeting/.test(lowerPrompt)) {
       return {
         name: "Calendar RSVP",
         prompt: trimmedPrompt,
-        trigger: automationTemplates.find((template) => template.id === "calendar-rsvp")?.trigger ?? null,
-        tools: toolsById([["google-calendar", "draft-rsvp"]])
+        trigger: firstTriggerMatch((trigger) => /calendar|gcal|invite/i.test(`${trigger.connector_slug} ${trigger.label}`)) ?? automationTemplates.find((template) => template.id === "calendar-rsvp")?.trigger ?? null,
+        tools: firstToolsByAction((action) => /calendar|gcal|rsvp|accept|deny/i.test(`${action.connector_slug} ${action.label}`), 1)
       };
     }
     if (/gmail|email|mail/.test(lowerPrompt)) {
       return {
         name: "Email reply draft",
         prompt: trimmedPrompt,
-        trigger: {
+        trigger: firstTriggerMatch((trigger) => /gmail|email|mail/i.test(`${trigger.connector_slug} ${trigger.label}`)) ?? {
           icon: "edit",
           leading: "Email arrives in",
           target: "Gmail"
         },
-        tools: toolsById([["gmail", "create-gmail-draft"]])
+        tools: firstToolsByAction((action) => /gmail|email|draft|send_email/i.test(`${action.connector_slug} ${action.label}`), 1)
       };
     }
     if (/slack|message|reply/.test(lowerPrompt)) {
       return {
         name: "Reply draft",
         prompt: trimmedPrompt,
-        trigger: automationTemplates.find((template) => template.id === "reply-drafts")?.trigger ?? null,
-        tools: toolsById([["slack", "send-to-slack"]])
+        trigger: firstTriggerMatch((trigger) => /slack|telegram|message|lark|wechat/i.test(`${trigger.connector_slug} ${trigger.label}`)) ?? automationTemplates.find((template) => template.id === "reply-drafts")?.trigger ?? null,
+        tools: firstToolsByAction((action) => /slack|telegram|message|reply|send/i.test(`${action.connector_slug} ${action.label}`), 1)
       };
     }
     if (/daily|weekday|morning|digest|every/.test(lowerPrompt)) {
       return {
         name: "Morning digest",
         prompt: trimmedPrompt,
-        trigger: everyDayTrigger,
-        tools: toolsById([
-          ["slack", "read-slack-channels"],
-          ["google-calendar", "read-calendar-events"]
-        ])
+        trigger: firstTriggerMatch((trigger) => trigger.kind === "schedule") ?? everyDayTrigger,
+        tools: firstToolsByAction((action) => /read|list|history|calendar|slack/i.test(`${action.connector_slug} ${action.label}`), 2)
       };
     }
     return {
@@ -601,6 +985,30 @@
       trigger: null,
       tools: []
     };
+  }
+
+  function prefersManualLocalDraft(lowerPrompt: string): boolean {
+    const asksManual = /\bmanual\b|手动|手工/.test(lowerPrompt);
+    const asksLocal = /\blocal(?:-only)?\b|本地/.test(lowerPrompt);
+    const rejectsExternal =
+      /no external|without external|do not use external|不要外部|不连外部|不使用外部/.test(lowerPrompt) ||
+      /no connectors?|without connectors?|do not use connectors?|不要连接器|不使用连接器/.test(lowerPrompt) ||
+      /no tools?|without tools?|do not use tools?|不要工具|不使用工具/.test(lowerPrompt);
+    const isSmokeOrTest = /\bsmoke\b|\btest\b|测试|验证/.test(lowerPrompt);
+    return asksManual || (asksLocal && (rejectsExternal || isSmokeOrTest));
+  }
+
+  function firstToolsByAction(match: (action: AutomationCatalogAction) => boolean, limit: number): SelectedAutomationTool[] {
+    const selected: SelectedAutomationTool[] = [];
+    for (const app of commonApps) {
+      for (const capability of app.capabilities) {
+        if (capability.action && match(capability.action)) {
+          selected.push(selectedToolFrom(app, capability));
+          if (selected.length >= limit) return selected;
+        }
+      }
+    }
+    return selected;
   }
 
   function openPromptAutomation(prompt: string) {
@@ -612,6 +1020,8 @@
     const draft = draftFromPrompt(trimmedPrompt);
     automationName = draft.name;
     automationPrompt = draft.prompt;
+    automationSource = { type: "natural_language", prompt: trimmedPrompt };
+    automationRunLocation = defaultAutomationRunLocation();
     automationTrigger = copyTrigger(draft.trigger);
     selectedTools = copySelectedTools(draft.tools);
     automationEnabled = true;
@@ -633,6 +1043,8 @@
     selectedAutomationId = item.id;
     automationName = item.title;
     automationPrompt = item.prompt ?? item.description;
+    automationSource = item.record?.spec.source ?? { type: "blank" };
+    automationRunLocation = item.record?.spec.run_location ?? defaultAutomationRunLocation();
     automationTrigger = copyTrigger(item.trigger ?? {
       icon: item.icon,
       leading: item.when
@@ -646,11 +1058,29 @@
     editingToolId = null;
     toolSearchQuery = "";
     screenMode = "detail";
+    void refreshSelectedRunHistory();
   }
 
   function selectTrigger(trigger: AutomationTrigger) {
-    automationTrigger = trigger;
+    automationTrigger = copyTrigger(trigger);
     triggerMenuOpen = false;
+  }
+
+  function selectCatalogTrigger(trigger: AutomationCatalogTrigger) {
+    selectTrigger(triggerFromCatalog(trigger));
+  }
+
+  function updateTriggerConfig(key: string, value: string) {
+    if (!automationTrigger) return;
+    const config = {
+      ...(automationTrigger.config ?? {}),
+      [key]: value
+    };
+    automationTrigger = {
+      ...automationTrigger,
+      config,
+      target: automationTrigger.catalog ? triggerTarget(automationTrigger.catalog, config) : automationTrigger.target
+    };
   }
 
   function removeTrigger() {
@@ -689,33 +1119,25 @@
     return [trigger.leading, trigger.target, trigger.actorPrefix, trigger.actor].filter(Boolean).join(" ");
   }
 
-  function saveAutomation() {
+  async function saveAutomation() {
+    if (automationSaving) return;
     const title = automationName.trim() || blankAutomationName;
     const description = automationPrompt.trim() || "Ready to configure.";
-    const nextSequence = savedAutomationSequence + 1;
-    savedAutomationSequence = nextSequence;
-    savedAutomations = [
-      {
-        id: `local-${nextSequence}`,
-        title,
-        description,
-        status: "Active",
-        source: "Puffer",
-        updated: "Just now",
-        when: triggerSummary(automationTrigger),
-        then: description,
-        review: "You can review results before any action is sent.",
-        recent: ["Saved locally"],
-        icon: automationTrigger?.icon ?? "bolt",
-        prompt: description,
-        trigger: copyTrigger(automationTrigger),
-        tools: copySelectedTools(selectedTools),
-        enabled: true,
-        owner: "You",
-        history: []
-      },
-      ...savedAutomations
-    ];
+    automationSaving = true;
+    try {
+      const record = await saveAutomationRecord({
+        id: nextAutomationId(title),
+        status: "enabled",
+        spec: automationSpecFromUi(title, description, automationSource)
+      });
+      upsertAutomationRecord(record);
+      automationLoadError = null;
+    } catch (error) {
+      automationLoadError = errorMessage(error);
+      automationSaving = false;
+      return;
+    }
+    automationSaving = false;
     activeAutomationLibraryTab = "your";
     homePrompt = "";
     triggerMenuOpen = false;
@@ -727,47 +1149,83 @@
     screenMode = "home";
   }
 
-  function saveAutomationDetail() {
+  async function saveAutomationDetail() {
     if (!selectedAutomationId) return;
-    const title = automationName.trim() || blankAutomationName;
-    const description = automationPrompt.trim() || "Ready to configure.";
-    savedAutomations = savedAutomations.map((item) =>
-      item.id === selectedAutomationId
-        ? {
-            ...item,
-            title,
-            description,
-            status: automationEnabled ? "Active" : "Paused",
-            updated: "Just now",
-            when: triggerSummary(automationTrigger),
-            then: description,
-            icon: automationTrigger?.icon ?? item.icon,
-            prompt: description,
-            trigger: copyTrigger(automationTrigger),
-            tools: copySelectedTools(selectedTools),
-            enabled: automationEnabled,
-            owner: item.owner ?? "You"
-          }
-        : item
-    );
-    triggerMenuOpen = false;
-    toolMenuOpen = false;
-    automationActionMenuOpen = false;
-    editingToolId = null;
-    toolSearchQuery = "";
+    if (automationSaving) return;
+    try {
+      await persistSelectedAutomationDetail();
+    } catch (error) {
+      automationLoadError = errorMessage(error);
+    }
   }
 
-  function runTestAutomation() {
+  async function persistSelectedAutomationDetail(): Promise<AutomationRecordDto> {
+    const id = selectedAutomationId;
+    if (!id) throw new Error("Automation is no longer selected; refresh before saving.");
+    const title = automationName.trim() || blankAutomationName;
+    const description = automationPrompt.trim() || "Ready to configure.";
+    const selected = selectedAutomation;
+    if (!selected) {
+      throw new Error("Automation is no longer loaded; refresh before saving.");
+    }
+    const expectedRevision = selected?.revision;
+    if (expectedRevision === undefined) {
+      throw new Error("Automation revision is missing; refresh before saving.");
+    }
+    automationSaving = true;
+    try {
+      const record = await saveAutomationRecord({
+        id,
+        expectedRevision,
+        status: automationEnabled ? "enabled" : "paused",
+        spec: detailSpecForSave(selected, title, description)
+      });
+      upsertAutomationRecord(record);
+      automationLoadError = null;
+      automationName = title;
+      automationPrompt = description;
+      triggerMenuOpen = false;
+      toolMenuOpen = false;
+      automationActionMenuOpen = false;
+      editingToolId = null;
+      toolSearchQuery = "";
+      return record;
+    } finally {
+      automationSaving = false;
+    }
+  }
+
+  function applyAutomationRuntimeSync(sync: AutomationRuntimeSyncResult) {
+    savedAutomations = savedAutomations.map((item) => {
+      if (item.id !== sync.id) return item;
+      const record = item.record
+        ? {
+            ...item.record,
+            revision: sync.revision,
+            runtime: sync.runtime
+          }
+        : item.record;
+      return {
+        ...item,
+        revision: sync.revision,
+        record,
+        recent: [`Revision ${sync.revision}`, runtimeStatusLabel(sync.runtime.status)]
+      };
+    });
+  }
+
+  async function runTestAutomation() {
     if (!selectedAutomationId) return;
+    if (automationRunning || automationSaving) return;
     const nextRunSequence = savedRunSequence + 1;
     savedRunSequence = nextRunSequence;
-    const run: AutomationRun = {
+    const runningRun: AutomationRun = {
       id: `test-${nextRunSequence}`,
       title: "Test run",
-      status: "Waiting for review",
+      status: "Running",
       started: "Just now",
       duration: "-",
-      summary: "Puffer is checking the current configuration."
+      summary: "Puffer is running the current configuration through daemon preview."
     };
     savedAutomations = savedAutomations.map((item) =>
       item.id === selectedAutomationId
@@ -775,16 +1233,123 @@
             ...item,
             updated: "Just now",
             recent: ["Test run started", ...item.recent.filter((entry) => entry !== "Test run started")],
-            history: [run, ...(item.history ?? [])]
+            history: [runningRun, ...(item.history ?? [])]
           }
         : item
     );
     activeAutomationDetailTab = "history";
+    automationRunning = true;
     triggerMenuOpen = false;
     toolMenuOpen = false;
     automationActionMenuOpen = false;
     editingToolId = null;
     toolSearchQuery = "";
+    let previewRequested = false;
+    try {
+      const saved = await persistSelectedAutomationDetail();
+      const sync = await syncAutomationPreview(saved.id, saved.revision);
+      applyAutomationRuntimeSync(sync);
+      previewRequested = true;
+      const preview = await runAutomationPreview(saved.id, previewInput());
+      const run: AutomationRun = {
+        id: `test-${nextRunSequence}`,
+        title: "Test run",
+        status: preview.status === "completed" ? "Completed" : preview.status,
+        started: "Just now",
+        duration: "-",
+        summary: preview.summary || summarizePreviewResult(preview.result),
+        compiled: preview.compiled,
+        runtimeStatus: preview.runtime.status
+      };
+      applyRunToSelected(run);
+      automationLoadError = null;
+    } catch (error) {
+      const run: AutomationRun = {
+        id: `test-${nextRunSequence}`,
+        title: "Test run",
+        status: "Error",
+        started: "Just now",
+        duration: "-",
+        summary: errorMessage(error),
+        error: errorMessage(error)
+      };
+      applyRunToSelected(run);
+      automationLoadError = errorMessage(error);
+    } finally {
+      automationRunning = false;
+      if (previewRequested) {
+        await refreshSelectedRunHistory();
+      }
+    }
+  }
+
+  function previewInput(): Record<string, unknown> {
+    return {
+      source: "desktop_preview",
+      preview: true,
+      trigger: automationTrigger ? triggerSummary(automationTrigger) : "Manual preview",
+      instructions: automationPrompt.trim(),
+      sample: {
+        text: automationPrompt.trim() || "Preview Automation run"
+      }
+    };
+  }
+
+  function summarizePreviewResult(result: unknown): string {
+    if (typeof result === "string") return result;
+    if (result == null) return "Preview completed.";
+    try {
+      return JSON.stringify(result).slice(0, 220);
+    } catch {
+      return "Preview completed.";
+    }
+  }
+
+  function applyRunToSelected(run: AutomationRun) {
+    if (!selectedAutomationId) return;
+    savedAutomations = savedAutomations.map((item) =>
+      item.id === selectedAutomationId
+        ? {
+            ...item,
+            history: [run, ...(item.history ?? []).filter((candidate) => candidate.id !== run.id)],
+            recent: [run.status === "Error" ? "Test run failed" : "Test run completed", ...item.recent.slice(0, 2)]
+          }
+        : item
+    );
+  }
+
+  async function refreshSelectedRunHistory() {
+    if (!selectedAutomationId) return;
+    try {
+      const history = await loadAutomationRunHistory(selectedAutomationId);
+      const runs = history.runs.map(runFromHistoryRecord);
+      savedAutomations = savedAutomations.map((item) =>
+        item.id === selectedAutomationId ? { ...item, history: runs } : item
+      );
+    } catch (error) {
+      automationLoadError = errorMessage(error);
+    }
+  }
+
+  function runFromHistoryRecord(record: AutomationRunHistoryRecord): AutomationRun {
+    const waitingForReview = record.approval?.required && record.approval.status.includes("review");
+    return {
+      id: record.id,
+      title: record.title,
+      status: waitingForReview ? "Waiting for review" : record.status === "completed" ? "Completed" : record.status === "error" ? "Error" : record.status,
+      started: formatUpdated(record.started_at_ms),
+      duration: formatDuration(record.duration_ms),
+      summary: record.error || record.summary,
+      error: record.error,
+      compiled: record.compiled,
+      runtimeStatus: record.runtime_status
+    };
+  }
+
+  function formatDuration(value: number): string {
+    if (!Number.isFinite(value) || value <= 0) return "-";
+    if (value < 1000) return `${Math.round(value)} ms`;
+    return `${(value / 1000).toFixed(1)} s`;
   }
 
   function returnToAutomationHome() {
@@ -812,8 +1377,16 @@
     toolMenuOpen = false;
   }
 
-  function deleteSelectedAutomation() {
+  async function deleteSelectedAutomation() {
     if (!selectedAutomationId) return;
+    const id = selectedAutomationId;
+    try {
+      await deleteAutomationRecord(id);
+      automationLoadError = null;
+    } catch (error) {
+      automationLoadError = errorMessage(error);
+      return;
+    }
     savedAutomations = savedAutomations.filter((item) => item.id !== selectedAutomationId);
     activeAutomationLibraryTab = "your";
     returnToAutomationHome();
@@ -905,6 +1478,49 @@
   }
 </script>
 
+{#snippet runLocationSection()}
+  <section class="pf-automation-builder-config">
+    <div class="pf-automation-section-title-row">
+      <h2>Run location</h2>
+      <button
+        type="button"
+        class="pf-automation-runtime-settings-link"
+        onclick={openAutomationRuntimeSettings}
+      >
+        Configure Runtime
+      </button>
+    </div>
+    <div class="pf-automation-run-location" role="radiogroup" aria-label="Run location">
+      <label>
+        <input
+          type="radio"
+          name="automation-run-location"
+          value="local"
+          checked={automationRunLocation === "local"}
+          onchange={() => (automationRunLocation = "local")}
+        />
+        <span>
+          <strong>Local</strong>
+          <small>Puffer starts and configures the local runtime when needed.</small>
+        </span>
+      </label>
+      <label>
+        <input
+          type="radio"
+          name="automation-run-location"
+          value="agent_env_cloud"
+          checked={automationRunLocation === "agent_env_cloud"}
+          onchange={() => (automationRunLocation = "agent_env_cloud")}
+        />
+        <span>
+          <strong>AgentEnv Cloud</strong>
+          <small>Use a cloud runtime for this automation.</small>
+        </span>
+      </label>
+    </div>
+  </section>
+{/snippet}
+
 <svelte:window onclick={closeFloatingMenusFromOutside} />
 
 <div class="pf-screen-top">
@@ -927,12 +1543,15 @@
       </div>
       <div class="pf-automation-builder-page-actions">
         <button type="button" class="sc-btn" data-variant="outline" data-size="sm" onclick={cancelCreate}>Cancel</button>
-        <button type="button" class="sc-btn" data-variant="default" data-size="sm" onclick={saveAutomation}>Save</button>
+        <button type="button" class="sc-btn" data-variant="default" data-size="sm" disabled={automationSaving} onclick={saveAutomation}>Save</button>
       </div>
     </header>
 
     <div class="pf-automation-builder-page-body">
       <main class="pf-automation-builder-main">
+        {#if automationLoadError}
+          <div class="pf-automation-error" role="alert">{automationLoadError}</div>
+        {/if}
         <section class="pf-automation-builder-field">
           <input
             id="automation-name"
@@ -969,6 +1588,32 @@
                   </button>
                 </span>
               </div>
+              {#if automationTrigger.catalog?.required_inputs?.length}
+                <div class="pf-automation-trigger-fields" aria-label="Trigger configuration">
+                  {#each automationTrigger.catalog.required_inputs as input (input.id)}
+                    <label>
+                      <span>{input.label}</span>
+                      {#if input.kind === "select" && input.options?.length}
+                        <select
+                          value={automationTrigger.config?.[input.id] ?? ""}
+                          onchange={(event) => updateTriggerConfig(input.id, event.currentTarget.value)}
+                        >
+                          {#each input.options as option}
+                            <option value={option}>{option}</option>
+                          {/each}
+                        </select>
+                      {:else}
+                        <input
+                          type={input.kind === "time" ? "time" : "text"}
+                          value={automationTrigger.config?.[input.id] ?? ""}
+                          placeholder={input.default == null ? "" : String(input.default)}
+                          oninput={(event) => updateTriggerConfig(input.id, event.currentTarget.value)}
+                        />
+                      {/if}
+                    </label>
+                  {/each}
+                </div>
+              {/if}
             {/if}
 
             <div class="pf-automation-trigger-menu-wrap">
@@ -987,22 +1632,35 @@
                     <Icon name="search" size={12} />
                     <input type="search" placeholder="Search triggers..." />
                   </label>
-                  <span>Scheduled</span>
-                  <button type="button" role="menuitem" onclick={() => selectTrigger(everyDayTrigger)}>
-                    <Icon name="clock" size={12} />
-                    Every...
-                    <Icon name="chevR" size={11} />
-                  </button>
-                  <button type="button" role="menuitem" onclick={() => selectTrigger(customScheduleTrigger)}><Icon name="clock" size={12} /> Custom (cron)</button>
-                  <span>GitHub / GitLab</span>
-                  <button type="button" role="menuitem" onclick={() => selectTrigger(draftOpenedTrigger)}><Icon name="git" size={12} /> Draft opened</button>
-                  <button type="button" role="menuitem" onclick={() => selectTrigger(prOpenedTrigger)}>
-                    <Icon name="git" size={12} />
-                    Pull request...
-                    <Icon name="chevR" size={11} />
-                  </button>
-                  <button type="button" role="menuitem" onclick={() => selectTrigger(commentAddedTrigger)}><Icon name="git" size={12} /> Comment added</button>
-                  <button type="button" role="menuitem" onclick={() => selectTrigger(labelChangeTrigger)}><Icon name="git" size={12} /> Label change</button>
+                  {#if triggerCatalog.length}
+                    <span>Triggers</span>
+                    {#each triggerCatalog as trigger (trigger.id)}
+                      <button type="button" role="menuitem" title={trigger.summary} onclick={() => selectCatalogTrigger(trigger)}>
+                        <Icon name={iconName(trigger.icon)} size={12} />
+                        {trigger.label}
+                        {#if trigger.connection_state}
+                          <small>{trigger.kind === "connector_event" ? "Pull request" : connectionStateLabel(trigger.connection_state)}</small>
+                        {/if}
+                      </button>
+                    {/each}
+                  {:else}
+                    <span>Scheduled</span>
+                    <button type="button" role="menuitem" onclick={() => selectTrigger(everyDayTrigger)}>
+                      <Icon name="clock" size={12} />
+                      Every...
+                      <Icon name="chevR" size={11} />
+                    </button>
+                    <button type="button" role="menuitem" onclick={() => selectTrigger(customScheduleTrigger)}><Icon name="clock" size={12} /> Custom (cron)</button>
+                    <span>GitHub / GitLab</span>
+                    <button type="button" role="menuitem" onclick={() => selectTrigger(draftOpenedTrigger)}><Icon name="git" size={12} /> Draft opened</button>
+                    <button type="button" role="menuitem" onclick={() => selectTrigger(prOpenedTrigger)}>
+                      <Icon name="git" size={12} />
+                      Pull request...
+                      <Icon name="chevR" size={11} />
+                    </button>
+                    <button type="button" role="menuitem" onclick={() => selectTrigger(commentAddedTrigger)}><Icon name="git" size={12} /> Comment added</button>
+                    <button type="button" role="menuitem" onclick={() => selectTrigger(labelChangeTrigger)}><Icon name="git" size={12} /> Label change</button>
+                  {/if}
                 </div>
               {/if}
             </div>
@@ -1064,6 +1722,12 @@
                       {tool.target}
                       <Icon name="chevD" size={10} />
                     </button>
+                  </span>
+                {/if}
+                {#if tool.action}
+                  <span class="pf-automation-tool-status">
+                    <span>{connectionStateLabel(tool.action.connection_state ?? "ready")}</span>
+                    <span>{tool.action.external_side_effect ? "Approval required" : (tool.action.permission_state ?? "Ready")}</span>
                   </span>
                 {/if}
                 <span class="pf-automation-row-actions">
@@ -1128,7 +1792,7 @@
                       </div>
                     </div>
                   {:else}
-                    <p class="pf-automation-app-empty">No matching apps.</p>
+                    <p class="pf-automation-app-empty">{commonApps.length ? "No matching apps." : "No catalog tools available."}</p>
                   {/each}
                 </div>
               {/if}
@@ -1136,20 +1800,7 @@
           </div>
         </section>
 
-        <section class="pf-automation-builder-config">
-          <h2>Cloud Agent Environment</h2>
-          <div class="pf-automation-environment-row">
-            <div>
-              <strong>Use Configured Environment</strong>
-              <p>Applies any environment setup and secrets. Disable to start the agent faster.</p>
-            </div>
-            <button type="button">Manage</button>
-            <label class="pf-automation-switch">
-              <input type="checkbox" aria-label="Use Configured Environment" checked />
-              <span></span>
-            </label>
-          </div>
-        </section>
+        {@render runLocationSection()}
 
       </main>
     </div>
@@ -1167,7 +1818,7 @@
           <Icon name="test" size={13} />
           <span>Test Run</span>
         </button>
-        <button type="button" class="sc-btn" data-variant="default" data-size="sm" onclick={saveAutomationDetail}>Save</button>
+        <button type="button" class="sc-btn" data-variant="default" data-size="sm" disabled={automationSaving} onclick={saveAutomationDetail}>Save</button>
         <div class="pf-automation-action-menu-wrap">
           <button
             type="button"
@@ -1193,6 +1844,9 @@
 
     <div class="pf-automation-detail-body">
       <main class="pf-automation-detail-main">
+        {#if automationLoadError}
+          <div class="pf-automation-error" role="alert">{automationLoadError}</div>
+        {/if}
         <section class="pf-automation-detail-identity" aria-label="Automation identity">
           <input
             class="pf-automation-detail-name"
@@ -1267,6 +1921,32 @@
                       </button>
                     </span>
                   </div>
+                  {#if automationTrigger.catalog?.required_inputs?.length}
+                    <div class="pf-automation-trigger-fields" aria-label="Trigger configuration">
+                      {#each automationTrigger.catalog.required_inputs as input (input.id)}
+                        <label>
+                          <span>{input.label}</span>
+                          {#if input.kind === "select" && input.options?.length}
+                            <select
+                              value={automationTrigger.config?.[input.id] ?? ""}
+                              onchange={(event) => updateTriggerConfig(input.id, event.currentTarget.value)}
+                            >
+                              {#each input.options as option}
+                                <option value={option}>{option}</option>
+                              {/each}
+                            </select>
+                          {:else}
+                            <input
+                              type={input.kind === "time" ? "time" : "text"}
+                              value={automationTrigger.config?.[input.id] ?? ""}
+                              placeholder={input.default == null ? "" : String(input.default)}
+                              oninput={(event) => updateTriggerConfig(input.id, event.currentTarget.value)}
+                            />
+                          {/if}
+                        </label>
+                      {/each}
+                    </div>
+                  {/if}
                 {/if}
 
                 <div class="pf-automation-trigger-menu-wrap">
@@ -1285,22 +1965,35 @@
                         <Icon name="search" size={12} />
                         <input type="search" placeholder="Search triggers..." />
                       </label>
-                      <span>Scheduled</span>
-                      <button type="button" role="menuitem" onclick={() => selectTrigger(everyDayTrigger)}>
-                        <Icon name="clock" size={12} />
-                        Every...
-                        <Icon name="chevR" size={11} />
-                      </button>
-                      <button type="button" role="menuitem" onclick={() => selectTrigger(customScheduleTrigger)}><Icon name="clock" size={12} /> Custom (cron)</button>
-                      <span>GitHub / GitLab</span>
-                      <button type="button" role="menuitem" onclick={() => selectTrigger(draftOpenedTrigger)}><Icon name="git" size={12} /> Draft opened</button>
-                      <button type="button" role="menuitem" onclick={() => selectTrigger(prOpenedTrigger)}>
-                        <Icon name="git" size={12} />
-                        Pull request...
-                        <Icon name="chevR" size={11} />
-                      </button>
-                      <button type="button" role="menuitem" onclick={() => selectTrigger(commentAddedTrigger)}><Icon name="git" size={12} /> Comment added</button>
-                      <button type="button" role="menuitem" onclick={() => selectTrigger(labelChangeTrigger)}><Icon name="git" size={12} /> Label change</button>
+                      {#if triggerCatalog.length}
+                        <span>Triggers</span>
+                        {#each triggerCatalog as trigger (trigger.id)}
+                          <button type="button" role="menuitem" title={trigger.summary} onclick={() => selectCatalogTrigger(trigger)}>
+                            <Icon name={iconName(trigger.icon)} size={12} />
+                            {trigger.label}
+                            {#if trigger.connection_state}
+                              <small>{trigger.kind === "connector_event" ? "Pull request" : connectionStateLabel(trigger.connection_state)}</small>
+                            {/if}
+                          </button>
+                        {/each}
+                      {:else}
+                        <span>Scheduled</span>
+                        <button type="button" role="menuitem" onclick={() => selectTrigger(everyDayTrigger)}>
+                          <Icon name="clock" size={12} />
+                          Every...
+                          <Icon name="chevR" size={11} />
+                        </button>
+                        <button type="button" role="menuitem" onclick={() => selectTrigger(customScheduleTrigger)}><Icon name="clock" size={12} /> Custom (cron)</button>
+                        <span>GitHub / GitLab</span>
+                        <button type="button" role="menuitem" onclick={() => selectTrigger(draftOpenedTrigger)}><Icon name="git" size={12} /> Draft opened</button>
+                        <button type="button" role="menuitem" onclick={() => selectTrigger(prOpenedTrigger)}>
+                          <Icon name="git" size={12} />
+                          Pull request...
+                          <Icon name="chevR" size={11} />
+                        </button>
+                        <button type="button" role="menuitem" onclick={() => selectTrigger(commentAddedTrigger)}><Icon name="git" size={12} /> Comment added</button>
+                        <button type="button" role="menuitem" onclick={() => selectTrigger(labelChangeTrigger)}><Icon name="git" size={12} /> Label change</button>
+                      {/if}
                     </div>
                   {/if}
                 </div>
@@ -1322,6 +2015,8 @@
                 </button>
               </div>
             </section>
+
+            {@render runLocationSection()}
 
             <section class="pf-automation-builder-config">
               <h2>Tools</h2>
@@ -1360,6 +2055,12 @@
                           {tool.target}
                           <Icon name="chevD" size={10} />
                         </button>
+                    </span>
+                  {/if}
+                    {#if tool.action}
+                      <span class="pf-automation-tool-status">
+                        <span>{connectionStateLabel(tool.action.connection_state ?? "ready")}</span>
+                        <span>{tool.action.external_side_effect ? "Approval required" : (tool.action.permission_state ?? "Ready")}</span>
                       </span>
                     {/if}
                     <span class="pf-automation-row-actions">
@@ -1424,7 +2125,7 @@
                           </div>
                         </div>
                       {:else}
-                        <p class="pf-automation-app-empty">No matching apps.</p>
+                        <p class="pf-automation-app-empty">{commonApps.length ? "No matching apps." : "No catalog tools available."}</p>
                       {/each}
                     </div>
                   {/if}
@@ -1541,6 +2242,12 @@
     </section>
 
     <section class="pf-automations-section" aria-label="Automation library">
+      {#if automationLoadError}
+        <div class="pf-automation-error" role="alert">{automationLoadError}</div>
+      {/if}
+      {#if automationCatalogError}
+        <div class="pf-automation-error" role="status">{automationCatalogError}</div>
+      {/if}
       <div class="pf-automation-library-toolbar">
         <div class="pf-automation-tabs" role="tablist" aria-label="Automation library">
           <button
@@ -1862,6 +2569,16 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
+  }
+
+  .pf-automation-error {
+    border: 1px solid color-mix(in oklab, var(--destructive) 42%, var(--border));
+    border-radius: 8px;
+    padding: 9px 10px;
+    color: var(--destructive);
+    background: color-mix(in oklab, var(--destructive) 9%, var(--background));
+    font-size: 12px;
+    line-height: 17px;
   }
 
   .pf-automation-library-toolbar {
@@ -2302,6 +3019,29 @@
     letter-spacing: 0;
   }
 
+  .pf-automation-section-title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .pf-automation-runtime-settings-link {
+    border: 0;
+    background: transparent;
+    color: var(--muted-foreground);
+    font: inherit;
+    font-size: 11px;
+    line-height: 15px;
+    padding: 0;
+    cursor: pointer;
+  }
+
+  .pf-automation-runtime-settings-link:hover {
+    color: var(--foreground);
+    text-decoration: underline;
+  }
+
   .pf-automation-name-input {
     width: 100%;
     height: 32px;
@@ -2318,7 +3058,7 @@
 
   .pf-automation-trigger-panel,
   .pf-automation-stack-panel,
-  .pf-automation-environment-row,
+  .pf-automation-run-location,
   .pf-automation-instructions-box {
     border: 1px solid var(--border);
     border-radius: 5px;
@@ -2465,6 +3205,38 @@
     background: var(--pf-selected-bg-hover);
   }
 
+  .pf-automation-trigger-fields {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 8px;
+    border-top: 1px solid var(--border);
+    padding: 8px 10px 10px;
+  }
+
+  .pf-automation-trigger-fields label {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    color: var(--muted-foreground);
+    font-size: 11px;
+    line-height: 15px;
+  }
+
+  .pf-automation-trigger-fields input,
+  .pf-automation-trigger-fields select {
+    min-width: 0;
+    height: 28px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--background);
+    color: var(--foreground);
+    font: inherit;
+    font-size: 12px;
+    padding: 0 7px;
+    outline: none;
+  }
+
   .pf-automation-instructions-box {
     display: flex;
     flex-direction: column;
@@ -2583,6 +3355,29 @@
     line-height: 17px;
   }
 
+  .pf-automation-tool-status {
+    flex: 0 1 auto;
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--muted-foreground);
+    font-size: 11px;
+    line-height: 16px;
+  }
+
+  .pf-automation-tool-status span {
+    min-width: 0;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--background);
+    padding: 1px 5px;
+  }
+
   .pf-automation-target-chip {
     height: 24px;
     display: inline-flex;
@@ -2608,22 +3403,6 @@
   .pf-automation-row-action:focus-visible {
     background: var(--pf-selected-bg-hover);
     color: var(--foreground);
-  }
-
-  .pf-automation-environment-row > button {
-    border: 0;
-    border-radius: 5px;
-    background: transparent;
-    color: var(--foreground);
-    font: inherit;
-    font-size: 11px;
-    line-height: 16px;
-    padding: 3px 6px;
-    cursor: pointer;
-  }
-
-  .pf-automation-environment-row > button:hover {
-    background: var(--pf-selected-bg-hover);
   }
 
   .pf-automation-app-menu {
@@ -2783,16 +3562,29 @@
     line-height: 17px;
   }
 
-  .pf-automation-environment-row {
-    min-height: 52px;
+  .pf-automation-run-location {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto auto;
-    align-items: center;
-    gap: 10px;
-    padding: 9px 10px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0;
   }
 
-  .pf-automation-environment-row strong {
+  .pf-automation-run-location label {
+    min-width: 0;
+    display: flex;
+    gap: 8px;
+    padding: 10px;
+    cursor: pointer;
+  }
+
+  .pf-automation-run-location label + label {
+    border-left: 1px solid var(--border);
+  }
+
+  .pf-automation-run-location input {
+    margin-top: 2px;
+  }
+
+  .pf-automation-run-location strong {
     display: block;
     color: var(--foreground);
     font-size: 12px;
@@ -2800,7 +3592,8 @@
     font-weight: 600;
   }
 
-  .pf-automation-environment-row p {
+  .pf-automation-run-location small {
+    display: block;
     margin: 1px 0 0;
     color: var(--muted-foreground);
     font-size: 11px;
@@ -3006,9 +3799,14 @@
       grid-template-columns: 1fr;
     }
 
-    .pf-automation-environment-row {
+    .pf-automation-run-location {
       grid-template-columns: 1fr;
       gap: 8px;
+    }
+
+    .pf-automation-run-location label + label {
+      border-left: 0;
+      border-top: 1px solid var(--border);
     }
 
     .pf-automation-history-list li {

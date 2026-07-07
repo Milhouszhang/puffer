@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use puffer_config::{ConfigPaths, PufferConfig, WorkflowBackendMode};
+use puffer_config::{ConfigPaths, PufferConfig, WorkflowBackendConfig, WorkflowBackendMode};
 use puffer_core::{blocking_client_for_url, HttpPurpose};
 use puffer_secrets::SecretVault;
 use puffer_workflow::{
@@ -118,7 +118,7 @@ fn runtime_check(step: &WorkflowRuntimeConnectionStep) -> WorkflowBackendConnect
     match step.state {
         WorkflowRuntimeConnectionStepState::Passed => WorkflowBackendConnectionCheckDto {
             state: WorkflowRuntimeConnectionStepState::Passed,
-            message: "Workflow runtime API is reachable.".to_string(),
+            message: "Automation runtime API is reachable.".to_string(),
             error: None,
         },
         WorkflowRuntimeConnectionStepState::Failed => {
@@ -129,17 +129,17 @@ fn runtime_check(step: &WorkflowRuntimeConnectionStep) -> WorkflowBackendConnect
             if auth_failure {
                 WorkflowBackendConnectionCheckDto {
                     state: WorkflowRuntimeConnectionStepState::Passed,
-                    message: "Workflow runtime API is reachable.".to_string(),
+                    message: "Automation runtime API is reachable.".to_string(),
                     error: None,
                 }
             } else {
-                failed_check("Unable to reach workflow runtime.", step)
+                failed_check("Unable to reach automation runtime.", step)
             }
         }
         WorkflowRuntimeConnectionStepState::Skipped => skipped_check(
             step.message
                 .as_deref()
-                .unwrap_or("Skipped because workflow runtime was not checked."),
+                .unwrap_or("Skipped because automation runtime was not checked."),
         ),
     }
 }
@@ -148,7 +148,7 @@ fn auth_check(step: &WorkflowRuntimeConnectionStep) -> WorkflowBackendConnection
     match step.state {
         WorkflowRuntimeConnectionStepState::Passed => WorkflowBackendConnectionCheckDto {
             state: WorkflowRuntimeConnectionStepState::Passed,
-            message: "Workflow runtime token is accepted.".to_string(),
+            message: "Automation runtime token is accepted.".to_string(),
             error: None,
         },
         WorkflowRuntimeConnectionStepState::Failed => {
@@ -157,15 +157,15 @@ fn auth_check(step: &WorkflowRuntimeConnectionStep) -> WorkflowBackendConnection
                 .as_ref()
                 .is_some_and(|error| auth_error_kind(error.kind));
             if auth_failure {
-                failed_check("Workflow runtime authentication failed.", step)
+                failed_check("Automation runtime authentication failed.", step)
             } else {
-                skipped_check("Skipped because workflow runtime was not reachable.")
+                skipped_check("Skipped because automation runtime was not reachable.")
             }
         }
         WorkflowRuntimeConnectionStepState::Skipped => skipped_check(
             step.message
                 .as_deref()
-                .unwrap_or("Skipped because workflow runtime was not checked."),
+                .unwrap_or("Skipped because automation runtime was not checked."),
         ),
     }
 }
@@ -174,11 +174,11 @@ fn workspace_check(step: &WorkflowRuntimeConnectionStep) -> WorkflowBackendConne
     match step.state {
         WorkflowRuntimeConnectionStepState::Passed => WorkflowBackendConnectionCheckDto {
             state: WorkflowRuntimeConnectionStepState::Passed,
-            message: "Workflow workspace is accessible.".to_string(),
+            message: "Automation workspace is accessible.".to_string(),
             error: None,
         },
         WorkflowRuntimeConnectionStepState::Failed => {
-            failed_check("Workflow workspace access failed.", step)
+            failed_check("Automation workspace access failed.", step)
         }
         WorkflowRuntimeConnectionStepState::Skipped => skipped_check(
             step.message
@@ -262,6 +262,42 @@ pub(crate) fn workflow_runtime_client(
     config: &PufferConfig,
 ) -> Result<WorkflowRuntimeClient> {
     let resolved = resolve_workflow_runtime_config(paths, config)?;
+    workflow_runtime_client_from_resolved(config, resolved)
+}
+
+pub(crate) fn workflow_runtime_client_for_mode(
+    paths: &ConfigPaths,
+    config: &PufferConfig,
+    mode: WorkflowBackendMode,
+) -> Result<WorkflowRuntimeClient> {
+    let mut selected = config.clone();
+    let transient_local =
+        selected.workflow_backend.mode != mode && mode == WorkflowBackendMode::Local;
+    if selected.workflow_backend.mode != mode {
+        selected.workflow_backend = WorkflowBackendConfig {
+            mode,
+            api_base_url: WorkflowBackendConfig::default_api_base_url(mode).to_string(),
+            frontend_url: WorkflowBackendConfig::default_frontend_url(mode).to_string(),
+            workspace_id: String::new(),
+            api_token_secret_id: String::new(),
+        };
+    }
+    let resolved = if transient_local {
+        resolve_workflow_runtime_config_with(
+            paths,
+            &selected,
+            workflow_local_runtime::ensure_ready_transient,
+        )?
+    } else {
+        resolve_workflow_runtime_config(paths, &selected)?
+    };
+    workflow_runtime_client_from_resolved(&selected, resolved)
+}
+
+fn workflow_runtime_client_from_resolved(
+    config: &PufferConfig,
+    resolved: ResolvedWorkflowRuntimeConfig,
+) -> Result<WorkflowRuntimeClient> {
     let http_client = blocking_client_for_url(
         &config.network.proxy,
         HttpPurpose::Discovery,
@@ -383,8 +419,8 @@ fn normalized_frontend_url(value: &str) -> Result<Url> {
 
 fn workflow_runtime_name(mode: WorkflowBackendMode) -> &'static str {
     match mode {
-        WorkflowBackendMode::Local => "workflow runtime",
-        WorkflowBackendMode::AgentEnvCloud => "AgentEnv Cloud workflow runtime",
+        WorkflowBackendMode::Local => "automation runtime",
+        WorkflowBackendMode::AgentEnvCloud => "AgentEnv Cloud automation runtime",
     }
 }
 
@@ -571,7 +607,7 @@ mod tests {
             .expect_err("missing token should error");
         assert!(error
             .to_string()
-            .contains("AgentEnv Cloud workflow runtime token is not configured"));
+            .contains("AgentEnv Cloud automation runtime token is not configured"));
     }
 
     #[test]

@@ -183,12 +183,27 @@ fn forward_message_without_outbound_reports_actionable_error() {
 
 struct RecordingWorkflowRunner {
     calls: StdMutex<Vec<(String, serde_json::Value)>>,
+    automation_calls: StdMutex<Vec<(String, serde_json::Value)>>,
 }
 
 impl WorkflowActionRunner for RecordingWorkflowRunner {
     fn run_workflow(&self, slug: &str, trigger: serde_json::Value) -> Result<WorkflowActionOutput> {
         self.calls.lock().unwrap().push((slug.to_string(), trigger));
         Ok(WorkflowActionOutput::new(format!("ran {slug}")))
+    }
+
+    fn run_automation(
+        &self,
+        automation_id: &str,
+        trigger: serde_json::Value,
+    ) -> Result<WorkflowActionOutput> {
+        self.automation_calls
+            .lock()
+            .unwrap()
+            .push((automation_id.to_string(), trigger));
+        Ok(WorkflowActionOutput::new(format!(
+            "ran automation {automation_id}"
+        )))
     }
 }
 
@@ -197,6 +212,7 @@ fn run_workflow_dispatches_connection_trigger() {
     let dispatcher = BuiltinActionDispatcher::new();
     let runner = Arc::new(RecordingWorkflowRunner {
         calls: StdMutex::new(Vec::new()),
+        automation_calls: StdMutex::new(Vec::new()),
     });
     dispatcher.set_workflow_runner(runner.clone());
     let action = ActionSpec::RunWorkflow {
@@ -233,6 +249,29 @@ fn run_workflow_dispatches_connection_trigger() {
     );
     assert!(calls[0].1.get("received_at").is_none());
     assert!(calls[0].1.get("received_at_ms").is_none());
+}
+
+#[test]
+fn run_automation_dispatches_to_automation_runner() {
+    let dispatcher = BuiltinActionDispatcher::new();
+    let runner = Arc::new(RecordingWorkflowRunner {
+        calls: StdMutex::new(Vec::new()),
+        automation_calls: StdMutex::new(Vec::new()),
+    });
+    dispatcher.set_workflow_runner(runner.clone());
+    let action = ActionSpec::RunAutomation {
+        automation_id: "reply-helper".into(),
+    };
+
+    let result = dispatcher.dispatch(&action, &envelope("hello", json!({"chat":"@x"})));
+
+    assert!(result.success, "{}", result.summary);
+    let calls = runner.automation_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "reply-helper");
+    assert_eq!(calls[0].1["type"], "connection");
+    assert_eq!(calls[0].1["text"], "hello");
+    assert_eq!(calls[0].1["payload"], json!({"chat":"@x"}));
 }
 
 struct RecordingTriageRunner {

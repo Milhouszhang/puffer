@@ -662,7 +662,7 @@ fn workflow_backend_options() -> Vec<WorkflowBackendOptionDto> {
         WorkflowBackendOptionDto {
             mode: WorkflowBackendMode::Local,
             label: "Run locally".to_string(),
-            description: "Runs workflows through a local runtime on this device.".to_string(),
+            description: "Runs automations through a local runtime on this device.".to_string(),
             api_url: WorkflowBackendConfig::default_api_base_url(WorkflowBackendMode::Local)
                 .to_string(),
             ui_url: WorkflowBackendConfig::default_frontend_url(WorkflowBackendMode::Local)
@@ -671,7 +671,7 @@ fn workflow_backend_options() -> Vec<WorkflowBackendOptionDto> {
         WorkflowBackendOptionDto {
             mode: WorkflowBackendMode::AgentEnvCloud,
             label: "Run on AgentEnv Cloud".to_string(),
-            description: "Sends required workflow data to AgentEnv Cloud for execution."
+            description: "Sends required automation data to AgentEnv Cloud for execution."
                 .to_string(),
             api_url: WorkflowBackendConfig::default_api_base_url(
                 WorkflowBackendMode::AgentEnvCloud,

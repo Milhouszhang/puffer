@@ -1,6 +1,6 @@
 use super::{
     trimmed, RuntimeContext, AGENTENV_LOCAL_RUNTIME_IMAGE, LOCAL_WORKFLOW_RUNTIME_API_PORT,
-    LOCAL_WORKFLOW_RUNTIME_PROJECT, POSTGRES_IMAGE, POSTGRES_URL, REDIS_IMAGE, REDIS_URL,
+    POSTGRES_IMAGE, POSTGRES_URL, REDIS_IMAGE, REDIS_URL,
 };
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -105,15 +105,16 @@ services:
         api_port = LOCAL_WORKFLOW_RUNTIME_API_PORT,
         host_port = runtime.host_port,
         postgres_image = POSTGRES_IMAGE,
-        project = LOCAL_WORKFLOW_RUNTIME_PROJECT,
+        project = runtime.stack_name,
         redis_image = REDIS_IMAGE,
     )
 }
 
 fn env_file_text(runtime: &RuntimeContext) -> String {
     format!(
-        "DATABASE_URL={POSTGRES_URL}\nREDIS_URL={REDIS_URL}\nAPI_KEY_PEPPER={}\nJWT_SECRET={}\nJWT_REFRESH_SECRET={}\nLOCAL_USER_ID={}\nLOCAL_WORKSPACE_ID={}\n",
+        "NODE_ENV=development\nGRPC_USE_TLS=false\nSCHEDULER_PROTO_PATH=/app/protos/scheduler/scheduler.proto\nHYPERVISOR_PROTO_PATH=/app/protos/hypervisor/hypervisor.proto\nDATABASE_URL={POSTGRES_URL}\nREDIS_URL={REDIS_URL}\nAPI_KEY_PEPPER={}\nGATEWAY_ENCRYPTION_KEY={}\nJWT_SECRET={}\nJWT_REFRESH_SECRET={}\nLOCAL_USER_ID={}\nLOCAL_WORKSPACE_ID={}\n",
         runtime.api_key_pepper,
+        runtime.gateway_encryption_key,
         runtime.jwt_secret,
         runtime.jwt_refresh_secret,
         runtime.user_id,

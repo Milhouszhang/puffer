@@ -2,7 +2,7 @@ use super::*;
 use crate::daemon_workflow_backend_settings::test_support::{
     lock_secret_store, temp_paths, ScopedSecretStoreKey,
 };
-use puffer_config::{ensure_workspace_dirs, WorkflowBackendMode};
+use puffer_config::{ensure_workspace_dirs, load_config, save_user_config, WorkflowBackendMode};
 use puffer_secrets::{SecretUpsert, SecretVault};
 use std::collections::VecDeque;
 use std::fs;
@@ -62,6 +62,7 @@ impl CommandRunner for FakeCommandRunner {
 struct FakeHealthChecker {
     ready: bool,
     node_definitions: bool,
+    node_definition_results: Arc<Mutex<VecDeque<bool>>>,
     ready_calls: Arc<Mutex<Vec<String>>>,
     node_definition_calls: Arc<Mutex<Vec<(String, String, String)>>>,
 }
@@ -71,6 +72,7 @@ impl FakeHealthChecker {
         Self {
             ready: true,
             node_definitions: true,
+            node_definition_results: Arc::new(Mutex::new(VecDeque::new())),
             ready_calls: Arc::new(Mutex::new(Vec::new())),
             node_definition_calls: Arc::new(Mutex::new(Vec::new())),
         }
@@ -80,6 +82,7 @@ impl FakeHealthChecker {
         Self {
             ready: false,
             node_definitions: false,
+            node_definition_results: Arc::new(Mutex::new(VecDeque::new())),
             ready_calls: Arc::new(Mutex::new(Vec::new())),
             node_definition_calls: Arc::new(Mutex::new(Vec::new())),
         }
@@ -89,6 +92,17 @@ impl FakeHealthChecker {
         Self {
             ready: true,
             node_definitions: false,
+            node_definition_results: Arc::new(Mutex::new(VecDeque::new())),
+            ready_calls: Arc::new(Mutex::new(Vec::new())),
+            node_definition_calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn node_definitions_ready_after_retry() -> Self {
+        Self {
+            ready: true,
+            node_definitions: true,
+            node_definition_results: Arc::new(Mutex::new(VecDeque::from(vec![false, true]))),
             ready_calls: Arc::new(Mutex::new(Vec::new())),
             node_definition_calls: Arc::new(Mutex::new(Vec::new())),
         }
@@ -125,7 +139,12 @@ impl HealthChecker for FakeHealthChecker {
                 workspace_id.to_string(),
                 api_key.to_string(),
             ));
-        Ok(self.node_definitions)
+        Ok(self
+            .node_definition_results
+            .lock()
+            .expect("node definition results")
+            .pop_front()
+            .unwrap_or(self.node_definitions))
     }
 }
 
@@ -178,7 +197,7 @@ fn write_test_env(paths: &ConfigPaths, user_id: &str, pepper: &str) {
     fs::write(
         stack_dir.join(LOCAL_WORKFLOW_RUNTIME_ENV_FILE),
         format!(
-            "DATABASE_URL={POSTGRES_URL}\nREDIS_URL={REDIS_URL}\nAPI_KEY_PEPPER={pepper}\nLOCAL_USER_ID={user_id}\nLOCAL_WORKSPACE_ID=11111111-1111-4111-8111-111111111111\n"
+            "NODE_ENV=development\nGRPC_USE_TLS=false\nSCHEDULER_PROTO_PATH=/app/protos/scheduler/scheduler.proto\nHYPERVISOR_PROTO_PATH=/app/protos/hypervisor/hypervisor.proto\nDATABASE_URL={POSTGRES_URL}\nREDIS_URL={REDIS_URL}\nAPI_KEY_PEPPER={pepper}\nGATEWAY_ENCRYPTION_KEY=gateway-test\nLOCAL_USER_ID={user_id}\nLOCAL_WORKSPACE_ID=11111111-1111-4111-8111-111111111111\n"
         ),
     )
     .expect("write env");
@@ -229,7 +248,7 @@ fn docker_unavailable_returns_docker_missing() {
 }
 
 #[test]
-fn image_missing_does_not_pull_or_start_services() {
+fn image_missing_pulls_before_reporting_missing() {
     let _guard = lock_secret_store();
     let _secret_store_key = ScopedSecretStoreKey::set();
     let temp = tempfile::tempdir().expect("tempdir");
@@ -238,6 +257,7 @@ fn image_missing_does_not_pull_or_start_services() {
     let mut responses = Vec::new();
     responses.extend(available());
     responses.push(fail("no image"));
+    responses.push(fail("pull failed"));
     let runner = FakeCommandRunner::new(responses);
 
     let status = start_with(
@@ -245,15 +265,18 @@ fn image_missing_does_not_pull_or_start_services() {
         &FakeHealthChecker::not_ready(),
         &paths,
         &mut config,
+        true,
         WaitPolicy::new(1, Duration::ZERO),
     )
     .expect("start");
 
     assert_eq!(status.state, LocalWorkflowRuntimeState::ImageMissing);
+    assert!(runner.calls().iter().any(|call| call.program == "docker"
+        && call.args.as_slice() == ["pull", "agentenv/api-server:local"]));
     assert!(!runner
         .calls()
         .iter()
-        .any(|call| is_compose_command(call, &["pull"])));
+        .any(|call| is_compose_command(call, &["up", "-d", "postgres", "redis"])));
 }
 
 #[test]
@@ -278,6 +301,7 @@ fn start_generates_compose_env_seed_and_runs_fixed_sequence() {
         &health,
         &paths,
         &mut config,
+        true,
         WaitPolicy::new(1, Duration::ZERO),
     )
     .expect("start");
@@ -288,6 +312,10 @@ fn start_generates_compose_env_seed_and_runs_fixed_sequence() {
         .workflow_backend
         .api_base_url
         .starts_with("http://127.0.0.1:"));
+    assert_ne!(
+        config.workflow_backend.api_base_url,
+        "http://127.0.0.1:3000"
+    );
     assert!(!config.workflow_backend.api_token_secret_id.is_empty());
 
     let token = reveal_runtime_token(&paths, &config);
@@ -305,14 +333,20 @@ fn start_generates_compose_env_seed_and_runs_fixed_sequence() {
     assert!(compose.contains("command: [\"node\", \"dist/database/migrate.js\"]"));
     assert!(compose.contains("psql \\\"$$DATABASE_URL\\\" -f /bootstrap/seed.sql"));
     assert!(compose.contains("127.0.0.1:"));
+    assert!(!compose.contains("127.0.0.1:3000:3000"));
     assert!(!compose.contains("\n  api-server:"));
     assert!(!compose.contains("workflow-worker"));
     assert!(!compose.contains(&token));
 
     let env = fs::read_to_string(stack_dir.join(LOCAL_WORKFLOW_RUNTIME_ENV_FILE)).expect("env");
+    assert!(env.contains("NODE_ENV=development"));
+    assert!(env.contains("GRPC_USE_TLS=false"));
+    assert!(env.contains("SCHEDULER_PROTO_PATH=/app/protos/scheduler/scheduler.proto"));
+    assert!(env.contains("HYPERVISOR_PROTO_PATH=/app/protos/hypervisor/hypervisor.proto"));
     assert!(env.contains(&format!("DATABASE_URL={POSTGRES_URL}")));
     assert!(env.contains(&format!("REDIS_URL={REDIS_URL}")));
     assert!(env.contains("API_KEY_PEPPER="));
+    assert!(env.contains("GATEWAY_ENCRYPTION_KEY="));
     assert!(env.contains("JWT_SECRET="));
     assert!(env.contains("JWT_REFRESH_SECRET="));
     assert!(env.contains("LOCAL_USER_ID="));
@@ -381,6 +415,138 @@ fn start_generates_compose_env_seed_and_runs_fixed_sequence() {
 }
 
 #[test]
+fn start_regenerates_unreadable_local_runtime_token() {
+    let _guard = lock_secret_store();
+    let _secret_store_key = ScopedSecretStoreKey::set();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = test_paths(&temp);
+    let mut config = PufferConfig::default();
+    config.workflow_backend.workspace_id = "11111111-1111-4111-8111-111111111111".to_string();
+
+    let wrong_key_vault = SecretVault::open_with_key(
+        SecretVault::default_path(&paths.user_config_dir),
+        [8_u8; 32],
+    );
+    let stale = wrong_key_vault
+        .put(SecretUpsert {
+            id: None,
+            label: WORKFLOW_RUNTIME_TOKEN_LABEL.to_string(),
+            description: Some(WORKFLOW_RUNTIME_TOKEN_DESCRIPTION.to_string()),
+            value: "stale-token".to_string(),
+            username: None,
+            origin: Some(config.workflow_backend.api_base_url.clone()),
+            source: "local_workflow_runtime".to_string(),
+        })
+        .expect("store stale token");
+    config.workflow_backend.api_token_secret_id = stale.id.clone();
+
+    let mut responses = Vec::new();
+    responses.extend(available());
+    responses.push(ok("image"));
+    responses.push(ok("postgres redis"));
+    responses.push(ok("migrated"));
+    responses.push(ok("seeded"));
+    responses.push(ok("api"));
+    let runner = FakeCommandRunner::new(responses);
+    let health = FakeHealthChecker::ready();
+
+    let status = start_with(
+        &runner,
+        &health,
+        &paths,
+        &mut config,
+        true,
+        WaitPolicy::new(1, Duration::ZERO),
+    )
+    .expect("start");
+
+    assert_eq!(status.state, LocalWorkflowRuntimeState::Ready);
+    assert!(!config.workflow_backend.api_token_secret_id.is_empty());
+    let regenerated = reveal_runtime_token(&paths, &config);
+    assert_ne!(regenerated, "stale-token");
+    assert_eq!(
+        health.node_definition_calls(),
+        vec![(
+            config.workflow_backend.api_base_url.clone(),
+            config.workflow_backend.workspace_id.clone(),
+            regenerated
+        )]
+    );
+}
+
+#[test]
+fn transient_start_from_cloud_config_preserves_user_workflow_backend() {
+    let _guard = lock_secret_store();
+    let _secret_store_key = ScopedSecretStoreKey::set();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = test_paths(&temp);
+    let mut config = PufferConfig::default();
+    config.workflow_backend.mode = WorkflowBackendMode::AgentEnvCloud;
+    config.workflow_backend.api_base_url = "https://api.agentenv.io".to_string();
+    config.workflow_backend.frontend_url = "https://agentenv.io".to_string();
+    config.workflow_backend.workspace_id = "workspace-cloud".to_string();
+    let vault =
+        SecretVault::open(SecretVault::default_path(&paths.user_config_dir)).expect("open vault");
+    let cloud_secret = vault
+        .put(SecretUpsert {
+            id: None,
+            label: "cloud".to_string(),
+            description: None,
+            value: "cloud-token".to_string(),
+            username: None,
+            origin: Some("https://api.agentenv.io".to_string()),
+            source: "test".to_string(),
+        })
+        .expect("cloud token");
+    config.workflow_backend.api_token_secret_id = cloud_secret.id.clone();
+    save_user_config(&paths, &config).expect("save cloud config");
+
+    let mut responses = Vec::new();
+    responses.extend(available());
+    responses.push(ok("image"));
+    responses.push(ok("postgres redis"));
+    responses.push(ok("migrated"));
+    responses.push(ok("seeded"));
+    responses.push(ok("api"));
+    let runner = FakeCommandRunner::new(responses);
+    let health = FakeHealthChecker::ready();
+
+    let status = start_transient_with(
+        &runner,
+        &health,
+        &paths,
+        &mut config,
+        WaitPolicy::new(1, Duration::ZERO),
+    )
+    .expect("transient start");
+
+    assert_eq!(status.state, LocalWorkflowRuntimeState::Ready);
+    assert_eq!(config.workflow_backend.mode, WorkflowBackendMode::Local);
+    assert!(config
+        .workflow_backend
+        .api_base_url
+        .starts_with("http://127.0.0.1:"));
+    assert_ne!(config.workflow_backend.api_token_secret_id, cloud_secret.id);
+    assert!(paths
+        .user_config_dir
+        .join(LOCAL_WORKFLOW_RUNTIME_DIR)
+        .join(LOCAL_WORKFLOW_RUNTIME_CONFIG_FILE)
+        .exists());
+
+    let saved = load_config(&paths).expect("reload saved config");
+    assert_eq!(
+        saved.workflow_backend.mode,
+        WorkflowBackendMode::AgentEnvCloud
+    );
+    assert_eq!(
+        saved.workflow_backend.api_base_url,
+        "https://api.agentenv.io"
+    );
+    assert_eq!(saved.workflow_backend.workspace_id, "workspace-cloud");
+    assert_eq!(saved.workflow_backend.api_token_secret_id, cloud_secret.id);
+}
+
+#[test]
 fn migrate_failure_reports_incompatible_runtime() {
     let _guard = lock_secret_store();
     let _secret_store_key = ScopedSecretStoreKey::set();
@@ -392,6 +558,7 @@ fn migrate_failure_reports_incompatible_runtime() {
     responses.push(ok("image"));
     responses.push(ok("postgres redis"));
     responses.push(fail("missing migration"));
+    responses.push(fail("pull failed"));
     let runner = FakeCommandRunner::new(responses);
 
     let status = start_with(
@@ -399,6 +566,7 @@ fn migrate_failure_reports_incompatible_runtime() {
         &FakeHealthChecker::not_ready(),
         &paths,
         &mut config,
+        true,
         WaitPolicy::new(1, Duration::ZERO),
     )
     .expect("start");
@@ -424,6 +592,7 @@ fn seed_failure_reports_incompatible_runtime() {
     responses.push(ok("postgres redis"));
     responses.push(ok("migrated"));
     responses.push(fail("bad sql"));
+    responses.push(fail("pull failed"));
     let runner = FakeCommandRunner::new(responses);
 
     let status = start_with(
@@ -431,6 +600,7 @@ fn seed_failure_reports_incompatible_runtime() {
         &FakeHealthChecker::not_ready(),
         &paths,
         &mut config,
+        true,
         WaitPolicy::new(1, Duration::ZERO),
     )
     .expect("start");
@@ -457,6 +627,7 @@ fn ready_without_node_definitions_reports_incompatible_runtime() {
     responses.push(ok("migrated"));
     responses.push(ok("seeded"));
     responses.push(ok("api"));
+    responses.push(fail("pull failed"));
     let runner = FakeCommandRunner::new(responses);
 
     let status = start_with(
@@ -464,11 +635,56 @@ fn ready_without_node_definitions_reports_incompatible_runtime() {
         &FakeHealthChecker::without_node_definitions(),
         &paths,
         &mut config,
+        true,
         WaitPolicy::new(1, Duration::ZERO),
     )
     .expect("start");
 
     assert_eq!(status.state, LocalWorkflowRuntimeState::IncompatibleRuntime);
+    assert!(runner.calls().iter().any(|call| call.program == "docker"
+        && call.args.as_slice() == ["pull", "agentenv/api-server:local"]));
+}
+
+#[test]
+fn incompatible_runtime_refreshes_image_and_retries_with_recreated_api() {
+    let _guard = lock_secret_store();
+    let _secret_store_key = ScopedSecretStoreKey::set();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = test_paths(&temp);
+    let mut config = PufferConfig::default();
+    let mut responses = Vec::new();
+    responses.extend(available());
+    responses.push(ok("image"));
+    responses.push(ok("postgres redis"));
+    responses.push(ok("migrated"));
+    responses.push(ok("seeded"));
+    responses.push(ok("api"));
+    responses.push(ok("pulled newer image"));
+    responses.push(ok("postgres redis"));
+    responses.push(ok("migrated"));
+    responses.push(ok("seeded"));
+    responses.push(ok("api recreated"));
+    let runner = FakeCommandRunner::new(responses);
+    let health = FakeHealthChecker::node_definitions_ready_after_retry();
+
+    let status = start_with(
+        &runner,
+        &health,
+        &paths,
+        &mut config,
+        true,
+        WaitPolicy::new(1, Duration::ZERO),
+    )
+    .expect("start");
+
+    assert_eq!(status.state, LocalWorkflowRuntimeState::Ready);
+    let calls = runner.calls();
+    assert!(calls.iter().any(|call| call.program == "docker"
+        && call.args.as_slice() == ["pull", "agentenv/api-server:local"]));
+    assert!(calls
+        .iter()
+        .any(|call| is_compose_command(call, &["up", "-d", "--force-recreate", "api"])));
+    assert_eq!(health.node_definition_calls().len(), 2);
 }
 
 #[test]

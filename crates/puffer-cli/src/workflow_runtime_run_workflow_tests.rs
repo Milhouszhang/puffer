@@ -49,6 +49,7 @@ fn process_runner_executes_agentenv_workflow_with_trigger_input_body() {
         resources: LoadedResources::default(),
         providers: ProviderRegistry::new(),
         auth_store: AuthStore::default(),
+        automation_store_path: crate::daemon_automations::automation_store_path(&paths),
         lock: Mutex::new(()),
     };
     let workflow_id = "Wf_01HX.Runtime-123";

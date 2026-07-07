@@ -19,7 +19,6 @@
   import WorkspacePicker from "./lib/screens/WorkspacePicker.svelte";
   import AgentDetail from "./lib/screens/agent/AgentDetail.svelte";
   import { isAlreadyPersistedTool, persistedToolIdSet } from "./lib/screens/agent/timelineToolDedup";
-  import Workflows from "./lib/screens/Workflows.svelte";
   import Automation from "./lib/screens/Automation.svelte";
   import Tasks from "./lib/screens/Tasks.svelte";
   import Contacts from "./lib/screens/Contacts.svelte";
@@ -269,6 +268,7 @@
 
   let settingsSnapshot = $state<SettingsSnapshot | null>(null);
   let settingsLoading = $state(false);
+  let settingsInitialSection = $state<"workflow-backend" | null>(null);
   let settingsRefreshGeneration = 0;
   let groupsRefreshGeneration = 0;
   const GROUPS_PAGE_SIZE = 100;
@@ -2922,9 +2922,15 @@
 
   function onSelectScreen(id: ScreenId) {
     saveCurrentTransientConversationState(selectedSession?.id);
+    if (id !== "settings") settingsInitialSection = null;
     tweaks = { ...tweaks, screen: id };
     openProjectId = null;
     openAgentSessionId = null;
+  }
+
+  function openAutomationRuntimeSettings() {
+    settingsInitialSection = "workflow-backend";
+    onSelectScreen("settings");
   }
 
   function onOpenAgent(id: string) {
@@ -4818,10 +4824,11 @@
                 onSetProjectTags={(path, tags) => void handleSetProjectTags(path, tags)}
               />
             {/if}
-          {:else if tweaks.screen === "workflows"}
-            <Workflows />
           {:else if tweaks.screen === "automation"}
-            <Automation />
+            <Automation
+              settingsSnapshot={settingsSnapshot}
+              onOpenAutomationRuntimeSettings={openAutomationRuntimeSettings}
+            />
           {:else if tweaks.screen === "tasks"}
             <Tasks onRunTaskCommand={runWorkflowCommand} />
           {:else if tweaks.screen === "contacts"}
@@ -4830,6 +4837,7 @@
             <Settings
               snapshot={settingsSnapshot}
               loading={settingsLoading}
+              initialSection={settingsInitialSection ?? undefined}
               tweaks={tweaks}
               preferences={desktopPreferences}
               daemonUrl={daemonUrl}

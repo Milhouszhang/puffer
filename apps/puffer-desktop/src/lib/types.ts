@@ -1113,6 +1113,204 @@ export type WorkflowSnapshot = {
   monitor_ignore_filter_error?: string | null;
 };
 
+export type AutomationStatus = "enabled" | "paused" | "archived";
+export type AutomationRunLocation = "local" | "agent_env_cloud";
+
+export type AutomationSource =
+  | { type: "blank" }
+  | { type: "natural_language"; prompt: string }
+  | { type: "template"; template_id: string; template_version?: string | null };
+
+export type AutomationNodeRef = {
+  node_type: string;
+  name?: string | null;
+  trusted?: boolean | null;
+  config?: Record<string, unknown>;
+};
+
+export type AutomationTriggerSpec =
+  | {
+      type: "agent_env_node";
+      id: string;
+      node: AutomationNodeRef;
+      summary?: string | null;
+    }
+  | {
+      type: "puffer_connection";
+      id: string;
+      connection_slug: string;
+      connector_slug?: string | null;
+      filter?: Record<string, unknown> | null;
+      ignore_filters?: Record<string, unknown>[];
+      contact_ids?: string[];
+      summary?: string | null;
+    }
+  | {
+      type: "manual";
+      id: string;
+      summary?: string | null;
+    };
+
+export type AutomationStepSpec =
+  | {
+      type: "agent_env_node";
+      id: string;
+      node: AutomationNodeRef;
+      summary?: string | null;
+    }
+  | {
+      type: "loop";
+      id: string;
+      loop: Record<string, unknown>;
+      body: AutomationFlowSpec;
+      summary?: string | null;
+    };
+
+export type AutomationFlowSpec = {
+  steps: AutomationStepSpec[];
+};
+
+export type AutomationReviewSpec = {
+  human_approval_required: boolean;
+};
+
+export type AutomationSpec = {
+  spec_version: number;
+  name: string;
+  description?: string | null;
+  source: AutomationSource;
+  instructions: string;
+  run_location?: AutomationRunLocation;
+  triggers: AutomationTriggerSpec[];
+  flow: AutomationFlowSpec;
+  review: AutomationReviewSpec;
+};
+
+export type AutomationRuntimeSummary = {
+  status: string;
+  spec_hash?: string | null;
+  compiled_revision?: number | null;
+  agentenv_workflow_count: number;
+  puffer_binding_count: number;
+  last_error?: string | null;
+};
+
+export type AutomationRecordDto = {
+  id: string;
+  status: AutomationStatus;
+  revision: number;
+  spec: AutomationSpec;
+  runtime: AutomationRuntimeSummary;
+  created_at_ms: number;
+  updated_at_ms: number;
+};
+
+export type AutomationListResult = {
+  automations: AutomationRecordDto[];
+};
+
+export type AutomationSaveRequest = {
+  id: string;
+  expectedRevision?: number;
+  status?: AutomationStatus;
+  spec: AutomationSpec;
+};
+
+export type AutomationDeleteResult = {
+  id: string;
+  deleted: boolean;
+};
+
+export type AutomationRuntimeSyncResult = {
+  id: string;
+  revision: number;
+  runtime: AutomationRuntimeSummary;
+};
+
+export type AutomationCatalogInput = {
+  id: string;
+  label: string;
+  kind: string;
+  required?: boolean;
+  default?: string | number | boolean | null;
+  options?: string[];
+  summary?: string | null;
+};
+
+export type AutomationCatalogTrigger = {
+  id: string;
+  kind: "schedule" | "connector_event" | string;
+  label: string;
+  summary: string;
+  icon?: string | null;
+  connector_slug?: string | null;
+  connection_slug?: string | null;
+  connection_state?: string | null;
+  permission_state?: string | null;
+  required_inputs: AutomationCatalogInput[];
+  spec_template: AutomationTriggerSpec;
+};
+
+export type AutomationCatalogAction = {
+  id: string;
+  kind: "connector_action" | "agentenv_node" | string;
+  label: string;
+  summary: string;
+  icon?: string | null;
+  connector_slug?: string | null;
+  connection_slug?: string | null;
+  action?: string | null;
+  connection_state?: string | null;
+  permission_state?: string | null;
+  permission_summary?: string | null;
+  external_side_effect?: boolean;
+  required_inputs: AutomationCatalogInput[];
+  input_schema?: Record<string, unknown> | null;
+  output_schema?: Record<string, unknown> | null;
+  node_ref: AutomationNodeRef;
+};
+
+export type AutomationCatalogResult = {
+  triggers: AutomationCatalogTrigger[];
+  actions: AutomationCatalogAction[];
+  trigger_error?: string | null;
+  action_error?: string | null;
+  agentenv_error?: string | null;
+};
+
+export type AutomationPreviewResult = {
+  id: string;
+  status: string;
+  summary?: string | null;
+  result?: unknown;
+  compiled: boolean;
+  runtime: AutomationRuntimeSummary;
+};
+
+export type AutomationRunHistoryRecord = {
+  id: string;
+  automation_id: string;
+  title: string;
+  status: string;
+  started_at_ms: number;
+  duration_ms: number;
+  summary: string;
+  source_event?: string | null;
+  compiled: boolean;
+  runtime_status: string;
+  result?: unknown;
+  error?: string | null;
+  approval?: {
+    required: boolean;
+    status: string;
+  } | null;
+};
+
+export type AutomationRunHistoryResult = {
+  automation_id: string;
+  runs: AutomationRunHistoryRecord[];
+};
+
 export type WorkflowMonitorMemory = {
   connection_slug: string;
   path: string;

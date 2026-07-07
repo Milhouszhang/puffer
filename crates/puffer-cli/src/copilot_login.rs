@@ -7,7 +7,7 @@
 //! provider credential; the runtime later exchanges it for a short-lived
 //! Copilot bearer (see `puffer-core/runtime/copilot.rs`).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use puffer_provider_registry::COPILOT_USER_AGENT;
 use serde::Deserialize;
 use std::time::Duration;
@@ -76,6 +76,7 @@ pub(crate) fn start_device_flow() -> Result<DeviceFlowStart> {
 }
 
 /// Outcome of a single poll of the device-flow token endpoint.
+#[derive(Debug)]
 pub(crate) enum DeviceFlowPoll {
     /// User has not authorized yet — keep polling.
     Pending,
@@ -87,39 +88,32 @@ pub(crate) enum DeviceFlowPoll {
     Failed(String),
 }
 
-/// Polls the token endpoint once with the device code.
-pub(crate) fn poll_device_flow(device_code: &str) -> Result<DeviceFlowPoll> {
-    #[derive(Deserialize)]
-    struct Resp {
-        #[serde(default)]
-        access_token: Option<String>,
-        #[serde(default)]
-        error: Option<String>,
+struct DevicePollHttpResponse {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct DevicePollResponse {
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn classify_device_flow_poll_response(
+    response: Result<DevicePollHttpResponse>,
+) -> Result<DeviceFlowPoll> {
+    let response = response?;
+    if !response.status.is_success() {
+        bail!(
+            "GitHub device-flow token poll failed ({}): {}",
+            response.status,
+            response.body
+        );
     }
-    let client = http_client()?;
-    // A single poll must not abort the whole login on a transient blip. Network
-    // errors and non-JSON/unknown bodies (e.g. a 5xx HTML error page from an
-    // infra hiccup) are treated as Pending so the caller keeps polling until the
-    // device code genuinely expires; only GitHub's documented terminal device-
-    // flow errors end the flow.
-    let response = match client
-        .post(ACCESS_TOKEN_URL)
-        .header("Accept", "application/json")
-        .header("User-Agent", COPILOT_USER_AGENT)
-        .form(&[
-            ("client_id", COPILOT_CLIENT_ID),
-            ("device_code", device_code),
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-        ])
-        .send()
-    {
-        Ok(response) => response,
-        Err(_) => return Ok(DeviceFlowPoll::Pending),
-    };
-    let body = response.text().unwrap_or_default();
-    let Ok(parsed) = serde_json::from_str::<Resp>(&body) else {
-        return Ok(DeviceFlowPoll::Pending);
-    };
+    let parsed: DevicePollResponse =
+        serde_json::from_str(&response.body).context("parsing GitHub device-flow poll response")?;
     if let Some(token) = parsed.access_token.filter(|t| !t.is_empty()) {
         return Ok(DeviceFlowPoll::Done(token));
     }
@@ -136,7 +130,80 @@ pub(crate) fn poll_device_flow(device_code: &str) -> Result<DeviceFlowPoll> {
             | "incorrect_device_code"
             | "device_flow_disabled"),
         ) => Ok(DeviceFlowPoll::Failed(err.to_string())),
-        // Unknown error code — treat as transient rather than aborting.
+        // Unknown GitHub error code — treat as transient rather than aborting.
         Some(_) => Ok(DeviceFlowPoll::Pending),
+    }
+}
+
+/// Polls the token endpoint once with the device code.
+pub(crate) fn poll_device_flow(device_code: &str) -> Result<DeviceFlowPoll> {
+    let client = http_client()?;
+    // GitHub's device-flow protocol has explicit non-terminal states
+    // (`authorization_pending`, `slow_down`). Transport failures are not one of
+    // them: surface those as poll errors so desktop callers can use their
+    // consecutive-error guard instead of waiting until device-code expiry.
+    let response = match client
+        .post(ACCESS_TOKEN_URL)
+        .header("Accept", "application/json")
+        .header("User-Agent", COPILOT_USER_AGENT)
+        .form(&[
+            ("client_id", COPILOT_CLIENT_ID),
+            ("device_code", device_code),
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ])
+        .send()
+    {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            Ok(DevicePollHttpResponse { status, body })
+        }
+        Err(error) => Err(anyhow!("GitHub device-flow poll network error: {error}")),
+    };
+    classify_device_flow_poll_response(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+    use reqwest::StatusCode;
+
+    fn classify_ok(body: &str) -> Result<DeviceFlowPoll> {
+        classify_device_flow_poll_response(Ok(DevicePollHttpResponse {
+            status: StatusCode::OK,
+            body: body.to_string(),
+        }))
+    }
+
+    #[test]
+    fn authorization_pending_remains_pending() {
+        let result = classify_ok(r#"{"error":"authorization_pending"}"#).unwrap();
+        assert!(matches!(result, DeviceFlowPoll::Pending));
+    }
+
+    #[test]
+    fn slow_down_remains_slow_down() {
+        let result = classify_ok(r#"{"error":"slow_down"}"#).unwrap();
+        assert!(matches!(result, DeviceFlowPoll::SlowDown));
+    }
+
+    #[test]
+    fn transport_errors_are_not_mapped_to_pending() {
+        let error = classify_device_flow_poll_response(Err(anyhow!("connection refused")))
+            .expect_err("transport failures must reject the poll RPC");
+        assert!(error.to_string().contains("connection refused"));
+    }
+
+    #[test]
+    fn malformed_poll_response_is_not_mapped_to_pending() {
+        let error = classify_ok("<html>bad gateway</html>")
+            .expect_err("malformed poll responses are not protocol pending states");
+        assert!(
+            error
+                .to_string()
+                .contains("parsing GitHub device-flow poll response"),
+            "{error:#}"
+        );
     }
 }

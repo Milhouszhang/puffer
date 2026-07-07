@@ -616,9 +616,7 @@ pub(super) fn resolve_openai_execution_config(
             // Auto-only plans (Free/Student): chat only works inside an
             // auto-mode session — the server rejects direct model selection
             // with `model_not_supported` without this header.
-            if let Some(session) = &copilot.session {
-                custom_headers.push(("Copilot-Session-Token".to_string(), session.token.clone()));
-            }
+            set_copilot_session_header(&mut custom_headers, copilot.session.as_ref());
             return Ok(OpenAIExecutionConfig {
                 provider_id: provider.id.clone(),
                 request_config: OpenAIRequestConfig {
@@ -730,22 +728,45 @@ fn codex_style_for_provider(provider: &ProviderDescriptor, oauth: bool) -> bool 
             != Some("1")
 }
 
-/// On a 401 from the GitHub Copilot chat endpoint, drop the cached exchanged
-/// bearer so the next turn re-exchanges the stored GitHub token. Copilot carries
-/// no `refresh_token` (the OAuth refresh path is skipped), so without this a
-/// bearer invalidated before its ~25min cached expiry would keep 401-ing every
-/// turn until expiry with no auto-recovery.
-fn evict_copilot_bearer_on_unauthorized(
-    auth_store: &AuthStore,
-    execution: &OpenAIExecutionConfig,
-    unauthorized: bool,
+fn set_copilot_session_header(
+    custom_headers: &mut Vec<(String, String)>,
+    session: Option<&super::copilot::CopilotSession>,
 ) {
+    custom_headers.retain(|(key, _)| !key.eq_ignore_ascii_case("copilot-session-token"));
+    if let Some(session) = session {
+        custom_headers.push(("Copilot-Session-Token".to_string(), session.token.clone()));
+    }
+}
+
+/// On a 401 from the GitHub Copilot chat endpoint, drop the cached exchanged
+/// bearer, re-exchange the stored GitHub OAuth token, update the active request
+/// config, and let the caller retry the same request once. Copilot carries no
+/// `refresh_token`, but the stored GitHub OAuth token is the durable credential
+/// for minting a fresh short-lived Copilot bearer.
+fn reexchange_copilot_bearer_on_unauthorized(
+    auth_store: &AuthStore,
+    execution: &mut OpenAIExecutionConfig,
+    unauthorized: bool,
+) -> Result<bool> {
     if !unauthorized || execution.provider_id != "github-copilot" {
-        return;
+        return Ok(false);
     }
-    if let Some(StoredCredential::OAuth(credential)) = auth_store.get("github-copilot") {
-        super::copilot::invalidate_bearer(&credential.access_token);
-    }
+    let github_token = match auth_store.get("github-copilot") {
+        Some(StoredCredential::OAuth(credential)) if !credential.access_token.is_empty() => {
+            credential.access_token.clone()
+        }
+        _ => return Ok(false),
+    };
+    super::copilot::invalidate_bearer(&github_token);
+    let copilot = super::copilot::copilot_bearer_token(&github_token)
+        .context("failed to re-exchange GitHub OAuth token for Copilot bearer after 401")?;
+    execution.request_config.base_url = copilot.api_url;
+    execution.request_config.auth = OpenAIAuth::ApiKey(copilot.token);
+    set_copilot_session_header(
+        &mut execution.request_config.custom_headers,
+        copilot.session.as_ref(),
+    );
+    Ok(true)
 }
 
 /// Sends a blocking OpenAI request and refreshes OAuth credentials once after a 401.
@@ -781,11 +802,21 @@ where
         false,
         proxy,
     )?;
-    evict_copilot_bearer_on_unauthorized(
+    if reexchange_copilot_bearer_on_unauthorized(
         auth_store,
         execution,
         response.status == StatusCode::UNAUTHORIZED,
-    );
+    )? {
+        let retry = build_request(&execution.request_config)?;
+        let retry_response = super::send_http_request_raw_with_proxy(
+            &retry.url,
+            &retry.headers,
+            &retry.body,
+            false,
+            proxy,
+        )?;
+        return parse_http_json_response(&retry.url, false, retry_response);
+    }
     if response.status != StatusCode::UNAUTHORIZED || execution.refresh_token.is_none() {
         return parse_http_json_response(&request.url, false, response);
     }
@@ -833,6 +864,29 @@ where
     F: Fn(&OpenAIRequestConfig) -> Result<puffer_provider_openai::BuiltOpenAIRequest>,
     G: FnMut(TurnStreamEvent),
 {
+    send_openai_request_with_refresh_streaming_using_parser(
+        auth_store,
+        execution,
+        proxy,
+        build_request,
+        on_event,
+        parse_openai_stream_response,
+    )
+}
+
+pub(super) fn send_openai_request_with_refresh_streaming_using_parser<F, G, P, T>(
+    auth_store: &mut AuthStore,
+    execution: &mut OpenAIExecutionConfig,
+    proxy: &ProxyConfig,
+    build_request: F,
+    on_event: &mut G,
+    parse_response: P,
+) -> Result<T>
+where
+    F: Fn(&OpenAIRequestConfig) -> Result<puffer_provider_openai::BuiltOpenAIRequest>,
+    G: FnMut(TurnStreamEvent) + ?Sized,
+    P: Fn(&str, Response, &mut G) -> Result<T> + Copy,
+{
     let request = build_request(&execution.request_config)?;
     // Layered retry: inner = connection-level (`retry_openai_transport`)
     // surfaces `RetryAttempt` events on `on_event`; outer =
@@ -870,13 +924,45 @@ where
             );
         },
     )?;
-    evict_copilot_bearer_on_unauthorized(
+    if reexchange_copilot_bearer_on_unauthorized(
         auth_store,
         execution,
         response.status() == StatusCode::UNAUTHORIZED,
-    );
+    )? {
+        let retry = build_request(&execution.request_config)?;
+        let retry_response = super::retry_on_5xx(
+            || {
+                retry_openai_transport(
+                    || {
+                        send_openai_request_stream_raw(
+                            &retry.url,
+                            &retry.headers,
+                            &retry.body,
+                            proxy,
+                        )
+                    },
+                    |attempt, max, error| {
+                        on_event(TurnStreamEvent::RetryAttempt {
+                            attempt,
+                            max_attempts: max,
+                            error: error.to_string(),
+                            kind: RetryAttemptKind::Transport,
+                        });
+                    },
+                )
+            },
+            |attempt, max, status| {
+                tracing::warn!(
+                    target: "puffer::runtime::openai",
+                    "5xx retry (post-copilot-401-reexchange): attempt {attempt}/{max}, HTTP {}",
+                    status.as_u16()
+                );
+            },
+        )?;
+        return parse_response(&retry.url, retry_response, on_event);
+    }
     if response.status() != StatusCode::UNAUTHORIZED || execution.refresh_token.is_none() {
-        return parse_openai_stream_response(&request.url, response, on_event);
+        return parse_response(&request.url, response, on_event);
     }
 
     let refresh_token = execution
@@ -922,7 +1008,7 @@ where
             );
         },
     )?;
-    parse_openai_stream_response(&retry.url, retry_response, on_event)
+    parse_response(&retry.url, retry_response, on_event)
 }
 
 fn send_openai_request_stream_raw(

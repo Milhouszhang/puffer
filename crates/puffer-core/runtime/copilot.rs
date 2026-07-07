@@ -11,6 +11,8 @@ use anyhow::{bail, Context, Result};
 use puffer_provider_registry::{apply_copilot_client_identity, COPILOT_TOKEN_URL};
 use reqwest::blocking::Client;
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -79,6 +81,34 @@ fn cache() -> &'static Mutex<HashMap<String, CachedToken>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
+type TestBearerExchange = Arc<dyn Fn(&str) -> Result<CopilotAuth> + Send + Sync>;
+
+#[cfg(test)]
+fn test_bearer_exchange() -> &'static Mutex<Option<TestBearerExchange>> {
+    static EXCHANGE: OnceLock<Mutex<Option<TestBearerExchange>>> = OnceLock::new();
+    EXCHANGE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(super) struct TestBearerExchangeGuard;
+
+#[cfg(test)]
+impl Drop for TestBearerExchangeGuard {
+    fn drop(&mut self) {
+        *test_bearer_exchange().lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_test_bearer_exchange<F>(exchange: F) -> TestBearerExchangeGuard
+where
+    F: Fn(&str) -> Result<CopilotAuth> + Send + Sync + 'static,
+{
+    *test_bearer_exchange().lock().unwrap() = Some(Arc::new(exchange));
+    TestBearerExchangeGuard
+}
+
 /// Drops the cached exchanged bearer for a GitHub token. Called when the chat
 /// endpoint rejects the bearer with 401 (e.g. it was invalidated before its
 /// cached expiry — revoked Copilot seat, server-side rotation), and on
@@ -109,6 +139,11 @@ fn now_secs() -> u64 {
 /// small burst at first use / expiry; a shared in-flight map would add locking
 /// complexity for little gain, so we accept it.
 pub(crate) fn copilot_bearer_token(github_token: &str) -> Result<CopilotAuth> {
+    #[cfg(test)]
+    if let Some(exchange) = test_bearer_exchange().lock().unwrap().clone() {
+        return exchange(github_token);
+    }
+
     let now = now_secs();
     if let Some(cached) = cache().lock().unwrap().get(github_token) {
         if cached.expires_at_secs > now + EXPIRY_SKEW_SECS {

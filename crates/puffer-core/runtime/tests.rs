@@ -1,7 +1,7 @@
 use super::*;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use puffer_config::{ensure_workspace_dirs, ConfigPaths, PufferConfig};
+use puffer_config::{ensure_workspace_dirs, ConfigPaths, ProxyConfig, PufferConfig};
 use puffer_provider_openai::{
     OpenAIAuth, OpenAIRequestConfig, OpenAIResponseToolCall, OpenAIResponsesTextConfig,
     OpenAIResponsesTextFormat, OpenAIResponsesTool,
@@ -1239,6 +1239,258 @@ fn parse_openai_sse_response_streaming_emits_text_deltas() {
         parsed["output"][0]["content"][0]["text"],
         json!("Hey there")
     );
+}
+
+fn copilot_test_execution(base_url: String, token: &str) -> super::openai::OpenAIExecutionConfig {
+    super::openai::OpenAIExecutionConfig {
+        provider_id: "github-copilot".to_string(),
+        request_config: OpenAIRequestConfig {
+            base_url,
+            version: "test".to_string(),
+            auth: OpenAIAuth::ApiKey(token.to_string()),
+            originator: "codex_cli_rs".to_string(),
+            session_id: Some("session-test".to_string()),
+            account_id: None,
+            custom_headers: Vec::new(),
+            query_params: Vec::new(),
+            chat_completions_path: Some("/chat/completions".to_string()),
+            responses_path: None,
+        },
+        refresh_token: None,
+        codex_style: false,
+    }
+}
+
+fn copilot_test_auth_store(github_token: &str) -> AuthStore {
+    let mut auth_store = AuthStore::default();
+    auth_store.set_oauth(
+        "github-copilot",
+        OAuthCredential {
+            access_token: github_token.to_string(),
+            refresh_token: String::new(),
+            expires_at_ms: 0,
+            account_id: None,
+            organization_id: None,
+            email: None,
+            plan_type: None,
+            rate_limit_tier: None,
+            scopes: Vec::new(),
+            organization_name: None,
+            organization_role: None,
+            workspace_role: None,
+        },
+    );
+    auth_store
+}
+
+fn install_copilot_exchange_for_test(
+    github_token: &'static str,
+    base_url: String,
+    token: &'static str,
+) -> super::copilot::TestBearerExchangeGuard {
+    super::copilot::install_test_bearer_exchange(move |received| {
+        assert_eq!(received, github_token);
+        Ok(super::copilot::CopilotAuth {
+            token: token.to_string(),
+            api_url: base_url.clone(),
+            session: Some(super::copilot::CopilotSession {
+                token: format!("{token}-session"),
+            }),
+        })
+    })
+}
+
+fn spawn_copilot_retry_server<F>(
+    expected_requests: usize,
+    response_for_index: F,
+) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>)
+where
+    F: Fn(usize) -> (u16, &'static str, String) + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let request_log = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut handled = 0_usize;
+        while handled < expected_requests && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut buffer = vec![0_u8; 65_536];
+                    let bytes = stream.read(&mut buffer).unwrap();
+                    let request = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+                    request_log.lock().unwrap().push(request);
+                    let (status, content_type, body) = response_for_index(handled);
+                    let reason = if status == 200 { "OK" } else { "Unauthorized" };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    handled += 1;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("listener accept failed: {error}"),
+            }
+        }
+    });
+    (format!("http://{address}"), requests, server)
+}
+
+#[test]
+fn copilot_non_streaming_401_reexchanges_bearer_and_retries_once() {
+    let _guard = env_lock();
+    let (base_url, requests, server) = spawn_copilot_retry_server(2, |index| {
+        if index == 0 {
+            (
+                401,
+                "application/json",
+                json!({ "error": "expired bearer" }).to_string(),
+            )
+        } else {
+            (200, "application/json", json!({ "ok": true }).to_string())
+        }
+    });
+    let _exchange =
+        install_copilot_exchange_for_test("gho-test-token", base_url.clone(), "fresh-copilot");
+    let mut auth_store = copilot_test_auth_store("gho-test-token");
+    let mut execution = copilot_test_execution(base_url, "stale-copilot");
+
+    let response = super::openai::send_openai_request_with_refresh(
+        &mut auth_store,
+        &mut execution,
+        &ProxyConfig::default(),
+        |config| {
+            puffer_provider_openai::build_json_post_request(
+                config,
+                "/chat/completions",
+                &json!({ "model": "gpt-4o", "messages": [] }),
+            )
+        },
+    );
+    server.join().unwrap();
+    let response = response.unwrap();
+
+    assert_eq!(response["ok"], json!(true));
+    assert_eq!(
+        execution.request_config.auth,
+        OpenAIAuth::ApiKey("fresh-copilot".to_string())
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0]
+        .to_ascii_lowercase()
+        .contains("authorization: bearer stale-copilot"));
+    let second = requests[1].to_ascii_lowercase();
+    assert!(second.contains("authorization: bearer fresh-copilot"));
+    assert!(second.contains("copilot-session-token: fresh-copilot-session"));
+}
+
+#[test]
+fn copilot_streaming_401_reexchanges_bearer_and_retries_once() {
+    let _guard = env_lock();
+    let (base_url, requests, server) = spawn_copilot_retry_server(2, |index| {
+        if index == 0 {
+            (
+                401,
+                "application/json",
+                json!({ "error": "expired bearer" }).to_string(),
+            )
+        } else {
+            (
+                200,
+                "text/event-stream",
+                concat!(
+                    "event: response.created\n",
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_copilot\"}}\n\n",
+                    "event: response.output_text.delta\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"stream \"}\n\n",
+                    "event: response.output_text.delta\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                    "event: response.completed\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_copilot\",\"status\":\"completed\"}}\n\n"
+                )
+                .to_string(),
+            )
+        }
+    });
+    let _exchange =
+        install_copilot_exchange_for_test("gho-test-token", base_url.clone(), "fresh-copilot");
+    let mut auth_store = copilot_test_auth_store("gho-test-token");
+    let mut execution = copilot_test_execution(base_url, "stale-copilot");
+    let mut deltas = Vec::new();
+
+    let response = super::openai::send_openai_request_with_refresh_streaming(
+        &mut auth_store,
+        &mut execution,
+        &ProxyConfig::default(),
+        |config| {
+            puffer_provider_openai::build_json_post_request(
+                config,
+                "/chat/completions",
+                &json!({ "model": "gpt-4o", "messages": [], "stream": true }),
+            )
+        },
+        &mut |event| {
+            if let TurnStreamEvent::TextDelta(delta) = event {
+                deltas.push(delta);
+            }
+        },
+    );
+    server.join().unwrap();
+    let response = response.unwrap();
+
+    assert_eq!(response.assistant_text, "stream ok");
+    assert_eq!(deltas, vec!["stream ".to_string(), "ok".to_string()]);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1]
+        .to_ascii_lowercase()
+        .contains("authorization: bearer fresh-copilot"));
+}
+
+#[test]
+fn copilot_401_retry_stops_after_second_unauthorized() {
+    let _guard = env_lock();
+    let (base_url, requests, server) = spawn_copilot_retry_server(2, |_| {
+        (
+            401,
+            "application/json",
+            json!({ "error": "still unauthorized" }).to_string(),
+        )
+    });
+    let _exchange =
+        install_copilot_exchange_for_test("gho-test-token", base_url.clone(), "fresh-copilot");
+    let mut auth_store = copilot_test_auth_store("gho-test-token");
+    let mut execution = copilot_test_execution(base_url, "stale-copilot");
+
+    let response = super::openai::send_openai_request_with_refresh(
+        &mut auth_store,
+        &mut execution,
+        &ProxyConfig::default(),
+        |config| {
+            puffer_provider_openai::build_json_post_request(
+                config,
+                "/chat/completions",
+                &json!({ "model": "gpt-4o", "messages": [] }),
+            )
+        },
+    );
+    server.join().unwrap();
+    let error = response.unwrap_err().to_string();
+
+    assert!(error.contains("request failed with status 401"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "must retry once, not loop forever");
+    assert!(requests[1]
+        .to_ascii_lowercase()
+        .contains("authorization: bearer fresh-copilot"));
 }
 
 #[test]

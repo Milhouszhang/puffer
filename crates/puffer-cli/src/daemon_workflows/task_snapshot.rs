@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
 use puffer_core::monitor_contract::{display_source_context, parse_monitor_contract};
-use puffer_subscriptions::normalize_contact_id;
+use puffer_subscriptions::{normalize_contact_id, OutboundAction, OutboundStore};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
@@ -65,23 +65,27 @@ pub(crate) fn add_task_context(paths: &ConfigPaths, snapshot: &mut Value) {
     let mut tasks = Vec::new();
     let mut errors = Vec::new();
     let workflow = workflow_root(paths);
+    let outbound_store = outbound_store(paths, &mut errors);
     append_task_file(
         &workflow.join("tasks.json"),
         "agent",
         "workspace",
         "workspace",
+        outbound_store.as_ref(),
         &mut tasks,
         &mut errors,
     );
     append_scoped_agent_tasks(
         &workflow.join("sessions"),
         "session",
+        outbound_store.as_ref(),
         &mut tasks,
         &mut errors,
     );
     append_scoped_agent_tasks(
         &workflow.join("team_tasks"),
         "team",
+        outbound_store.as_ref(),
         &mut tasks,
         &mut errors,
     );
@@ -90,6 +94,7 @@ pub(crate) fn add_task_context(paths: &ConfigPaths, snapshot: &mut Value) {
         "monitor",
         "monitor",
         "monitors",
+        outbound_store.as_ref(),
         &mut tasks,
         &mut errors,
     );
@@ -107,6 +112,7 @@ pub(crate) fn add_task_context(paths: &ConfigPaths, snapshot: &mut Value) {
 fn append_scoped_agent_tasks(
     parent: &Path,
     scope_kind: &str,
+    outbound_store: Option<&OutboundStore>,
     tasks: &mut Vec<Value>,
     errors: &mut Vec<String>,
 ) {
@@ -123,6 +129,7 @@ fn append_scoped_agent_tasks(
                     "agent",
                     &scope,
                     &label,
+                    outbound_store,
                     tasks,
                     errors,
                 );
@@ -137,16 +144,23 @@ fn append_task_file(
     source: &str,
     scope: &str,
     scope_label: &str,
+    outbound_store: Option<&OutboundStore>,
     tasks: &mut Vec<Value>,
     errors: &mut Vec<String>,
 ) {
-    match load_task_file(path, source, scope, scope_label) {
+    match load_task_file(path, source, scope, scope_label, outbound_store) {
         Ok(rows) => tasks.extend(rows),
         Err(error) => errors.push(error.to_string()),
     }
 }
 
-fn load_task_file(path: &Path, source: &str, scope: &str, scope_label: &str) -> Result<Vec<Value>> {
+fn load_task_file(
+    path: &Path,
+    source: &str,
+    scope: &str,
+    scope_label: &str,
+    outbound_store: Option<&OutboundStore>,
+) -> Result<Vec<Value>> {
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -159,11 +173,17 @@ fn load_task_file(path: &Path, source: &str, scope: &str, scope_label: &str) -> 
     Ok(store
         .tasks
         .into_iter()
-        .map(|task| task_json(task, source, scope, scope_label))
+        .map(|task| task_json(task, source, scope, scope_label, outbound_store))
         .collect())
 }
 
-fn task_json(task: TaskSnapshotRecord, source: &str, scope: &str, scope_label: &str) -> Value {
+fn task_json(
+    task: TaskSnapshotRecord,
+    source: &str,
+    scope: &str,
+    scope_label: &str,
+    outbound_store: Option<&OutboundStore>,
+) -> Value {
     json!({
         "task_id": task.task_id,
         "subject": task.subject,
@@ -210,16 +230,7 @@ fn task_json(task: TaskSnapshotRecord, source: &str, scope: &str, scope_label: &
         "source_context": monitor_source_context(&task.metadata),
         "source_messages": monitor_source_messages(&task.metadata),
         "completion_policy": monitor_completion_policy(&task.metadata),
-        "pending_action": metadata_value(
-            &task.metadata,
-            &["pending_action", "pendingAction"],
-            &["pending_action", "pendingAction"]
-        ),
-        "pending_reply": metadata_value(
-            &task.metadata,
-            &["pending_reply", "pendingReply"],
-            &["reply", "draft"]
-        ),
+        "outboundAction": outbound_action_for_metadata(outbound_store, &task.metadata),
         "ignore_reason": metadata_string(
             &task.metadata,
             &["ignore_reason", "ignoreReason"],
@@ -253,6 +264,52 @@ fn task_json(task: TaskSnapshotRecord, source: &str, scope: &str, scope_label: &
         ),
         "actions": monitor_actions_for_status(&task.metadata, &task.status),
         "possible_ignore_reasons": monitor_ignore_reasons(&task.metadata),
+    })
+}
+
+pub(super) fn outbound_store(
+    paths: &ConfigPaths,
+    errors: &mut Vec<String>,
+) -> Option<OutboundStore> {
+    match OutboundStore::load(outbound_actions_path(paths)) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            errors.push(error.to_string());
+            None
+        }
+    }
+}
+
+pub(super) fn outbound_action_for_metadata(
+    store: Option<&OutboundStore>,
+    metadata: &Map<String, Value>,
+) -> Option<Value> {
+    let action_id = metadata_string(
+        metadata,
+        &["outbound_action_id", "outboundActionId"],
+        &["outbound_action_id", "outboundActionId"],
+    )?;
+    let action = store?.get(&action_id).ok().flatten()?;
+    Some(outbound_action_json(&action))
+}
+
+fn outbound_actions_path(paths: &ConfigPaths) -> PathBuf {
+    paths.user_config_dir.join("outbound_actions.json")
+}
+
+fn outbound_action_json(action: &OutboundAction) -> Value {
+    json!({
+        "id": action.id,
+        "version": action.version,
+        "status": action.status,
+        "message": action.message,
+        "approvedMessage": action.approved_message,
+        "recipientStableId": action.recipient_stable_id,
+        "recipientSource": action.recipient_source,
+        "createdAtMs": action.created_at_ms,
+        "expiresAtMs": action.expires_at_ms,
+        "receipt": action.receipt,
+        "error": action.error,
     })
 }
 
@@ -292,26 +349,6 @@ fn scope_label(scope_kind: &str, scope_id: &str) -> String {
         return format!("session {short}");
     }
     format!("{scope_kind} {scope_id}")
-}
-
-fn metadata_string(
-    metadata: &Map<String, Value>,
-    top_level_keys: &[&str],
-    monitor_keys: &[&str],
-) -> Option<String> {
-    top_level_keys
-        .iter()
-        .find_map(|key| string_value(metadata.get(*key)))
-        .or_else(|| {
-            metadata
-                .get("monitor")
-                .and_then(Value::as_object)
-                .and_then(|monitor| {
-                    monitor_keys
-                        .iter()
-                        .find_map(|key| string_value(monitor.get(*key)))
-                })
-        })
 }
 
 fn metadata_bool(metadata: &Map<String, Value>, key: &str) -> bool {
@@ -667,12 +704,19 @@ fn sender_avatar_url_from_cache(
 }
 
 fn sender_avatar_contact_ids(metadata: &Map<String, Value>, context: &Value) -> Vec<String> {
+    // A mixed-sender burst has no single contact. Attributing the task to one
+    // member — or to a leaked singular sender hint — is exactly the
+    // wrong-contact bug (agentenv/monorepo#682): return no ids so the snapshot
+    // enriches no single contact rather than fabricating one.
+    if is_mixed_sender_burst(metadata) {
+        return Vec::new();
+    }
     let sender = context.get("sender").and_then(Value::as_object);
     let mut ids = BTreeSet::new();
     if let Some(sender_id) = sender
         .and_then(|sender| scalar_string(sender.get("id")))
         .or_else(|| {
-            metadata_scalar_string(
+            metadata_string(
                 metadata,
                 &["sender_id", "senderId"],
                 &["sender_id", "senderId"],
@@ -694,7 +738,7 @@ fn sender_avatar_contact_ids(metadata: &Map<String, Value>, context: &Value) -> 
     if let Some(username) = sender
         .and_then(|sender| scalar_string(sender.get("username")))
         .or_else(|| {
-            metadata_scalar_string(
+            metadata_string(
                 metadata,
                 &["sender_username", "senderUsername"],
                 &["sender_username", "senderUsername"],
@@ -711,7 +755,25 @@ fn sender_avatar_contact_ids(metadata: &Map<String, Value>, context: &Value) -> 
     ids.into_iter().collect()
 }
 
-fn metadata_scalar_string(
+/// Whether the plural `sender_ids` stamp marks this as a mixed-sender burst
+/// (>=2 distinct members) — a task with no single contact it can be
+/// attributed to (agentenv/monorepo#682, #655).
+fn is_mixed_sender_burst(metadata: &Map<String, Value>) -> bool {
+    metadata
+        .get("sender_ids")
+        .or_else(|| metadata.get("senderIds"))
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values
+                .iter()
+                .filter_map(|value| scalar_string(Some(value)))
+                .collect::<BTreeSet<_>>()
+                .len()
+                >= 2
+        })
+}
+
+fn metadata_string(
     metadata: &Map<String, Value>,
     top_level_keys: &[&str],
     monitor_keys: &[&str],
@@ -773,6 +835,9 @@ fn derived_monitor_source_context(metadata: &Map<String, Value>) -> Option<Value
     if !connector_slug.contains("telegram") {
         return None;
     }
+    // Ids are stamped as i64 by the subscriber/burst paths and as strings by
+    // older records — the number-tolerant reader keeps legacy no-contract
+    // tasks renderable either way (agentenv/monorepo#682).
     let chat_id = metadata_string(metadata, &["chat_id", "chatId"], &["chat_id", "chatId"])?;
     let chat_kind = metadata_string(
         metadata,
@@ -922,6 +987,7 @@ fn scalar_string(value: Option<&Value>) -> Option<String> {
 mod tests {
     use super::*;
     use puffer_config::ConfigPaths;
+    use puffer_subscriptions::{NewOutboundDraft, OutboundOrigin, OutboundStore, RecipientSource};
 
     #[test]
     fn task_context_reads_agent_session_team_and_monitor_tasks() {
@@ -1001,14 +1067,7 @@ mod tests {
                         "actions": [{
                             "actionName": "Send",
                             "actionPrompt": "Send the approved Telegram reply."
-                        }],
-                        "pending_action": {
-                            "id": "telegram-action-1",
-                            "type": "telegram_reply_draft_intent",
-                            "status": "sent",
-                            "version": 4,
-                            "agent_draft_text": "Thanks, sent."
-                        }
+                        }]
                     }
                 }]
             }))
@@ -1066,7 +1125,7 @@ mod tests {
             .iter()
             .find(|task| task["task_id"] == "monitor-sent")
             .unwrap();
-        assert_eq!(sent_monitor_task["pending_action"]["status"], "sent");
+        assert!(sent_monitor_task["outboundAction"].is_null());
         assert!(sent_monitor_task["actions"].as_array().unwrap().is_empty());
         assert!(snapshot["task_error"].is_null());
     }
@@ -1115,6 +1174,72 @@ mod tests {
             "8759047281"
         );
         assert!(monitor_task["completion_policy"].is_null());
+    }
+
+    #[test]
+    fn task_context_embeds_referenced_outbound_action() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::discover(tempdir.path());
+        let action = OutboundStore::load(paths.user_config_dir.join("outbound_actions.json"))
+            .unwrap()
+            .create_draft(NewOutboundDraft {
+                connector_slug: "telegram-login".to_string(),
+                connection_slug: "telegram-user".to_string(),
+                action: "send_message".to_string(),
+                input: json!({ "chat_id": "42", "message": "Deployment finished." }),
+                recipient_stable_id: "telegram:42".to_string(),
+                recipient_source: RecipientSource::Stamped,
+                message: "Deployment finished.".to_string(),
+                origin: OutboundOrigin {
+                    session_id: "session-1".to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    task_id: Some("monitor-1".to_string()),
+                },
+                ttl_ms: None,
+            })
+            .unwrap();
+        let workflow = workflow_root(&paths);
+        std::fs::create_dir_all(&workflow).unwrap();
+        std::fs::write(
+            workflow.join("monitor_tasks.json"),
+            serde_json::to_string_pretty(&json!({
+                "tasks": [{
+                    "task_id": "monitor-1",
+                    "subject": "Answer Telegram support ping",
+                    "description": "Alice asked whether the deployment is finished.",
+                    "status": "pending",
+                    "metadata": {
+                        "_monitor": true,
+                        "monitor_connection": "telegram-user",
+                        "monitor_connector": "telegram-login",
+                        "outbound_action_id": action.id
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut snapshot = json!({});
+        add_task_context(&paths, &mut snapshot);
+        let tasks = snapshot["tasks"].as_array().unwrap();
+        let monitor_task = tasks
+            .iter()
+            .find(|task| task["task_id"] == "monitor-1")
+            .unwrap();
+
+        assert_eq!(monitor_task["outboundAction"]["id"], action.id);
+        assert_eq!(monitor_task["outboundAction"]["version"], 1);
+        assert_eq!(monitor_task["outboundAction"]["status"], "draft_ready");
+        assert_eq!(
+            monitor_task["outboundAction"]["message"],
+            "Deployment finished."
+        );
+        assert_eq!(
+            monitor_task["outboundAction"]["recipientStableId"],
+            "telegram:42"
+        );
+        assert_eq!(monitor_task["outboundAction"]["recipientSource"], "stamped");
     }
 
     #[test]
@@ -1241,5 +1366,160 @@ mod tests {
         assert_eq!(source_messages[6]["direction"], "outgoing");
         assert_eq!(source_messages[7]["text"], "简报下今年F1的竞争格局");
         assert_eq!(source_messages[7]["message_id"], 53953);
+    }
+
+    #[test]
+    fn issue_682_group_message_resolves_actual_sender_contact() {
+        // A telegram GROUP message from member B (in a group owned by A) must
+        // resolve to B's contact id, never the group/chat or its owner
+        // (agentenv/monorepo#682). The subscriber stamps sender_id as B's i64;
+        // the render layer must carry it into source_context.sender.id and the
+        // snapshot must derive exactly B's contact id.
+        let group_chat_id = -1_001_234_567_890i64; // a group chat id, never a contact
+        let sender_b = 5_229_190_700i64;
+        let metadata: Map<String, Value> = serde_json::from_value(json!({
+            "_monitor": true,
+            "monitor_connection": "telegram-user",
+            "monitor_connector": "telegram-login",
+            "monitor": {
+                "schema_version": 2,
+                "kind": "telegram.reply",
+                "source": {
+                    "connector_slug": "telegram-login",
+                    "connection_slug": "telegram-user",
+                    "chat_id": group_chat_id,
+                    "chat_kind": "group",
+                    "sender_id": sender_b,
+                    "message_id": 6090
+                },
+                "action": { "type": "draft_then_approve" }
+            }
+        }))
+        .unwrap();
+        let context = monitor_source_context(&metadata).expect("group message context");
+        assert_eq!(
+            context["sender"]["id"],
+            json!(sender_b.to_string()),
+            "render must carry the actual group-message sender id"
+        );
+        let ids = sender_avatar_contact_ids(&metadata, &context);
+        assert_eq!(
+            ids,
+            vec![format!("telegram-user-id@{sender_b}")],
+            "group message must attribute to the actual sender B, never the group/chat"
+        );
+    }
+
+    #[test]
+    fn issue_682_numeric_sender_id_resolves_to_contact_end_to_end() {
+        // Subscriber-shaped identity arrives as i64. The render layer coerces it
+        // into source_context.sender.id (string) and the snapshot derives the
+        // telegram-user-id contact id — locked end to end (agentenv/monorepo#682).
+        let sender = 8_759_047_281i64;
+        let metadata: Map<String, Value> = serde_json::from_value(json!({
+            "_monitor": true,
+            "monitor_connection": "telegram-user",
+            "monitor_connector": "telegram-login",
+            "monitor": {
+                "schema_version": 2,
+                "kind": "telegram.reply",
+                "source": {
+                    "connector_slug": "telegram-login",
+                    "connection_slug": "telegram-user",
+                    "chat_id": sender,
+                    "chat_kind": "user",
+                    "sender_id": sender,
+                    "message_id": 6090
+                },
+                "action": { "type": "draft_then_approve" }
+            }
+        }))
+        .unwrap();
+        let context = monitor_source_context(&metadata).expect("numeric sender context");
+        assert_eq!(
+            context["sender"]["id"],
+            json!(sender.to_string()),
+            "numeric sender id must render as a string"
+        );
+        let ids = sender_avatar_contact_ids(&metadata, &context);
+        assert!(
+            ids.contains(&format!("telegram-user-id@{sender}")),
+            "numeric sender id must derive its telegram-user-id contact, got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn issue_682_multi_sender_burst_has_no_single_contact_attribution() {
+        // A mixed-sender burst stamps the plural `sender_ids` set (>=2 distinct
+        // members). It has no single contact, so the task must not be attributed
+        // to one member — even a leaked singular sender hint must not win over
+        // the known multi-sender set (agentenv/monorepo#682, #655).
+        let metadata: Map<String, Value> = serde_json::from_value(json!({
+            "_monitor": true,
+            "monitor_connection": "telegram-user",
+            "monitor_connector": "telegram-login",
+            "chat_id": -1_001_234_567_890i64,
+            "chat_kind": "group",
+            "sender_ids": [42, 43],
+            // A stray singular hint must not fabricate a single-contact link.
+            "sender_id": 42,
+            "source_message_ids": [6090, 6091]
+        }))
+        .unwrap();
+        let context = monitor_source_context(&metadata)
+            .expect("a mixed-sender burst still derives a source context");
+        let ids = sender_avatar_contact_ids(&metadata, &context);
+        assert!(
+            ids.is_empty(),
+            "mixed-sender burst must not attribute to one contact, got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn issue_682_legacy_numeric_chat_id_derives_human_gated_completion_policy() {
+        // The number-tolerant derive also feeds default_monitor_completion_policy:
+        // a legacy reply-shaped telegram task with a numeric chat_id must now
+        // ADVERTISE the human gating the daemon already enforces (its
+        // enforcement leg was number-tolerant all along) instead of showing no
+        // policy (agentenv/monorepo#682).
+        let metadata: Map<String, Value> = serde_json::from_value(json!({
+            "_monitor": true,
+            "monitor_connection": "telegram-user",
+            "monitor_connector": "telegram-login",
+            "chat_id": 42i64,
+            "chat_kind": "user",
+            "sender_id": 42i64,
+            "actions": [{"name": "reply", "prompt": "Reply to the sender"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            monitor_completion_policy(&metadata),
+            Some(json!({
+                "mode": "draft_then_approve",
+                "requires_human_approval": true,
+                "requires_receipt": true,
+            }))
+        );
+    }
+
+    #[test]
+    fn issue_682_legacy_numeric_ids_still_derive_source_context() {
+        // A legacy task without a typed contract falls back to
+        // derived_monitor_source_context; ids stamped as i64 must not kill the
+        // whole derivation (agentenv/monorepo#682).
+        let metadata: Map<String, Value> = serde_json::from_value(json!({
+            "_monitor": true,
+            "monitor_connection": "telegram-user",
+            "monitor_connector": "telegram-login",
+            "chat_id": 42i64,
+            "chat_kind": "user",
+            "sender_id": 42i64
+        }))
+        .unwrap();
+        let context = monitor_source_context(&metadata).expect("legacy numeric context");
+        assert_eq!(context["sender"]["id"], json!("42"));
+        assert_eq!(context["delivery_target"]["chat_id"], json!("42"));
+        let ids = sender_avatar_contact_ids(&metadata, &context);
+        assert_eq!(ids, vec!["telegram-user-id@42".to_string()]);
     }
 }

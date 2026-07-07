@@ -747,6 +747,18 @@ fn ensure_telegram_connection_record(
                 connection.connector_slug
             );
         }
+        // Re-login: a fresh authorization supersedes any Degraded /
+        // AuthRequired state left from the previous session (#752).
+        let connection = manager
+            .connection_store()
+            .update(connection_slug, |record| {
+                if record.state != puffer_subscriptions::ConnectionState::Disabled {
+                    record.state = puffer_subscriptions::ConnectionState::Authenticated;
+                }
+                record.health = None;
+                record.auth_failure_notified = false;
+            })
+            .map_err(|error| anyhow!("reset connection `{connection_slug}`: {error}"))?;
         return Ok((connection, false));
     }
     let description = telegram_connection_description(payload);

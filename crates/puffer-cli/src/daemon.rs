@@ -273,6 +273,23 @@ async fn run_async(options: DaemonOptions) -> Result<()> {
     let state = Arc::new(state);
     crate::workflow_run_events::set_workflow_run_event_sink(state.event_sender());
 
+    // Bridge subscriber `contacts_hydrated` control events to the UI bus as
+    // `contacts:updated`, so the desktop contacts screen refetches when the
+    // subscriber finishes hydrating a Telegram account (#604) instead of
+    // polling. Best-effort: if no manager is installed there is nothing to tap.
+    if let Ok(manager) = subscription_manager() {
+        let bus = manager.bus();
+        let contacts_state = state.clone();
+        tokio::spawn(async move {
+            let mut rx = bus.subscribe();
+            while let Some(envelope) = rx.recv().await {
+                if let Some(ui_event) = contacts_updated_from_envelope(&envelope) {
+                    contacts_state.publish_event(ui_event);
+                }
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route(
@@ -834,6 +851,43 @@ fn is_replay_channel(event: &str) -> bool {
         || event.starts_with("workflow:")
         || event.starts_with("contacts:infer:")
         || event.starts_with("connector-setup:")
+}
+
+/// Maps a subscriber `contacts_hydrated` control envelope to the UI
+/// `contacts:updated` event so the desktop contacts screen refetches when the
+/// subscriber finishes (or attempts) contact hydration (#604). Returns `None`
+/// for any other envelope. Kept pure so the mapping is unit-testable without a
+/// running daemon.
+fn contacts_updated_from_envelope(
+    envelope: &puffer_subscriber_runtime::EventEnvelope,
+) -> Option<ServerEnvelope> {
+    if !envelope.event.control || envelope.event.kind != "contacts_hydrated" {
+        return None;
+    }
+    // Forward only terminal outcomes of an actual hydration run. Non-terminal
+    // emissions (the single-flight refusal `hydrating` and the login-phase
+    // `auth_required`) must NOT reach the UI: the desktop refetches on
+    // contacts:updated and a refetch re-dispatches hydration, so forwarding
+    // them would close an unbounded refetch⇄dispatch feedback loop.
+    let state = envelope.event.payload.get("state").and_then(Value::as_str);
+    if !matches!(state, Some("ready") | Some("failed")) {
+        return None;
+    }
+    let connection = if envelope.event.topic.is_empty() {
+        envelope.subscriber_id.as_str()
+    } else {
+        envelope.event.topic.as_str()
+    };
+    let ok = envelope
+        .event
+        .payload
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(ServerEnvelope::Event {
+        event: "contacts:updated".to_string(),
+        payload: json!({ "connection": connection, "ok": ok }),
+    })
 }
 
 impl DaemonState {
@@ -1754,17 +1808,14 @@ async fn dispatch_request(
         "monitor_task_complete" | "task_monitor_complete" => respond!(
             crate::daemon_workflows::handle_monitor_task_complete(&state.paths, &params)
         ),
-        "monitor_reply_send" | "task_monitor_reply_send" => respond!(
-            crate::daemon_workflows::handle_monitor_reply_send(&state.paths, &params)
+        "outbound_action_execute" => respond!(
+            crate::daemon_workflows::handle_outbound_action_execute(&state.paths, &params)
         ),
-        "monitor_action_execute" | "task_monitor_action_execute" => respond!(
-            crate::daemon_workflows::handle_monitor_action_execute(&state.paths, &params)
+        "outbound_action_cancel" => respond!(
+            crate::daemon_workflows::handle_outbound_action_cancel(&state.paths, &params)
         ),
-        "connector_action_execute" => respond!(
-            crate::daemon_workflows::handle_connector_action_execute(&state.paths, &params)
-        ),
-        "connector_action_draft_status" => respond!(
-            crate::daemon_workflows::handle_connector_action_draft_status(&state.paths, &params)
+        "outbound_action_status" => respond!(
+            crate::daemon_workflows::handle_outbound_action_status(&state.paths, &params)
         ),
         "monitor_memory_save" | "task_monitor_memory_save" => respond!(
             crate::daemon_workflows::handle_monitor_memory_save(&state.paths, &params)
@@ -5228,13 +5279,8 @@ fn resolve_monitor_reply_turn_scope(
         }
         Some(kind) if kind != "telegram.reply" => return Ok(None),
         _ => {
-            if !monitor_task_is_human_gated(&task) {
-                return Ok(None);
-            }
             if !monitor_task_has_delivery_target(&task) {
-                anyhow::bail!(
-                    "monitor task `{prompt_task_id}` is missing a source delivery target"
-                );
+                return Ok(None);
             }
             MONITOR_REPLY_ACTION_PROMPT_SCOPE
         }
@@ -5317,31 +5363,6 @@ fn monitor_tasks_path_for_scope(paths: &ConfigPaths) -> std::path::PathBuf {
         .join("runtime")
         .join("claude_workflow")
         .join("monitor_tasks.json")
-}
-
-fn monitor_task_is_human_gated(task: &Value) -> bool {
-    let Some(metadata) = task.get("metadata").and_then(Value::as_object) else {
-        return false;
-    };
-    let policy = metadata
-        .get("completion_policy")
-        .or_else(|| metadata.get("completionPolicy"));
-    let mode = policy.and_then(|policy| {
-        policy
-            .get("mode")
-            .and_then(Value::as_str)
-            .or_else(|| policy.as_str())
-    });
-    matches!(mode, Some("draft_then_approve" | "send_to_source"))
-        || policy
-            .and_then(|policy| {
-                policy
-                    .get("requires_human_approval")
-                    .or_else(|| policy.get("requiresHumanApproval"))
-                    .and_then(Value::as_bool)
-            })
-            .unwrap_or(false)
-        || monitor_task_has_delivery_target(task)
 }
 
 fn monitor_task_has_delivery_target(task: &Value) -> bool {
@@ -7218,6 +7239,105 @@ mod tests {
         assert!(!super::is_replay_channel("workflow-run:finished"));
     }
 
+    #[test]
+    fn contacts_hydrated_maps_to_contacts_updated_event() {
+        use puffer_subscriber_runtime::{Event, EventEnvelope};
+        let envelope = EventEnvelope {
+            envelope_id: "e1".into(),
+            subscriber_id: "telegram-user".into(),
+            received_at_ms: 0,
+            event: Event {
+                topic: "telegram-user".into(),
+                kind: "contacts_hydrated".into(),
+                control: true,
+                dedup_key: None,
+                text: String::new(),
+                payload: serde_json::json!({ "ok": true, "state": "ready" }),
+            },
+        };
+        let ui = super::contacts_updated_from_envelope(&envelope)
+            .expect("contacts_hydrated maps to a UI event");
+        match ui {
+            super::ServerEnvelope::Event { event, payload } => {
+                assert_eq!(event, "contacts:updated");
+                assert_eq!(payload["connection"], "telegram-user");
+                assert_eq!(payload["ok"], true);
+            }
+            _ => panic!("expected an Event envelope"),
+        }
+    }
+
+    #[test]
+    fn non_contacts_control_event_is_ignored() {
+        use puffer_subscriber_runtime::{Event, EventEnvelope};
+        let envelope = EventEnvelope {
+            envelope_id: "e1".into(),
+            subscriber_id: "telegram-user".into(),
+            received_at_ms: 0,
+            event: Event {
+                topic: "telegram-user".into(),
+                kind: "ready".into(),
+                control: true,
+                dedup_key: None,
+                text: String::new(),
+                payload: serde_json::Value::Null,
+            },
+        };
+        assert!(super::contacts_updated_from_envelope(&envelope).is_none());
+    }
+
+    #[test]
+    fn non_terminal_contacts_hydrated_is_not_forwarded() {
+        use puffer_subscriber_runtime::{Event, EventEnvelope};
+        // Refusal (`hydrating`) and login-phase (`auth_required`) emissions
+        // must not trigger a UI refetch — forwarding them would close a
+        // refetch⇄dispatch feedback loop.
+        for state in ["hydrating", "auth_required"] {
+            let envelope = EventEnvelope {
+                envelope_id: "e1".into(),
+                subscriber_id: "telegram-user".into(),
+                received_at_ms: 0,
+                event: Event {
+                    topic: "telegram-user".into(),
+                    kind: "contacts_hydrated".into(),
+                    control: true,
+                    dedup_key: None,
+                    text: String::new(),
+                    payload: serde_json::json!({ "ok": false, "state": state }),
+                },
+            };
+            assert!(
+                super::contacts_updated_from_envelope(&envelope).is_none(),
+                "state {state} must not be forwarded"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_contacts_hydrated_is_forwarded() {
+        use puffer_subscriber_runtime::{Event, EventEnvelope};
+        let envelope = EventEnvelope {
+            envelope_id: "e1".into(),
+            subscriber_id: "telegram-user".into(),
+            received_at_ms: 0,
+            event: Event {
+                topic: "telegram-user".into(),
+                kind: "contacts_hydrated".into(),
+                control: true,
+                dedup_key: None,
+                text: String::new(),
+                payload: serde_json::json!({ "ok": false, "state": "failed", "error": "net down" }),
+            },
+        };
+        match super::contacts_updated_from_envelope(&envelope) {
+            Some(super::ServerEnvelope::Event { event, payload }) => {
+                assert_eq!(event, "contacts:updated");
+                assert_eq!(payload["ok"], false);
+            }
+            _ => panic!("failed hydration must be forwarded so the banner updates"),
+        }
+    }
+
     use super::{
         append_ordered_turn_progress, apply_daemon_yolo_mode, apply_proxy_env_at_startup,
         apply_turn_model_override, apply_turn_request_options, browser_launch_settings_or_default,
@@ -8726,9 +8846,16 @@ models: []
     // ── #561: monitor-reply scope must not lock unrelated follow-up turns ──────
 
     /// Builds a daemon state whose monitor task store holds one open, human-gated
-    /// (legacy `MonitorReplyDraft`) Telegram task `monitor-16` with a delivery
-    /// target. The returned `TempDir` must outlive the state.
+    /// Telegram reply task `monitor-16` with a delivery target. The returned
+    /// `TempDir` must outlive the state.
     fn monitor_reply_env() -> (tempfile::TempDir, DaemonState) {
+        monitor_reply_env_with_metadata(json!({
+            "completion_policy": { "mode": "draft_then_approve" },
+            "source_context": { "delivery_target": { "chat_id": 7842887746_i64 } }
+        }))
+    }
+
+    fn monitor_reply_env_with_metadata(metadata: Value) -> (tempfile::TempDir, DaemonState) {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace_root = temp.path().join("workspace");
         let paths = ConfigPaths {
@@ -8749,10 +8876,7 @@ models: []
                 "tasks": [{
                     "task_id": "monitor-16",
                     "status": "open",
-                    "metadata": {
-                        "completion_policy": { "mode": "draft_then_approve" },
-                        "source_context": { "delivery_target": { "chat_id": 7842887746_i64 } }
-                    }
+                    "metadata": metadata
                 }]
             }))
             .unwrap(),
@@ -8815,6 +8939,28 @@ models: []
         .expect("re-arm scope resolves")
         .expect("re-running the action re-scopes the turn");
         assert_eq!(rearm.prompt_tool_scope, MONITOR_REPLY_ACTION_PROMPT_SCOPE);
+    }
+
+    #[test]
+    fn monitor_reply_scope_ignores_completion_policy_without_delivery_target() {
+        let (_temp, state) = monitor_reply_env_with_metadata(json!({
+            "completion_policy": { "mode": "draft_then_approve" }
+        }));
+        let session_id = Uuid::new_v4().to_string();
+
+        let scope = resolve_monitor_reply_turn_scope(
+            &state,
+            &json!({ "monitorActionTaskId": "monitor-16" }),
+            MONITOR_ACTION_MSG,
+            &session_id,
+            "turn-action",
+        )
+        .expect("scope resolution should not reject review-only tasks");
+
+        assert!(
+            scope.is_none(),
+            "completion policy alone must not create an outbound reply scope"
+        );
     }
 
     /// A plain (non-action) message carrying a `monitorActionTaskId` param is

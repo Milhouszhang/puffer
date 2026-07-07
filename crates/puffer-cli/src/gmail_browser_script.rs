@@ -40,6 +40,14 @@ pub(crate) const GMAIL_INBOX_SCRIPT: &str = r#"
       return /attachment/i.test(label);
     });
   };
+  const fnv1a = (str) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(16);
+  };
   const candidateRows = Array.from(document.querySelectorAll('tr[role="row"]'));
   const visibleRows = candidateRows.filter(visible);
   const rows = visibleRows
@@ -78,7 +86,11 @@ pub(crate) const GMAIL_INBOX_SCRIPT: &str = r#"
         row.querySelector(".zF") !== null ||
         aria.includes("unread");
       const hasAttachment = rowHasAttachment(row, aria);
-      const fallback = [sender, subject, snippet, index].join(":");
+      // Content-only on purpose: index would break on archive shifts (#594).
+      // Known tradeoff: two messageId-less rows with identical sender/from/
+      // subject/truncated-snippet collapse to one id and the later one is
+      // deduped. Changing this derivation requires bumping SEEN_KEY_VERSION.
+      const fallback = "c" + fnv1a([sender, fromEmail, subject, snippet].join(" "));
       return {
         id: messageId || fallback,
         threadId,
@@ -100,6 +112,14 @@ pub(crate) const GMAIL_INBOX_SCRIPT: &str = r#"
     /inbox is empty/i.test(bodyText) ||
     /no mail/i.test(bodyText);
   const status = rows.length > 0 || empty ? "ok" : "loading";
+  // Logged-in mailbox identity: `?authuser=` silently falls back to the
+  // default session account when the configured address is not signed in,
+  // so the scraped mailbox can differ from the configured account.
+  const accountEl = document.querySelector(
+    'a[aria-label*="Account"], a[href*="SignOutOptions"]'
+  );
+  const accountLabel = (accountEl && accountEl.getAttribute("aria-label")) || "";
+  const mailboxMatch = accountLabel.match(/[\w.+-]+@[\w.-]+/);
   return {
     status,
     href,
@@ -107,6 +127,7 @@ pub(crate) const GMAIL_INBOX_SCRIPT: &str = r#"
     bodyText: bodyText.slice(0, 200),
     empty,
     rows,
+    mailbox: mailboxMatch ? mailboxMatch[0].toLowerCase() : "",
     candidateRowCount: candidateRows.length,
     visibleRowCount: visibleRows.length,
     filteredRowCount: rows.length,

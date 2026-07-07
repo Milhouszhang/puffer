@@ -1,30 +1,27 @@
 //! [`TurnSession`] impl for the OpenAI Chat Completions API.
 //!
-//! No live SSE parser yet — the response comes back as one JSON
-//! payload via `send_openai_request_with_refresh`. Streaming and
-//! non-streaming `one_turn_*` variants both go through the same
-//! request path; the streaming path additionally fires
-//! `ThinkingDelta` and `TextDelta` events synthesized from the
-//! parsed response so reasoning-capable Chat Completions providers
-//! (Moonshot Kimi, Deepseek, OpenRouter relays, …) keep their
-//! thinking blocks visible in the TUI. Real per-token streaming is
-//! a follow-up (would need `stream: true` on the request body and a
-//! Chat Completions SSE parser).
+//! Streaming requests send `stream: true` and parse Chat Completions
+//! SSE (`data: {...}` chunks plus `[DONE]`). Non-SSE JSON responses
+//! are still accepted as a compatibility fallback and synthesize the
+//! same text/thinking events the old path emitted.
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use puffer_provider_openai::{
-    build_chat_completions_request, extract_chat_completions_reasoning,
+    build_chat_completions_request, build_json_post_request, extract_chat_completions_reasoning,
     extract_chat_completions_tool_calls, extract_chat_completions_visible_text,
     parse_chat_completions_response, OpenAIChatCompletionTool, OpenAIChatCompletionsRequest,
-    OpenAIChatResponseFormat, OpenAIRequestConfig, OpenAIResponsesToolChoiceMode,
+    OpenAIChatMessage, OpenAIChatResponseFormat, OpenAIRequestConfig, OpenAIResponseToolCall,
+    OpenAIResponsesToolChoiceMode,
 };
 use puffer_provider_registry::{
     AuthStore, OpenAiCompletionsCompat, ProviderDescriptor, ThinkingFormat,
 };
 use puffer_resources::LoadedResources;
 use puffer_tools::ToolRegistry;
+use reqwest::blocking::Response;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::io::{BufRead, Read};
 
 use super::conversation::{
     build_system_reminder, generate_openai_summary, items_to_chat_messages,
@@ -32,7 +29,7 @@ use super::conversation::{
 };
 use super::{
     parse_openai_text, parse_openai_text_fallback, send_openai_request_with_refresh,
-    OpenAIExecutionConfig,
+    send_openai_request_with_refresh_streaming_using_parser, OpenAIExecutionConfig,
 };
 use crate::permissions::{load_runtime_permission_context_with_inputs, RuntimePermissionInputs};
 use crate::runtime::agent_loop::{AssistantTurn, TurnSession};
@@ -72,24 +69,7 @@ impl TurnSession for OpenAICompletionsTurnSession {
         items: &mut Vec<ConversationItem>,
         on_event: &mut dyn FnMut(TurnStreamEvent),
     ) -> Result<AssistantTurn> {
-        // Use the rich `send_and_parse` (not `one_turn_blocking`) so
-        // we keep `reasoning_chain` after parsing. Synthesize streaming
-        // events from the (already-final) response so the TUI's
-        // thinking + assistant cards stay populated. Real per-token
-        // streaming is a follow-up — needs `stream: true` on the wire
-        // body and a Chat Completions SSE parser. For reasoning-capable
-        // providers this is the difference between "thinking block
-        // visible" and "thinking block missing" (issue raised against
-        // `kimi-coding/k2p5` with `effort: xhigh`).
-        let result = self.send_and_parse(state, auth_store, items)?;
-        if let Some(reasoning) = result.reasoning_chain.as_deref() {
-            if !reasoning.is_empty() {
-                on_event(TurnStreamEvent::ThinkingDelta(reasoning.to_string()));
-            }
-        }
-        if !result.assistant_text.is_empty() {
-            on_event(TurnStreamEvent::TextDelta(result.assistant_text.clone()));
-        }
+        let result = self.send_streaming_and_parse(state, auth_store, items, on_event)?;
         Ok(result.into_assistant_turn())
     }
 
@@ -129,6 +109,7 @@ struct CompletionsTurnResult {
     tool_calls: Vec<ToolCallRequest>,
     assistant_text: String,
     reasoning_chain: Option<String>,
+    emitted_tool_call_ids: HashSet<String>,
 }
 
 impl CompletionsTurnResult {
@@ -138,7 +119,7 @@ impl CompletionsTurnResult {
             tool_calls: self.tool_calls,
             assistant_text: self.assistant_text,
             input_tokens_hint: None,
-            emitted_tool_call_ids: HashSet::new(),
+            emitted_tool_call_ids: self.emitted_tool_call_ids,
             usage_report: None,
         }
     }
@@ -156,6 +137,52 @@ impl OpenAICompletionsTurnSession {
         auth_store: &mut AuthStore,
         items: &mut Vec<ConversationItem>,
     ) -> Result<CompletionsTurnResult> {
+        let prepared = self.prepare_request(state, items);
+
+        let body_for_each_attempt = move |request_config: &OpenAIRequestConfig| {
+            build_prepared_chat_completions_request(request_config, &prepared, false)
+        };
+
+        let response: Value = send_openai_request_with_refresh(
+            auth_store,
+            &mut self.execution,
+            &state.config.network.proxy,
+            body_for_each_attempt,
+        )?;
+
+        Self::result_from_response_value(&response, state)
+    }
+
+    fn send_streaming_and_parse(
+        &mut self,
+        state: &mut AppState,
+        auth_store: &mut AuthStore,
+        items: &mut Vec<ConversationItem>,
+        on_event: &mut dyn FnMut(TurnStreamEvent),
+    ) -> Result<CompletionsTurnResult> {
+        let prepared = self.prepare_request(state, items);
+
+        let body_for_each_attempt = move |request_config: &OpenAIRequestConfig| {
+            build_prepared_chat_completions_request(request_config, &prepared, true)
+        };
+
+        let streamed = send_openai_request_with_refresh_streaming_using_parser(
+            auth_store,
+            &mut self.execution,
+            &state.config.network.proxy,
+            body_for_each_attempt,
+            on_event,
+            parse_chat_completions_stream_response,
+        )?;
+
+        Ok(Self::result_from_stream(streamed, state))
+    }
+
+    fn prepare_request(
+        &self,
+        state: &AppState,
+        items: &[ConversationItem],
+    ) -> PreparedCompletionsRequest {
         let messages = items_to_chat_messages(
             items,
             Some(&self.system_prompt),
@@ -164,15 +191,6 @@ impl OpenAICompletionsTurnSession {
             Some(&self.system_reminder),
         );
 
-        let model_id = self.model_id.clone();
-        let tools = self.tools.clone();
-        let response_format = self.response_format.clone();
-
-        // Resolve effort + thinking params per the model's compat. When
-        // `requires_reasoning_content_on_assistant_messages` is set, also
-        // patch every prior assistant message to carry an empty
-        // `reasoning_content` so DeepSeek-style relays don't reject the
-        // replay.
         let reasoning_fields = resolve_reasoning_fields(
             self.compat.as_ref(),
             self.model_supports_reasoning,
@@ -188,40 +206,30 @@ impl OpenAICompletionsTurnSession {
                 }
             }
         }
-        let messages_for_attempt = messages.clone();
 
-        let body_for_each_attempt = move |request_config: &OpenAIRequestConfig| {
-            build_chat_completions_request(
-                request_config,
-                &OpenAIChatCompletionsRequest {
-                    model: model_id.clone(),
-                    messages: messages_for_attempt.clone(),
-                    tools: tools.clone(),
-                    tool_choice: if tools.is_empty() {
-                        None
-                    } else {
-                        Some(OpenAIResponsesToolChoiceMode::Auto)
-                    },
-                    response_format: response_format.clone(),
-                    reasoning_effort: reasoning_fields.reasoning_effort.clone(),
-                    reasoning: reasoning_fields.reasoning.clone(),
-                    thinking: reasoning_fields.thinking.clone(),
-                    enable_thinking: reasoning_fields.enable_thinking,
-                    chat_template_kwargs: reasoning_fields.chat_template_kwargs.clone(),
-                },
-            )
-        };
+        PreparedCompletionsRequest {
+            model_id: self.model_id.clone(),
+            messages,
+            tools: self.tools.clone(),
+            response_format: self.response_format.clone(),
+            reasoning_fields,
+        }
+    }
 
-        let response: Value = send_openai_request_with_refresh(
-            auth_store,
-            &mut self.execution,
-            &state.config.network.proxy,
-            body_for_each_attempt,
-        )?;
+    fn result_from_response_value(
+        response: &Value,
+        state: &AppState,
+    ) -> Result<CompletionsTurnResult> {
+        let parsed = chat_completions_result_from_json_value(response)?;
+        Ok(Self::result_from_stream(parsed, state))
+    }
 
-        let parsed = parse_chat_completions_response(&serde_json::to_string(&response)?)?;
-        let tool_calls_vendor = extract_chat_completions_tool_calls(&parsed)?;
-        let tool_calls: Vec<ToolCallRequest> = tool_calls_vendor
+    fn result_from_stream(
+        streamed: ChatCompletionsStreamResult,
+        state: &AppState,
+    ) -> CompletionsTurnResult {
+        let tool_calls: Vec<ToolCallRequest> = streamed
+            .tool_calls
             .iter()
             .map(|tc| ToolCallRequest {
                 call_id: tc.call_id.clone(),
@@ -229,20 +237,13 @@ impl OpenAICompletionsTurnSession {
                 input: serde_json::to_string(&tc.arguments).unwrap_or_default(),
             })
             .collect();
-
-        // Strip any inline `<think>…</think>` block from the visible
-        // text so it doesn't double-render alongside the thinking card
-        // emitted from `extract_chat_completions_reasoning`.
-        let assistant_text_from_msg = extract_chat_completions_visible_text(&parsed);
-        let reasoning_chain = extract_chat_completions_reasoning(&parsed);
-
         let mut pre_tool_items: Vec<ConversationItem> = Vec::new();
-        if !assistant_text_from_msg.trim().is_empty() {
+        if !streamed.assistant_text.trim().is_empty() {
             pre_tool_items.push(ConversationItem::assistant_message(
-                &assistant_text_from_msg,
+                &streamed.assistant_text,
             ));
         }
-        for tc in &tool_calls_vendor {
+        for tc in &streamed.tool_calls {
             pre_tool_items.push(ConversationItem::FunctionCall {
                 call_id: tc.call_id.clone(),
                 name: tc.name.clone(),
@@ -251,24 +252,466 @@ impl OpenAICompletionsTurnSession {
         }
 
         let final_assistant_text = if tool_calls.is_empty() {
-            if assistant_text_from_msg.trim().is_empty() {
-                parse_openai_text(&response)
-                    .or_else(|_| parse_openai_text_fallback(&response, state))
+            if streamed.assistant_text.trim().is_empty() {
+                parse_openai_text(&streamed.raw_response)
+                    .or_else(|_| parse_openai_text_fallback(&streamed.raw_response, state))
                     .unwrap_or_default()
             } else {
-                assistant_text_from_msg
+                streamed.assistant_text
             }
         } else {
             String::new()
         };
 
-        Ok(CompletionsTurnResult {
+        CompletionsTurnResult {
             pre_tool_items,
             tool_calls,
             assistant_text: final_assistant_text,
-            reasoning_chain,
+            reasoning_chain: streamed.reasoning_chain,
+            emitted_tool_call_ids: streamed.emitted_tool_call_ids,
+        }
+    }
+}
+
+struct PreparedCompletionsRequest {
+    model_id: String,
+    messages: Vec<OpenAIChatMessage>,
+    tools: Vec<OpenAIChatCompletionTool>,
+    response_format: Option<OpenAIChatResponseFormat>,
+    reasoning_fields: ReasoningFields,
+}
+
+fn build_prepared_chat_completions_request(
+    config: &OpenAIRequestConfig,
+    prepared: &PreparedCompletionsRequest,
+    stream: bool,
+) -> Result<puffer_provider_openai::BuiltOpenAIRequest> {
+    let request = OpenAIChatCompletionsRequest {
+        model: prepared.model_id.clone(),
+        messages: prepared.messages.clone(),
+        tools: prepared.tools.clone(),
+        tool_choice: if prepared.tools.is_empty() {
+            None
+        } else {
+            Some(OpenAIResponsesToolChoiceMode::Auto)
+        },
+        response_format: prepared.response_format.clone(),
+        reasoning_effort: prepared.reasoning_fields.reasoning_effort.clone(),
+        reasoning: prepared.reasoning_fields.reasoning.clone(),
+        thinking: prepared.reasoning_fields.thinking.clone(),
+        enable_thinking: prepared.reasoning_fields.enable_thinking,
+        chat_template_kwargs: prepared.reasoning_fields.chat_template_kwargs.clone(),
+    };
+
+    if !stream {
+        return build_chat_completions_request(config, &request);
+    }
+
+    let path = config
+        .chat_completions_path
+        .as_deref()
+        .unwrap_or("/v1/chat/completions");
+    let mut body = serde_json::to_value(&request)?;
+    body["stream"] = Value::Bool(true);
+    build_json_post_request(config, path, &body)
+}
+
+struct ChatCompletionsStreamResult {
+    assistant_text: String,
+    reasoning_chain: Option<String>,
+    tool_calls: Vec<OpenAIResponseToolCall>,
+    emitted_tool_call_ids: HashSet<String>,
+    raw_response: Value,
+}
+
+fn parse_chat_completions_stream_response<G>(
+    url: &str,
+    response: Response,
+    on_event: &mut G,
+) -> Result<ChatCompletionsStreamResult>
+where
+    G: FnMut(TurnStreamEvent) + ?Sized,
+{
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    if !status.is_success() {
+        let text = response.text().unwrap_or_default();
+        if let Some(quota) =
+            super::super::quota::classify_response("openai", status.as_u16(), &text)
+        {
+            return Err(anyhow::Error::new(quota));
+        }
+        bail!("request failed with status {}: {}", status, text);
+    }
+
+    let mut reader = std::io::BufReader::new(response);
+    let looks_like_sse = if is_chat_completions_event_stream(content_type.as_deref(), "") {
+        true
+    } else {
+        let prefix = reader.fill_buf()?;
+        let prefix = std::str::from_utf8(prefix).unwrap_or_default();
+        is_chat_completions_event_stream(content_type.as_deref(), prefix)
+    };
+
+    if looks_like_sse {
+        return parse_chat_completions_sse_reader(reader, on_event)
+            .with_context(|| format!("failed to parse Chat Completions SSE response from {url}"));
+    }
+
+    let mut text = String::new();
+    reader.read_to_string(&mut text)?;
+    let raw: Value = serde_json::from_str(&text)
+        .with_context(|| format!("response from {url} was not valid JSON"))?;
+    let result = chat_completions_result_from_json_value(&raw)
+        .with_context(|| format!("response from {url} was not a valid Chat Completions payload"))?;
+    if let Some(reasoning) = result.reasoning_chain.as_deref() {
+        if !reasoning.is_empty() {
+            on_event(TurnStreamEvent::ThinkingDelta(reasoning.to_string()));
+        }
+    }
+    if !result.assistant_text.is_empty() {
+        on_event(TurnStreamEvent::TextDelta(result.assistant_text.clone()));
+    }
+    Ok(result)
+}
+
+fn chat_completions_result_from_json_value(
+    response: &Value,
+) -> Result<ChatCompletionsStreamResult> {
+    let parsed = parse_chat_completions_response(&serde_json::to_string(response)?)?;
+    let tool_calls = extract_chat_completions_tool_calls(&parsed)?;
+    Ok(ChatCompletionsStreamResult {
+        assistant_text: extract_chat_completions_visible_text(&parsed),
+        reasoning_chain: extract_chat_completions_reasoning(&parsed),
+        tool_calls,
+        emitted_tool_call_ids: HashSet::new(),
+        raw_response: response.clone(),
+    })
+}
+
+fn is_chat_completions_event_stream(content_type: Option<&str>, text: &str) -> bool {
+    content_type.is_some_and(|value| value.starts_with("text/event-stream"))
+        || text.trim_start().starts_with("data:")
+        || text.trim_start().starts_with("event:")
+}
+
+fn parse_chat_completions_sse_reader<R, G>(
+    mut reader: R,
+    on_event: &mut G,
+) -> Result<ChatCompletionsStreamResult>
+where
+    R: BufRead,
+    G: FnMut(TurnStreamEvent) + ?Sized,
+{
+    let mut state = ChatCompletionsSseState::default();
+    let mut line = String::new();
+    let mut data_lines = Vec::new();
+
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            flush_chat_completions_sse_event(&data_lines, &mut state, on_event)?;
+            break;
+        }
+
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            if flush_chat_completions_sse_event(&data_lines, &mut state, on_event)? {
+                data_lines.clear();
+                break;
+            }
+            data_lines.clear();
+            continue;
+        }
+
+        if let Some(data) = trimmed.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
+
+    if !state.terminal {
+        bail!("stream closed before Chat Completions [DONE]");
+    }
+    Ok(state.into_result())
+}
+
+fn flush_chat_completions_sse_event<G>(
+    data_lines: &[String],
+    state: &mut ChatCompletionsSseState,
+    on_event: &mut G,
+) -> Result<bool>
+where
+    G: FnMut(TurnStreamEvent) + ?Sized,
+{
+    let data = data_lines.join("\n");
+    if data.is_empty() {
+        return Ok(false);
+    }
+    if data == "[DONE]" {
+        state.emit_complete_tool_calls(true, on_event);
+        state.terminal = true;
+        return Ok(true);
+    }
+
+    let event: Value = serde_json::from_str(&data)
+        .with_context(|| format!("invalid Chat Completions SSE payload: {data}"))?;
+    state.process_event(&event, on_event)?;
+    Ok(false)
+}
+
+#[derive(Default)]
+struct ChatCompletionsSseState {
+    id: Option<String>,
+    finish_reason: Option<String>,
+    terminal: bool,
+    assistant_text: String,
+    reasoning_chain: String,
+    tool_call_deltas: BTreeMap<usize, ChatCompletionsToolCallDelta>,
+    emitted_tool_call_ids: HashSet<String>,
+}
+
+impl ChatCompletionsSseState {
+    fn process_event<G>(&mut self, event: &Value, on_event: &mut G) -> Result<()>
+    where
+        G: FnMut(TurnStreamEvent) + ?Sized,
+    {
+        if let Some(error) = event.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| event.get("message").and_then(Value::as_str))
+                .unwrap_or("Chat Completions stream failed");
+            bail!("{message}");
+        }
+
+        if self.id.is_none() {
+            if let Some(id) = event.get("id").and_then(Value::as_str) {
+                self.id = Some(id.to_string());
+            }
+        }
+
+        for choice in event
+            .get("choices")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(delta) = choice.get("delta") {
+                self.process_delta(delta, on_event)?;
+            }
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                if !reason.is_empty() {
+                    self.finish_reason = Some(reason.to_string());
+                    if reason == "tool_calls" {
+                        self.emit_complete_tool_calls(true, on_event);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_delta<G>(&mut self, delta: &Value, on_event: &mut G) -> Result<()>
+    where
+        G: FnMut(TurnStreamEvent) + ?Sized,
+    {
+        if let Some(content) = delta.get("content").and_then(Value::as_str) {
+            self.assistant_text.push_str(content);
+            on_event(TurnStreamEvent::TextDelta(content.to_string()));
+        }
+
+        for key in ["reasoning_content", "reasoning"] {
+            if let Some(reasoning) = delta.get(key).and_then(Value::as_str) {
+                self.reasoning_chain.push_str(reasoning);
+                on_event(TurnStreamEvent::ThinkingDelta(reasoning.to_string()));
+            }
+        }
+
+        if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for (position, tool_call) in tool_calls.iter().enumerate() {
+                let index = tool_call
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(position);
+                {
+                    let entry = self.tool_call_deltas.entry(index).or_default();
+                    if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                        if !id.is_empty() {
+                            entry.call_id = id.to_string();
+                        }
+                    }
+                    if let Some(kind) = tool_call.get("type").and_then(Value::as_str) {
+                        if !kind.is_empty() {
+                            entry.kind = kind.to_string();
+                        }
+                    }
+                    if let Some(function) = tool_call.get("function") {
+                        if let Some(name) = function.get("name").and_then(Value::as_str) {
+                            if !name.is_empty() {
+                                entry.name = name.to_string();
+                            }
+                        }
+                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                            entry.arguments.push_str(arguments);
+                        }
+                    }
+                }
+                self.maybe_emit_tool_call(index, false, on_event);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn maybe_emit_tool_call<G>(&mut self, index: usize, allow_raw: bool, on_event: &mut G)
+    where
+        G: FnMut(TurnStreamEvent) + ?Sized,
+    {
+        if self
+            .tool_call_deltas
+            .get(&index)
+            .map(|entry| entry.emitted)
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let Some((tool_call, raw_arguments)) = self.completed_tool_call(index, allow_raw) else {
+            return;
+        };
+        on_event(TurnStreamEvent::ToolCallsRequested(vec![ToolCallRequest {
+            call_id: tool_call.call_id.clone(),
+            tool_id: tool_call.name.clone(),
+            input: raw_arguments,
+        }]));
+        self.emitted_tool_call_ids.insert(tool_call.call_id.clone());
+        if let Some(entry) = self.tool_call_deltas.get_mut(&index) {
+            entry.emitted = true;
+        }
+    }
+
+    fn emit_complete_tool_calls<G>(&mut self, allow_raw: bool, on_event: &mut G)
+    where
+        G: FnMut(TurnStreamEvent) + ?Sized,
+    {
+        let indexes: Vec<usize> = self.tool_call_deltas.keys().copied().collect();
+        for index in indexes {
+            self.maybe_emit_tool_call(index, allow_raw, on_event);
+        }
+    }
+
+    fn completed_tool_call(
+        &self,
+        index: usize,
+        allow_raw: bool,
+    ) -> Option<(OpenAIResponseToolCall, String)> {
+        let entry = self.tool_call_deltas.get(&index)?;
+        if entry.call_id.is_empty() || entry.name.is_empty() {
+            return None;
+        }
+        let parsed_arguments = match serde_json::from_str::<Value>(&entry.arguments) {
+            Ok(value) => value,
+            Err(_) if allow_raw => Value::String(entry.arguments.clone()),
+            Err(_) => return None,
+        };
+        Some((
+            OpenAIResponseToolCall {
+                item_id: None,
+                status: None,
+                call_id: entry.call_id.clone(),
+                name: entry.name.clone(),
+                arguments: parsed_arguments,
+            },
+            entry.arguments.clone(),
+        ))
+    }
+
+    fn into_result(mut self) -> ChatCompletionsStreamResult {
+        let mut noop = |_| {};
+        self.emit_complete_tool_calls(true, &mut noop);
+        let tool_calls = self
+            .tool_call_deltas
+            .keys()
+            .filter_map(|index| self.completed_tool_call(*index, true).map(|(call, _)| call))
+            .collect::<Vec<_>>();
+        let raw_response = self.build_raw_response();
+        ChatCompletionsStreamResult {
+            assistant_text: self.assistant_text,
+            reasoning_chain: (!self.reasoning_chain.is_empty()).then_some(self.reasoning_chain),
+            tool_calls,
+            emitted_tool_call_ids: self.emitted_tool_call_ids,
+            raw_response,
+        }
+    }
+
+    fn build_raw_response(&self) -> Value {
+        let tool_calls = self
+            .tool_call_deltas
+            .values()
+            .filter(|entry| !entry.call_id.is_empty() && !entry.name.is_empty())
+            .map(|entry| {
+                json!({
+                    "id": entry.call_id,
+                    "type": if entry.kind.is_empty() { "function" } else { entry.kind.as_str() },
+                    "function": {
+                        "name": entry.name,
+                        "arguments": entry.arguments,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut message = json!({
+            "role": "assistant",
+            "content": if self.assistant_text.is_empty() {
+                Value::Null
+            } else {
+                Value::String(self.assistant_text.clone())
+            },
+        });
+        if !self.reasoning_chain.is_empty() {
+            message["reasoning_content"] = Value::String(self.reasoning_chain.clone());
+        }
+        if !tool_calls.is_empty() {
+            message["tool_calls"] = Value::Array(tool_calls);
+        }
+
+        json!({
+            "id": self.id.clone().unwrap_or_default(),
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": self.finish_reason.clone().unwrap_or_else(|| "stop".to_string()),
+            }],
         })
     }
+}
+
+#[derive(Default)]
+struct ChatCompletionsToolCallDelta {
+    call_id: String,
+    kind: String,
+    name: String,
+    arguments: String,
+    emitted: bool,
+}
+
+#[cfg(test)]
+fn parse_chat_completions_sse_response_for_tests<G>(
+    stream: &str,
+    on_event: &mut G,
+) -> Result<ChatCompletionsStreamResult>
+where
+    G: FnMut(TurnStreamEvent),
+{
+    parse_chat_completions_sse_reader(std::io::BufReader::new(stream.as_bytes()), on_event)
 }
 
 pub(super) fn setup_completions_session(
@@ -582,5 +1025,68 @@ mod reasoning_fields_tests {
     fn off_effort_emits_no_reasoning_fields() {
         let f = resolve_reasoning_fields(None, true, "off");
         assert!(f.reasoning_effort.is_none());
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use crate::runtime::TurnStreamEvent;
+
+    #[test]
+    fn parses_gemini_complete_tool_call_chunk() {
+        let stream = concat!(
+            "data: {\"id\":\"chatcmpl-gemini\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_gemini_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-gemini\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut events = Vec::new();
+        let parsed =
+            parse_chat_completions_sse_response_for_tests(stream, &mut |event| events.push(event))
+                .unwrap();
+
+        assert_eq!(parsed.assistant_text, "");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].call_id, "call_gemini_1");
+        assert_eq!(parsed.tool_calls[0].name, "read_file");
+        assert_eq!(
+            parsed.tool_calls[0].arguments,
+            json!({ "path": "Cargo.toml" })
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TurnStreamEvent::ToolCallsRequested(calls)
+                if calls.len() == 1
+                    && calls[0].call_id == "call_gemini_1"
+                    && calls[0].input == "{\"path\":\"Cargo.toml\"}"
+        )));
+    }
+
+    #[test]
+    fn parses_openai_fragmented_tool_call_deltas() {
+        let stream = concat!(
+            "data: {\"id\":\"chatcmpl-openai\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"I'll check. \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-openai\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_openai_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"pa\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-openai\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"Cargo\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-openai\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\".toml\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut text_deltas = Vec::new();
+        let parsed = parse_chat_completions_sse_response_for_tests(stream, &mut |event| {
+            if let TurnStreamEvent::TextDelta(delta) = event {
+                text_deltas.push(delta);
+            }
+        })
+        .unwrap();
+
+        assert_eq!(text_deltas, vec!["I'll check. ".to_string()]);
+        assert_eq!(parsed.assistant_text, "I'll check. ");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].call_id, "call_openai_1");
+        assert_eq!(parsed.tool_calls[0].name, "read_file");
+        assert_eq!(
+            parsed.tool_calls[0].arguments,
+            json!({ "path": "Cargo.toml" })
+        );
     }
 }

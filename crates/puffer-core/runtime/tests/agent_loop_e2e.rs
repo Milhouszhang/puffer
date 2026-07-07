@@ -596,6 +596,58 @@ fn openai_completions_agent_loop_runs_tool_then_text() {
     );
 }
 
+#[test]
+fn openai_completions_agent_loop_uses_real_sse_streaming() {
+    let temp = tempfile::tempdir().unwrap();
+    let (base_url, requests, server) = spawn_server("text/event-stream", 1, |_| {
+        concat!(
+            "data: {\"id\":\"chatcmpl-sse\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-sse\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"world\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-sse\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string()
+    });
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(openai_completions_provider(base_url));
+    let mut auth_store = AuthStore::default();
+    auth_store.set_api_key("openai-completions-test", "sk-openai");
+
+    let mut state = AppState::new(
+        PufferConfig::default(),
+        temp.path().to_path_buf(),
+        session_for(temp.path()),
+    );
+    state.current_provider = Some("openai-completions-test".to_string());
+    state.current_model = Some("openai-completions-test/gpt-5".to_string());
+
+    let mut text_deltas = Vec::new();
+    let turn = execute_user_prompt_streaming(
+        &mut state,
+        &LoadedResources::default(),
+        &registry,
+        &mut auth_store,
+        "say hello",
+        |event| {
+            if let TurnStreamEvent::TextDelta(delta) = event {
+                text_deltas.push(delta);
+            }
+        },
+    )
+    .unwrap();
+
+    server.join().unwrap();
+
+    assert_eq!(turn.assistant_text, "hello world");
+    assert_eq!(text_deltas, vec!["hello ".to_string(), "world".to_string()]);
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let body = extract_request_body(&captured[0]);
+    let body_json: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(body_json["stream"], json!(true), "request body: {body}");
+}
+
 // ---------------------------------------------------------------------------
 // Cross-provider behavior: same prompt + same tool, both Anthropic and
 // OpenAI Responses produce semantically equivalent end states (one tool

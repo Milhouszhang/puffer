@@ -15,6 +15,9 @@ export type ConnectorDraftSendState =
 export const UNCERTAIN_SEND_MESSAGE =
   "Send status is uncertain. Check Telegram before retrying.";
 
+export const DUPLICATE_RISK_ACK_COPY =
+  "The previous send outcome is unknown. Only retry after you have checked Telegram and confirmed the message was not delivered. Retrying can send a duplicate.";
+
 export type ConnectorDraftStatusResult = {
   state: ConnectorDraftSendState;
   error: string;

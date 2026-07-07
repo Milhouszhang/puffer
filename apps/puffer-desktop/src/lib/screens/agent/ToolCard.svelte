@@ -16,7 +16,8 @@
   import { normalizeCanvasSpec } from "./canvasSpec";
   import {
     classifyOutboundSendError,
-    connectorDraftStateForStatus
+    connectorDraftStateForStatus,
+    DUPLICATE_RISK_ACK_COPY
   } from "./connectorDraftStatus";
 
   type Props = {
@@ -1159,6 +1160,7 @@
     if (connectorDraftSendState === "sent") return "Sent";
     if (connectorDraftSendState === "cancelled") return "Cancelled";
     if (connectorDraftSendState === "expired") return "Expired";
+    if (connectorDraftSendState === "uncertain") return "Confirm no duplicate & retry";
     return "Approve and send";
   }
 
@@ -1213,22 +1215,27 @@
   });
 
   async function sendConnectorDraft(draft: ConnectorDraftRender) {
-    // `uncertain` blocks approve too: the server demands duplicate_risk_ack and
-    // the operator must cancel (still allowed) or resolve out-of-band first.
-    if (
-      ["sending", "cancelling", "sent", "cancelled", "expired", "uncertain"].includes(
-        connectorDraftSendState
-      )
-    )
-      return;
+    const isDuplicateRiskRetry = connectorDraftSendState === "uncertain";
+    if (["sending", "cancelling", "sent", "cancelled", "expired"].includes(connectorDraftSendState)) return;
+    if (isDuplicateRiskRetry) {
+      const confirmed = window.confirm(DUPLICATE_RISK_ACK_COPY);
+      if (!confirmed) return;
+    }
     connectorDraftSendState = "sending";
     connectorDraftSendError = "";
     try {
+      const version = isDuplicateRiskRetry
+        ? (await outboundActionStatus({
+            actionId: draft.draftId,
+            version: draft.version
+          })).version
+        : draft.version;
       const result = await executeOutboundAction({
         actionId: draft.draftId,
-        version: draft.version,
+        version,
         approvedMessage: draft.message,
-        clientRequestId: clientRequestId(draft.draftId)
+        clientRequestId: clientRequestId(draft.draftId),
+        duplicateRiskAck: isDuplicateRiskRetry
       });
       applyConnectorDraftStatus(result.status);
       if (result.status !== "sent") {
@@ -1338,8 +1345,7 @@
               class="sc-btn pf-connector-draft-send"
               data-size="sm"
               disabled={connectorDraftIsBusy() ||
-                connectorDraftIsTerminal() ||
-                connectorDraftSendState === "uncertain"}
+                connectorDraftIsTerminal()}
               onclick={() => void sendConnectorDraft(toolRender)}
             >
               <Icon name={connectorDraftPrimaryIcon()} size={12} />
@@ -1796,6 +1802,14 @@
   }
   .pf-connector-draft-send:disabled {
     opacity: 0.72;
+  }
+  .pf-connector-draft[data-state="uncertain"] .pf-connector-draft-send {
+    border-color: color-mix(in oklab, var(--destructive) 70%, var(--border));
+    background: color-mix(in oklab, var(--destructive) 88%, black);
+    color: white;
+  }
+  .pf-connector-draft[data-state="uncertain"] .pf-connector-draft-send:hover:not(:disabled) {
+    background: color-mix(in oklab, var(--destructive) 78%, black);
   }
   .pf-connector-draft-cancel {
     color: var(--muted-foreground);

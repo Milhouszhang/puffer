@@ -64,6 +64,31 @@ test("rejects daemon-only requests before Tauri backend fallback", async () => {
   expect(invoke).not.toHaveBeenCalled();
 });
 
+test("sends duplicate risk acknowledgement only for explicit outbound retries", async () => {
+  const { request } = mockDesktopDaemonClient();
+  request.mockResolvedValueOnce({ status: "sent", actionId: "action-1", receipt: { ok: true } });
+  const api = await import("./desktop");
+
+  await api.executeOutboundAction({
+    actionId: "action-1",
+    version: 5,
+    approvedMessage: "Approved text",
+    clientRequestId: "client-ack",
+    duplicateRiskAck: true
+  });
+
+  expect(request).toHaveBeenCalledWith(
+    "outbound_action_execute",
+    {
+      action_id: "action-1",
+      version: 5,
+      approved_message: "Approved text",
+      client_request_id: "client-ack",
+      duplicate_risk_ack: true
+    }
+  );
+});
+
 test("marks automation and workflow runtime API calls as daemon-only", async () => {
   const { invoke, request } = mockDesktopDaemonClient();
   const api = await import("./desktop");

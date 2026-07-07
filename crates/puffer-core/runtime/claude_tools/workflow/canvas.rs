@@ -533,6 +533,27 @@ mod tests {
     }
 
     #[test]
+    fn render_media_picker_links_use_url_allowlist() {
+        let spec = json!({
+            "title": "Media",
+            "body": [{
+                "type": "mediaPicker",
+                "id": "pick",
+                "items": [{ "id": "bad", "url": "javascript:alert(1)" }]
+            }]
+        });
+        let html = render_canvas(&spec, None);
+        assert!(
+            html.contains("function safeUrl"),
+            "mediaPicker links must validate URL schemes before rendering"
+        );
+        assert!(
+            !html.contains("href=\"${esc(it.url)}\""),
+            "mediaPicker must not put model-provided URLs directly in href attributes"
+        );
+    }
+
+    #[test]
     fn execute_writes_html_file() {
         let tempdir = tempfile::tempdir().unwrap();
         let cwd = tempdir.path().to_path_buf();

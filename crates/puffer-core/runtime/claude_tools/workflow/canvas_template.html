@@ -145,6 +145,7 @@ function fireAction(node,ac){
 // coerce any value the model might emit into readable text (never [object Object])
 const S=v=>{if(v==null)return '';if(typeof v==='string')return v;if(Array.isArray(v))return v.map(S).join('\n');if(typeof v==='object'){for(const k of ['code','diff','text','value','content','body']){if(typeof v[k]==='string')return v[k]}try{return JSON.stringify(v,null,1)}catch(e){return ''}}return String(v)};
 const esc=s=>S(s).replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
+function safeUrl(u){const raw=S(u).trim();if(!raw)return '';try{const parsed=new URL(raw,window.location.href);return parsed.protocol==='http:'||parsed.protocol==='https:'?raw:''}catch(e){return ''}}
 const diff=t=>esc(t).split('\n').map(l=>l[0]==='+'?`<span class="add">${l}</span>`:l[0]==='-'?`<span class="del">${l}</span>`:l).join('');
 // tolerant location: accept {path|file|location, line}; skip empties
 const locText=l=>{if(typeof l==='string')return l;const p=l.path||l.file||l.location||l.name||'';const ln=(l.line!=null)?':'+l.line:'';return (p+ln)||''};
@@ -183,7 +184,7 @@ const COMP={
  // desktop-only inputs degrade gracefully here instead of "[unknown component]"
  dependentSelect:n=>selectControl({...n,options:(n.options||[]).map(o=>({id:o.id,label:(o.label||o.id||'')+(o.group?' — '+o.group:'')}))},false),
  editableTable:n=>{const c=E('div','control');if(n.label)c.append(E('div','ctl-label',esc(n.label)));c.append(COMP.table({columns:n.columns,rows:STATE.values[n.id]||n.rows||[]}));c.append(E('div','ctl-help','Editable in Puffer Desktop; shown read-only here.'));return c},
- mediaPicker:n=>{const c=E('div','control');(n.items||[]).forEach(it=>{const line=(it.url?`<a href="${esc(it.url)}" target="_blank" rel="noopener">${esc(it.label||it.id)}</a>`:esc(it.label||it.id))+(it.description?` — ${esc(it.description)}`:'');c.append(E('div','text',line))});c.append(E('div','ctl-help','Media selection requires Puffer Desktop; items listed for reference.'));return c},
+ mediaPicker:n=>{const c=E('div','control');(n.items||[]).forEach(it=>{const href=safeUrl(it.url);const label=esc(it.label||it.id||(href?it.url:'Media item'));const line=(href?`<a href="${esc(href)}" target="_blank" rel="noopener">${label}</a>`:label)+(it.description?` — ${esc(it.description)}`:'');c.append(E('div','text',line))});c.append(E('div','ctl-help','Media selection requires Puffer Desktop; items listed for reference.'));return c},
  mediaModelSelect:()=>E('div','control','<div class="ctl-help">Media model selection requires Puffer Desktop.</div>'),
  heatmap:n=>{const w=E('div','heat');const t=E('table');const hr=E('tr');hr.append(E('th'));(n.columns||[]).forEach(c=>hr.append(E('th',null,esc(c))));t.append(hr);(n.rows||[]).forEach(r=>{const tr=E('tr');tr.append(E('td','rl',esc(r.label)));(r.cells||[]).forEach(cell=>{const v=typeof cell==='object'?cell.v:cell;const td=E('td','cell');td.dataset.v=v;if(cell&&cell.note)td.title=cell.note;tr.append(td)});t.append(tr)});w.append(t);return w},
 };

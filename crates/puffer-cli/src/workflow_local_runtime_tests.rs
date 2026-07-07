@@ -312,7 +312,10 @@ fn start_generates_compose_env_seed_and_runs_fixed_sequence() {
         .workflow_backend
         .api_base_url
         .starts_with("http://127.0.0.1:"));
-    assert_ne!(config.workflow_backend.api_base_url, "http://127.0.0.1:3000");
+    assert_ne!(
+        config.workflow_backend.api_base_url,
+        "http://127.0.0.1:3000"
+    );
     assert!(!config.workflow_backend.api_token_secret_id.is_empty());
 
     let token = reveal_runtime_token(&paths, &config);

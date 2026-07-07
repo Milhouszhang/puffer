@@ -606,6 +606,45 @@ pub(super) fn resolve_openai_execution_config(
     append_default_openai_headers(&mut custom_headers, provider.id.as_str(), None);
     let session_id = Some(state.session.id.to_string());
     let originator = OPENAI_CODEX_ORIGINATOR.to_string();
+    // GitHub Copilot: the stored credential is a GitHub OAuth token, but the
+    // chat endpoint wants a short-lived Copilot bearer. Exchange (and cache) it
+    // here; the client-identity headers come from the descriptor's `headers`.
+    if provider.id == "github-copilot" {
+        if let Some(StoredCredential::OAuth(credential)) = auth_store.get(provider.id.as_str()) {
+            let copilot = super::copilot::copilot_bearer_token(&credential.access_token)?;
+            let mut custom_headers = custom_headers;
+            // Auto-only plans (Free/Student): chat only works inside an
+            // auto-mode session — the server rejects direct model selection
+            // with `model_not_supported` without this header.
+            if let Some(session) = &copilot.session {
+                custom_headers.push(("Copilot-Session-Token".to_string(), session.token.clone()));
+            }
+            return Ok(OpenAIExecutionConfig {
+                provider_id: provider.id.clone(),
+                request_config: OpenAIRequestConfig {
+                    // Use the account-specific endpoint from the token exchange
+                    // (individual / business / enterprise), not the descriptor's
+                    // placeholder host.
+                    base_url: copilot.api_url.clone(),
+                    version: openai_request_version(provider, false),
+                    auth: OpenAIAuth::ApiKey(copilot.token),
+                    originator,
+                    session_id,
+                    account_id: None,
+                    custom_headers,
+                    query_params: provider
+                        .query_params
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                    chat_completions_path: provider.chat_completions_path.clone(),
+                    responses_path: None,
+                },
+                refresh_token: None,
+                codex_style: false,
+            });
+        }
+    }
     match auth_store.get(provider.id.as_str()) {
         Some(StoredCredential::ApiKey { key }) => Ok(OpenAIExecutionConfig {
             provider_id: provider.id.clone(),
@@ -691,6 +730,24 @@ fn codex_style_for_provider(provider: &ProviderDescriptor, oauth: bool) -> bool 
             != Some("1")
 }
 
+/// On a 401 from the GitHub Copilot chat endpoint, drop the cached exchanged
+/// bearer so the next turn re-exchanges the stored GitHub token. Copilot carries
+/// no `refresh_token` (the OAuth refresh path is skipped), so without this a
+/// bearer invalidated before its ~25min cached expiry would keep 401-ing every
+/// turn until expiry with no auto-recovery.
+fn evict_copilot_bearer_on_unauthorized(
+    auth_store: &AuthStore,
+    execution: &OpenAIExecutionConfig,
+    unauthorized: bool,
+) {
+    if !unauthorized || execution.provider_id != "github-copilot" {
+        return;
+    }
+    if let Some(StoredCredential::OAuth(credential)) = auth_store.get("github-copilot") {
+        super::copilot::invalidate_bearer(&credential.access_token);
+    }
+}
+
 /// Sends a blocking OpenAI request and refreshes OAuth credentials once after a 401.
 pub(super) fn send_openai_request_with_refresh<F>(
     auth_store: &mut AuthStore,
@@ -724,6 +781,11 @@ where
         false,
         proxy,
     )?;
+    evict_copilot_bearer_on_unauthorized(
+        auth_store,
+        execution,
+        response.status == StatusCode::UNAUTHORIZED,
+    );
     if response.status != StatusCode::UNAUTHORIZED || execution.refresh_token.is_none() {
         return parse_http_json_response(&request.url, false, response);
     }
@@ -808,6 +870,11 @@ where
             );
         },
     )?;
+    evict_copilot_bearer_on_unauthorized(
+        auth_store,
+        execution,
+        response.status() == StatusCode::UNAUTHORIZED,
+    );
     if response.status() != StatusCode::UNAUTHORIZED || execution.refresh_token.is_none() {
         return parse_openai_stream_response(&request.url, response, on_event);
     }

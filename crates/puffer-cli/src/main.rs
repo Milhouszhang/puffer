@@ -14,6 +14,7 @@ mod command_surface;
 mod command_surface_desktop;
 mod connect;
 mod connectors;
+mod copilot_login;
 mod daemon;
 mod daemon_automation_runtime;
 mod daemon_automations;

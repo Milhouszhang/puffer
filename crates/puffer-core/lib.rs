@@ -75,6 +75,7 @@ pub use runtime::claude_tools::execute_workflow_tool;
 pub use runtime::execute_tool_action_once;
 pub use runtime::execute_user_prompt as execute_user_turn;
 pub use runtime::install_subscription_manager;
+pub use runtime::invalidate_copilot_bearer;
 pub use runtime::lambda_gate::LambdaHostConcreteToolBinding;
 pub use runtime::mcp_discovery;
 pub use runtime::quota::{QuotaError, QuotaErrorKind, QUOTA_EXIT_CODE};

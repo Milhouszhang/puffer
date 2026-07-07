@@ -46,7 +46,7 @@ pub(crate) fn handle_monitor_memory_save(paths: &ConfigPaths, params: &Value) ->
     }
     fs::write(&path, params.content)
         .with_context(|| format!("failed to write {}", path.display()))?;
-    super::handle_workflow_list(paths)
+    super::handle_workflow_list_with_runtime(paths, false)
 }
 
 fn load_monitor_memories(paths: &ConfigPaths) -> Result<Vec<Value>> {

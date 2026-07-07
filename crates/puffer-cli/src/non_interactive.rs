@@ -600,14 +600,20 @@ fn compose_prompt(
 }
 
 fn hydrate_env_auth(auth_store: &mut AuthStore) {
-    for (provider, env_name) in [
-        ("openai", "OPENAI_API_KEY"),
-        ("anthropic", "ANTHROPIC_API_KEY"),
-    ] {
-        if let Ok(value) = std::env::var(env_name) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                auth_store.set_api_key(provider, trimmed.to_string());
+    let mappings: &[(&str, &[&str])] = &[
+        ("openai", &["OPENAI_API_KEY"]),
+        ("anthropic", &["ANTHROPIC_API_KEY"]),
+        ("google", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+    ];
+
+    for (provider, env_names) in mappings {
+        for env_name in *env_names {
+            if let Ok(value) = std::env::var(env_name) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    auth_store.set_api_key(*provider, trimmed.to_string());
+                    break;
+                }
             }
         }
     }
@@ -798,6 +804,47 @@ impl ReplayArtifact {
 mod tests {
     use super::*;
     use puffer_provider_registry::ProviderDescriptor;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        name: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let prior = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, prior }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let prior = std::env::var(name).ok();
+            std::env::remove_var(name);
+            Self { name, prior }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    fn api_key(auth_store: &AuthStore, provider: &str) -> Option<String> {
+        match auth_store.get(provider) {
+            Some(StoredCredential::ApiKey { key }) => Some(key.clone()),
+            _ => None,
+        }
+    }
 
     #[test]
     fn compose_prompt_includes_transcript_and_skill() {
@@ -831,6 +878,44 @@ mod tests {
             r#"{"type":"user_message","text":"hi"}"#
         ));
         assert!(!looks_like_jsonl_transcript(r#"{"role":"user"}"#));
+    }
+
+    #[test]
+    fn hydrate_env_auth_uses_gemini_api_key_for_google() {
+        let _lock = env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _openai = EnvGuard::remove("OPENAI_API_KEY");
+        let _anthropic = EnvGuard::remove("ANTHROPIC_API_KEY");
+        let _google = EnvGuard::remove("GOOGLE_API_KEY");
+        let _gemini = EnvGuard::set("GEMINI_API_KEY", " gemini-key ");
+        let mut auth_store = AuthStore::default();
+
+        hydrate_env_auth(&mut auth_store);
+
+        assert_eq!(
+            api_key(&auth_store, "google").as_deref(),
+            Some("gemini-key")
+        );
+    }
+
+    #[test]
+    fn hydrate_env_auth_uses_google_api_key_alias_for_google() {
+        let _lock = env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _openai = EnvGuard::remove("OPENAI_API_KEY");
+        let _anthropic = EnvGuard::remove("ANTHROPIC_API_KEY");
+        let _gemini = EnvGuard::remove("GEMINI_API_KEY");
+        let _google = EnvGuard::set("GOOGLE_API_KEY", " google-key ");
+        let mut auth_store = AuthStore::default();
+
+        hydrate_env_auth(&mut auth_store);
+
+        assert_eq!(
+            api_key(&auth_store, "google").as_deref(),
+            Some("google-key")
+        );
     }
 
     #[test]

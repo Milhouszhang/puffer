@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use puffer_automation::AutomationStore;
 use puffer_config::{load_config, ConfigPaths, PufferConfig};
 use puffer_core::{
     execute_tool_action_once, execute_user_turn_streaming,
@@ -47,6 +48,7 @@ pub(crate) fn install(
         resources: resources.clone(),
         providers: providers.clone(),
         auth_store: auth_store.clone(),
+        automation_store_path: crate::daemon_automations::automation_store_path(paths),
         lock: Mutex::new(()),
     });
     install_workflow_runner(runner).context("failed to install workflow runner")?;
@@ -59,6 +61,7 @@ struct ProcessWorkflowRunner {
     resources: LoadedResources,
     providers: ProviderRegistry,
     auth_store: AuthStore,
+    automation_store_path: PathBuf,
     lock: Mutex<()>,
 }
 
@@ -83,6 +86,22 @@ impl WorkflowActionRunner for ProcessWorkflowRunner {
         Ok(WorkflowActionOutput::new(workflow_execute_summary(
             slug, &response,
         )))
+    }
+
+    fn run_automation(
+        &self,
+        automation_id: &str,
+        trigger: serde_json::Value,
+    ) -> Result<WorkflowActionOutput> {
+        let _guard = workflow_runner_lock(&self.lock);
+        let automation_store = AutomationStore::load(&self.automation_store_path)
+            .context("reload automation store")?;
+        crate::daemon_automation_runtime::run_automation_with_store(
+            &self.paths,
+            &automation_store,
+            automation_id,
+            trigger,
+        )
     }
 
     fn run_tool_action(
@@ -1830,6 +1849,7 @@ mod tests {
             resources: LoadedResources::default(),
             providers,
             auth_store: AuthStore::default(),
+            automation_store_path: crate::daemon_automations::automation_store_path(&paths),
             lock: Mutex::new(()),
         };
 

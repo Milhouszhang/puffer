@@ -5,6 +5,7 @@
   import InlineCanvasNode from "./InlineCanvasNode.svelte";
   import { initialValues } from "./inlineCanvasInitialValues";
   import { hasMediaModelSelect, selectionComplete } from "./mediaModelSelect";
+  import { actionMessage } from "./canvasActions";
   import { canRegenerate, regeneratePrompt, type SubmitState } from "./canvasRegenerate";
 
   type CanvasSpec = Record<string, unknown>;
@@ -145,6 +146,24 @@
     }
   }
 
+  // A finding action continues the conversation with the finding's context
+  // bundled — same contract as fireAction() in the HTML fallback.
+  async function fireFindingAction(node: CanvasSpec, action: CanvasSpec) {
+    if (!onSubmitCanvasState || !canvasId || !sessionId) {
+      statusMessage = "Canvas is still preparing.";
+      return;
+    }
+    statusMessage = null;
+    try {
+      const accepted = await onSubmitCanvasState(actionMessage(node, action, canvasId));
+      if (destroyed) return;
+      if (accepted === false) statusMessage = "Could not reach the agent. Try again.";
+    } catch {
+      if (destroyed) return;
+      statusMessage = "Unable to send the action to the agent.";
+    }
+  }
+
   async function savePendingPatch(): Promise<boolean> {
     if (!sessionId || !canvasId || Object.keys(pendingPatch).length === 0) return saveState !== "error";
     const patchToSave = pendingPatch;
@@ -200,7 +219,13 @@
 
   <div class="inline-canvas-body">
     {#each bodyNodes() as node, index (`${text(node.type)}-${index}`)}
-      <InlineCanvasNode {node} {values} {sessionId} onChange={setValue} />
+      <InlineCanvasNode
+        {node}
+        {values}
+        {sessionId}
+        onChange={setValue}
+        onAction={onSubmitCanvasState ? fireFindingAction : undefined}
+      />
     {/each}
     {#if onSubmitCanvasState}
       <div class="inline-canvas-selection-actions">
@@ -639,6 +664,27 @@
     color: var(--muted-foreground);
     font-style: normal;
     font-size: var(--pf-chat-meta-size);
+  }
+  :global(.ic-finding-actions) {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin-top: 9px;
+  }
+  :global(.ic-action) {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--foreground);
+    cursor: pointer;
+    font: inherit;
+    font-size: var(--pf-chat-meta-size);
+    font-weight: 600;
+    padding: 4px 10px;
+  }
+  :global(.ic-action.primary) {
+    border-color: color-mix(in oklab, var(--puffer-accent) 42%, var(--border));
+    background: color-mix(in oklab, var(--puffer-accent) 12%, var(--background));
   }
   :global(.ic-location) {
     margin: 4px 0;

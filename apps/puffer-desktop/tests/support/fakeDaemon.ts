@@ -123,6 +123,8 @@ type MonitorHistoryFixture = {
   messages: JsonRecord[];
 };
 
+type AutomationRecordFixture = JsonRecord;
+
 type ContactsSnapshotFixture = {
   contacts: JsonRecord[];
   candidates: JsonRecord[];
@@ -356,6 +358,167 @@ export function defaultFakeMediaCapabilities(): FakeMediaCapability[] {
   ];
 }
 
+function defaultAutomationCatalog(): JsonRecord {
+  const scheduleInput = [
+    { id: "mode", label: "Mode", kind: "select", required: true, default: "daily", options: ["daily", "weekday", "cron"] },
+    { id: "time", label: "Time", kind: "time", required: true, default: "09:00" },
+    { id: "timezone", label: "Timezone", kind: "text", required: true, default: "local" }
+  ];
+  const triggerTemplate = {
+    type: "agent_env_node",
+    id: "trigger-1",
+    node: {
+      node_type: "schedule",
+      name: "Schedule",
+      trusted: true,
+      config: { mode: "daily", time: "09:00", target: "09:00", timezone: "local" }
+    },
+    summary: "Every day at 09:00"
+  };
+  const connectorAction = (
+    connector: string,
+    action: string,
+    label: string,
+    summary: string,
+    external = false
+  ) => ({
+    id: `connector:${connector}:${action}`,
+    kind: "connector_action",
+    connector_slug: connector,
+    connection_slug: connector,
+    action,
+    label,
+    summary,
+    icon: connector.includes("github") ? "git" : connector.includes("calendar") ? "clock" : connector.includes("gmail") ? "edit" : "logs",
+    connection_state: "authenticated",
+    permission_state: external ? "external_side_effect" : "read",
+    permission_summary: external ? "Creates a draft for human approval." : "Reads context for the run.",
+    external_side_effect: external,
+    required_inputs: [],
+    input_schema: { type: "object", properties: {} },
+    output_schema: { type: "object", properties: { completed: { type: "boolean" }, summary: { type: "string" } } },
+    node_ref: {
+      node_type: "puffer_connector_action",
+      name: label,
+      trusted: true,
+      config: {
+        kind: "connector_action",
+        connector_slug: connector,
+        connection_slug: connector,
+        action,
+        draft_only: external
+      }
+    }
+  });
+
+  return {
+    triggers: [
+      {
+        id: "schedule:daily",
+        kind: "schedule",
+        label: "Every day at",
+        summary: "Run daily at a configured time.",
+        icon: "clock",
+        connection_state: "ready",
+        permission_state: "ready",
+        required_inputs: scheduleInput,
+        spec_template: triggerTemplate
+      },
+      {
+        id: "schedule:cron",
+        kind: "schedule",
+        label: "Custom schedule",
+        summary: "Run from a cron expression.",
+        icon: "clock",
+        connection_state: "ready",
+        permission_state: "ready",
+        required_inputs: [
+          { id: "mode", label: "Mode", kind: "select", required: true, default: "cron", options: ["cron"] },
+          { id: "cron", label: "Cron", kind: "text", required: true, default: "0 9 * * 1-5" },
+          { id: "timezone", label: "Timezone", kind: "text", required: true, default: "local" }
+        ],
+        spec_template: {
+          type: "agent_env_node",
+          id: "trigger-1",
+          node: {
+            node_type: "schedule",
+            name: "Cron schedule",
+            trusted: true,
+            config: { mode: "cron", cron: "0 9 * * 1-5", timezone: "local" }
+          },
+          summary: "Custom schedule 0 9 * * 1-5"
+        }
+      },
+      {
+        id: "connector:github:github",
+        kind: "connector_event",
+        connector_slug: "github",
+        connection_slug: "github",
+        label: "PR opened in",
+        summary: "GitHub pull request, issue, and comment events.",
+        icon: "git",
+        connection_state: "authenticated",
+        permission_state: "ready",
+        required_inputs: [
+          { id: "repo", label: "Repository", kind: "text", required: true, default: "Select repos" },
+          { id: "event", label: "Event", kind: "select", required: true, default: "pull_request", options: ["pull_request", "comment", "label"] },
+          { id: "filter", label: "Filter", kind: "text", required: false, default: "" }
+        ],
+        spec_template: {
+          type: "puffer_connection",
+          id: "trigger-1",
+          connection_slug: "github",
+          connector_slug: "github",
+          summary: "Pull request event"
+        }
+      }
+    ],
+    actions: [
+      connectorAction("github", "watch-pull-requests", "Watch Pull Requests", "Read PR titles, diffs, status, and review activity."),
+      connectorAction("github", "comment-on-pull-request", "Comment on Pull Request", "Prepare a pull request comment for review.", true),
+      connectorAction("github", "update-commit-status", "Update Commit Status", "Prepare a commit status update for review.", true),
+      connectorAction("slack", "read-slack-channels", "Read Slack Channels", "Use Slack channels as context."),
+      connectorAction("slack", "send-to-slack", "Send to Slack", "Draft a Slack message for review.", true),
+      connectorAction("slack", "reply-in-thread", "Reply in Slack Thread", "Draft a Slack thread reply.", true),
+      connectorAction("gmail", "read-gmail-threads", "Read Gmail Threads", "Use Gmail threads as context."),
+      connectorAction("gmail", "create-gmail-draft", "Create Gmail Draft", "Create a Gmail draft for review.", true),
+      connectorAction("gmail", "apply-gmail-label", "Apply Gmail Label", "Prepare a label change.", true),
+      connectorAction("google-calendar", "read-calendar-events", "Read Calendar Events", "Use calendar events as context."),
+      connectorAction("google-calendar", "check-availability", "Check Availability", "Check free/busy context."),
+      connectorAction("google-calendar", "draft-rsvp", "Draft RSVP", "Draft an RSVP for review.", true),
+      connectorAction("linear", "read-linear-issues", "Read Linear Issues", "Use Linear issues as context."),
+      connectorAction("linear", "create-linear-issue", "Create Linear Issue", "Draft a Linear issue for review.", true),
+      connectorAction("linear", "comment-on-linear", "Comment on Linear Issue", "Draft a Linear comment.", true),
+      connectorAction("notion", "search-notion", "Search Notion", "Search Notion as context."),
+      connectorAction("notion", "create-notion-page", "Create Notion Page", "Draft a Notion page.", true),
+      connectorAction("notion", "update-notion-page", "Update Notion Page", "Draft a Notion page update.", true),
+      {
+        id: "agentenv:raw-node",
+        kind: "agentenv_node",
+        label: "Raw AgentEnv Node",
+        summary: "Internal runtime node definition.",
+        icon: "bolt",
+        connection_state: "ready",
+        permission_state: "review",
+        permission_summary: "Review before running",
+        external_side_effect: false,
+        required_inputs: [],
+        input_schema: { type: "object", properties: {} },
+        output_schema: { type: "object", properties: {} },
+        node_ref: {
+          node_type: "raw-node",
+          name: "Raw AgentEnv Node",
+          trusted: false,
+          config: {}
+        }
+      }
+    ],
+    trigger_error: null,
+    action_error: null,
+    agentenv_error: "list AgentEnv node definitions"
+  };
+}
+
 function cloneMediaCapability(capability: FakeMediaCapability): FakeMediaCapability {
   return {
     ...capability,
@@ -572,20 +735,20 @@ function defaultAuthStatuses(): JsonRecord[] {
 
 function workflowBackendOptions(): JsonRecord[] {
   return [
-    {
-      mode: "local",
-      label: "Run locally",
-      description: "Connects to a workflow runtime running on this device.",
-      apiUrl: "http://127.0.0.1:3000",
-      uiUrl: "http://localhost:5173"
-    },
-    {
-      mode: "agent_env_cloud",
-      label: "Run on AgentEnv Cloud",
-      description: "Sends required workflow data to AgentEnv Cloud for execution.",
-      apiUrl: "https://api.agentenv.io",
-      uiUrl: "https://agentenv.io"
-    }
+      {
+        mode: "local",
+        label: "Run locally",
+        description: "Connects to an automation runtime running on this device.",
+        apiUrl: "http://127.0.0.1:3000",
+        uiUrl: "http://localhost:5173"
+      },
+      {
+        mode: "agent_env_cloud",
+        label: "Run on AgentEnv Cloud",
+        description: "Sends required automation data to AgentEnv Cloud for execution.",
+        apiUrl: "https://api.agentenv.io",
+        uiUrl: "https://agentenv.io"
+      }
   ];
 }
 
@@ -603,9 +766,9 @@ function defaultWorkflowBackend(): WorkflowBackendFixture {
 function defaultWorkflowBackendConnection(): WorkflowBackendConnectionFixture {
   return {
     success: true,
-    runtime: { state: "passed", message: "Workflow runtime API is reachable." },
-    auth: { state: "passed", message: "Workflow runtime token is accepted." },
-    workspace: { state: "passed", message: "Workflow workspace is accessible." }
+    runtime: { state: "passed", message: "Automation runtime API is reachable." },
+    auth: { state: "passed", message: "Automation runtime token is accepted." },
+    workspace: { state: "passed", message: "Automation workspace is accessible." }
   };
 }
 
@@ -720,6 +883,8 @@ export class FakeDaemon {
     connectionSlug: string;
   }>();
   private readonly workflowExecutions = new Map<string, JsonRecord[]>();
+  private readonly automationRecords = new Map<string, AutomationRecordFixture>();
+  private readonly automationRuns = new Map<string, JsonRecord[]>();
   private readonly outboundActions = new Map<string, {
     version: number;
     status: string;
@@ -1188,6 +1353,7 @@ export class FakeDaemon {
     workspaceRoot?: string;
     auth?: JsonRecord[];
     externalCredentials?: JsonRecord[];
+    automations?: JsonRecord[];
     url?: string;
     emitBrowserOpenFrame?: boolean;
     emitBrowserResizeFrame?: boolean;
@@ -1197,6 +1363,10 @@ export class FakeDaemon {
     this.workspaceRoot = options.workspaceRoot ?? this.workspaceRoot;
     this.authStatuses = options.auth ?? defaultAuthStatuses();
     this.externalCredentials = options.externalCredentials ?? [];
+    for (const automation of options.automations ?? []) {
+      const id = this.recordString(automation, ["id", "automation_id", "automationId"]);
+      if (id) this.automationRecords.set(id, this.cloneAutomationRecord(automation));
+    }
     this.permissions = {
       ...this.permissions,
       path: `${this.workspaceRoot}/.puffer/permissions.json`
@@ -1864,6 +2034,24 @@ export class FakeDaemon {
         return this.listRuntimeWorkflowExecutions(request.params);
       case "workflow_get_execution":
         return this.getRuntimeWorkflowExecution(request.params);
+      case "automation_list":
+        return this.listAutomations();
+      case "automation_get":
+        return this.getAutomation(request.params);
+      case "automation_save":
+        return this.saveAutomation(request.params);
+      case "automation_delete":
+        return this.deleteAutomation(request.params);
+      case "automation_catalog":
+        return defaultAutomationCatalog();
+      case "automation_compile_deploy":
+        return this.compileDeployAutomation(request.params);
+      case "automation_sync_preview":
+        return this.syncAutomationPreview(request.params);
+      case "automation_run_preview":
+        return this.runAutomationPreview(request.params);
+      case "automation_run_history":
+        return this.listAutomationRunHistory(request.params);
       case "outbound_action_execute":
         return this.handleOutboundExecute(request.params);
       case "outbound_action_cancel":
@@ -2330,6 +2518,335 @@ export class FakeDaemon {
       if (trimmed) return trimmed;
     }
     return null;
+  }
+
+  private cloneAutomationRecord(record: JsonRecord): AutomationRecordFixture {
+    return JSON.parse(JSON.stringify(record)) as AutomationRecordFixture;
+  }
+
+  private stableJson(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map((item) => this.stableJson(item)).join(",")}]`;
+    if (isJsonRecord(value)) {
+      return `{${Object.keys(value)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${this.stableJson(value[key])}`)
+        .join(",")}}`;
+    }
+    return JSON.stringify(value);
+  }
+
+  private automationId(params: JsonRecord): string {
+    const id = this.recordString(params, ["id", "automation_id", "automationId"]);
+    if (!id) throw new Error("missing automation id");
+    return id;
+  }
+
+  private automationRuntimeSummary(record?: JsonRecord): JsonRecord {
+    const runtime = isJsonRecord(record?.runtime) ? record.runtime : {};
+    return {
+      status: this.recordString(runtime, ["status"]) ?? "not_compiled",
+      spec_hash: typeof runtime.spec_hash === "string" ? runtime.spec_hash : null,
+      compiled_revision:
+        typeof runtime.compiled_revision === "number" ? runtime.compiled_revision : null,
+      agentenv_workflow_count:
+        typeof runtime.agentenv_workflow_count === "number" ? runtime.agentenv_workflow_count : 0,
+      puffer_binding_count:
+        typeof runtime.puffer_binding_count === "number" ? runtime.puffer_binding_count : 0,
+      last_error: typeof runtime.last_error === "string" ? runtime.last_error : null
+    };
+  }
+
+  private automationRecordResponse(record: JsonRecord): AutomationRecordFixture {
+    return {
+      id: String(record.id),
+      status: this.recordString(record, ["status"]) ?? "paused",
+      revision: typeof record.revision === "number" ? record.revision : 1,
+      spec: isJsonRecord(record.spec) ? JSON.parse(JSON.stringify(record.spec)) : {},
+      runtime: this.automationRuntimeSummary(record),
+      created_at_ms: typeof record.created_at_ms === "number" ? record.created_at_ms : Date.now(),
+      updated_at_ms: typeof record.updated_at_ms === "number" ? record.updated_at_ms : Date.now()
+    };
+  }
+
+  private listAutomations(): JsonRecord {
+    const automations = Array.from(this.automationRecords.values())
+      .map((record) => this.automationRecordResponse(record))
+      .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+    return { automations };
+  }
+
+  private getAutomation(params: JsonRecord): AutomationRecordFixture {
+    const id = this.automationId(params);
+    const record = this.automationRecords.get(id);
+    if (!record) throw new Error(`automation ${id} not found`);
+    return this.automationRecordResponse(record);
+  }
+
+  private validateAutomationSpec(spec: JsonRecord): void {
+    if (spec.spec_version !== 1) throw new Error("automation spec_version must be 1");
+    if (typeof spec.name !== "string" || spec.name.trim() === "") {
+      throw new Error("automation.name must not be empty");
+    }
+    if (typeof spec.instructions !== "string" || spec.instructions.trim() === "") {
+      throw new Error("automation.instructions must not be empty");
+    }
+    if (!isJsonRecord(spec.source)) throw new Error("automation.source is required");
+    const sourceType = String(spec.source.type ?? "");
+    if (!["blank", "natural_language", "template"].includes(sourceType)) {
+      throw new Error("automation.source type is invalid");
+    }
+    if (sourceType === "natural_language" && typeof spec.source.prompt !== "string") {
+      throw new Error("automation.source prompt is required");
+    }
+    if (sourceType === "template" && typeof spec.source.template_id !== "string") {
+      throw new Error("automation.source template_id is required");
+    }
+    if (!Array.isArray(spec.triggers) || spec.triggers.length === 0) {
+      throw new Error("automation.triggers must contain at least one trigger");
+    }
+    for (const trigger of spec.triggers) this.validateAutomationTrigger(trigger);
+    if (!isJsonRecord(spec.flow) || !Array.isArray(spec.flow.steps) || spec.flow.steps.length === 0) {
+      throw new Error("automation.flow.steps must contain at least one step");
+    }
+    for (const step of spec.flow.steps) this.validateAutomationStep(step);
+  }
+
+  private validateAutomationTrigger(value: unknown): void {
+    if (!isJsonRecord(value)) throw new Error("automation trigger must be an object");
+    if (typeof value.id !== "string" || value.id.trim() === "") {
+      throw new Error("automation trigger id must not be empty");
+    }
+    const type = String(value.type ?? "");
+    if (type === "manual") return;
+    if (type === "agent_env_node") {
+      this.validateAutomationNode(value.node);
+      return;
+    }
+    if (type === "puffer_connection") {
+      if (typeof value.connection_slug !== "string" || value.connection_slug.trim() === "") {
+        throw new Error("automation trigger connection_slug must not be empty");
+      }
+      return;
+    }
+    throw new Error("automation trigger type is invalid");
+  }
+
+  private validateAutomationStep(value: unknown): void {
+    if (!isJsonRecord(value)) throw new Error("automation step must be an object");
+    if (typeof value.id !== "string" || value.id.trim() === "") {
+      throw new Error("automation step id must not be empty");
+    }
+    const type = String(value.type ?? "");
+    if (type === "agent_env_node") {
+      this.validateAutomationNode(value.node);
+      return;
+    }
+    if (type === "loop") {
+      if (!isJsonRecord(value.loop)) throw new Error("automation loop config is required");
+      if (
+        !isJsonRecord(value.body) ||
+        !Array.isArray(value.body.steps) ||
+        value.body.steps.length === 0
+      ) {
+        throw new Error("automation loop body must contain at least one step");
+      }
+      for (const step of value.body.steps) this.validateAutomationStep(step);
+      return;
+    }
+    throw new Error("automation step type is invalid");
+  }
+
+  private validateAutomationNode(value: unknown): void {
+    if (!isJsonRecord(value)) throw new Error("automation node must be an object");
+    if (typeof value.node_type !== "string" || value.node_type.trim() === "") {
+      throw new Error("automation node_type must not be empty");
+    }
+  }
+
+  private saveAutomation(params: JsonRecord): AutomationRecordFixture {
+    const id = this.automationId(params);
+    if (!isJsonRecord(params.spec)) throw new Error("automation_save requires spec");
+    this.validateAutomationSpec(params.spec);
+    const existing = this.automationRecords.get(id);
+    const timestamp = Date.now();
+    if (!existing) {
+      if (params.expectedRevision !== undefined || params.expected_revision !== undefined) {
+        throw new Error("automation_save create must not include expected_revision");
+      }
+      const record = {
+        id,
+        status: this.recordString(params, ["status"]) ?? "paused",
+        revision: 1,
+        spec: JSON.parse(JSON.stringify(params.spec)),
+        runtime: this.automationRuntimeSummary(),
+        created_at_ms: timestamp,
+        updated_at_ms: timestamp
+      };
+      this.automationRecords.set(id, record);
+      return this.automationRecordResponse(record);
+    }
+
+    const expectedRevision =
+      typeof params.expectedRevision === "number"
+        ? params.expectedRevision
+        : typeof params.expected_revision === "number"
+          ? params.expected_revision
+          : null;
+    if (expectedRevision === null) throw new Error("automation_save update requires expected_revision");
+    const currentRevision = typeof existing.revision === "number" ? existing.revision : 1;
+    if (expectedRevision !== currentRevision) {
+      throw new Error(`automation ${id} revision conflict: expected ${expectedRevision}, found ${currentRevision}`);
+    }
+
+    const specChanged = this.stableJson(existing.spec) !== this.stableJson(params.spec);
+    const nextRevision = specChanged ? currentRevision + 1 : currentRevision;
+    const record = {
+      ...existing,
+      status: this.recordString(params, ["status"]) ?? this.recordString(existing, ["status"]) ?? "paused",
+      revision: nextRevision,
+      spec: specChanged ? JSON.parse(JSON.stringify(params.spec)) : existing.spec,
+      runtime: specChanged ? this.automationRuntimeSummary() : this.automationRuntimeSummary(existing),
+      updated_at_ms: timestamp
+    };
+    this.automationRecords.set(id, record);
+    return this.automationRecordResponse(record);
+  }
+
+  private deleteAutomation(params: JsonRecord): JsonRecord {
+    const id = this.automationId(params);
+    if (!this.automationRecords.delete(id)) throw new Error(`automation ${id} not found`);
+    return { id, deleted: true };
+  }
+
+  private compileDeployAutomation(params: JsonRecord): JsonRecord {
+    const id = this.automationId(params);
+    const record = this.automationRecords.get(id);
+    if (!record) throw new Error(`automation ${id} not found`);
+    const expectedRevision =
+      typeof params.expectedRevision === "number"
+        ? params.expectedRevision
+        : typeof params.expected_revision === "number"
+          ? params.expected_revision
+          : null;
+    const revision = typeof record.revision === "number" ? record.revision : 1;
+    if (expectedRevision !== null && expectedRevision !== revision) {
+      throw new Error(`automation ${id} revision conflict: expected ${expectedRevision}, found ${revision}`);
+    }
+    record.runtime = {
+      status: "deployed",
+      spec_hash: "sha256:fake",
+      compiled_revision: revision,
+      agentenv_workflow_count: 1,
+      puffer_binding_count: 0,
+      last_error: null
+    };
+    this.automationRecords.set(id, record);
+    return {
+      id,
+      revision,
+      runtime: this.automationRuntimeSummary(record)
+    };
+  }
+
+  private syncAutomationPreview(params: JsonRecord): JsonRecord {
+    const id = this.automationId(params);
+    const record = this.automationRecords.get(id);
+    if (!record) throw new Error(`automation ${id} not found`);
+    const expectedRevision =
+      typeof params.expectedRevision === "number"
+        ? params.expectedRevision
+        : typeof params.expected_revision === "number"
+          ? params.expected_revision
+          : null;
+    const revision = typeof record.revision === "number" ? record.revision : 1;
+    if (expectedRevision !== null && expectedRevision !== revision) {
+      throw new Error(`automation ${id} revision conflict: expected ${expectedRevision}, found ${revision}`);
+    }
+    const currentRuntime = this.automationRuntimeSummary(record);
+    if (
+      currentRuntime.status === "deployed" &&
+      currentRuntime.compiled_revision === revision &&
+      currentRuntime.agentenv_workflow_count > 0
+    ) {
+      return {
+        id,
+        revision,
+        runtime: currentRuntime
+      };
+    }
+    record.runtime = {
+      status: "draft_synced",
+      spec_hash: "sha256:fake",
+      compiled_revision: revision,
+      agentenv_workflow_count: 1,
+      puffer_binding_count: 0,
+      last_error: null
+    };
+    this.automationRecords.set(id, record);
+    return {
+      id,
+      revision,
+      runtime: this.automationRuntimeSummary(record)
+    };
+  }
+
+  private runAutomationPreview(params: JsonRecord): JsonRecord {
+    const id = this.automationId(params);
+    const record = this.automationRecords.get(id);
+    if (!record) throw new Error(`automation ${id} not found`);
+    const runtime = this.automationRuntimeSummary(record);
+    const revision = typeof record.revision === "number" ? record.revision : 1;
+    if (
+      !["deployed", "draft_synced"].includes(String(runtime.status)) ||
+      runtime.compiled_revision !== revision ||
+      runtime.agentenv_workflow_count < 1
+    ) {
+      throw new Error(
+        `automation \`${id}\` runtime is not deployed for revision ${revision}; deploy before running a test preview`
+      );
+    }
+    const timestamp = Date.now();
+    const run = {
+      id: `preview-${id}-${timestamp}`,
+      automation_id: id,
+      title: "Test run",
+      status: "completed",
+      started_at_ms: timestamp,
+      duration_ms: 12,
+      summary: "Preview completed with a reviewable draft.",
+      source_event: "manual_preview",
+      compiled: true,
+      runtime_status: runtime.status,
+      result: {
+        summary: "Preview completed with a reviewable draft.",
+        pending_action: {
+          state: "draft",
+          approval_required: true
+        }
+      },
+      error: null,
+      approval: {
+        required: true,
+        status: "draft_pending_review"
+      }
+    };
+    this.automationRuns.set(id, [run, ...(this.automationRuns.get(id) ?? [])]);
+    return {
+      id,
+      status: "completed",
+      summary: run.summary,
+      result: run.result,
+      compiled: true,
+      runtime
+    };
+  }
+
+  private listAutomationRunHistory(params: JsonRecord): JsonRecord {
+    const id = this.automationId(params);
+    return {
+      automation_id: id,
+      runs: (this.automationRuns.get(id) ?? []).map((run) => JSON.parse(JSON.stringify(run)))
+    };
   }
 
   private workflowListResponse(): JsonRecord {

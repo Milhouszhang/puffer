@@ -33,6 +33,9 @@
     errorMessage: string | null;
     externals: ExternalCredential[];
     busyImportKey: string | null;
+    copilotLogin: { userCode: string; verificationUri: string } | null;
+    onLoginCopilot: (providerId: string) => void;
+    onCancelLogin: () => void;
     onLoginOauth: (providerId: string) => void;
     onLoginApiKey: (
       providerId: string,
@@ -310,6 +313,9 @@
               errorMessage={props.errorMessage}
               externals={props.externals}
               busyImportKey={props.busyImportKey}
+              copilotLogin={props.copilotLogin}
+              onLoginCopilot={props.onLoginCopilot}
+              onCancelLogin={props.onCancelLogin}
               onLoginOauth={props.onLoginOauth}
               onLoginApiKey={props.onLoginApiKey}
               onLogout={props.onLogout}
@@ -334,6 +340,9 @@
             errorMessage={props.errorMessage}
             externals={props.externals}
             busyImportKey={props.busyImportKey}
+            copilotLogin={props.copilotLogin}
+            onLoginCopilot={props.onLoginCopilot}
+            onCancelLogin={props.onCancelLogin}
             onLoginOauth={props.onLoginOauth}
             onLoginApiKey={props.onLoginApiKey}
             onLogout={props.onLogout}

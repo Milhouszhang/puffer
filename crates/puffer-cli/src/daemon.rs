@@ -33,6 +33,7 @@ use axum::{
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use indexmap::IndexMap;
+use puffer_automation::AutomationStore;
 use puffer_config::{
     ensure_workspace_dirs, load_config, save_user_config, ConfigPaths, MediaConfig,
     MediaGenerationConfig, ProxyConfig, ProxyEndpoint, ProxyScheme, PufferConfig,
@@ -59,7 +60,8 @@ use puffer_provider_openai::{
     OpenAIRealtimeClientSecretRequest, OpenAIRequestConfig,
 };
 use puffer_provider_registry::{
-    AuthStore, ModelDescriptor, ProviderDescriptor, ProviderRegistry, StoredCredential,
+    AuthStore, ModelDescriptor, OAuthCredential, ProviderDescriptor, ProviderRegistry,
+    StoredCredential,
 };
 use puffer_resources::{load_resources, LoadedResources, McpServerSpec};
 use puffer_secrets::{SecretUpsert, SecretVault};
@@ -480,6 +482,9 @@ pub(crate) struct DaemonState {
     pub(crate) browsers: Arc<BrowserRegistry>,
     /// Local model setup/status jobs used by the desktop MiniCPM card.
     pub(crate) local_models: crate::daemon_local_model::LocalModelInstaller,
+    /// User-facing Automation records. Shared by all Automation daemon RPCs so
+    /// store-level locking protects concurrent requests inside one daemon.
+    automations: Arc<AutomationStore>,
     disable_auto_title: bool,
     yolo: bool,
     media_discovery_cache: Arc<Mutex<Option<ExactMediaDiscoveryCache>>>,
@@ -520,6 +525,10 @@ impl DaemonState {
 
     pub(crate) fn config_paths(&self) -> &ConfigPaths {
         &self.paths
+    }
+
+    pub(crate) fn automation_store(&self) -> &AutomationStore {
+        self.automations.as_ref()
     }
 
     /// Returns a clone of the currently loaded daemon config.
@@ -772,6 +781,9 @@ impl DaemonState {
             browser_launch_settings_or_default(BrowserLaunchSettings::from_config(&paths, &config));
         let (events, _rx) = broadcast::channel::<ServerEnvelope>(256);
         let browser_profile_root = paths.user_config_dir.join("browser-profiles");
+        let automations = Arc::new(AutomationStore::load(
+            crate::daemon_automations::automation_store_path(&paths),
+        )?);
         let ptys = Arc::new(PtyRegistry::new());
         ptys.spawn_idle_pruner();
         Ok(Self {
@@ -790,6 +802,7 @@ impl DaemonState {
                 browser_launch_settings,
             )),
             local_models: crate::daemon_local_model::LocalModelInstaller::new(),
+            automations,
             disable_auto_title,
             yolo,
             media_discovery_cache: Arc::new(Mutex::new(None)),
@@ -1484,21 +1497,21 @@ async fn dispatch_request(
             .await;
         }
 
-        "list_grouped_sessions" => respond!(handle_list_grouped_sessions(&state)),
+        "list_grouped_sessions" => respond!(detached!(|s| handle_list_grouped_sessions(&s))),
         "list_grouped_sessions_page" => {
             respond!(detached!(|s, p| handle_list_grouped_sessions_page(&s, &p)))
         }
-        "load_desktop_pins" => respond!(handle_load_desktop_pins(&state)),
-        "set_desktop_pin" => respond!(handle_set_desktop_pin(&state, &params)),
-        "load_file_tabs" => respond!(handle_load_file_tabs(&state, &params)),
-        "save_file_tabs" => respond!(handle_save_file_tabs(&state, &params)),
-        "load_session_detail" => respond!(handle_load_session_detail(&state, &params)),
-        "rename_session" => respond!(handle_rename_session(&state, &params)),
-        "delete_session" => respond!(handle_delete_session(&state, &params)),
-        "set_session_tags" => respond!(handle_set_session_tags(&state, &params)),
-        "delete_project" => respond!(handle_delete_project(&state, &params)),
-        "set_project_tags" => respond!(handle_set_project_tags(&state, &params)),
-        "refresh_repo_status" => respond!(handle_refresh_repo_status(&state, &params)),
+        "load_desktop_pins" => respond!(detached!(|s| handle_load_desktop_pins(&s))),
+        "set_desktop_pin" => respond!(detached!(|s, p| handle_set_desktop_pin(&s, &p))),
+        "load_file_tabs" => respond!(detached!(|s, p| handle_load_file_tabs(&s, &p))),
+        "save_file_tabs" => respond!(detached!(|s, p| handle_save_file_tabs(&s, &p))),
+        "load_session_detail" => respond!(detached!(|s, p| handle_load_session_detail(&s, &p))),
+        "rename_session" => respond!(detached!(|s, p| handle_rename_session(&s, &p))),
+        "delete_session" => respond!(detached!(|s, p| handle_delete_session(&s, &p))),
+        "set_session_tags" => respond!(detached!(|s, p| handle_set_session_tags(&s, &p))),
+        "delete_project" => respond!(detached!(|s, p| handle_delete_project(&s, &p))),
+        "set_project_tags" => respond!(detached!(|s, p| handle_set_project_tags(&s, &p))),
+        "refresh_repo_status" => respond!(detached!(|s, p| handle_refresh_repo_status(&s, &p))),
         "load_settings_snapshot" => respond!(detached!(|s| handle_load_settings_snapshot(&s))),
         "login_with_api_key" => {
             respond!(detached!(|s, p| handle_login_with_api_key(&s, &p)))
@@ -1508,6 +1521,12 @@ async fn dispatch_request(
         }
         "login_with_agentenv" => {
             respond!(detached!(|s| handle_login_with_agentenv(&s)))
+        }
+        "copilot_login_start" => {
+            respond!(detached!(|s, p| handle_copilot_login_start(&s, &p)))
+        }
+        "copilot_login_poll" => {
+            respond!(detached!(|s, p| handle_copilot_login_poll(&s, &p)))
         }
         "list_external_credentials" => {
             respond!(detached!(|s| handle_list_external_credentials(&s)))
@@ -1748,45 +1767,81 @@ async fn dispatch_request(
         "workflow_get_execution" => respond!(detached!(|s, p| {
             crate::daemon_workflows::handle_workflow_get_execution(s.config_paths(), &p)
         })),
+        "automation_list" => respond!(detached!(|s| {
+            crate::daemon_automations::handle_automation_list(s.automation_store())
+        })),
+        "automation_get" => respond!(detached!(|s, p| {
+            crate::daemon_automations::handle_automation_get(s.automation_store(), &p)
+        })),
+        "automation_save" => respond!(detached!(|s, p| {
+            crate::daemon_automations::handle_automation_save(s.automation_store(), &p)
+        })),
+        "automation_delete" => respond!(detached!(|s, p| {
+            crate::daemon_automations::handle_automation_delete(s.automation_store(), &p)
+        })),
+        "automation_catalog" => respond!(detached!(|s| {
+            crate::daemon_automations::handle_automation_catalog(s.config_paths())
+        })),
+        "automation_compile_deploy" => respond!(detached!(|s, p| {
+            crate::daemon_automation_runtime::handle_automation_compile_deploy(&s, &p)
+        })),
+        "automation_sync_preview" => respond!(detached!(|s, p| {
+            crate::daemon_automation_runtime::handle_automation_sync_preview(&s, &p)
+        })),
+        "automation_run_preview" => respond!(detached!(|s, p| {
+            crate::daemon_automation_runtime::handle_automation_run_preview(&s, &p)
+        })),
+        "automation_run_history" => respond!(detached!(|s, p| {
+            crate::daemon_automation_runtime::handle_automation_run_history(&s, &p)
+        })),
         "workflow_open_ui" => respond!(detached!(|s| {
             crate::daemon_workflow_runtime::handle_workflow_open_ui(&s)
         })),
-        "workflow_binding_create" => respond!(
-            crate::daemon_workflows::handle_workflow_binding_create(&state.paths, &params)
-        ),
-        "monitor_create" | "task_monitor_create" => respond!(
-            crate::daemon_workflows::handle_monitor_create(&state.paths, &params)
-        ),
-        "monitor_task_ignore" | "task_monitor_ignore" => respond!(
-            crate::daemon_workflows::handle_monitor_task_ignore(&state.paths, &params)
-        ),
-        "monitor_rule_add" | "task_monitor_rule_add" => respond!(
-            crate::daemon_workflows::handle_monitor_rule_add(&state.paths, &params)
-        ),
-        "monitor_rule_delete" | "task_monitor_rule_delete" => respond!(
-            crate::daemon_workflows::handle_monitor_rule_delete(&state.paths, &params)
-        ),
-        "monitor_task_complete" | "task_monitor_complete" => respond!(
-            crate::daemon_workflows::handle_monitor_task_complete(&state.paths, &params)
-        ),
-        "outbound_action_execute" => respond!(
-            crate::daemon_workflows::handle_outbound_action_execute(&state.paths, &params)
-        ),
-        "outbound_action_cancel" => respond!(
-            crate::daemon_workflows::handle_outbound_action_cancel(&state.paths, &params)
-        ),
-        "outbound_action_status" => respond!(
-            crate::daemon_workflows::handle_outbound_action_status(&state.paths, &params)
-        ),
-        "monitor_memory_save" | "task_monitor_memory_save" => respond!(
-            crate::daemon_workflows::handle_monitor_memory_save(&state.paths, &params)
-        ),
-        "monitor_history_list" | "task_monitor_history_list" => respond!(
-            crate::daemon_workflows::handle_monitor_history_list(&state.paths, &params)
-        ),
-        "monitor_trace_list" | "task_monitor_trace_list" => respond!(
-            crate::daemon_workflows::handle_monitor_trace_list(&state.paths, &params)
-        ),
+        "workflow_binding_create" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_workflow_binding_create(s.config_paths(), &p)
+        })),
+        "monitor_create" | "task_monitor_create" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_create(s.config_paths(), &p)
+        })),
+        "monitor_task_ignore" | "task_monitor_ignore" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_task_ignore(s.config_paths(), &p)
+        })),
+        "monitor_rule_add" | "task_monitor_rule_add" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_rule_add(s.config_paths(), &p)
+        })),
+        "monitor_rule_delete" | "task_monitor_rule_delete" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_rule_delete(s.config_paths(), &p)
+        })),
+        "monitor_task_complete" | "task_monitor_complete" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_task_complete(s.config_paths(), &p)
+        })),
+        "monitor_reply_send" | "task_monitor_reply_send" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_outbound_action_execute(s.config_paths(), &p)
+        })),
+        "monitor_action_execute" | "task_monitor_action_execute" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_outbound_action_execute(s.config_paths(), &p)
+        })),
+        "connector_action_execute" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_outbound_action_execute(s.config_paths(), &p)
+        })),
+        "outbound_action_execute" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_outbound_action_execute(s.config_paths(), &p)
+        })),
+        "outbound_action_cancel" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_outbound_action_cancel(s.config_paths(), &p)
+        })),
+        "outbound_action_status" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_outbound_action_status(s.config_paths(), &p)
+        })),
+        "monitor_memory_save" | "task_monitor_memory_save" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_memory_save(s.config_paths(), &p)
+        })),
+        "monitor_history_list" | "task_monitor_history_list" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_history_list(s.config_paths(), &p)
+        })),
+        "monitor_trace_list" | "task_monitor_trace_list" => respond!(detached!(|s, p| {
+            crate::daemon_workflows::handle_monitor_trace_list(s.config_paths(), &p)
+        })),
         "telegram_diagnostics_export" | "task_telegram_diagnostics_export" => respond!(
             crate::daemon_workflows::handle_telegram_diagnostics_export(&state.paths, &params)
         ),
@@ -2932,6 +2987,113 @@ fn string_at_any(value: &Value, paths: &[&[&str]]) -> Option<String> {
     None
 }
 
+/// Starts the GitHub Copilot device-flow login. Returns the user code +
+/// verification URL for the client to display; no credential is stored yet.
+fn handle_copilot_login_start(_state: &DaemonState, _params: &Value) -> Result<Value> {
+    let start = crate::copilot_login::start_device_flow()?;
+    Ok(json!({
+        "deviceCode": start.device_code,
+        "userCode": start.user_code,
+        "verificationUri": start.verification_uri,
+        "interval": start.interval,
+        "expiresIn": start.expires_in,
+    }))
+}
+
+/// Polls the Copilot device flow once. On success stores the GitHub token as the
+/// `github-copilot` OAuth credential and returns the refreshed settings
+/// snapshot; otherwise reports the poll status so the client can keep waiting.
+fn handle_copilot_login_poll(state: &DaemonState, params: &Value) -> Result<Value> {
+    let device_code = params
+        .get("deviceCode")
+        .or_else(|| params.get("device_code"))
+        .and_then(|v| v.as_str())
+        .context("missing deviceCode")?;
+    match crate::copilot_login::poll_device_flow(device_code)? {
+        crate::copilot_login::DeviceFlowPoll::Pending => Ok(json!({ "status": "pending" })),
+        crate::copilot_login::DeviceFlowPoll::SlowDown => Ok(json!({ "status": "slow_down" })),
+        crate::copilot_login::DeviceFlowPoll::Failed(err) => {
+            Ok(json!({ "status": "error", "error": err }))
+        }
+        crate::copilot_login::DeviceFlowPoll::Done(token) => {
+            // No discovery here: we only need auth_store to write the new
+            // credential (and the copilot entry would error anyway, since the
+            // credential isn't stored yet). The snapshot below runs its own
+            // fresh discovery — this avoids a second, useless network pass that
+            // could add seconds of latency to the login-complete response.
+            let mut inputs = state.build_runtime_inputs_without_discovery()?;
+            let auth_path = state.paths.user_config_dir.join("auth.json");
+            // Reconnect (re-login without an explicit logout) issues a new
+            // GitHub token. Evict the OLD token's cached Copilot bearer so it
+            // isn't orphaned in the process cache (keyed by github token) with
+            // no future logout/401 to ever remove it.
+            if let Some(StoredCredential::OAuth(previous)) = inputs.auth_store.get("github-copilot")
+            {
+                let previous_token = previous.access_token.clone();
+                if previous_token != token {
+                    puffer_core::invalidate_copilot_bearer(&previous_token);
+                }
+            }
+            set_stored_credential(
+                &mut inputs.auth_store,
+                "github-copilot".to_string(),
+                StoredCredential::OAuth(OAuthCredential {
+                    access_token: token,
+                    ..Default::default()
+                }),
+            );
+            inputs.auth_store.save(&auth_path)?;
+            let _ = desktop_api::ensure_default_routing(
+                &state.paths,
+                &inputs.providers,
+                &inputs.auth_store,
+                "github-copilot",
+            );
+            // A different Copilot account may have been connected before: its
+            // account-specific model list is cached under the account-agnostic
+            // "github-copilot" id, so drop it to force a re-discovery for THIS
+            // account (otherwise a lower-tier account is offered the previous
+            // account's models and hits model_not_supported at chat time).
+            puffer_provider_registry::invalidate_provider_discovery_cache("github-copilot");
+            let config = state.config.lock().unwrap().clone();
+            // The credential is now persisted, so the login HAS succeeded.
+            // Build the snapshot WITHOUT discovery: it only needs to reflect the
+            // now-connected provider (from auth_store), and Copilot's model list
+            // is discovered lazily (list_provider_models / background) when the
+            // picker opens. Running full multi-provider network discovery here
+            // could exceed the login-poll RPC timeout, surfacing a saved login
+            // as a failure. Fall back to the already-held inputs if reload fails.
+            let snapshot: Option<SettingsSnapshotDto> = (|| {
+                reload_daemon_config(state)?;
+                let fresh = state.build_runtime_inputs_without_discovery()?;
+                desktop_api::load_settings_snapshot(
+                    &state.paths,
+                    &config,
+                    &fresh.resources,
+                    &fresh.providers,
+                    &fresh.auth_store,
+                    &fresh.session_store,
+                )
+            })()
+            .or_else(|_| {
+                desktop_api::load_settings_snapshot(
+                    &state.paths,
+                    &config,
+                    &inputs.resources,
+                    &inputs.providers,
+                    &inputs.auth_store,
+                    &inputs.session_store,
+                )
+            })
+            .ok();
+            match snapshot {
+                Some(snapshot) => Ok(json!({ "status": "done", "snapshot": snapshot })),
+                None => Ok(json!({ "status": "done" })),
+            }
+        }
+    }
+}
+
 /// Lists importable credentials discovered under external tool config roots.
 fn handle_list_external_credentials(state: &DaemonState) -> Result<Value> {
     let inputs = state.build_runtime_inputs()?;
@@ -2998,9 +3160,27 @@ fn handle_logout_provider(state: &DaemonState, params: &Value) -> Result<Value> 
         .and_then(|v| v.as_str())
         .context("missing providerId")?;
     let provider_id = canonical_desktop_provider_id(requested_provider_id);
-    let mut inputs = state.build_runtime_inputs()?;
+    let mut inputs = state.build_runtime_inputs_without_discovery()?;
     let auth_path = state.paths.user_config_dir.join("auth.json");
+    // Capture the GitHub token before removing it so we can drop the exchanged
+    // Copilot bearer keyed by it (below) — otherwise a logged-out account's
+    // still-valid short-lived bearer lingers in the process cache until expiry.
+    let copilot_github_token = if provider_id == "github-copilot" {
+        match inputs.auth_store.get(&provider_id) {
+            Some(StoredCredential::OAuth(credential)) => Some(credential.access_token.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
     desktop_api::logout_provider(&mut inputs.auth_store, &auth_path, &provider_id)?;
+    // Drop this provider's cached discovery so a later re-login (possibly a
+    // different account, e.g. Copilot) re-discovers instead of serving the
+    // logged-out account's cached, account-specific model list.
+    puffer_provider_registry::invalidate_provider_discovery_cache(&provider_id);
+    if let Some(token) = copilot_github_token {
+        puffer_core::invalidate_copilot_bearer(&token);
+    }
     let fresh = state.build_runtime_inputs()?;
     let config = state.config.lock().unwrap().clone();
     let snapshot: SettingsSnapshotDto = desktop_api::load_settings_snapshot(

@@ -31,6 +31,13 @@ pub(crate) fn oauth_family_for_provider(
     providers: &ProviderRegistry,
     provider_id: &str,
 ) -> Option<OauthFamily> {
+    // GitHub Copilot authenticates via a GitHub device flow, not the PKCE
+    // redirect families below (its openai-completions api would otherwise be
+    // misrouted to the OpenAI family). It is handled by the dedicated
+    // copilot_login_start / copilot_login_poll RPCs instead.
+    if provider_id == "github-copilot" {
+        return None;
+    }
     let provider = providers.provider(provider_id)?;
     if !provider.auth_modes.contains(&AuthMode::OAuth) {
         return None;

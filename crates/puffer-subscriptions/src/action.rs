@@ -259,6 +259,17 @@ pub trait WorkflowActionRunner: Send + Sync {
     /// `trigger` as the runtime payload.
     fn run_workflow(&self, slug: &str, trigger: serde_json::Value) -> Result<WorkflowActionOutput>;
 
+    /// Executes a product-level Puffer Automation with `trigger` as the
+    /// Automation runner input.
+    fn run_automation(
+        &self,
+        automation_id: &str,
+        trigger: serde_json::Value,
+    ) -> Result<WorkflowActionOutput> {
+        let _ = (automation_id, trigger);
+        anyhow::bail!("automation actions are not installed in this runtime")
+    }
+
     /// Executes a Puffer tool call from a workflow action.
     fn run_tool_action(
         &self,
@@ -552,6 +563,21 @@ impl BuiltinActionDispatcher {
         }
     }
 
+    fn run_automation(&self, automation_id: &str, envelope: &EventEnvelope) -> ActionResult {
+        let trigger = trigger_payload(envelope);
+        match self.resolved_workflow_runner() {
+            Some(runner) => match runner.run_automation(automation_id, trigger) {
+                Ok(output) => ActionResult::success_from_output(output),
+                Err(error) => ActionResult::failure(format!(
+                    "run_automation `{automation_id}` failed: {error:#}"
+                )),
+            },
+            None => ActionResult::failure(format!(
+                "run_automation: no workflow runner is installed; `{automation_id}` cannot be run"
+            )),
+        }
+    }
+
     fn tool_call(
         &self,
         tool: &str,
@@ -776,6 +802,9 @@ impl ActionDispatcher for BuiltinActionDispatcher {
                 template,
             } => self.forward_message(platform, target, template.as_deref(), envelope),
             ActionSpec::RunWorkflow { workflow_id } => self.run_workflow(workflow_id, envelope),
+            ActionSpec::RunAutomation { automation_id } => {
+                self.run_automation(automation_id, envelope)
+            }
             ActionSpec::ConnectorAct {
                 connector_slug,
                 action,

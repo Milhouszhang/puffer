@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "benchmark/genskill/ladybird",
+    "crates/puffer-automation",
     "crates/puffer-cli",
     "crates/puffer-config",
     "crates/puffer-connector-core",

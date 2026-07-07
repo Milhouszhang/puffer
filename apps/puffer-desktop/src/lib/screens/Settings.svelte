@@ -67,6 +67,7 @@
   type Props = {
     snapshot: SettingsSnapshot | null;
     loading: boolean;
+    initialSection?: Section;
     tweaks: Tweaks;
     preferences: DesktopPreferences;
     daemonUrl: string | null;
@@ -82,6 +83,9 @@
     onResetAppearance: () => void;
     onRefresh: () => void;
     onLogout: (providerId: string) => void;
+    copilotLogin?: { userCode: string; verificationUri: string } | null;
+    onLoginCopilot?: (providerId: string) => void;
+    onCancelLogin?: () => void;
     onLoginOauth?: (providerId: string) => void;
     onApiKeyLogin?: (
       providerId: string,
@@ -120,6 +124,7 @@
 
   type Section = "general" | "providers" | "secrets" | "network" | "remote" | "browser" | "workflow-backend" | "connectors" | "permissions" | "skills" | "mcp" | "git" | "appearance" | "shortcuts";
   let section = $state<Section>("general");
+  let appliedInitialSection = $state<Section | null>(null);
 
   const navItems: { id: Section; label: string; icon: IconName }[] = [
     { id: "general",     label: "General",    icon: "settings" },
@@ -128,7 +133,7 @@
     { id: "network",     label: "Network",    icon: "globe" },
     { id: "remote",      label: "Remote",     icon: "server" },
     { id: "browser",     label: "Browser",    icon: "globe" },
-    { id: "workflow-backend", label: "Workflows", icon: "git" },
+    { id: "workflow-backend", label: "Automation Runtime", icon: "bolt" },
     { id: "connectors",  label: "Connectors", icon: "server" },
     { id: "permissions", label: "Permissions", icon: "bolt" },
     { id: "skills",      label: "Verified Skills", icon: "shield" },
@@ -178,14 +183,14 @@
       {
         mode: "local",
         label: "Run locally",
-        description: "Connects to a workflow runtime running on this device.",
+        description: "Connects to an automation runtime running on this device.",
         apiUrl: "http://127.0.0.1:3000",
         uiUrl: "http://localhost:5173"
       },
       {
         mode: "agent_env_cloud",
         label: "Run on AgentEnv Cloud",
-        description: "Sends required workflow data to AgentEnv Cloud for execution.",
+        description: "Sends required automation data to AgentEnv Cloud for execution.",
         apiUrl: "https://api.agentenv.io",
         uiUrl: "https://agentenv.io"
       }
@@ -455,7 +460,7 @@
   }
 
   function connectorStatusLabel(connector: WorkflowConnector): string {
-    if (connector.can_trigger_workflow ?? connector.can_subscribe) return "workflow";
+    if (connector.can_trigger_workflow ?? connector.can_subscribe) return "automation";
     if (connector.can_proxy_agent) return "proxy";
     return connector.requires_auth ? "auth" : "available";
   }
@@ -1297,13 +1302,15 @@
 
   async function persistWorkflowBackend(): Promise<WorkflowBackendSettings> {
     const token = workflowBackendToken.trim();
+    const isLocal = workflowBackendForm.mode === "local";
+    const localOption = workflowBackendOption("local");
     const saved = await saveWorkflowBackendConfig({
       mode: workflowBackendForm.mode,
-      apiUrl: workflowBackendForm.apiUrl.trim(),
-      uiUrl: workflowBackendForm.uiUrl.trim(),
-      workspaceId: workflowBackendForm.workspaceId.trim(),
-      apiToken: token || null,
-      keepToken: !token && workflowBackendSnapshot.hasToken
+      apiUrl: isLocal ? (localOption?.apiUrl ?? "http://127.0.0.1:3000") : workflowBackendForm.apiUrl.trim(),
+      uiUrl: isLocal ? (localOption?.uiUrl ?? "http://localhost:5173") : workflowBackendForm.uiUrl.trim(),
+      workspaceId: isLocal ? "" : workflowBackendForm.workspaceId.trim(),
+      apiToken: isLocal ? null : token || null,
+      keepToken: isLocal ? false : !token && workflowBackendSnapshot.hasToken
     });
     workflowBackendToken = "";
     applyWorkflowBackendSettings(saved);
@@ -1318,9 +1325,12 @@
     workflowBackendTestResult = null;
     try {
       const saved = await persistWorkflowBackend();
-      workflowBackendSaved = saved.hasToken
-        ? "Workflow settings saved. API token is configured."
-        : "Workflow settings saved. API token is not configured.";
+      workflowBackendSaved =
+        saved.mode === "local"
+          ? "Local automation runtime is managed by Puffer."
+          : saved.hasToken
+            ? "Automation runtime settings saved. API token is configured."
+            : "Automation runtime settings saved. API token is not configured.";
       props.onRefresh();
     } catch (e) {
       workflowBackendError = (e as Error).message ?? String(e);
@@ -1402,6 +1412,13 @@
   // different daemon/workspace/config source. Otherwise Settings can show
   // permissions, MCP servers, or default model choices from the prior daemon.
   let settingsSourceKey = $state("");
+  $effect(() => {
+    if (props.initialSection && props.initialSection !== appliedInitialSection) {
+      section = props.initialSection;
+      appliedInitialSection = props.initialSection;
+    }
+  });
+
   $effect(() => {
     const nextKey = [
       props.daemonUrl ?? "",
@@ -1809,6 +1826,9 @@
           errorMessage={props.authError ?? null}
           externals={props.externals ?? []}
           busyImportKey={props.busyImportKey ?? null}
+          copilotLogin={props.copilotLogin ?? null}
+          onLoginCopilot={props.onLoginCopilot ?? (() => {})}
+          onCancelLogin={props.onCancelLogin ?? (() => {})}
           onLoginOauth={props.onLoginOauth ?? (() => {})}
           onLoginApiKey={props.onApiKeyLogin ?? (() => {})}
           onLogout={props.onLogout}
@@ -1844,11 +1864,11 @@
       />
 
     {:else if section === "workflow-backend"}
-      <h2>Workflows</h2>
-      <p class="lead">Choose where workflow data is sent when opening the Workflow Console.</p>
+      <h2>Automation Runtime</h2>
+      <p class="lead">Choose the default runtime used by new automations and preview runs.</p>
 
       {#if !daemonReachable}
-        <div class="pf-settings-note">Preview mode - launch Puffer in the desktop app to configure Workflows.</div>
+        <div class="pf-settings-note">Preview mode - launch Puffer in the desktop app to configure Automation Runtime.</div>
       {/if}
       {#if workflowBackendError}
         <div class="pf-settings-note warn" role="alert">{workflowBackendError}</div>
@@ -1860,9 +1880,9 @@
       <div class="pf-settings-row" style="align-items: start;">
         <div class="meta">
           <div class="label">Mode</div>
-          <div class="desc">Select the workflow runtime Puffer should connect to.</div>
+          <div class="desc">Select the automation runtime Puffer should connect to.</div>
         </div>
-        <div class="pf-workflow-backend-mode" role="radiogroup" aria-label="Workflow mode">
+        <div class="pf-workflow-backend-mode" role="radiogroup" aria-label="Automation runtime mode">
           <label class="pf-workflow-backend-option">
             <input
               type="radio"
@@ -1873,7 +1893,7 @@
             />
             <span>
               <strong>Run locally</strong>
-              <small>Connects to a workflow runtime running on this device. Requires local services to be installed and running.</small>
+              <small>Puffer starts the local AgentEnv runtime stack and connects to it on this device.</small>
             </span>
           </label>
           <label class="pf-workflow-backend-option">
@@ -1886,74 +1906,87 @@
             />
             <span>
               <strong>Run on AgentEnv Cloud</strong>
-              <small>Sends required workflow data to AgentEnv Cloud for execution.</small>
+              <small>Sends required automation data to AgentEnv Cloud for execution.</small>
             </span>
           </label>
         </div>
       </div>
 
-      <div class="pf-settings-row">
-        <div class="meta">
-          <div class="label">API URL</div>
-          <div class="desc">Workflow runtime API endpoint.</div>
+      {#if workflowBackendForm.mode === "local"}
+        <div class="pf-settings-row">
+          <div class="meta">
+            <div class="label">Local runtime</div>
+            <div class="desc">Puffer checks Docker, pulls the local runtime image when needed, and generates runtime credentials automatically.</div>
+          </div>
+          <div class="pf-workflow-backend-local-summary">
+            <span class="pf-status-pill ready">Managed</span>
+            <span>Image, env, workspace, and token are prepared on first run.</span>
+          </div>
         </div>
-        <input
-          class="sc-input pf-workflow-backend-input"
-          aria-label="API URL"
-          value={workflowBackendForm.apiUrl}
-          disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
-          oninput={(e) => (workflowBackendForm = { ...workflowBackendForm, apiUrl: (e.currentTarget as HTMLInputElement).value })}
-        />
-      </div>
-
-      <div class="pf-settings-row">
-        <div class="meta">
-          <div class="label">Workflow Console URL</div>
-          <div class="desc">External UI opened from the Workflows page.</div>
-        </div>
-        <input
-          class="sc-input pf-workflow-backend-input"
-          aria-label="Workflow Console URL"
-          value={workflowBackendForm.uiUrl}
-          disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
-          oninput={(e) => (workflowBackendForm = { ...workflowBackendForm, uiUrl: (e.currentTarget as HTMLInputElement).value })}
-        />
-      </div>
-
-      <div class="pf-settings-row">
-        <div class="meta">
-          <div class="label">Workspace ID</div>
-          <div class="desc">Workspace used for workflow runtime calls.</div>
-        </div>
-        <input
-          class="sc-input pf-workflow-backend-input"
-          aria-label="Workspace ID"
-          value={workflowBackendForm.workspaceId}
-          disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
-          oninput={(e) => (workflowBackendForm = { ...workflowBackendForm, workspaceId: (e.currentTarget as HTMLInputElement).value })}
-        />
-      </div>
-
-      <div class="pf-settings-row">
-        <div class="meta">
-          <div class="label">API Token</div>
-          <div class="desc">Saved in the user-level secret store. Existing tokens are retained when this field is empty.</div>
-        </div>
-        <div class="pf-workflow-backend-token">
+      {:else}
+        <div class="pf-settings-row">
+          <div class="meta">
+            <div class="label">API URL</div>
+            <div class="desc">Automation runtime API endpoint.</div>
+          </div>
           <input
             class="sc-input pf-workflow-backend-input"
-            aria-label="API Token"
-            type="password"
-            value={workflowBackendToken}
-            placeholder={workflowBackendSnapshot.hasToken ? "Configured - enter a new token to replace" : "Not configured"}
+            aria-label="API URL"
+            value={workflowBackendForm.apiUrl}
             disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
-            oninput={(e) => (workflowBackendToken = (e.currentTarget as HTMLInputElement).value)}
+            oninput={(e) => (workflowBackendForm = { ...workflowBackendForm, apiUrl: (e.currentTarget as HTMLInputElement).value })}
           />
-          <span class="pf-status-pill" class:ready={workflowBackendSnapshot.hasToken}>
-            {workflowBackendSnapshot.hasToken ? "Configured" : "Not configured"}
-          </span>
         </div>
-      </div>
+
+        <div class="pf-settings-row">
+          <div class="meta">
+            <div class="label">Automation Console URL</div>
+            <div class="desc">External UI opened for automation runtime management.</div>
+          </div>
+          <input
+            class="sc-input pf-workflow-backend-input"
+            aria-label="Automation Console URL"
+            value={workflowBackendForm.uiUrl}
+            disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
+            oninput={(e) => (workflowBackendForm = { ...workflowBackendForm, uiUrl: (e.currentTarget as HTMLInputElement).value })}
+          />
+        </div>
+
+        <div class="pf-settings-row">
+          <div class="meta">
+            <div class="label">Workspace ID</div>
+            <div class="desc">Workspace used for automation runtime calls.</div>
+          </div>
+          <input
+            class="sc-input pf-workflow-backend-input"
+            aria-label="Workspace ID"
+            value={workflowBackendForm.workspaceId}
+            disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
+            oninput={(e) => (workflowBackendForm = { ...workflowBackendForm, workspaceId: (e.currentTarget as HTMLInputElement).value })}
+          />
+        </div>
+
+        <div class="pf-settings-row">
+          <div class="meta">
+            <div class="label">API Token</div>
+            <div class="desc">Saved in the user-level secret store. Existing tokens are retained when this field is empty.</div>
+          </div>
+          <div class="pf-workflow-backend-token">
+            <input
+              class="sc-input pf-workflow-backend-input"
+              aria-label="API Token"
+              type="password"
+              value={workflowBackendToken}
+              placeholder={workflowBackendSnapshot.hasToken ? "Configured - enter a new token to replace" : "Not configured"}
+              disabled={!daemonReachable || workflowBackendSaving || workflowBackendTesting}
+              oninput={(e) => (workflowBackendToken = (e.currentTarget as HTMLInputElement).value)}
+            />
+            <span class="pf-status-pill" class:ready={workflowBackendSnapshot.hasToken}>
+              {workflowBackendSnapshot.hasToken ? "Configured" : "Not configured"}
+            </span>
+          </div>
+        </div>
+      {/if}
 
       <div class="pf-settings-row" style="border-bottom: 0;">
         <div class="meta">
@@ -1989,9 +2022,9 @@
           class="pf-workflow-backend-result"
           data-success={workflowBackendTestResult.success}
           role="status"
-          aria-label="Workflow connection result"
+          aria-label="Automation runtime connection result"
         >
-          <strong>{workflowBackendTestResult.success ? "Connection succeeded." : "Unable to connect to workflow runtime."}</strong>
+          <strong>{workflowBackendTestResult.success ? "Connection succeeded." : "Unable to connect to automation runtime."}</strong>
           <div>
             <span>Runtime</span>
             <small>{workflowBackendCheckText(workflowBackendTestResult.runtime)}</small>
@@ -2996,7 +3029,7 @@
       <div class="pf-settings-row">
         <div class="meta">
           <div class="label">Density</div>
-          <div class="desc">Adjust spacing for list-heavy and repeated workflows.</div>
+          <div class="desc">Adjust spacing for list-heavy and repeated work.</div>
         </div>
         <div class="pf-appearance-control">
           {#each densities as d (d)}

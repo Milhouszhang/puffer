@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentActivityStatus,
+  AutomationCatalogResult,
+  AutomationDeleteResult,
+  AutomationListResult,
+  AutomationPreviewResult,
+  AutomationRecordDto,
+  AutomationRuntimeSyncResult,
+  AutomationRunHistoryResult,
+  AutomationSaveRequest,
   AttachmentPreviewResult,
   AttachmentState,
   AuthProviderStatus,
@@ -342,6 +350,7 @@ type BackendChromeSecretsImportResult = ChromeSecretsImportResult;
 type BackendRemoteOperation = RemoteOperation;
 
 const WORKFLOW_DAEMON_OPTIONS = { requireWebSocket: true, timeoutMs: 15000 } as const;
+const AUTOMATION_DAEMON_OPTIONS = { requireWebSocket: true, timeoutMs: 15000 } as const;
 
 type StageChatAttachmentHook = (
   sessionId: string,
@@ -893,6 +902,69 @@ export async function loginWithAgentEnv(): Promise<SettingsSnapshot> {
     return mockSettingsSnapshot;
   }
   return invoke<BackendSettingsSnapshot>("login_with_agentenv");
+}
+
+export interface CopilotLoginStartResult {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  interval: number;
+  expiresIn: number;
+}
+
+export interface CopilotLoginPollResult {
+  status: "pending" | "slow_down" | "done" | "error";
+  error?: string;
+  snapshot?: BackendSettingsSnapshot;
+}
+
+// Starts the GitHub Copilot device flow. Returns the code the user must enter
+// at the verification URL; no credential is stored until polling succeeds.
+export async function copilotLoginStart(
+  remote?: RemoteConnection
+): Promise<CopilotLoginStartResult> {
+  if (shouldInvokeRemote(remote)) {
+    return invoke<CopilotLoginStartResult>("copilot_login_start", { ...remoteArgs(remote) });
+  }
+  if (canReachDaemon()) {
+    const client = await ensureLocalDaemonClient();
+    return client.request<CopilotLoginStartResult>("copilot_login_start", {});
+  }
+  if (!canInvokeTauri()) {
+    return {
+      deviceCode: "mock-device",
+      userCode: "MOCK-CODE",
+      verificationUri: "https://github.com/login/device",
+      interval: 5,
+      expiresIn: 900
+    };
+  }
+  return invoke<CopilotLoginStartResult>("copilot_login_start", { ...remoteArgs(remote) });
+}
+
+// Polls the Copilot device flow once. On "done" the snapshot reflects the new
+// github-copilot credential.
+export async function copilotLoginPoll(
+  deviceCode: string,
+  remote?: RemoteConnection
+): Promise<CopilotLoginPollResult> {
+  if (shouldInvokeRemote(remote)) {
+    return invoke<CopilotLoginPollResult>("copilot_login_poll", {
+      deviceCode,
+      ...remoteArgs(remote)
+    });
+  }
+  if (canReachDaemon()) {
+    const client = await ensureLocalDaemonClient();
+    return client.request<CopilotLoginPollResult>("copilot_login_poll", { deviceCode });
+  }
+  if (!canInvokeTauri()) {
+    return { status: "error", error: "GitHub Copilot login is unavailable in this build." };
+  }
+  return invoke<CopilotLoginPollResult>("copilot_login_poll", {
+    deviceCode,
+    ...remoteArgs(remote)
+  });
 }
 
 export async function loginWithApiKey(
@@ -1664,6 +1736,74 @@ async function workflowRequest<T>(
 ): Promise<T> {
   const client = await ensureLocalDaemonClient();
   return client.request<T>(method, params, WORKFLOW_DAEMON_OPTIONS);
+}
+
+async function automationRequest<T>(
+  method: string,
+  params: Record<string, unknown> = {}
+): Promise<T> {
+  const client = await ensureLocalDaemonClient();
+  return client.request<T>(method, params, AUTOMATION_DAEMON_OPTIONS);
+}
+
+/** Load user-facing Automations from the daemon-owned AutomationStore. */
+export async function listAutomations(): Promise<AutomationListResult> {
+  return automationRequest<AutomationListResult>("automation_list");
+}
+
+/** Load one user-facing Automation by Puffer Automation id. */
+export async function getAutomation(id: string): Promise<AutomationRecordDto> {
+  return automationRequest<AutomationRecordDto>("automation_get", { id });
+}
+
+/** Create or update one user-facing Automation semantic spec. */
+export async function saveAutomationRecord(
+  input: AutomationSaveRequest
+): Promise<AutomationRecordDto> {
+  const params: Record<string, unknown> = {
+    id: input.id,
+    status: input.status,
+    spec: input.spec
+  };
+  if (input.expectedRevision !== undefined) {
+    params.expectedRevision = input.expectedRevision;
+  }
+  return automationRequest<AutomationRecordDto>("automation_save", params);
+}
+
+/** Permanently delete one user-facing Automation. */
+export async function deleteAutomationRecord(id: string): Promise<AutomationDeleteResult> {
+  return automationRequest<AutomationDeleteResult>("automation_delete", { id });
+}
+
+/** Load real trigger/action choices for the Automation builder. */
+export async function loadAutomationCatalog(): Promise<AutomationCatalogResult> {
+  return automationRequest<AutomationCatalogResult>("automation_catalog");
+}
+
+/** Sync an Automation runtime for preview without publishing live bindings. */
+export async function syncAutomationPreview(
+  id: string,
+  expectedRevision?: number
+): Promise<AutomationRuntimeSyncResult> {
+  const params: Record<string, unknown> = { id };
+  if (expectedRevision !== undefined) {
+    params.expectedRevision = expectedRevision;
+  }
+  return automationRequest<AutomationRuntimeSyncResult>("automation_sync_preview", params);
+}
+
+/** Execute a daemon-backed Automation preview run. */
+export async function runAutomationPreview(
+  id: string,
+  input: Record<string, unknown> = {}
+): Promise<AutomationPreviewResult> {
+  return automationRequest<AutomationPreviewResult>("automation_run_preview", { id, input });
+}
+
+/** Load daemon-backed preview/run history for one Automation. */
+export async function loadAutomationRunHistory(id: string): Promise<AutomationRunHistoryResult> {
+  return automationRequest<AutomationRunHistoryResult>("automation_run_history", { id });
 }
 
 /** Load registered workflows from the daemon. */

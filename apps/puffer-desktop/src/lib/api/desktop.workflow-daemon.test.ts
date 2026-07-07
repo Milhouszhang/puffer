@@ -89,10 +89,36 @@ test("sends duplicate risk acknowledgement only for explicit outbound retries", 
   );
 });
 
-test("marks workflow backend and runtime API calls as daemon-only", async () => {
+test("marks automation and workflow runtime API calls as daemon-only", async () => {
   const { invoke, request } = mockDesktopDaemonClient();
   const api = await import("./desktop");
+  const automationSpec = {
+    spec_version: 1,
+    name: "Automation 1",
+    source: { type: "blank" as const },
+    instructions: "Run the automation.",
+    triggers: [{ type: "manual" as const, id: "manual" }],
+    flow: {
+      steps: [
+        {
+          type: "agent_env_node" as const,
+          id: "agent",
+          node: { node_type: "puffer_agent" }
+        }
+      ]
+    },
+    review: { human_approval_required: true }
+  };
 
+  await api.listAutomations();
+  await api.getAutomation("automation-1");
+  await api.saveAutomationRecord({
+    id: "automation-1",
+    expectedRevision: 1,
+    status: "enabled",
+    spec: automationSpec
+  });
+  await api.deleteAutomationRecord("automation-1");
   await api.loadWorkflowBackendConfig();
   await api.saveWorkflowBackendConfig({
     mode: "agent_env_cloud",
@@ -143,6 +169,10 @@ test("marks workflow backend and runtime API calls as daemon-only", async () => 
 
   const workflowOptions = { requireWebSocket: true, timeoutMs: 15000 };
   expect(request.mock.calls.map(([method, _params, options]) => [method, options])).toEqual([
+    ["automation_list", workflowOptions],
+    ["automation_get", workflowOptions],
+    ["automation_save", workflowOptions],
+    ["automation_delete", workflowOptions],
     ["workflow_backend_get_config", workflowOptions],
     ["workflow_backend_save_config", workflowOptions],
     ["workflow_backend_test_connection", workflowOptions],

@@ -32,6 +32,14 @@
     "custom"
   ];
 
+  // Google and GitHub Copilot are real providers with backend descriptors
+  // (`resources/providers/google.yaml` / `github-copilot.yaml`) and normally
+  // come from the registry. They are ALSO listed here as fallback entries so
+  // they remain offerable when the registry catalog is empty (daemon down or
+  // the first render before it responds) — providerSettingsCatalog dedupes by
+  // id, so the registry entry supersedes these whenever it is present. Google
+  // uses its OpenAI-compatible Gemini endpoint (api_key); Copilot uses a GitHub
+  // device-flow login + Copilot token exchange (see the OAuth section below).
   const EXTRA_SETUP_PROVIDERS: ProviderSummary[] = [
     {
       id: "github-copilot",
@@ -46,7 +54,7 @@
     {
       id: "google",
       displayName: "Google",
-      baseUrl: "https://generativelanguage.googleapis.com",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
       defaultApi: "openai-completions",
       modelCount: 0,
       authModes: ["api_key"],
@@ -93,6 +101,9 @@
   export let externals: ExternalCredential[] = [];
   export let busyImportKey: string | null = null;
   export let onLoginOauth: (providerId: string) => void = () => {};
+  export let onLoginCopilot: (providerId: string) => void = () => {};
+  export let onCancelLogin: () => void = () => {};
+  export let copilotLogin: { userCode: string; verificationUri: string } | null = null;
   export let onLoginApiKey: (
     providerId: string,
     apiKey: string,
@@ -101,6 +112,35 @@
   export let onLogout: (providerId: string) => void = () => {};
   export let onImportExternal: (providerId: string, source: "claude" | "codex") => void = () => {};
   export let onRefresh: () => void = () => {};
+
+  let copilotCodeCopied = false;
+  async function copyCopilotCode(code: string) {
+    try {
+      await navigator.clipboard.writeText(code);
+      copilotCodeCopied = true;
+      setTimeout(() => (copilotCodeCopied = false), 2000);
+    } catch {
+      // Clipboard blocked; the code is shown for manual copy.
+    }
+  }
+  function startCopilotLogin(providerId: string) {
+    // Route through beginPendingConnection so the modal auto-closes once the
+    // device-flow finishes (same mechanism as the api-key / oauth flows).
+    beginPendingConnection(providerId);
+    onLoginCopilot(providerId);
+  }
+  async function openExternalUrl(url: string) {
+    // Only ever open http(s) — mirror the open_url command's allowlist so the
+    // window.open fallback can't be used to reach file:// / native handlers.
+    if (!/^https?:\/\//i.test(url)) return;
+    // window.open is unreliable in the Tauri webview; use the opener command.
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("open_url", { url });
+    } catch {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+  }
 
   let apiKeys: Record<string, string> = {};
   let baseUrls: Record<string, string> = {};
@@ -191,6 +231,19 @@
   }
 
   function closeProviderModal() {
+    // Dismissing the modal during the Copilot device flow must cancel it —
+    // otherwise the app keeps polling GitHub (staying "busy" and blocking other
+    // providers) until the device code times out. Only the Copilot flow is
+    // canceled here: PKCE OAuth (e.g. Anthropic) is completed in the browser and
+    // intentionally keeps running if the modal is closed, and API-key submits are
+    // fast. `busyProviderId === "github-copilot"` also covers the brief window
+    // before the device code arrives (copilotLogin still null).
+    if (
+      (copilotLogin || busyProviderId === "github-copilot") &&
+      !pendingApiKeyProvider
+    ) {
+      onCancelLogin();
+    }
     activeProviderId = null;
   }
 
@@ -621,21 +674,62 @@
           {#if !isCustomProvider(activeProvider) && supports(activeProvider, "oauth")}
             <div class="provider-modal-section">
               <h3>OAuth</h3>
-              <button
-                class="oauth-btn"
-                disabled={credentialBusy}
-                on:click={() => submitOauth(activeProvider.id)}
-              >
-                {busyProviderId === activeProvider.id
-                  ? "Opening browser..."
-                  : auth
-                    ? remoteEnabled
-                      ? "Reconnect with OAuth (remote)"
-                      : "Reconnect with OAuth"
-                    : remoteEnabled
-                      ? "Connect with OAuth (remote)"
-                      : "Connect with OAuth"}
-              </button>
+              {#if activeProvider.id === "github-copilot"}
+                <button
+                  class="oauth-btn"
+                  disabled={credentialBusy || copilotLogin !== null}
+                  on:click={() => startCopilotLogin(activeProvider.id)}
+                >
+                  {copilotLogin
+                    ? "Waiting for GitHub authorization…"
+                    : busyProviderId === activeProvider.id
+                      ? "Starting…"
+                      : auth
+                        ? "Reconnect GitHub Copilot"
+                        : "Connect GitHub Copilot"}
+                </button>
+                {#if copilotLogin}
+                  <div class="pf-copilot-device">
+                    <div class="pf-copilot-code-row">
+                      <code class="pf-copilot-code">{copilotLogin.userCode}</code>
+                      <button
+                        type="button"
+                        class="pf-copilot-copy"
+                        on:click={() => copyCopilotCode(copilotLogin.userCode)}
+                      >
+                        {copilotCodeCopied ? "Copied ✓" : "Copy code"}
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      class="oauth-btn"
+                      on:click={() => openExternalUrl(copilotLogin.verificationUri)}
+                    >
+                      Open {copilotLogin.verificationUri}
+                    </button>
+                    <p class="pf-copilot-hint">
+                      Enter the code on GitHub to authorize — this connects automatically once you
+                      approve. Waiting…
+                    </p>
+                  </div>
+                {/if}
+              {:else}
+                <button
+                  class="oauth-btn"
+                  disabled={credentialBusy}
+                  on:click={() => submitOauth(activeProvider.id)}
+                >
+                  {busyProviderId === activeProvider.id
+                    ? "Opening browser..."
+                    : auth
+                      ? remoteEnabled
+                        ? "Reconnect with OAuth (remote)"
+                        : "Reconnect with OAuth"
+                      : remoteEnabled
+                        ? "Connect with OAuth (remote)"
+                        : "Connect with OAuth"}
+                </button>
+              {/if}
             </div>
           {/if}
 
@@ -876,6 +970,42 @@
   .actions {
     display: grid;
     gap: 8px;
+  }
+  .pf-copilot-device {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .pf-copilot-code-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .pf-copilot-code {
+    flex: 1;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 20px;
+    letter-spacing: 2px;
+    font-weight: 600;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: rgba(111, 101, 89, 0.1);
+    text-align: center;
+    user-select: all;
+  }
+  .pf-copilot-copy {
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(111, 101, 89, 0.24);
+    background: rgba(255, 255, 255, 0.9);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .pf-copilot-hint {
+    font-size: 12px;
+    opacity: 0.72;
+    margin: 0;
   }
   .oauth-btn,
   .apikey-btn,

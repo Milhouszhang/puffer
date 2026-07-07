@@ -1770,13 +1770,13 @@ async fn dispatch_request(
             crate::daemon_workflows::handle_monitor_task_complete(s.config_paths(), &p)
         })),
         "monitor_reply_send" | "task_monitor_reply_send" => respond!(detached!(|s, p| {
-            crate::daemon_workflows::handle_monitor_reply_send(s.config_paths(), &p)
+            crate::daemon_workflows::handle_outbound_action_execute(s.config_paths(), &p)
         })),
         "monitor_action_execute" | "task_monitor_action_execute" => respond!(detached!(|s, p| {
-            crate::daemon_workflows::handle_monitor_action_execute(s.config_paths(), &p)
+            crate::daemon_workflows::handle_outbound_action_execute(s.config_paths(), &p)
         })),
         "connector_action_execute" => respond!(detached!(|s, p| {
-            crate::daemon_workflows::handle_connector_action_execute(s.config_paths(), &p)
+            crate::daemon_workflows::handle_outbound_action_execute(s.config_paths(), &p)
         })),
         "outbound_action_execute" => respond!(detached!(|s, p| {
             crate::daemon_workflows::handle_outbound_action_execute(s.config_paths(), &p)

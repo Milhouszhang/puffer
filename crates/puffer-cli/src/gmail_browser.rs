@@ -30,7 +30,7 @@ const CONFIG_FILE: &str = "config.toml";
 const SEEN_FILE: &str = "seen.json";
 /// Bump when the row-id derivation changes shape; mismatched stores
 /// rebaseline (observe, don't emit) instead of flooding (#594).
-const SEEN_KEY_VERSION: u32 = 2;
+const SEEN_KEY_VERSION: u32 = 3;
 /// Upper bound on remembered row keys; oldest half evicted on overflow.
 const SEEN_MAX_KEYS: usize = 2000;
 const AUTH_STATE_FILE: &str = "auth_state.json";
@@ -1338,6 +1338,22 @@ mod tests {
         // #594: archive shifts row indexes; identity must not include index.
         assert!(GMAIL_INBOX_SCRIPT.contains("fnv1a"));
         assert!(!GMAIL_INBOX_SCRIPT.contains("snippet, index].join"));
+    }
+
+    #[test]
+    fn inbox_script_fallback_id_includes_thread_identity() {
+        // #772: same-content messageId-less rows in different Gmail threads
+        // must not collapse to the same content-hash fallback id.
+        assert!(GMAIL_INBOX_SCRIPT.contains("threadId || rawThreadId"));
+        assert!(GMAIL_INBOX_SCRIPT
+            .contains("[threadId || rawThreadId, sender, fromEmail, subject, snippet]"));
+    }
+
+    #[test]
+    fn seen_key_version_tracks_thread_aware_fallback_ids() {
+        // The fallback id derivation changed for #772, so existing stores
+        // must observe one clean rebaseline poll instead of flooding users.
+        assert_eq!(SEEN_KEY_VERSION, 3);
     }
 
     fn test_paths(temp: &tempfile::TempDir) -> ConfigPaths {

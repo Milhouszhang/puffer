@@ -9,9 +9,10 @@ disable-model-invocation: false
 ---
 
 A **recipe** for the `Canvas` tool: how to structure a code review as a Canvas
-page. Canvas is a design system (see `resources/canvas/components.md` for the
-component catalog and when to use each). This recipe is the task-level rule for
-*code review* specifically.
+page. Canvas is a design system — the Canvas tool description documents the
+component vocabulary and geometry (the repo's `resources/canvas/components.md`
+holds the full catalog). This recipe is the task-level rule for *code review*
+specifically.
 
 ## When to use
 After reviewing a diff/PR/branch, when the result is easier to act on as a
@@ -61,6 +62,9 @@ scannable page than as prose. Call `Canvas` once with the composed tree.
 }
 ```
 
-## Follow-up (not yet wired)
-Actions are emitted with `{id, intent, node}`; the round-trip that bundles the
-finding + locations + diff back into a new agent turn is a planned follow-up.
+## Action round-trip
+Action buttons are wired on both surfaces: clicking one bundles the finding
+(title, severity, locations, diff evidence) plus an intent-specific instruction
+into a message and continues the conversation as a new agent turn — inline in
+Puffer Desktop, or through the daemon bridge from the HTML fallback (degrading
+to clipboard copy when no daemon is reachable).

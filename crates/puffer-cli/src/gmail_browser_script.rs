@@ -86,11 +86,11 @@ pub(crate) const GMAIL_INBOX_SCRIPT: &str = r#"
         row.querySelector(".zF") !== null ||
         aria.includes("unread");
       const hasAttachment = rowHasAttachment(row, aria);
-      // Content-only on purpose: index would break on archive shifts (#594).
-      // Known tradeoff: two messageId-less rows with identical sender/from/
-      // subject/truncated-snippet collapse to one id and the later one is
-      // deduped. Changing this derivation requires bumping SEEN_KEY_VERSION.
-      const fallback = "c" + fnv1a([sender, fromEmail, subject, snippet].join(" "));
+      // Content + thread identity on purpose: index would break on archive
+      // shifts (#594), but thread identity keeps same-content messageId-less
+      // rows from different threads from colliding (#772). Changing this
+      // derivation requires bumping SEEN_KEY_VERSION.
+      const fallback = "c" + fnv1a([threadId || rawThreadId, sender, fromEmail, subject, snippet].join(" "));
       return {
         id: messageId || fallback,
         threadId,

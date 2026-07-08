@@ -8,6 +8,7 @@
 //! - **Auto-backgrounding** (CC): Long-running tasks automatically move to background
 //!   after a configurable timeout budget.
 
+use crate::runtime::CancelToken;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -211,19 +212,77 @@ pub enum BackgroundTaskStatus {
     Pending,
     /// Task is currently running.
     Running,
+    /// A stop was requested; the worker has not yet acknowledged.
+    Stopping,
     /// Task completed successfully.
     Completed,
     /// Task failed with an error.
     Failed,
     /// Task was cancelled/stopped by the user or system.
     Stopped,
+    /// Task was scoped to a turn that finished before the worker acked its stop.
+    Abandoned,
 }
 
 impl BackgroundTaskStatus {
     /// Returns true if the task has reached a terminal state.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Stopped)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Stopped | Self::Abandoned
+        )
     }
+}
+
+/// Whether a background task hosts an agent loop or a shell process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundTaskKind {
+    Agent,
+    Shell,
+}
+
+/// Whether a background task is bound to its owner turn or detached from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundTaskDurability {
+    /// Stopped when the owner turn finishes.
+    ScopedToTurn,
+    /// Survives the owner turn; only an explicit `TaskStop` ends it.
+    DurableAcrossTurns,
+}
+
+impl BackgroundTaskDurability {
+    /// Maps the tool-facing `durable` boolean to a durability.
+    pub fn from_durable_flag(durable: bool) -> Self {
+        if durable {
+            Self::DurableAcrossTurns
+        } else {
+            Self::ScopedToTurn
+        }
+    }
+}
+
+/// Full registration record for an owner-aware, stoppable background task.
+pub struct BackgroundTaskRegistration {
+    pub task_id: String,
+    pub description: String,
+    pub kind: BackgroundTaskKind,
+    pub agent_id: Option<String>,
+    pub output_file: Option<String>,
+    pub auto_backgrounded: bool,
+    pub owner_turn_id: Option<String>,
+    pub owner_session_id: Option<String>,
+    pub durability: BackgroundTaskDurability,
+    pub cancel: Option<CancelToken>,
+    pub process_id: Option<u32>,
+}
+
+/// Summary of what `stop_scoped_by_turn` did for one turn.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TurnTaskStopReport {
+    pub stop_requested: usize,
+    pub abandoned: usize,
 }
 
 /// Metadata and state for one background task.
@@ -241,12 +300,26 @@ pub struct BackgroundTaskInfo {
     pub output_file: Option<String>,
     /// True if this task was auto-backgrounded (CC-style timeout).
     pub auto_backgrounded: bool,
+    /// Whether this task hosts an agent loop or a shell process.
+    pub kind: BackgroundTaskKind,
+    /// Turn that spawned this task, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_turn_id: Option<String>,
+    /// Session that spawned this task, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_session_id: Option<String>,
+    /// Whether this task is scoped to its owner turn or detached.
+    pub durability: BackgroundTaskDurability,
+    /// OS pid of the underlying process, for shell tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<u32>,
 }
 
 /// Shared mutable state for one tracked background task.
 struct TrackedTask {
     info: BackgroundTaskInfo,
     output: Arc<Mutex<HeadTailBuffer>>,
+    cancel: Option<CancelToken>,
     _start_instant: Instant,
 }
 
@@ -258,21 +331,17 @@ pub struct BackgroundTaskManager {
 }
 
 impl BackgroundTaskManager {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             tasks: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Registers a new background task. Returns `Err` if the concurrent limit
-    /// has been reached.
-    pub fn register(
+    /// Registers a new owner-aware background task. Returns `Err` if the
+    /// concurrent limit has been reached.
+    pub fn register_with_options(
         &self,
-        task_id: &str,
-        description: &str,
-        agent_id: Option<&str>,
-        output_file: Option<&str>,
-        auto_backgrounded: bool,
+        registration: BackgroundTaskRegistration,
     ) -> Result<Arc<Mutex<HeadTailBuffer>>, String> {
         let mut tasks = self.tasks.lock().unwrap();
 
@@ -290,37 +359,136 @@ impl BackgroundTaskManager {
 
         let output = Arc::new(Mutex::new(HeadTailBuffer::new()));
         let info = BackgroundTaskInfo {
-            task_id: task_id.to_string(),
-            description: description.to_string(),
+            task_id: registration.task_id.clone(),
+            description: registration.description,
             status: BackgroundTaskStatus::Running,
             created_at: now_ms(),
             completed_at: None,
-            agent_id: agent_id.map(ToString::to_string),
-            output_file: output_file.map(ToString::to_string),
-            auto_backgrounded,
+            agent_id: registration.agent_id,
+            output_file: registration.output_file,
+            auto_backgrounded: registration.auto_backgrounded,
+            kind: registration.kind,
+            owner_turn_id: registration.owner_turn_id,
+            owner_session_id: registration.owner_session_id,
+            durability: registration.durability,
+            process_id: registration.process_id,
         };
         tasks.insert(
-            task_id.to_string(),
+            registration.task_id,
             TrackedTask {
                 info,
                 output: Arc::clone(&output),
+                cancel: registration.cancel,
                 _start_instant: Instant::now(),
             },
         );
         Ok(output)
     }
 
-    /// Marks a task as completed or failed.
+    /// Registers a new background task. Returns `Err` if the concurrent limit
+    /// has been reached. Legacy no-owner callers default to a durable agent so
+    /// nothing new can stop them.
+    pub fn register(
+        &self,
+        task_id: &str,
+        description: &str,
+        agent_id: Option<&str>,
+        output_file: Option<&str>,
+        auto_backgrounded: bool,
+    ) -> Result<Arc<Mutex<HeadTailBuffer>>, String> {
+        self.register_with_options(BackgroundTaskRegistration {
+            task_id: task_id.to_string(),
+            description: description.to_string(),
+            kind: BackgroundTaskKind::Agent,
+            agent_id: agent_id.map(str::to_string),
+            output_file: output_file.map(str::to_string),
+            auto_backgrounded,
+            owner_turn_id: None,
+            owner_session_id: None,
+            durability: BackgroundTaskDurability::DurableAcrossTurns,
+            cancel: None,
+            process_id: None,
+        })
+    }
+
+    /// Marks a task as completed or failed. Terminal statuses are monotonic
+    /// (a late duplicate never overwrites), and a worker acking a requested
+    /// stop lands in `Stopped` rather than `Completed`/`Failed`.
     pub fn complete(&self, task_id: &str, success: bool) {
         let mut tasks = self.tasks.lock().unwrap();
         if let Some(task) = tasks.get_mut(task_id) {
-            task.info.status = if success {
+            if task.info.status.is_terminal() {
+                return;
+            }
+            task.info.status = if task.info.status == BackgroundTaskStatus::Stopping {
+                BackgroundTaskStatus::Stopped
+            } else if success {
                 BackgroundTaskStatus::Completed
             } else {
                 BackgroundTaskStatus::Failed
             };
             task.info.completed_at = Some(now_ms());
         }
+    }
+
+    /// Requests a stop of one task: cancels its token, kills its process if
+    /// any, and marks it `Stopping`. Returns its info snapshot, or `None` if the
+    /// task is unknown. A no-op on already-terminal tasks.
+    pub fn request_stop(&self, task_id: &str) -> Option<BackgroundTaskInfo> {
+        let mut tasks = self.tasks.lock().unwrap();
+        let task = tasks.get_mut(task_id)?;
+        if !task.info.status.is_terminal() {
+            stop_one(task, "task_stop");
+        }
+        Some(task.info.clone())
+    }
+
+    /// Stops every live task scoped to `turn_id`, then waits up to
+    /// `drain_timeout` for the workers to ack. Any still-live scoped task at the
+    /// deadline is force-marked `Abandoned`. Durable tasks are never touched.
+    pub fn stop_scoped_by_turn(
+        &self,
+        turn_id: &str,
+        reason: &str,
+        drain_timeout: Duration,
+    ) -> TurnTaskStopReport {
+        let mut report = TurnTaskStopReport::default();
+        let is_scoped_live = |info: &BackgroundTaskInfo| {
+            info.owner_turn_id.as_deref() == Some(turn_id)
+                && info.durability == BackgroundTaskDurability::ScopedToTurn
+                && !info.status.is_terminal()
+        };
+        {
+            let mut tasks = self.tasks.lock().unwrap();
+            for task in tasks.values_mut() {
+                if is_scoped_live(&task.info) {
+                    stop_one(task, reason);
+                    report.stop_requested += 1;
+                }
+            }
+        }
+        let start = Instant::now();
+        while start.elapsed() < drain_timeout {
+            let any_live = self
+                .tasks
+                .lock()
+                .unwrap()
+                .values()
+                .any(|t| is_scoped_live(&t.info));
+            if !any_live {
+                return report;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let mut tasks = self.tasks.lock().unwrap();
+        for task in tasks.values_mut() {
+            if is_scoped_live(&task.info) {
+                task.info.status = BackgroundTaskStatus::Abandoned;
+                task.info.completed_at = Some(now_ms());
+                report.abandoned += 1;
+            }
+        }
+        report
     }
 
     /// Marks a task as stopped (cancelled).
@@ -501,6 +669,21 @@ pub enum AutoBgResult<T> {
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
+
+/// Cancels one task's token, kills its process if any, notes the stop in its
+/// output, and marks it `Stopping`.
+fn stop_one(task: &mut TrackedTask, reason: &str) {
+    if let Some(cancel) = &task.cancel {
+        cancel.cancel();
+    }
+    if let Some(pid) = task.info.process_id {
+        let _ = crate::runtime::claude_tools::workflow::store::terminate_process(pid);
+    }
+    if let Ok(mut output) = task.output.lock() {
+        output.write_str(&format!("\n[stop requested: {reason}]\n"));
+    }
+    task.info.status = BackgroundTaskStatus::Stopping;
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()

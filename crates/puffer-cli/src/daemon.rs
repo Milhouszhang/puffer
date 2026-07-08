@@ -4785,18 +4785,62 @@ fn handle_cancel_turn(state: &DaemonState, params: &Value) -> Result<Value> {
         .or_else(|| params.get("turn_id"))
         .and_then(|v| v.as_str())
         .context("missing turnId")?;
-    if cancel_turn_by_id(state, turn_id) {
+    if cancel_turn_by_id(state, turn_id, TurnFinishReason::CancelledByUser) {
         Ok(json!({"ok": true}))
     } else {
         Ok(json!({"ok": false, "error": "turn not found"}))
     }
 }
 
-/// Cancels one running turn by id: flips its cancel token, denies any pending
-/// permission/question prompts, reports the cancellation to listeners, and
-/// removes it from the registry. Returns whether a turn with this id existed.
-/// Shared by the `cancel_turn` RPC and the client-disconnect watchdog (#600).
-fn cancel_turn_by_id(state: &DaemonState, turn_id: &str) -> bool {
+/// Bounded wait for a turn's scoped background children to acknowledge a stop
+/// during turn finish. Overridable via `PUFFER_TURN_CHILD_DRAIN_MS`; default 2s.
+fn daemon_child_drain_timeout() -> std::time::Duration {
+    std::env::var("PUFFER_TURN_CHILD_DRAIN_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_secs(2))
+}
+
+/// The only path that removes a live turn. Finishes the scope (denying pending
+/// interactions), harvests turn-scoped background children, clears the turn's
+/// outbound budget, and removes it from the registry. Safe to call on
+/// already-removed turns (returns early).
+fn finish_turn(state: &DaemonState, turn_id: &str, reason: TurnFinishReason) {
+    let Some(handle) = state.turns.lock().unwrap().get(turn_id).cloned() else {
+        return;
+    };
+    if !matches!(reason, TurnFinishReason::Complete) {
+        handle.cancel.cancel();
+    }
+    let report = handle.scope.finish(reason);
+    let child_report = puffer_core::background_tasks::task_manager().stop_scoped_by_turn(
+        turn_id,
+        reason.as_str(),
+        daemon_child_drain_timeout(),
+    );
+    // puffer_core::runtime::outbound_budget::budget_registry().clear_turn(turn_id); // enabled in outbound-budget task
+    if report.pending_permissions_resolved + report.pending_questions_resolved > 0
+        || child_report.stop_requested + child_report.abandoned > 0
+    {
+        eprintln!(
+            "turn {turn_id} finish({}): pending_perms={} pending_questions={} children_stopped={} children_abandoned={}",
+            reason.as_str(),
+            report.pending_permissions_resolved,
+            report.pending_questions_resolved,
+            child_report.stop_requested,
+            child_report.abandoned
+        );
+    }
+    state.turns.lock().unwrap().remove(turn_id);
+}
+
+/// Cancels one running turn by id: routes it through `finish_turn` (which flips
+/// the cancel token, denies pending prompts, and harvests scoped children) and
+/// reports the cancellation to listeners. Returns whether a turn existed.
+/// Shared by the `cancel_turn` RPC (`CancelledByUser`) and the client-disconnect
+/// watchdog (`ClientDisconnected`, #600).
+fn cancel_turn_by_id(state: &DaemonState, turn_id: &str, reason: TurnFinishReason) -> bool {
     let handle = {
         let turns = state.turns.lock().unwrap();
         turns.get(turn_id).cloned()
@@ -4804,8 +4848,7 @@ fn cancel_turn_by_id(state: &DaemonState, turn_id: &str) -> bool {
     let Some(handle) = handle else {
         return false;
     };
-    handle.cancel.cancel();
-    let _report = handle.scope.finish(TurnFinishReason::CancelledByUser);
+    finish_turn(state, turn_id, reason);
     // Cancellation cleanup is best-effort: never let a failed report block the
     // cancel (especially on the disconnect path, where no client is waiting).
     if let (Some(session_uuid), Some(session_id)) =
@@ -4826,7 +4869,6 @@ fn cancel_turn_by_id(state: &DaemonState, turn_id: &str) -> bool {
     } else {
         report_cancelled_sessionless_turn(state, &handle.channel, turn_id, &handle.cancel_reported);
     }
-    state.turns.lock().unwrap().remove(turn_id);
     true
 }
 
@@ -4839,7 +4881,7 @@ fn cancel_all_active_turns(state: &DaemonState) -> usize {
     let turn_ids: Vec<String> = state.turns.lock().unwrap().keys().cloned().collect();
     turn_ids
         .iter()
-        .filter(|turn_id| cancel_turn_by_id(state, turn_id))
+        .filter(|turn_id| cancel_turn_by_id(state, turn_id, TurnFinishReason::ClientDisconnected))
         .count()
 }
 
@@ -5615,7 +5657,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     None,
                     Some("attachment-staging"),
                 );
-                state.turns.lock().unwrap().remove(&turn_id);
+                finish_turn(&state, &turn_id, TurnFinishReason::Error);
                 return Ok(json!({ "turnId": turn_id }));
             }
         }
@@ -5654,7 +5696,6 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
         );
     }
 
-    let state_for_thread = state.clone();
     let turn_id_thread = turn_id.clone();
     let turn_id_resp = turn_id.clone();
     let channel_thread = channel.clone();
@@ -5697,7 +5738,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     None,
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
         };
@@ -5713,7 +5754,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     None,
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
         };
@@ -5778,7 +5819,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                         None,
                         None,
                     );
-                    setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                     return;
                 }
             }
@@ -5792,6 +5833,13 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 scope.turn_id.clone(),
             );
         }
+        app_state.set_current_turn_context(puffer_core::CurrentTurnContext {
+            turn_id: turn_id_thread.clone(),
+            session_id: session_id_for_thread.clone(),
+            task_id: monitor_reply_scope_for_thread
+                .as_ref()
+                .map(|s| s.task_id.clone()),
+        });
         // Issue #560: reconcile the model's view of the browser with the real
         // tab registry every turn, instead of letting it trust stale
         // `connected:true` tool output replayed from the transcript.
@@ -5811,7 +5859,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 None,
                 None,
             );
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+            finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
             return;
         }
         match persist_explicit_turn_routing(
@@ -5839,7 +5887,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     None,
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
         }
@@ -5859,7 +5907,11 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 &user_prompt_persisted_thread,
                 &progress_thread,
             );
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+            finish_turn(
+                &setup_state,
+                &turn_id_thread,
+                TurnFinishReason::CancelledByUser,
+            );
             return;
         }
         app_state.set_exact_media_discovery_cache(setup_state.exact_media_discovery_cache(&inputs));
@@ -5896,7 +5948,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     None,
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
             let _ = inputs
@@ -5942,7 +5994,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 None,
                 Some("attachment-hydration"),
             );
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+            finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
             return;
         }
 
@@ -6218,14 +6270,15 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
             )
         });
 
+        let mut finish_reason = TurnFinishReason::Complete;
         match outcome {
             Ok(turn) => {
                 if cancel_reported_thread.load(Ordering::SeqCst) {
-                    state_for_thread
-                        .turns
-                        .lock()
-                        .unwrap()
-                        .remove(&turn_id_thread);
+                    finish_turn(
+                        &setup_state,
+                        &turn_id_thread,
+                        TurnFinishReason::CancelledByUser,
+                    );
                     return;
                 }
                 if !turn.assistant_text.is_empty() {
@@ -6289,11 +6342,11 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
             }
             Err(err) => {
                 if cancel_reported_thread.load(Ordering::SeqCst) {
-                    state_for_thread
-                        .turns
-                        .lock()
-                        .unwrap()
-                        .remove(&turn_id_thread);
+                    finish_turn(
+                        &setup_state,
+                        &turn_id_thread,
+                        TurnFinishReason::CancelledByUser,
+                    );
                     return;
                 }
                 eprintln!("turn {turn_id_thread} failed: {err:#}");
@@ -6319,14 +6372,11 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     Some(raw),
                     Some(category),
                 );
+                finish_reason = TurnFinishReason::Error;
             }
         }
 
-        state_for_thread
-            .turns
-            .lock()
-            .unwrap()
-            .remove(&turn_id_thread);
+        finish_turn(&setup_state, &turn_id_thread, finish_reason);
     });
 
     Ok(json!({"turnId": turn_id_resp}))
@@ -6412,7 +6462,7 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
                     None,
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
         };
@@ -6428,7 +6478,7 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
                     None,
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
         };
@@ -6442,6 +6492,11 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
             .unwrap_or(session_uuid)
             .to_string();
         let mut app_state = AppState::from_session_record(cfg_for_turn, record);
+        app_state.set_current_turn_context(puffer_core::CurrentTurnContext {
+            turn_id: turn_id_thread.clone(),
+            session_id: session_id_for_thread.clone(),
+            task_id: None,
+        });
         app_state.browser_status = browser_status_for_turn(
             &turn_browser_tab_context(&setup_state, &browser_root_session_id),
             session_used_browser,
@@ -6511,7 +6566,7 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
             )
         });
 
-        match outcome {
+        let finish_reason = match outcome {
             Ok(()) => {
                 let assistant_text = app_state
                     .transcript
@@ -6541,6 +6596,7 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
                         "sessionId": session_id_for_thread.clone(),
                     }),
                 });
+                TurnFinishReason::Complete
             }
             Err(err) => {
                 eprintln!("slash command {turn_id_thread} failed: {err:#}");
@@ -6556,8 +6612,9 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
                     None,
                     None,
                 );
+                TurnFinishReason::Error
             }
-        }
+        };
 
         let _ = (
             cancel.clone(),
@@ -6566,7 +6623,7 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
             progress.clone(),
             scope.clone(),
         );
-        setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+        finish_turn(&setup_state, &turn_id_thread, finish_reason);
     });
 
     Ok(json!({"turnId": turn_id_resp}))
@@ -6643,6 +6700,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             "assistantText": assistant_text,
                         }),
                     });
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Complete);
                 }
                 Err(error) => {
                     if !(cancel_thread.is_cancelled()
@@ -6656,9 +6714,9 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             None,
                         );
                     }
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 }
             }
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
             return;
         }
 
@@ -6682,6 +6740,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             "assistantText": assistant_text,
                         }),
                     });
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Complete);
                 }
                 Err(error) => {
                     if !(cancel_thread.is_cancelled()
@@ -6695,9 +6754,9 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             None,
                         );
                     }
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 }
             }
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
             return;
         }
 
@@ -6721,6 +6780,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             "assistantText": assistant_text,
                         }),
                     });
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Complete);
                 }
                 Err(error) => {
                     if !(cancel_thread.is_cancelled()
@@ -6734,9 +6794,9 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             None,
                         );
                     }
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 }
             }
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
             return;
         }
 
@@ -6760,6 +6820,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             "assistantText": assistant_text,
                         }),
                     });
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Complete);
                 }
                 Err(error) => {
                     if !(cancel_thread.is_cancelled()
@@ -6773,9 +6834,9 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             None,
                         );
                     }
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 }
             }
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
             return;
         }
 
@@ -6799,6 +6860,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             "assistantText": assistant_text,
                         }),
                     });
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Complete);
                 }
                 Err(error) => {
                     if !(cancel_thread.is_cancelled()
@@ -6812,9 +6874,9 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             None,
                         );
                     }
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 }
             }
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
             return;
         }
 
@@ -6828,13 +6890,18 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                     format!("build_runtime_inputs: {err:#}"),
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
         };
         let cfg_for_turn = setup_state.config.lock().unwrap().clone();
         let metadata = connector_setup_session_metadata(setup_state.cwd.clone(), Uuid::new_v4());
         let mut app_state = AppState::new(cfg_for_turn, setup_state.cwd.clone(), metadata);
+        app_state.set_current_turn_context(puffer_core::CurrentTurnContext {
+            turn_id: turn_id_thread.clone(),
+            session_id: turn_id_thread.clone(),
+            task_id: None,
+        });
         let stream_actor = app_state.system_actor();
 
         let question_state = setup_state.clone();
@@ -6893,7 +6960,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
             Ok::<_, anyhow::Error>(turn)
         });
 
-        match outcome {
+        let finish_reason = match outcome {
             Ok(turn) => {
                 setup_state.publish_event(ServerEnvelope::Event {
                     event: channel_thread.clone(),
@@ -6906,6 +6973,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                         &stream_actor,
                     ),
                 });
+                TurnFinishReason::Complete
             }
             Err(error) => {
                 if !(cancel_thread.is_cancelled() && cancel_reported_thread.load(Ordering::SeqCst))
@@ -6918,9 +6986,10 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                         None,
                     );
                 }
+                TurnFinishReason::Error
             }
-        }
-        setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+        };
+        finish_turn(&setup_state, &turn_id_thread, finish_reason);
     });
 
     Ok(json!({"turnId": turn_id_resp, "setupId": turn_id_resp}))

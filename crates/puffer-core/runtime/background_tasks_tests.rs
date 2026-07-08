@@ -326,15 +326,19 @@ fn task_manager_stop_then_complete_is_idempotent() {
     let mgr = BackgroundTaskManager::new();
     let _ = mgr.register("s1", "stop test", None, None, false);
 
-    mgr.stop("s1");
+    // request_stop marks the task Stopping; the worker ack (`complete`) then
+    // converges it to the terminal Stopped state.
+    mgr.request_stop("s1");
+    mgr.complete("s1", true);
     let info = mgr.get_info("s1").unwrap();
     assert_eq!(info.status, BackgroundTaskStatus::Stopped);
     assert_eq!(mgr.active_count(), 0);
 
-    // Completing after stop still updates status
+    // Completing after a terminal stop is a no-op: terminal statuses are
+    // monotonic, so the task stays Stopped.
     mgr.complete("s1", true);
     let info = mgr.get_info("s1").unwrap();
-    assert_eq!(info.status, BackgroundTaskStatus::Completed);
+    assert_eq!(info.status, BackgroundTaskStatus::Stopped);
 }
 
 #[test]
@@ -374,7 +378,7 @@ fn task_manager_has_capacity_reflects_limit() {
     }
     assert!(!mgr.has_capacity());
 
-    mgr.stop("c-0");
+    mgr.complete("c-0", true);
     assert!(mgr.has_capacity());
 }
 
@@ -524,4 +528,96 @@ fn end_to_end_background_task_lifecycle() {
     mgr.cleanup_older_than(Duration::ZERO);
     assert!(mgr.get_info("e2e-agent-1").is_none());
     assert_eq!(mgr.active_count(), 0);
+}
+
+#[test]
+fn complete_on_stopping_yields_stopped_and_terminal_is_monotonic() {
+    let mgr = BackgroundTaskManager::new();
+    let cancel = crate::runtime::CancelToken::new();
+    mgr.register_with_options(BackgroundTaskRegistration {
+        task_id: "agent-1".into(),
+        description: "background agent".into(),
+        kind: BackgroundTaskKind::Agent,
+        agent_id: Some("agent-1".into()),
+        output_file: None,
+        auto_backgrounded: false,
+        owner_turn_id: Some("turn-1".into()),
+        owner_session_id: Some("session-1".into()),
+        durability: BackgroundTaskDurability::ScopedToTurn,
+        cancel: Some(cancel.clone()),
+        process_id: None,
+    })
+    .unwrap();
+
+    mgr.request_stop("agent-1").unwrap();
+    assert!(cancel.is_cancelled());
+    assert_eq!(
+        mgr.get_info("agent-1").unwrap().status,
+        BackgroundTaskStatus::Stopping
+    );
+
+    mgr.complete("agent-1", true); // worker acks
+    assert_eq!(
+        mgr.get_info("agent-1").unwrap().status,
+        BackgroundTaskStatus::Stopped
+    );
+
+    mgr.complete("agent-1", false); // late duplicate must not overwrite
+    assert_eq!(
+        mgr.get_info("agent-1").unwrap().status,
+        BackgroundTaskStatus::Stopped
+    );
+}
+
+#[test]
+fn stop_scoped_by_turn_spares_durable_and_abandons_unacked() {
+    let mgr = BackgroundTaskManager::new();
+    let scoped_cancel = crate::runtime::CancelToken::new();
+    let durable_cancel = crate::runtime::CancelToken::new();
+    for (id, durability, cancel) in [
+        (
+            "scoped",
+            BackgroundTaskDurability::ScopedToTurn,
+            &scoped_cancel,
+        ),
+        (
+            "durable",
+            BackgroundTaskDurability::DurableAcrossTurns,
+            &durable_cancel,
+        ),
+    ] {
+        mgr.register_with_options(BackgroundTaskRegistration {
+            task_id: id.into(),
+            description: id.into(),
+            kind: BackgroundTaskKind::Agent,
+            agent_id: Some(id.into()),
+            output_file: None,
+            auto_backgrounded: false,
+            owner_turn_id: Some("turn-1".into()),
+            owner_session_id: Some("session-1".into()),
+            durability,
+            cancel: Some(cancel.clone()),
+            process_id: None,
+        })
+        .unwrap();
+    }
+
+    let report = mgr.stop_scoped_by_turn(
+        "turn-1",
+        "test_finish",
+        std::time::Duration::from_millis(30),
+    );
+
+    assert_eq!(report.stop_requested, 1);
+    assert_eq!(report.abandoned, 1); // scoped worker never acked within drain
+    assert!(scoped_cancel.is_cancelled());
+    assert!(!durable_cancel.is_cancelled());
+    assert_eq!(
+        mgr.get_info("scoped").unwrap().status,
+        BackgroundTaskStatus::Abandoned
+    );
+    assert_eq!(
+        mgr.get_info("durable").unwrap().status,
+        BackgroundTaskStatus::Running
+    );
 }

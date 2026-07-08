@@ -26,9 +26,8 @@ use anyhow::{bail, Context, Result};
 use puffer_core::{CancelToken, UserQuestionPromptResponse};
 use puffer_subscriptions::{ConnectionRecord, ConnectionState};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 /// Connector slug this setup handles (matches the catalog template).
@@ -49,7 +48,7 @@ const WINDOW_WAIT_TIMEOUT: Duration = Duration::from_secs(90);
 /// Total time to wait for the user to scan + log in before giving up.
 const LOGIN_WAIT_TOTAL: Duration = Duration::from_secs(300);
 
-type PendingQuestions = Arc<Mutex<HashMap<String, mpsc::Sender<UserQuestionPromptResponse>>>>;
+type PendingQuestions = Arc<crate::daemon_turn_scope::TurnScope>;
 
 /// Returns true when connector setup args target the WeChat connector.
 pub(crate) fn connect_args_are_wechat(connect_args: &str) -> bool {
@@ -233,12 +232,12 @@ impl SetupFlow {
         loop {
             self.cancel.check()?;
             if self.rt.block_on(instance.is_logged_in()).unwrap_or(false) {
-                self.pending_questions.lock().unwrap().remove(&request_id);
+                self.pending_questions.deregister_user_question(&request_id);
                 self.status("WeChat login detected — finishing up…");
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                self.pending_questions.lock().unwrap().remove(&request_id);
+                self.pending_questions.deregister_user_question(&request_id);
                 bail!("WeChat login was not detected in time; click WeChat ▸ Start to retry.");
             }
             // Block up to one poll interval for a manual Continue; on timeout we
@@ -246,14 +245,14 @@ impl SetupFlow {
             match rx.recv_timeout(LOGIN_POLL_INTERVAL) {
                 Ok(_) => {
                     // Manual Continue but not logged in yet — re-show the prompt.
-                    self.pending_questions.lock().unwrap().remove(&request_id);
+                    self.pending_questions.deregister_user_question(&request_id);
                     let (rid, new_rx) = self.publish_scan_question(cfg, authority)?;
                     request_id = rid;
                     rx = new_rx;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    self.pending_questions.lock().unwrap().remove(&request_id);
+                    self.pending_questions.deregister_user_question(&request_id);
                     bail!("connector setup question channel closed");
                 }
             }
@@ -311,11 +310,9 @@ impl SetupFlow {
             .next_request_id
             .fetch_add(1, Ordering::SeqCst)
             .to_string();
-        let (tx, rx) = mpsc::channel();
-        self.pending_questions
-            .lock()
-            .unwrap()
-            .insert(request_id.clone(), tx);
+        let rx = self
+            .pending_questions
+            .register_user_question(request_id.clone());
 
         let mut payload = Map::new();
         payload.insert("type".to_string(), json!("user-question-request"));

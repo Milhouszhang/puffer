@@ -109,6 +109,7 @@ use crate::daemon_turn_recovery::{
     DEFAULT_STALE_TURN_RETRY_AFTER_MS,
 };
 use crate::daemon_turn_routing::persist_explicit_turn_routing;
+use crate::daemon_turn_scope::{PendingWait, ResolveInteractionError, TurnFinishReason, TurnScope};
 use crate::daemon_ui_state::{
     load_file_tabs_state, load_pin_state, load_session_routing_state, set_file_tabs_state,
     set_pin_state, set_session_routing_state, DesktopFileTab, DesktopFileTabsState,
@@ -595,6 +596,17 @@ impl DaemonState {
     }
 }
 
+/// Bounded wait for a pending UI interaction before the daemon gives up and
+/// resolves it (permission → Deny, question → empty answers). Overridable via
+/// `PUFFER_DAEMON_INTERACTION_TIMEOUT_MS`; defaults to 15 minutes.
+fn daemon_interaction_timeout() -> std::time::Duration {
+    std::env::var("PUFFER_DAEMON_INTERACTION_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_secs(15 * 60))
+}
+
 #[derive(Clone)]
 struct TurnHandle {
     session_id: Option<String>,
@@ -605,9 +617,7 @@ struct TurnHandle {
     cancel: CancelToken,
     cancel_reported: Arc<AtomicBool>,
     user_prompt_persisted: Arc<AtomicBool>,
-    pending: Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<PermissionPromptAction>>>>,
-    pending_questions:
-        Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<UserQuestionPromptResponse>>>>,
+    scope: Arc<TurnScope>,
     progress: Arc<Mutex<TurnProgress>>,
 }
 
@@ -4641,18 +4651,33 @@ fn handle_resolve_permission(state: &DaemonState, params: &Value) -> Result<Valu
         .and_then(|v| v.as_str())
         .context("missing requestId")?;
     let action = parse_permission_action(params)?;
-    let responder = {
-        let mut turns = state.turns.lock().unwrap();
-        turns
-            .get_mut(turn_id)
-            .and_then(|h| h.pending.lock().unwrap().remove(request_id))
+    let scope = {
+        let turns = state.turns.lock().unwrap();
+        turns.get(turn_id).map(|h| h.scope.clone())
     };
-    let responder = responder
-        .ok_or_else(|| anyhow::anyhow!("no pending request `{request_id}` on turn `{turn_id}`"))?;
-    responder
-        .send(action)
-        .map_err(|_| anyhow::anyhow!("worker already released the permission channel"))?;
+    let scope = scope.ok_or_else(|| anyhow::anyhow!("no in-flight turn `{turn_id}` to resolve"))?;
+    scope
+        .resolve_permission(request_id, action)
+        .map_err(|err| anyhow::anyhow!(resolve_interaction_error_message(request_id, err)))?;
     Ok(json!({"ok": true}))
+}
+
+/// Renders a scope resolve error into a client-facing RPC error string.
+fn resolve_interaction_error_message(request_id: &str, error: ResolveInteractionError) -> String {
+    match error {
+        ResolveInteractionError::Finished => {
+            format!("turn finished before `{request_id}` was resolved")
+        }
+        ResolveInteractionError::Expired => {
+            format!("request `{request_id}` expired (interaction timeout)")
+        }
+        ResolveInteractionError::Unknown => {
+            format!("no pending request `{request_id}` on this turn")
+        }
+        ResolveInteractionError::WorkerReleased => {
+            "worker already released the channel".to_string()
+        }
+    }
 }
 
 fn parse_permission_action(params: &Value) -> Result<PermissionPromptAction> {
@@ -4737,21 +4762,20 @@ fn handle_resolve_user_question(state: &DaemonState, params: &Value) -> Result<V
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
-    let responder = {
-        let mut turns = state.turns.lock().unwrap();
-        turns
-            .get_mut(turn_id)
-            .and_then(|h| h.pending_questions.lock().unwrap().remove(request_id))
+    let scope = {
+        let turns = state.turns.lock().unwrap();
+        turns.get(turn_id).map(|h| h.scope.clone())
     };
-    let responder = responder.ok_or_else(|| {
-        anyhow::anyhow!("no pending user question request `{request_id}` on turn `{turn_id}`")
-    })?;
-    responder
-        .send(UserQuestionPromptResponse {
-            answers,
-            annotations,
-        })
-        .map_err(|_| anyhow::anyhow!("worker already released the user question channel"))?;
+    let scope = scope.ok_or_else(|| anyhow::anyhow!("no in-flight turn `{turn_id}` to resolve"))?;
+    scope
+        .resolve_user_question(
+            request_id,
+            UserQuestionPromptResponse {
+                answers,
+                annotations,
+            },
+        )
+        .map_err(|err| anyhow::anyhow!(resolve_interaction_error_message(request_id, err)))?;
     Ok(json!({"ok": true}))
 }
 
@@ -4761,18 +4785,61 @@ fn handle_cancel_turn(state: &DaemonState, params: &Value) -> Result<Value> {
         .or_else(|| params.get("turn_id"))
         .and_then(|v| v.as_str())
         .context("missing turnId")?;
-    if cancel_turn_by_id(state, turn_id) {
+    if cancel_turn_by_id(state, turn_id, TurnFinishReason::CancelledByUser) {
         Ok(json!({"ok": true}))
     } else {
         Ok(json!({"ok": false, "error": "turn not found"}))
     }
 }
 
-/// Cancels one running turn by id: flips its cancel token, denies any pending
-/// permission/question prompts, reports the cancellation to listeners, and
-/// removes it from the registry. Returns whether a turn with this id existed.
-/// Shared by the `cancel_turn` RPC and the client-disconnect watchdog (#600).
-fn cancel_turn_by_id(state: &DaemonState, turn_id: &str) -> bool {
+/// Bounded wait for a turn's scoped background children to acknowledge a stop
+/// during turn finish. Overridable via `PUFFER_TURN_CHILD_DRAIN_MS`; default 2s.
+fn daemon_child_drain_timeout() -> std::time::Duration {
+    std::env::var("PUFFER_TURN_CHILD_DRAIN_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_secs(2))
+}
+
+/// The only path that removes a live turn. Finishes the scope (denying pending
+/// interactions), harvests turn-scoped background children, clears the turn's
+/// outbound budget, and removes it from the registry. Safe to call on
+/// already-removed turns (returns early).
+fn finish_turn(state: &DaemonState, turn_id: &str, reason: TurnFinishReason) {
+    let Some(handle) = state.turns.lock().unwrap().get(turn_id).cloned() else {
+        return;
+    };
+    // `scope` shares the handle's cancel token, and `finish` flips it for every
+    // non-`Complete` reason — so cancellation is owned there, not duplicated here.
+    let report = handle.scope.finish(reason);
+    let child_report = puffer_core::background_tasks::task_manager().stop_scoped_by_turn(
+        turn_id,
+        reason.as_str(),
+        daemon_child_drain_timeout(),
+    );
+    puffer_core::outbound_budget::budget_registry().clear_turn(turn_id);
+    if report.pending_permissions_resolved + report.pending_questions_resolved > 0
+        || child_report.stop_requested + child_report.abandoned > 0
+    {
+        eprintln!(
+            "turn {turn_id} finish({}): pending_perms={} pending_questions={} children_stopped={} children_abandoned={}",
+            reason.as_str(),
+            report.pending_permissions_resolved,
+            report.pending_questions_resolved,
+            child_report.stop_requested,
+            child_report.abandoned
+        );
+    }
+    state.turns.lock().unwrap().remove(turn_id);
+}
+
+/// Cancels one running turn by id: routes it through `finish_turn` (which flips
+/// the cancel token, denies pending prompts, and harvests scoped children) and
+/// reports the cancellation to listeners. Returns whether a turn existed.
+/// Shared by the `cancel_turn` RPC (`CancelledByUser`) and the client-disconnect
+/// watchdog (`ClientDisconnected`, #600).
+fn cancel_turn_by_id(state: &DaemonState, turn_id: &str, reason: TurnFinishReason) -> bool {
     let handle = {
         let turns = state.turns.lock().unwrap();
         turns.get(turn_id).cloned()
@@ -4780,22 +4847,7 @@ fn cancel_turn_by_id(state: &DaemonState, turn_id: &str) -> bool {
     let Some(handle) = handle else {
         return false;
     };
-    handle.cancel.cancel();
-    {
-        let mut pending = handle.pending.lock().unwrap();
-        for (_, tx) in pending.drain() {
-            let _ = tx.send(PermissionPromptAction::Deny);
-        }
-    }
-    {
-        let mut pending_questions = handle.pending_questions.lock().unwrap();
-        for (_, tx) in pending_questions.drain() {
-            let _ = tx.send(UserQuestionPromptResponse {
-                answers: serde_json::Map::new(),
-                annotations: serde_json::Map::new(),
-            });
-        }
-    }
+    finish_turn(state, turn_id, reason);
     // Cancellation cleanup is best-effort: never let a failed report block the
     // cancel (especially on the disconnect path, where no client is waiting).
     if let (Some(session_uuid), Some(session_id)) =
@@ -4816,7 +4868,6 @@ fn cancel_turn_by_id(state: &DaemonState, turn_id: &str) -> bool {
     } else {
         report_cancelled_sessionless_turn(state, &handle.channel, turn_id, &handle.cancel_reported);
     }
-    state.turns.lock().unwrap().remove(turn_id);
     true
 }
 
@@ -4829,7 +4880,7 @@ fn cancel_all_active_turns(state: &DaemonState) -> usize {
     let turn_ids: Vec<String> = state.turns.lock().unwrap().keys().cloned().collect();
     turn_ids
         .iter()
-        .filter(|turn_id| cancel_turn_by_id(state, turn_id))
+        .filter(|turn_id| cancel_turn_by_id(state, turn_id, TurnFinishReason::ClientDisconnected))
         .count()
 }
 
@@ -5605,7 +5656,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     None,
                     Some("attachment-staging"),
                 );
-                state.turns.lock().unwrap().remove(&turn_id);
+                finish_turn(&state, &turn_id, TurnFinishReason::Error);
                 return Ok(json!({ "turnId": turn_id }));
             }
         }
@@ -5613,12 +5664,8 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
     let monitor_reply_scope =
         resolve_monitor_reply_turn_scope(&state, &params, &message, &session_id, &turn_id)?;
 
-    let pending: Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<PermissionPromptAction>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let pending_questions: Arc<
-        Mutex<HashMap<String, std::sync::mpsc::Sender<UserQuestionPromptResponse>>>,
-    > = Arc::new(Mutex::new(HashMap::new()));
     let cancel = CancelToken::new();
+    let scope = Arc::new(TurnScope::new(cancel.clone(), daemon_interaction_timeout()));
     let cancel_reported = Arc::new(AtomicBool::new(false));
     let user_prompt_persisted = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(Mutex::new(TurnProgress::default()));
@@ -5642,14 +5689,12 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 cancel: cancel.clone(),
                 cancel_reported: cancel_reported.clone(),
                 user_prompt_persisted: user_prompt_persisted.clone(),
-                pending: pending.clone(),
-                pending_questions: pending_questions.clone(),
+                scope: scope.clone(),
                 progress: progress.clone(),
             },
         );
     }
 
-    let state_for_thread = state.clone();
     let turn_id_thread = turn_id.clone();
     let turn_id_resp = turn_id.clone();
     let channel_thread = channel.clone();
@@ -5692,7 +5737,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     None,
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
         };
@@ -5708,7 +5753,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     None,
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
         };
@@ -5773,7 +5818,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                         None,
                         None,
                     );
-                    setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                     return;
                 }
             }
@@ -5787,6 +5832,13 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 scope.turn_id.clone(),
             );
         }
+        app_state.set_current_turn_context(puffer_core::CurrentTurnContext {
+            turn_id: turn_id_thread.clone(),
+            session_id: session_id_for_thread.clone(),
+            task_id: monitor_reply_scope_for_thread
+                .as_ref()
+                .map(|s| s.task_id.clone()),
+        });
         // Issue #560: reconcile the model's view of the browser with the real
         // tab registry every turn, instead of letting it trust stale
         // `connected:true` tool output replayed from the transcript.
@@ -5806,7 +5858,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 None,
                 None,
             );
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+            finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
             return;
         }
         match persist_explicit_turn_routing(
@@ -5834,7 +5886,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     None,
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
         }
@@ -5854,7 +5906,11 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 &user_prompt_persisted_thread,
                 &progress_thread,
             );
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+            finish_turn(
+                &setup_state,
+                &turn_id_thread,
+                TurnFinishReason::CancelledByUser,
+            );
             return;
         }
         app_state.set_exact_media_discovery_cache(setup_state.exact_media_discovery_cache(&inputs));
@@ -5891,7 +5947,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     None,
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
             let _ = inputs
@@ -5937,7 +5993,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 None,
                 Some("attachment-hydration"),
             );
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+            finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
             return;
         }
 
@@ -6108,7 +6164,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
         let perm_state = setup_state.clone();
         let perm_channel = channel_thread.clone();
         let perm_turn = turn_id_thread.clone();
-        let perm_pending = pending.clone();
+        let perm_scope = scope.clone();
         let perm_actor = stream_actor.clone();
         let perm_cancel = cancel.clone();
         let on_permission = move |req: PermissionPromptRequest| -> PermissionPromptAction {
@@ -6119,8 +6175,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 return PermissionPromptAction::Deny;
             }
             let request_id = next_req_id.fetch_add(1, Ordering::SeqCst).to_string();
-            let (tx, rx) = std::sync::mpsc::channel();
-            perm_pending.lock().unwrap().insert(request_id.clone(), tx);
+            let rx = perm_scope.register_permission(request_id.clone());
 
             perm_state.publish_event(ServerEnvelope::Event {
                 event: perm_channel.clone(),
@@ -6139,13 +6194,18 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 ),
             });
 
-            rx.recv().unwrap_or(PermissionPromptAction::Deny)
+            match perm_scope.wait_permission(&request_id, rx) {
+                PendingWait::Resolved(action) => action,
+                PendingWait::TimedOut | PendingWait::Cancelled | PendingWait::Released => {
+                    PermissionPromptAction::Deny
+                }
+            }
         };
 
         let question_state = setup_state.clone();
         let question_channel = channel_thread.clone();
         let question_turn = turn_id_thread.clone();
-        let question_pending = pending_questions.clone();
+        let question_scope = scope.clone();
         let question_next_id = setup_state.next_request_id.clone();
         let question_actor = stream_actor.clone();
         let question_cancel = cancel.clone();
@@ -6161,11 +6221,7 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 };
             }
             let request_id = question_next_id.fetch_add(1, Ordering::SeqCst).to_string();
-            let (tx, rx) = std::sync::mpsc::channel();
-            question_pending
-                .lock()
-                .unwrap()
-                .insert(request_id.clone(), tx);
+            let rx = question_scope.register_user_question(request_id.clone());
 
             question_state.publish_event(ServerEnvelope::Event {
                 event: question_channel.clone(),
@@ -6181,10 +6237,18 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                 ),
             });
 
-            rx.recv().unwrap_or(UserQuestionPromptResponse {
-                answers: serde_json::Map::new(),
-                annotations: serde_json::Map::new(),
-            })
+            match question_scope.wait_user_question(&request_id, rx) {
+                PendingWait::Resolved(response) => response,
+                PendingWait::TimedOut | PendingWait::Cancelled | PendingWait::Released => {
+                    UserQuestionPromptResponse {
+                        answers: serde_json::Map::new(),
+                        annotations: serde_json::Map::from_iter([(
+                            "_puffer_interaction_status".to_string(),
+                            serde_json::Value::String("timeout_or_cancelled".to_string()),
+                        )]),
+                    }
+                }
+            }
         };
 
         let mut auth_store = inputs.auth_store.clone();
@@ -6205,14 +6269,15 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
             )
         });
 
+        let mut finish_reason = TurnFinishReason::Complete;
         match outcome {
             Ok(turn) => {
                 if cancel_reported_thread.load(Ordering::SeqCst) {
-                    state_for_thread
-                        .turns
-                        .lock()
-                        .unwrap()
-                        .remove(&turn_id_thread);
+                    finish_turn(
+                        &setup_state,
+                        &turn_id_thread,
+                        TurnFinishReason::CancelledByUser,
+                    );
                     return;
                 }
                 if !turn.assistant_text.is_empty() {
@@ -6276,11 +6341,11 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
             }
             Err(err) => {
                 if cancel_reported_thread.load(Ordering::SeqCst) {
-                    state_for_thread
-                        .turns
-                        .lock()
-                        .unwrap()
-                        .remove(&turn_id_thread);
+                    finish_turn(
+                        &setup_state,
+                        &turn_id_thread,
+                        TurnFinishReason::CancelledByUser,
+                    );
                     return;
                 }
                 eprintln!("turn {turn_id_thread} failed: {err:#}");
@@ -6306,14 +6371,11 @@ async fn start_turn(state: Arc<DaemonState>, params: Value) -> Result<Value> {
                     Some(raw),
                     Some(category),
                 );
+                finish_reason = TurnFinishReason::Error;
             }
         }
 
-        state_for_thread
-            .turns
-            .lock()
-            .unwrap()
-            .remove(&turn_id_thread);
+        finish_turn(&setup_state, &turn_id_thread, finish_reason);
     });
 
     Ok(json!({"turnId": turn_id_resp}))
@@ -6342,12 +6404,8 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
     let session_uuid = Uuid::parse_str(&session_id).context("invalid sessionId")?;
     let turn_id = Uuid::new_v4().to_string();
     let channel = format!("session:{session_id}:event");
-    let pending: Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<PermissionPromptAction>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let pending_questions: Arc<
-        Mutex<HashMap<String, std::sync::mpsc::Sender<UserQuestionPromptResponse>>>,
-    > = Arc::new(Mutex::new(HashMap::new()));
     let cancel = CancelToken::new();
+    let scope = Arc::new(TurnScope::new(cancel.clone(), daemon_interaction_timeout()));
     let cancel_reported = Arc::new(AtomicBool::new(false));
     let user_prompt_persisted = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(Mutex::new(TurnProgress::default()));
@@ -6371,8 +6429,7 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
                 cancel: cancel.clone(),
                 cancel_reported: cancel_reported.clone(),
                 user_prompt_persisted: user_prompt_persisted.clone(),
-                pending: pending.clone(),
-                pending_questions: pending_questions.clone(),
+                scope: scope.clone(),
                 progress: progress.clone(),
             },
         );
@@ -6404,7 +6461,7 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
                     None,
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
         };
@@ -6420,7 +6477,7 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
                     None,
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
         };
@@ -6434,6 +6491,11 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
             .unwrap_or(session_uuid)
             .to_string();
         let mut app_state = AppState::from_session_record(cfg_for_turn, record);
+        app_state.set_current_turn_context(puffer_core::CurrentTurnContext {
+            turn_id: turn_id_thread.clone(),
+            session_id: session_id_for_thread.clone(),
+            task_id: None,
+        });
         app_state.browser_status = browser_status_for_turn(
             &turn_browser_tab_context(&setup_state, &browser_root_session_id),
             session_used_browser,
@@ -6443,7 +6505,7 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
         let question_state = setup_state.clone();
         let question_channel = channel_thread.clone();
         let question_turn = turn_id_thread.clone();
-        let question_pending = pending_questions.clone();
+        let question_scope = scope.clone();
         let question_next_id = next_req_id.clone();
         let question_actor = stream_actor.clone();
         let question_cancel = cancel.clone();
@@ -6459,11 +6521,7 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
                 };
             }
             let request_id = question_next_id.fetch_add(1, Ordering::SeqCst).to_string();
-            let (tx, rx) = std::sync::mpsc::channel();
-            question_pending
-                .lock()
-                .unwrap()
-                .insert(request_id.clone(), tx);
+            let rx = question_scope.register_user_question(request_id.clone());
 
             question_state.publish_event(ServerEnvelope::Event {
                 event: question_channel.clone(),
@@ -6479,10 +6537,18 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
                 ),
             });
 
-            rx.recv().unwrap_or(UserQuestionPromptResponse {
-                answers: serde_json::Map::new(),
-                annotations: serde_json::Map::new(),
-            })
+            match question_scope.wait_user_question(&request_id, rx) {
+                PendingWait::Resolved(response) => response,
+                PendingWait::TimedOut | PendingWait::Cancelled | PendingWait::Released => {
+                    UserQuestionPromptResponse {
+                        answers: serde_json::Map::new(),
+                        annotations: serde_json::Map::from_iter([(
+                            "_puffer_interaction_status".to_string(),
+                            serde_json::Value::String("timeout_or_cancelled".to_string()),
+                        )]),
+                    }
+                }
+            }
         };
 
         let mut auth_store = inputs.auth_store.clone();
@@ -6499,7 +6565,7 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
             )
         });
 
-        match outcome {
+        let finish_reason = match outcome {
             Ok(()) => {
                 let assistant_text = app_state
                     .transcript
@@ -6529,6 +6595,7 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
                         "sessionId": session_id_for_thread.clone(),
                     }),
                 });
+                TurnFinishReason::Complete
             }
             Err(err) => {
                 eprintln!("slash command {turn_id_thread} failed: {err:#}");
@@ -6544,17 +6611,18 @@ async fn start_slash_command_turn(state: Arc<DaemonState>, params: Value) -> Res
                     None,
                     None,
                 );
+                TurnFinishReason::Error
             }
-        }
+        };
 
         let _ = (
             cancel.clone(),
             cancel_reported.clone(),
             user_prompt_persisted.clone(),
             progress.clone(),
-            pending.clone(),
+            scope.clone(),
         );
-        setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+        finish_turn(&setup_state, &turn_id_thread, finish_reason);
     });
 
     Ok(json!({"turnId": turn_id_resp}))
@@ -6569,12 +6637,8 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
         .to_string();
     let connect_args = connector_setup_connect_args(&message)?;
     let channel = format!("connector-setup:{turn_id}:event");
-    let pending: Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<PermissionPromptAction>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let pending_questions: Arc<
-        Mutex<HashMap<String, std::sync::mpsc::Sender<UserQuestionPromptResponse>>>,
-    > = Arc::new(Mutex::new(HashMap::new()));
     let cancel = CancelToken::new();
+    let scope = Arc::new(TurnScope::new(cancel.clone(), daemon_interaction_timeout()));
     let cancel_reported = Arc::new(AtomicBool::new(false));
     let user_prompt_persisted = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(Mutex::new(TurnProgress::default()));
@@ -6595,8 +6659,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                 cancel: cancel.clone(),
                 cancel_reported: cancel_reported.clone(),
                 user_prompt_persisted,
-                pending,
-                pending_questions: pending_questions.clone(),
+                scope: scope.clone(),
                 progress,
             },
         );
@@ -6623,7 +6686,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                 turn_id_thread.clone(),
                 connect_args.clone(),
                 next_req_id.clone(),
-                pending_questions.clone(),
+                scope.clone(),
                 cancel_thread.clone(),
             );
             match outcome {
@@ -6636,6 +6699,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             "assistantText": assistant_text,
                         }),
                     });
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Complete);
                 }
                 Err(error) => {
                     if !(cancel_thread.is_cancelled()
@@ -6649,9 +6713,9 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             None,
                         );
                     }
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 }
             }
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
             return;
         }
 
@@ -6662,7 +6726,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                 turn_id_thread.clone(),
                 connect_args.clone(),
                 next_req_id.clone(),
-                pending_questions.clone(),
+                scope.clone(),
                 cancel_thread.clone(),
             );
             match outcome {
@@ -6675,6 +6739,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             "assistantText": assistant_text,
                         }),
                     });
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Complete);
                 }
                 Err(error) => {
                     if !(cancel_thread.is_cancelled()
@@ -6688,9 +6753,9 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             None,
                         );
                     }
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 }
             }
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
             return;
         }
 
@@ -6701,7 +6766,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                 turn_id_thread.clone(),
                 connect_args.clone(),
                 next_req_id.clone(),
-                pending_questions.clone(),
+                scope.clone(),
                 cancel_thread.clone(),
             );
             match outcome {
@@ -6714,6 +6779,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             "assistantText": assistant_text,
                         }),
                     });
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Complete);
                 }
                 Err(error) => {
                     if !(cancel_thread.is_cancelled()
@@ -6727,9 +6793,9 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             None,
                         );
                     }
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 }
             }
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
             return;
         }
 
@@ -6740,7 +6806,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                 turn_id_thread.clone(),
                 connect_args.clone(),
                 next_req_id.clone(),
-                pending_questions.clone(),
+                scope.clone(),
                 cancel_thread.clone(),
             );
             match outcome {
@@ -6753,6 +6819,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             "assistantText": assistant_text,
                         }),
                     });
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Complete);
                 }
                 Err(error) => {
                     if !(cancel_thread.is_cancelled()
@@ -6766,9 +6833,9 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             None,
                         );
                     }
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 }
             }
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
             return;
         }
 
@@ -6779,7 +6846,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                 turn_id_thread.clone(),
                 connect_args.clone(),
                 next_req_id.clone(),
-                pending_questions.clone(),
+                scope.clone(),
                 cancel_thread.clone(),
             );
             match outcome {
@@ -6792,6 +6859,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             "assistantText": assistant_text,
                         }),
                     });
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Complete);
                 }
                 Err(error) => {
                     if !(cancel_thread.is_cancelled()
@@ -6805,9 +6873,9 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                             None,
                         );
                     }
+                    finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 }
             }
-            setup_state.turns.lock().unwrap().remove(&turn_id_thread);
             return;
         }
 
@@ -6821,19 +6889,24 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                     format!("build_runtime_inputs: {err:#}"),
                     None,
                 );
-                setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+                finish_turn(&setup_state, &turn_id_thread, TurnFinishReason::Error);
                 return;
             }
         };
         let cfg_for_turn = setup_state.config.lock().unwrap().clone();
         let metadata = connector_setup_session_metadata(setup_state.cwd.clone(), Uuid::new_v4());
         let mut app_state = AppState::new(cfg_for_turn, setup_state.cwd.clone(), metadata);
+        app_state.set_current_turn_context(puffer_core::CurrentTurnContext {
+            turn_id: turn_id_thread.clone(),
+            session_id: turn_id_thread.clone(),
+            task_id: None,
+        });
         let stream_actor = app_state.system_actor();
 
         let question_state = setup_state.clone();
         let question_channel = channel_thread.clone();
         let question_turn = turn_id_thread.clone();
-        let question_pending = pending_questions.clone();
+        let question_scope = scope.clone();
         let question_next_id = next_req_id.clone();
         let question_actor = stream_actor.clone();
         let question_cancel = cancel.clone();
@@ -6849,11 +6922,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                 };
             }
             let request_id = question_next_id.fetch_add(1, Ordering::SeqCst).to_string();
-            let (tx, rx) = std::sync::mpsc::channel();
-            question_pending
-                .lock()
-                .unwrap()
-                .insert(request_id.clone(), tx);
+            let rx = question_scope.register_user_question(request_id.clone());
 
             question_state.publish_event(ServerEnvelope::Event {
                 event: question_channel.clone(),
@@ -6869,10 +6938,18 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                 ),
             });
 
-            rx.recv().unwrap_or(UserQuestionPromptResponse {
-                answers: serde_json::Map::new(),
-                annotations: serde_json::Map::new(),
-            })
+            match question_scope.wait_user_question(&request_id, rx) {
+                PendingWait::Resolved(response) => response,
+                PendingWait::TimedOut | PendingWait::Cancelled | PendingWait::Released => {
+                    UserQuestionPromptResponse {
+                        answers: serde_json::Map::new(),
+                        annotations: serde_json::Map::from_iter([(
+                            "_puffer_interaction_status".to_string(),
+                            serde_json::Value::String("timeout_or_cancelled".to_string()),
+                        )]),
+                    }
+                }
+            }
         };
 
         let outcome = with_user_question_prompt_handler(on_user_question, || {
@@ -6882,7 +6959,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
             Ok::<_, anyhow::Error>(turn)
         });
 
-        match outcome {
+        let finish_reason = match outcome {
             Ok(turn) => {
                 setup_state.publish_event(ServerEnvelope::Event {
                     event: channel_thread.clone(),
@@ -6895,6 +6972,7 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                         &stream_actor,
                     ),
                 });
+                TurnFinishReason::Complete
             }
             Err(error) => {
                 if !(cancel_thread.is_cancelled() && cancel_reported_thread.load(Ordering::SeqCst))
@@ -6907,9 +6985,10 @@ async fn start_connector_setup_turn(state: Arc<DaemonState>, params: Value) -> R
                         None,
                     );
                 }
+                TurnFinishReason::Error
             }
-        }
-        setup_state.turns.lock().unwrap().remove(&turn_id_thread);
+        };
+        finish_turn(&setup_state, &turn_id_thread, finish_reason);
     });
 
     Ok(json!({"turnId": turn_id_resp, "setupId": turn_id_resp}))
@@ -7483,17 +7562,18 @@ mod tests {
         append_ordered_turn_progress, apply_daemon_yolo_mode, apply_proxy_env_at_startup,
         apply_turn_model_override, apply_turn_request_options, browser_launch_settings_or_default,
         browser_permission_payload_json, browser_status_for_turn, cancel_all_active_turns,
-        connector_setup_connect_args, connector_setup_id, daemon_now_ms, desktop_latency_ms,
-        file_media_mime_type, generated_video_handler, handle_create_file_media_access,
-        handle_create_generated_video_access, handle_create_openai_realtime_client_secret,
-        handle_create_session, handle_generate_media, handle_import_external_credential,
-        handle_list_lambda_skill_libraries, handle_list_media_capabilities,
-        handle_list_permissions, handle_list_provider_models, handle_load_session_detail,
-        handle_local_model_status, handle_login_with_api_key, handle_logout_provider,
-        handle_read_generated_media_preview, handle_remove_lambda_skill_library,
-        handle_save_lambda_skill_library, handle_save_permissions, handle_save_proxy_settings,
-        handle_set_lambda_skill_approval, handle_set_lambda_skill_enabled, handle_update_config,
-        model_descriptor_dto, parse_single_byte_range, permission_review_payload_json,
+        connector_setup_connect_args, connector_setup_id, daemon_interaction_timeout,
+        daemon_now_ms, desktop_latency_ms, file_media_mime_type, generated_video_handler,
+        handle_create_file_media_access, handle_create_generated_video_access,
+        handle_create_openai_realtime_client_secret, handle_create_session, handle_generate_media,
+        handle_import_external_credential, handle_list_lambda_skill_libraries,
+        handle_list_media_capabilities, handle_list_permissions, handle_list_provider_models,
+        handle_load_session_detail, handle_local_model_status, handle_login_with_api_key,
+        handle_logout_provider, handle_read_generated_media_preview,
+        handle_remove_lambda_skill_library, handle_save_lambda_skill_library,
+        handle_save_permissions, handle_save_proxy_settings, handle_set_lambda_skill_approval,
+        handle_set_lambda_skill_enabled, handle_update_config, model_descriptor_dto,
+        parse_single_byte_range, permission_review_payload_json,
         realtime_session_config_from_params, report_cancelled_turn, requires_explicit_subscription,
         resolve_create_session_model_id, resolve_monitor_reply_turn_scope, run_off_runtime,
         session_used_browser_tool, start_connector_setup_turn, turn_browser_tab_context,
@@ -7502,6 +7582,7 @@ mod tests {
         TurnHandle, TurnProgress, TurnProgressItem, TurnRequestOptions,
         MONITOR_REPLY_ACTION_PROMPT_SCOPE,
     };
+    use crate::daemon_turn_scope::TurnScope;
     use axum::{
         extract::{Path as AxumPath, State},
         http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -7518,7 +7599,7 @@ mod tests {
     };
     use puffer_session_store::{SessionMetadata, SessionStore, TranscriptEvent, TurnBoundaryState};
     use serde_json::{json, Value};
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -8068,11 +8149,10 @@ models: []
             channel: "agent".to_string(),
             message: String::new(),
             attachments: Vec::new(),
-            cancel,
+            cancel: cancel.clone(),
             cancel_reported: Arc::new(AtomicBool::new(false)),
             user_prompt_persisted: Arc::new(AtomicBool::new(false)),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            pending_questions: Arc::new(Mutex::new(HashMap::new())),
+            scope: Arc::new(TurnScope::new(cancel, daemon_interaction_timeout())),
             progress: Arc::new(Mutex::new(TurnProgress::default())),
         }
     }

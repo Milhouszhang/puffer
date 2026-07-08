@@ -38,6 +38,7 @@ mod daemon_telegram_ranking;
 mod daemon_title;
 mod daemon_turn_recovery;
 mod daemon_turn_routing;
+mod daemon_turn_scope;
 mod daemon_ui_state;
 #[cfg(unix)]
 mod daemon_wechat_browser_setup;

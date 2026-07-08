@@ -265,16 +265,33 @@ fn execute_connector_act_with_dispatcher(
             parsed.action
         )
     })?;
+    let turn_context = state.current_turn_context().cloned();
+    let origin_session_id = turn_context
+        .as_ref()
+        .map(|c| c.session_id.clone())
+        .unwrap_or_else(|| state.session.id.to_string());
+    let origin_turn_id = turn_context
+        .as_ref()
+        .map(|c| c.turn_id.clone())
+        .or_else(|| {
+            state
+                .monitor_reply_scope
+                .as_ref()
+                .map(|s| s.turn_id.clone())
+        });
+    let origin_task_id = turn_context
+        .as_ref()
+        .and_then(|c| c.task_id.clone())
+        .or_else(|| {
+            state
+                .monitor_reply_scope
+                .as_ref()
+                .map(|s| s.task_id.clone())
+        });
     let origin = SendOrigin::LlmInitiated {
-        session_id: state.session.id.to_string(),
-        turn_id: state
-            .monitor_reply_scope
-            .as_ref()
-            .map(|scope| scope.turn_id.clone()),
-        task_id: state
-            .monitor_reply_scope
-            .as_ref()
-            .map(|scope| scope.task_id.clone()),
+        session_id: origin_session_id,
+        turn_id: origin_turn_id,
+        task_id: origin_task_id,
     };
     let decision = puffer_subscriptions::outbound_gate::evaluate(
         &origin,
@@ -299,6 +316,31 @@ fn execute_connector_act_with_dispatcher(
             parsed.connector_slug,
             parsed.action
         );
+    }
+    // Charge the per-turn outbound budget only for ungated *external* sends
+    // (gate returned Allowed AND the action has an external side effect — i.e.
+    // the Telegram `react` whitelist). Internal actions and rule automation are
+    // never charged (rule automation never reaches this LLM-initiated path).
+    if let Some(ctx) = &turn_context {
+        let is_external = puffer_subscriptions::outbound_gate::effective_action_permission(
+            &parsed.connector_slug,
+            &template,
+            &parsed.action,
+        )
+        .map(|permission| permission.external_side_effect)
+        .unwrap_or(false);
+        if is_external {
+            use crate::runtime::outbound_budget::{budget_registry, OutboundBudgetKind};
+            budget_registry()
+                .charge(&ctx.turn_id, OutboundBudgetKind::UngatedExternal)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "outbound external-action quota exceeded for this turn ({} sends). \
+                         Slow down; do not keep firing external actions.",
+                        crate::runtime::outbound_budget::UNGATED_EXTERNAL_LIMIT_PER_TURN
+                    )
+                })?;
+        }
     }
     let connection = parsed
         .connection_slug
@@ -443,13 +485,30 @@ pub fn execute_connector_action_draft(
             action
         )
     })?;
+    let turn_context = state.current_turn_context().cloned();
+    let origin_session_id = turn_context
+        .as_ref()
+        .map(|c| c.session_id.clone())
+        .unwrap_or_else(|| state.session.id.to_string());
+    let origin_turn_id = turn_context
+        .as_ref()
+        .map(|c| c.turn_id.clone())
+        .or_else(|| {
+            state
+                .monitor_reply_scope
+                .as_ref()
+                .map(|s| s.turn_id.clone())
+        });
+    // A draft's task binding is ONLY the model-supplied `task_id` (already
+    // scope-validated above). We deliberately do NOT fall back to the turn
+    // context or monitor scope: omitting `task_id` means a free-form send that
+    // is not tied to the task (plan-05 spec test-matrix item 4). Auto-stamping
+    // the scope's task here would relax the human-gated outbound semantics.
+    let origin_task_id = parsed.task_id.clone();
     let origin = SendOrigin::LlmInitiated {
-        session_id: state.session.id.to_string(),
-        turn_id: state
-            .monitor_reply_scope
-            .as_ref()
-            .map(|scope| scope.turn_id.clone()),
-        task_id: parsed.task_id.clone(),
+        session_id: origin_session_id.clone(),
+        turn_id: origin_turn_id.clone(),
+        task_id: origin_task_id.clone(),
     };
     let decision =
         puffer_subscriptions::outbound_gate::evaluate(&origin, &connector_slug, &template, &action);
@@ -469,6 +528,20 @@ pub fn execute_connector_action_draft(
     ensure_connector_action_draft_connection(&manager, &connector_slug, &connection)?;
     let message = draft_message_text(&action_input)
         .context("ConnectorActionDraft requires a message body")?;
+    // Charge the per-turn draft budget after gate/validation so rejected inputs
+    // don't consume budget. Existing drafts await human review; don't pile on.
+    if let Some(ctx) = &turn_context {
+        use crate::runtime::outbound_budget::{budget_registry, OutboundBudgetKind};
+        budget_registry()
+            .charge(&ctx.turn_id, OutboundBudgetKind::Draft)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "outbound draft quota exceeded for this turn ({} drafts). \
+                     Existing drafts are pending human review; do not create more.",
+                    crate::runtime::outbound_budget::DRAFT_LIMIT_PER_TURN
+                )
+            })?;
+    }
     let paths = ConfigPaths::discover(cwd);
     let store = OutboundStore::load(outbound_actions_path(&paths))?;
     let action_record = store.create_draft(NewOutboundDraft {
@@ -480,12 +553,9 @@ pub fn execute_connector_action_draft(
         recipient_source,
         message,
         origin: OutboundOrigin {
-            session_id: state.session.id.to_string(),
-            turn_id: state
-                .monitor_reply_scope
-                .as_ref()
-                .map(|scope| scope.turn_id.clone()),
-            task_id: parsed.task_id.clone(),
+            session_id: origin_session_id.clone(),
+            turn_id: origin_turn_id.clone(),
+            task_id: origin_task_id.clone(),
         },
         ttl_ms: None,
     })?;
@@ -1474,6 +1544,42 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("sha256:"));
+    }
+
+    #[test]
+    fn connector_action_draft_stamps_turn_id_from_current_turn_context() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_override = set_puffer_home_override(home.path());
+        let connection_slug = "telegram-user-draft-ctx";
+        ensure_connected_test_connection(connection_slug, "telegram-login");
+        let (mut state, tmp) = make_state();
+        state.set_current_turn_context(crate::CurrentTurnContext {
+            turn_id: "turn-1".into(),
+            session_id: state.session.id.to_string(),
+            task_id: None,
+        });
+
+        let raw = execute_connector_action_draft(
+            &mut state,
+            tmp.path(),
+            json!({
+                "connector_slug": "telegram-login",
+                "connection_slug": connection_slug,
+                "action": "send_message",
+                "input": {
+                    "chat_id": 123456789,
+                    "message": "stamped by turn context"
+                }
+            }),
+        )
+        .expect("draft should be saved");
+        let payload: Value = serde_json::from_str(&raw).unwrap();
+        let draft_id = payload["draft"]["id"].as_str().expect("draft id");
+
+        let paths = ConfigPaths::discover(tmp.path());
+        let store = OutboundStore::load(outbound_actions_path(&paths)).unwrap();
+        let action = store.get(draft_id).unwrap().expect("draft persisted");
+        assert_eq!(action.origin.turn_id.as_deref(), Some("turn-1"));
     }
 
     #[test]

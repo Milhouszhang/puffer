@@ -48,6 +48,7 @@ mod microcompact;
 mod openai;
 mod openai_sse;
 mod openai_ws;
+pub mod outbound_budget;
 pub(crate) mod overflow;
 mod permission_prompt;
 mod plan_events;

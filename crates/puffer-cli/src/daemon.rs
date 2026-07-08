@@ -4819,7 +4819,7 @@ fn finish_turn(state: &DaemonState, turn_id: &str, reason: TurnFinishReason) {
         reason.as_str(),
         daemon_child_drain_timeout(),
     );
-    // puffer_core::runtime::outbound_budget::budget_registry().clear_turn(turn_id); // enabled in outbound-budget task
+    puffer_core::outbound_budget::budget_registry().clear_turn(turn_id);
     if report.pending_permissions_resolved + report.pending_questions_resolved > 0
         || child_report.stop_requested + child_report.abandoned > 0
     {

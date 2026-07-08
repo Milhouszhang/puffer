@@ -78,6 +78,7 @@ pub use runtime::install_subscription_manager;
 pub use runtime::invalidate_copilot_bearer;
 pub use runtime::lambda_gate::LambdaHostConcreteToolBinding;
 pub use runtime::mcp_discovery;
+pub use runtime::outbound_budget;
 pub use runtime::quota::{QuotaError, QuotaErrorKind, QUOTA_EXIT_CODE};
 pub use runtime::resource_watcher;
 pub use runtime::resource_watcher::ResourceWatcher;

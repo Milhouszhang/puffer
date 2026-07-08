@@ -491,15 +491,6 @@ impl BackgroundTaskManager {
         report
     }
 
-    /// Marks a task as stopped (cancelled).
-    pub fn stop(&self, task_id: &str) {
-        let mut tasks = self.tasks.lock().unwrap();
-        if let Some(task) = tasks.get_mut(task_id) {
-            task.info.status = BackgroundTaskStatus::Stopped;
-            task.info.completed_at = Some(now_ms());
-        }
-    }
-
     /// Returns a snapshot of the task info, if it exists.
     pub fn get_info(&self, task_id: &str) -> Option<BackgroundTaskInfo> {
         let tasks = self.tasks.lock().unwrap();

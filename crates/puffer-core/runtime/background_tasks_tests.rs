@@ -326,7 +326,10 @@ fn task_manager_stop_then_complete_is_idempotent() {
     let mgr = BackgroundTaskManager::new();
     let _ = mgr.register("s1", "stop test", None, None, false);
 
-    mgr.stop("s1");
+    // request_stop marks the task Stopping; the worker ack (`complete`) then
+    // converges it to the terminal Stopped state.
+    mgr.request_stop("s1");
+    mgr.complete("s1", true);
     let info = mgr.get_info("s1").unwrap();
     assert_eq!(info.status, BackgroundTaskStatus::Stopped);
     assert_eq!(mgr.active_count(), 0);
@@ -375,7 +378,7 @@ fn task_manager_has_capacity_reflects_limit() {
     }
     assert!(!mgr.has_capacity());
 
-    mgr.stop("c-0");
+    mgr.complete("c-0", true);
     assert!(mgr.has_capacity());
 }
 

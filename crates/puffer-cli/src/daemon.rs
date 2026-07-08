@@ -4810,9 +4810,8 @@ fn finish_turn(state: &DaemonState, turn_id: &str, reason: TurnFinishReason) {
     let Some(handle) = state.turns.lock().unwrap().get(turn_id).cloned() else {
         return;
     };
-    if !matches!(reason, TurnFinishReason::Complete) {
-        handle.cancel.cancel();
-    }
+    // `scope` shares the handle's cancel token, and `finish` flips it for every
+    // non-`Complete` reason — so cancellation is owned there, not duplicated here.
     let report = handle.scope.finish(reason);
     let child_report = puffer_core::background_tasks::task_manager().stop_scoped_by_turn(
         turn_id,

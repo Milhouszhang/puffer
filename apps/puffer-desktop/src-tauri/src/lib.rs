@@ -434,21 +434,46 @@ fn run_agent_turn(
 
 #[tauri::command]
 fn resolve_permission(
-    _turn_id: String,
-    _request_id: String,
-    _action: String,
+    app: AppHandle,
+    state: State<'_, SharedBackend>,
+    turn_id: String,
+    request_id: String,
+    action: String,
 ) -> Result<(), String> {
-    Ok(())
+    backend_call(
+        app,
+        state,
+        "resolve_permission",
+        json!({
+            "turnId": turn_id,
+            "requestId": request_id,
+            "action": action,
+        }),
+    )
+    .map(|_| ())
 }
 
 #[tauri::command]
 fn resolve_user_question(
-    _turn_id: String,
-    _request_id: String,
-    _answers: Value,
-    _annotations: Value,
+    app: AppHandle,
+    state: State<'_, SharedBackend>,
+    turn_id: String,
+    request_id: String,
+    answers: Value,
+    annotations: Value,
 ) -> Result<(), String> {
-    Ok(())
+    backend_call(
+        app,
+        state,
+        "resolve_user_question",
+        json!({
+            "turnId": turn_id,
+            "requestId": request_id,
+            "answers": answers,
+            "annotations": annotations,
+        }),
+    )
+    .map(|_| ())
 }
 
 #[tauri::command]

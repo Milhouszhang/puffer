@@ -2308,14 +2308,8 @@ export async function resolvePermission(
   requestId: string,
   action: PermissionAction
 ): Promise<void> {
-  try {
-    const client = await ensureLocalDaemonClient();
-    await client.request("resolve_permission", { turnId, requestId, action });
-    return;
-  } catch (daemonError) {
-    if (!canInvokeTauri()) throw daemonError;
-    await invoke("resolve_permission", { turnId, requestId, action });
-  }
+  const client = await ensureLocalDaemonClient();
+  await client.request("resolve_permission", { turnId, requestId, action });
 }
 
 /** Resolves a pending AskUserQuestion prompt for an in-flight turn. */
@@ -2325,14 +2319,8 @@ export async function resolveUserQuestion(
   answers: UserQuestionAnswers,
   annotations: UserQuestionAnnotations = {}
 ): Promise<void> {
-  try {
-    const client = await ensureLocalDaemonClient();
-    await client.request("resolve_user_question", { turnId, requestId, answers, annotations });
-    return;
-  } catch (daemonError) {
-    if (!canInvokeTauri()) throw daemonError;
-    await invoke("resolve_user_question", { turnId, requestId, answers, annotations });
-  }
+  const client = await ensureLocalDaemonClient();
+  await client.request("resolve_user_question", { turnId, requestId, answers, annotations });
 }
 
 /** Best-effort cancel: the current model/tool step completes then the turn

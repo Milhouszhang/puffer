@@ -294,7 +294,9 @@ impl BackendState {
             | "workflow_runs_list"
             | "workflow_run_show" => workflow_runtime_unavailable(method),
             "run_agent_turn" => self.run_agent_turn(events.clone(), params),
-            "resolve_permission" | "resolve_user_question" => Ok(json!({})),
+            "resolve_permission" | "resolve_user_question" => anyhow::bail!(
+                "{method} requires the daemon turn lifecycle; the in-process backend does not host interactive turns"
+            ),
             "cancel_turn" => {
                 let turn_id = string_param(&params, &["turnId", "turn_id"])?;
                 if let Some(flag) = self.turns.lock().unwrap().get(&turn_id) {
@@ -2322,6 +2324,22 @@ mod tests {
     use std::ffi::OsString;
 
     static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resolver_methods_error_instead_of_noop_success() {
+        let backend = BackendState::new();
+        for method in ["resolve_permission", "resolve_user_question"] {
+            let result = backend.handle(
+                EventEmitter::websocket_only(),
+                method,
+                serde_json::json!({
+                    "turnId": "missing-turn",
+                    "requestId": "missing-request"
+                }),
+            );
+            assert!(result.is_err(), "{method} must not silently succeed");
+        }
+    }
 
     #[test]
     fn generate_media_result_serializes_artifacts_array() {

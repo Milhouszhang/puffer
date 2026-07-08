@@ -120,6 +120,7 @@ pub(crate) fn execute_tool(
                 .unwrap_or_else(puffer_media::ExactMediaDiscoveryCache::empty);
             let session_id = state.session.id;
             let process_store = state.process_store.clone();
+            let turn_context = state.current_turn_context().cloned();
             let mut internal_permission_handler = |request| match request {
                 bash_internal_permissions::InternalToolBrokerRequest::Permission(request) => {
                     bash_internal_permissions::InternalToolBrokerResponse::Permission(
@@ -149,6 +150,7 @@ pub(crate) fn execute_tool(
                 input,
                 Some(&process_store),
                 Some(&mut internal_permission_handler),
+                turn_context,
             )?;
             let output = serde_json::to_string_pretty(&execution.output)
                 .context("failed to serialize Bash output")?;
@@ -394,6 +396,7 @@ pub(crate) fn execute_parallel_bash_with_media_broker(
         args,
         media_ctx.process_store,
         Some(&mut handler),
+        None,
     )?;
     let output = serde_json::to_string_pretty(&execution.output)
         .context("failed to serialize Bash output")?;

@@ -2437,6 +2437,20 @@ pub(super) fn execute_task_stop(state: &mut AppState, _cwd: &Path, input: Value)
         }))?);
     }
 
+    if let Some(info) = crate::runtime::background_tasks::task_manager().request_stop(&target) {
+        use crate::runtime::background_tasks::BackgroundTaskKind;
+        return Ok(serde_json::to_string_pretty(&json!({
+            "message": format!("Successfully stopped task: {target}"),
+            "task_id": target,
+            "task_type": match info.kind {
+                BackgroundTaskKind::Agent => "agent",
+                BackgroundTaskKind::Shell => "shell",
+            },
+            "status": "stopped",
+            "output_file": info.output_file,
+        }))?);
+    }
+
     let mut agents = load_store::<AgentStore>(&agents_path(store_cwd))?;
     if let Some(agent) = agents
         .agents
@@ -2520,6 +2534,29 @@ pub(super) fn execute_task_output(
             timeout,
         );
     }
+    if let Some(info) = crate::runtime::background_tasks::task_manager().get_info(&parsed.task_id) {
+        let output = crate::runtime::background_tasks::task_manager()
+            .read_output(&parsed.task_id)
+            .unwrap_or_default();
+        let retrieval = if info.status.is_terminal() {
+            "success"
+        } else {
+            "not_ready"
+        };
+        return task_output_response(
+            retrieval,
+            json!({
+                "task_id": info.task_id,
+                "status": format!("{:?}", info.status).to_ascii_lowercase(),
+                "description": info.description,
+                "output": output,
+            }),
+            info.output_file.clone(),
+            block,
+            timeout,
+        );
+    }
+
     let agents = load_store::<AgentStore>(&agents_path(store_cwd))?;
     if let Some(agent) = agents
         .agents

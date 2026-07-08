@@ -73,6 +73,8 @@ pub struct ClaudeBashInput {
     #[serde(default)]
     pub run_in_background: bool,
     #[serde(default)]
+    pub durable: bool,
+    #[serde(default)]
     pub tty: bool,
 }
 
@@ -131,7 +133,7 @@ pub fn execute_from_value(
         &std::sync::Arc<std::sync::Mutex<crate::runtime::process_store::ProcessStore>>,
     >,
 ) -> Result<ClaudeBashExecution> {
-    execute_from_value_with_internal_permissions(cwd, session_id, input, process_store, None)
+    execute_from_value_with_internal_permissions(cwd, session_id, input, process_store, None, None)
 }
 
 /// Parses JSON input and executes Bash with an internal tool permission callback.
@@ -143,10 +145,18 @@ pub(crate) fn execute_from_value_with_internal_permissions(
         &std::sync::Arc<std::sync::Mutex<crate::runtime::process_store::ProcessStore>>,
     >,
     internal_permissions: Option<&mut InternalPermissionHandler<'_>>,
+    turn_context: Option<crate::CurrentTurnContext>,
 ) -> Result<ClaudeBashExecution> {
     let typed: ClaudeBashInput =
         serde_json::from_value(input).context("invalid Bash tool input payload")?;
-    execute_with_internal_permissions(cwd, session_id, typed, process_store, internal_permissions)
+    execute_with_internal_permissions(
+        cwd,
+        session_id,
+        typed,
+        process_store,
+        internal_permissions,
+        turn_context,
+    )
 }
 
 /// Executes a Claude-style `Bash` tool invocation in the provided working directory.
@@ -158,7 +168,7 @@ pub fn execute(
         &std::sync::Arc<std::sync::Mutex<crate::runtime::process_store::ProcessStore>>,
     >,
 ) -> Result<ClaudeBashExecution> {
-    execute_with_internal_permissions(cwd, session_id, input, process_store, None)
+    execute_with_internal_permissions(cwd, session_id, input, process_store, None, None)
 }
 
 fn execute_with_internal_permissions(
@@ -169,6 +179,7 @@ fn execute_with_internal_permissions(
         &std::sync::Arc<std::sync::Mutex<crate::runtime::process_store::ProcessStore>>,
     >,
     internal_permissions: Option<&mut InternalPermissionHandler<'_>>,
+    turn_context: Option<crate::CurrentTurnContext>,
 ) -> Result<ClaudeBashExecution> {
     if input.tty {
         if let Some(store) = process_store {
@@ -176,7 +187,13 @@ fn execute_with_internal_permissions(
         }
     }
     if input.run_in_background {
-        return execute_background(cwd, session_id, input, internal_permissions.is_some());
+        return execute_background(
+            cwd,
+            session_id,
+            input,
+            internal_permissions.is_some(),
+            turn_context,
+        );
     }
     execute_foreground(cwd, input, internal_permissions)
 }
@@ -268,6 +285,7 @@ fn execute_background(
     session_id: &Uuid,
     input: ClaudeBashInput,
     internal_permission_required: bool,
+    turn_context: Option<crate::CurrentTurnContext>,
 ) -> Result<ClaudeBashExecution> {
     let output_dir = shell_output_dir(cwd)?;
     let pending_output_file =
@@ -313,6 +331,32 @@ fn execute_background(
         &output_file,
     )?;
 
+    // Mirror the shell into the owner-aware registry so a finishing turn (or a
+    // TaskStop that reaches the registry branch) can stop it. `let _`: registry
+    // capacity refusal must not fail the shell launch — the store registration
+    // above stays authoritative.
+    {
+        use crate::runtime::background_tasks::{
+            task_manager, BackgroundTaskDurability, BackgroundTaskKind, BackgroundTaskRegistration,
+        };
+        let _ = task_manager().register_with_options(BackgroundTaskRegistration {
+            task_id: task_id.clone(),
+            description: input
+                .description
+                .clone()
+                .unwrap_or_else(|| input.command.clone()),
+            kind: BackgroundTaskKind::Shell,
+            agent_id: None,
+            output_file: Some(output_file.display().to_string()),
+            auto_backgrounded: false,
+            owner_turn_id: turn_context.as_ref().map(|c| c.turn_id.clone()),
+            owner_session_id: turn_context.as_ref().map(|c| c.session_id.clone()),
+            durability: BackgroundTaskDurability::from_durable_flag(input.durable),
+            cancel: None,
+            process_id: Some(pid),
+        });
+    }
+
     // Spawn a reaper thread that calls wait() on the child process.
     // Without this, the child becomes a zombie after exit because nobody
     // collects its exit status.  The reaper also marks the task as completed
@@ -321,8 +365,14 @@ fn execute_background(
     let reaper_cwd = cwd.to_path_buf();
     let reaper_session_id = *session_id;
     let reaper_task_id = task_id.clone();
+    let reaper_registry_task_id = task_id.clone();
     thread::spawn(move || {
         let exit_status = child.wait();
+        let exit_ok = exit_status
+            .as_ref()
+            .ok()
+            .map(|status| status.success())
+            .unwrap_or(false);
         let exit_code = exit_status.ok().and_then(|s| s.code());
         // Best-effort: mark the stored task as completed.
         let _ = super::workflow::mark_shell_task_completed(
@@ -331,6 +381,10 @@ fn execute_background(
             &reaper_task_id,
             exit_code,
         );
+        // Converge the owner-aware registry (guarded by terminal monotonicity —
+        // a prior stop request stays Stopping→Stopped, not overwritten).
+        crate::runtime::background_tasks::task_manager()
+            .complete(&reaper_registry_task_id, exit_ok);
     });
 
     Ok(ClaudeBashExecution {
@@ -639,6 +693,7 @@ mod tests {
             timeout: None,
             description: None,
             run_in_background: false,
+            durable: false,
             tty: false,
         };
         assert_eq!(tool_description(&input), "Run shell command");
@@ -651,6 +706,7 @@ mod tests {
             timeout: None,
             description: Some("Show greeting".to_string()),
             run_in_background: false,
+            durable: false,
             tty: false,
         };
         assert_eq!(tool_description(&input), "Show greeting");
@@ -668,6 +724,7 @@ mod tests {
                     timeout: Some(5_000),
                     description: None,
                     run_in_background: false,
+                    durable: false,
                     tty: false,
                 },
                 None,
@@ -691,6 +748,7 @@ mod tests {
                     timeout: Some(5_000),
                     description: None,
                     run_in_background: false,
+                    durable: false,
                     tty: false,
                 },
                 None,
@@ -713,6 +771,7 @@ mod tests {
                     timeout: Some(5_000),
                     description: None,
                     run_in_background: false,
+                    durable: false,
                     tty: false,
                 },
                 None,
@@ -748,6 +807,7 @@ mod tests {
                     timeout: Some(20),
                     description: None,
                     run_in_background: false,
+                    durable: false,
                     tty: false,
                 },
                 None,
@@ -771,6 +831,7 @@ mod tests {
                     timeout: Some(5_000),
                     description: None,
                     run_in_background: true,
+                    durable: false,
                     tty: false,
                 },
                 None,
@@ -795,6 +856,7 @@ mod tests {
                     timeout: Some(5_000),
                     description: Some("Sleep briefly".to_string()),
                     run_in_background: true,
+                    durable: false,
                     tty: false,
                 },
                 None,
@@ -859,6 +921,7 @@ mod tests {
             timeout: None,
             description: None,
             run_in_background: false,
+            durable: false,
             tty: false,
         };
         let error = summary_line(&input).unwrap_err();
@@ -926,6 +989,7 @@ mod tests {
                     timeout: Some(5_000),
                     description: None,
                     run_in_background: false,
+                    durable: false,
                     tty: false,
                 },
                 None,

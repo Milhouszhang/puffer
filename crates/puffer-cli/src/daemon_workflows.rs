@@ -31,7 +31,10 @@ pub(crate) use binding_create::handle_workflow_binding_create;
 pub(crate) use binding_delete::handle_workflow_binding_delete;
 pub(crate) use connection_delete::handle_workflow_connection_delete;
 pub(crate) use connector_action_execute::{
+    create_automation_connector_action_draft, handle_automation_pending_action_get,
+    handle_automation_pending_action_list, handle_automation_pending_action_reject,
     handle_connector_action_draft_status, handle_connector_action_execute,
+    AutomationConnectorActionDraftParams, CreatedAutomationConnectorActionDraft,
 };
 pub(crate) use monitor_action_execute::handle_monitor_action_execute;
 pub(crate) use monitor_create::handle_monitor_create;
@@ -78,7 +81,18 @@ pub(crate) fn handle_workflow_list_with_runtime(
     let (workflows, workflow_error) = if include_workflows {
         match runtime_workflows(paths) {
             Ok(workflows) => (workflows, None),
-            Err(error) => (Vec::new(), Some(error.to_string())),
+            Err(error) => {
+                let detail = format!("{error:#}");
+                tracing::warn!(error = %detail, "workflow runtime list failed");
+                (
+                    Vec::new(),
+                    Some(
+                        crate::daemon_workflow_runtime::public_workflow_runtime_error_message(
+                            &error,
+                        ),
+                    ),
+                )
+            }
         }
     } else {
         (Vec::new(), None)

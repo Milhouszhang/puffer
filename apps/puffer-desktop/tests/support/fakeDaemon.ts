@@ -2082,8 +2082,6 @@ export class FakeDaemon {
         return this.rejectAutomationPendingAction(request.params);
       case "connector_action_execute":
         return this.executeConnectorActionDraft(request.params);
-      case "connector_action_draft_status":
-        return this.connectorActionDraftStatus(request.params);
       case "outbound_action_execute":
         return this.handleOutboundExecute(request.params);
       case "outbound_action_cancel":
@@ -3029,19 +3027,6 @@ export class FakeDaemon {
       status: "sent",
       draftId: draft.draft_id,
       receipt: draft.receipt
-    };
-  }
-
-  private connectorActionDraftStatus(params: JsonRecord): JsonRecord {
-    const draft = this.pendingAutomationAction(params);
-    this.validatePendingActionVersion(draft, params);
-    return {
-      draftId: draft.draft_id,
-      version: draft.version,
-      status: draft.status,
-      error: draft.error ?? null,
-      receipt: draft.receipt ?? null,
-      updatedAtMs: draft.updated_at_ms ?? null
     };
   }
 

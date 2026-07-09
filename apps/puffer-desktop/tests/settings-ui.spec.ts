@@ -19,7 +19,7 @@ async function openProviderSetup(page: Page, providerName: string) {
 
 async function openAutomationRuntimeSettings(page: Page) {
   await page.getByRole("button", { name: "Settings" }).click();
-  await page.locator(".pf-settings-nav").getByRole("button", { name: "Automation Runtime" }).click();
+  await page.locator(".pf-settings-nav").getByRole("button", { name: "Automation" }).click();
   return page.locator(".pf-settings-pane");
 }
 
@@ -194,7 +194,7 @@ test("settings exposes automation runtime configuration", async ({ page }) => {
   await daemon.open(page, { allowUnauthenticatedWorkspace: true });
 
   const pane = await openAutomationRuntimeSettings(page);
-  await expect(pane.getByRole("heading", { name: "Automation Runtime" })).toBeVisible();
+  await expect(pane.getByRole("heading", { name: "Automation" })).toBeVisible();
   await expect(pane.getByRole("radiogroup", { name: "Automation runtime mode" })).toBeVisible();
   await expect(pane.getByText("Workflow", { exact: true })).toHaveCount(0);
   await expect(pane.getByText("Local runtime", { exact: true })).toBeVisible();
@@ -2068,7 +2068,7 @@ test("settings does not expose legacy Workflows runtime labels", async ({ page }
   await page.getByRole("button", { name: "Settings" }).click();
   await expect(page.locator(".pf-settings-nav").getByRole("button", { name: "Workflows" })).toHaveCount(0);
   await expect(page.getByLabel("Workflow Console URL")).toHaveCount(0);
-  await expect(page.locator(".pf-settings-nav").getByRole("button", { name: "Automation Runtime" })).toBeVisible();
+  await expect(page.locator(".pf-settings-nav").getByRole("button", { name: "Automation" })).toBeVisible();
   expect(daemon.requests.some((request) => request.method.startsWith("workflow_backend_"))).toBe(false);
 });
 

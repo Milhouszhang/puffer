@@ -4066,13 +4066,15 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1);
 
         let store: Value = serde_json::from_str(
-            &std::fs::read_to_string(paths.user_config_dir.join("outbound_action_drafts.json"))
-                .unwrap(),
+            &std::fs::read_to_string(paths.user_config_dir.join("outbound_actions.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(store["drafts"].as_array().unwrap().len(), 1);
-        assert_eq!(store["drafts"][0]["action"], "read_status");
-        assert_eq!(store["drafts"][0]["approval_kind"], "exact_action");
+        assert_eq!(store["actions"].as_array().unwrap().len(), 1);
+        assert_eq!(store["actions"][0]["action"], "read_status");
+        assert_eq!(
+            store["actions"][0]["input"]["__automation"]["automation_id"],
+            "reply-helper"
+        );
     }
 
     #[test]
@@ -4164,19 +4166,23 @@ mod tests {
         assert!(executor.calls.lock().unwrap().is_empty());
 
         let store: Value = serde_json::from_str(
-            &std::fs::read_to_string(paths.user_config_dir.join("outbound_action_drafts.json"))
-                .unwrap(),
+            &std::fs::read_to_string(paths.user_config_dir.join("outbound_actions.json")).unwrap(),
         )
         .unwrap();
-        let draft = &store["drafts"][0];
-        assert_eq!(draft["created_by"], "ConnectorActionDraft");
+        let draft = &store["actions"][0];
         assert_eq!(draft["status"], "draft_ready");
         assert_eq!(draft["action"], "send_message");
-        assert_eq!(draft["session_id"], Value::Null);
-        assert_eq!(draft["turn_id"], Value::Null);
-        assert_eq!(draft["automation_id"], "reply-helper");
-        assert_eq!(draft["automation_run_id"], "run-42");
-        assert_eq!(draft["step_id"], "send");
+        assert_eq!(draft["origin"]["session_id"], "automation:reply-helper");
+        assert_eq!(draft["origin"]["turn_id"], "run-42");
+        assert_eq!(
+            draft["input"]["__automation"]["automation_id"],
+            "reply-helper"
+        );
+        assert_eq!(
+            draft["input"]["__automation"]["automation_run_id"],
+            "run-42"
+        );
+        assert_eq!(draft["input"]["__automation"]["step_id"], "send");
         assert_eq!(draft["input"]["chat_id"], 42);
     }
 
@@ -4226,16 +4232,20 @@ mod tests {
         assert!(captured[0].starts_with("POST /v1/workflows/execute-in-memory "));
 
         let store: Value = serde_json::from_str(
-            &std::fs::read_to_string(paths.user_config_dir.join("outbound_action_drafts.json"))
-                .unwrap(),
+            &std::fs::read_to_string(paths.user_config_dir.join("outbound_actions.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(store["drafts"].as_array().unwrap().len(), 1);
-        assert_eq!(store["drafts"][0]["automation_id"], "reply-helper");
-        assert!(store["drafts"][0]["automation_run_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("preview-reply-helper-"));
+        assert_eq!(store["actions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            store["actions"][0]["input"]["__automation"]["automation_id"],
+            "reply-helper"
+        );
+        assert!(
+            store["actions"][0]["input"]["__automation"]["automation_run_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("preview-reply-helper-")
+        );
     }
 
     #[test]

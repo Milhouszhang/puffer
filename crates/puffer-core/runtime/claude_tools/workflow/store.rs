@@ -902,7 +902,7 @@ pub(super) fn process_is_running(pid: u32) -> bool {
 }
 
 /// Waits for the process to exit, returning true when it stops within the timeout.
-pub(super) fn wait_for_process_exit(pid: u32, timeout_ms: u64) -> bool {
+pub(crate) fn wait_for_process_exit(pid: u32, timeout_ms: u64) -> bool {
     let deadline = now_ms().saturating_add(timeout_ms);
     while now_ms() < deadline {
         if !process_is_running(pid) {
@@ -914,7 +914,7 @@ pub(super) fn wait_for_process_exit(pid: u32, timeout_ms: u64) -> bool {
 }
 
 /// Attempts to terminate a background shell process by pid.
-pub(super) fn terminate_process(pid: u32) -> Result<()> {
+pub(crate) fn terminate_process(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
         let status = Command::new("kill")

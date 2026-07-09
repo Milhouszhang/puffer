@@ -976,6 +976,90 @@ fn daemon_rejects_concurrent_turn_for_same_session() {
     daemon.stop();
 }
 
+/// After a turn finishes (removed via `finish_turn`), a late `resolve_user_question`
+/// RPC for that turn must be rejected, not silently answered `{"ok": true}`.
+/// Also drives the child-drain path with a short `PUFFER_TURN_CHILD_DRAIN_MS`.
+#[test]
+fn daemon_rejects_resolve_after_turn_finished() {
+    let mock = MockOpenAiServer::start("Puffer smoke reply");
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let workspace = tempdir.path().join("workspace");
+    let puffer_home = tempdir.path().join("home");
+    let puffer_config = puffer_home.join(".puffer");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(&puffer_config).expect("puffer config");
+    std::fs::write(
+        puffer_config.join("auth.json"),
+        json!({
+            "format_version": 1,
+            "providers": { "openai": { "kind": "api_key", "key": "sk-test" } }
+        })
+        .to_string(),
+    )
+    .expect("auth store");
+    let discovery_cache = tempdir.path().join("discovery.json");
+    std::fs::write(&discovery_cache, discovery_cache_json()).expect("discovery cache");
+
+    let mut daemon = DaemonProcess::start_with_env(
+        &workspace,
+        &puffer_home,
+        &discovery_cache,
+        &[("PUFFER_TURN_CHILD_DRAIN_MS", "25")],
+    );
+    let mut client = DaemonClient::connect(&daemon.handshake);
+
+    client.rpc(
+        "update_config",
+        json!({
+            "openaiBaseUrl": mock.base_url,
+            "defaultProvider": "openai",
+            "defaultModel": "openai/gpt-5",
+        }),
+    );
+    let session = client.rpc(
+        "create_session",
+        json!({ "cwd": workspace.display().to_string() }),
+    );
+    let session_id = session["sessionId"].as_str().expect("session id");
+
+    let turn = client.rpc(
+        "run_agent_turn",
+        json!({
+            "sessionId": session_id,
+            "message": "Say exactly: Puffer smoke reply",
+            "permissionMode": "read-only",
+        }),
+    );
+    let turn_id = turn["turnId"].as_str().expect("turn id").to_string();
+    let complete = client.wait_for_event(|message| {
+        message["event"] == format!("session:{session_id}:event")
+            && message["payload"]["type"] == "turn-complete"
+    });
+    assert_eq!(complete["payload"]["turnId"], turn_id);
+
+    // The turn is finished and removed; a resolve for it must error loudly.
+    let error = client
+        .try_rpc(
+            "resolve_user_question",
+            json!({
+                "turnId": turn_id,
+                "requestId": "req-never-issued",
+                "answers": {},
+                "annotations": {},
+            }),
+        )
+        .expect_err("late resolve on a finished turn must be rejected");
+    let serialized = error.to_string();
+    assert!(
+        serialized.contains("no in-flight turn")
+            || serialized.contains("finished")
+            || serialized.contains("expired"),
+        "unexpected resolve error: {serialized}"
+    );
+
+    daemon.stop();
+}
+
 struct DaemonProcess {
     child: Child,
     handshake: Value,

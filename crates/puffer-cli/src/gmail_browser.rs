@@ -28,6 +28,11 @@ pub(crate) const STATE_ROOT: &str = "gmail-browser-accounts";
 
 const CONFIG_FILE: &str = "config.toml";
 const SEEN_FILE: &str = "seen.json";
+/// Bump when the row-id derivation changes shape; mismatched stores
+/// rebaseline (observe, don't emit) instead of flooding (#594).
+const SEEN_KEY_VERSION: u32 = 3;
+/// Upper bound on remembered row keys; oldest half evicted on overflow.
+const SEEN_MAX_KEYS: usize = 2000;
 const AUTH_STATE_FILE: &str = "auth_state.json";
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const ERROR_BACKOFF: Duration = Duration::from_secs(10);
@@ -53,12 +58,72 @@ impl GmailBrowserConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct SeenState {
     #[serde(default)]
     initialized: bool,
     #[serde(default)]
-    seen: BTreeSet<String>,
+    key_version: u32,
+    #[serde(default)]
+    seen: Vec<String>,
+    /// Configured account → mailbox actually logged in when its rows were
+    /// observed. `?authuser=` silently falls back to the default session
+    /// account, so a mailbox-identity flip changes every row id under the
+    /// same key prefix — that must rebaseline, not flood.
+    #[serde(default)]
+    mailboxes: BTreeMap<String, String>,
+}
+
+/// Fresh installs start on the current key version so the initial-window
+/// top-row emit still fires; only stores persisted by older code (whose
+/// missing field deserializes to `0` via the serde field default) trigger
+/// the rebaseline migration (#594).
+impl Default for SeenState {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            key_version: SEEN_KEY_VERSION,
+            seen: Vec::new(),
+            mailboxes: BTreeMap::new(),
+        }
+    }
+}
+
+impl SeenState {
+    // Linear scan is fine: `seen` is bounded by SEEN_MAX_KEYS and order
+    // carries the eviction recency, so a side index would buy nothing.
+    fn contains(&self, key: &str) -> bool {
+        self.seen.iter().any(|k| k == key)
+    }
+
+    /// True when this store was written with a different row-id derivation
+    /// and must rebaseline (observe, don't emit) before emitting again.
+    fn needs_rebaseline(&self) -> bool {
+        self.key_version != SEEN_KEY_VERSION
+    }
+
+    /// True when this account's logged-in mailbox differs from the one its
+    /// seen keys were recorded under (empty observations never count: an
+    /// extraction miss must not wipe valid state).
+    fn mailbox_changed(&self, account: &str, observed: &str) -> bool {
+        if observed.is_empty() {
+            return false;
+        }
+        self.mailboxes
+            .get(account)
+            .is_some_and(|prev| !prev.is_empty() && prev != observed)
+    }
+
+    /// True when an account joins an already-established store with no keys
+    /// of its own: its whole backlog would otherwise emit as new mail, so
+    /// its first poll observes silently instead.
+    fn account_needs_bootstrap(&self, account: &str) -> bool {
+        let prefix = format!("{account}:");
+        self.initialized
+            && !self.seen.is_empty()
+            && !self.mailboxes.contains_key(account)
+            && !self.seen.iter().any(|key| key.starts_with(&prefix))
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -454,8 +519,10 @@ async fn poll_once(
     let handshake_ref = ensure_browser_daemon(config, handshake)?;
     let seen_count_before = seen.seen.len();
     let initialized_before = seen.initialized;
-    let mut newly_seen = BTreeSet::new();
+    let mut newly_seen: Vec<String> = Vec::new();
+    let mut observed_mailboxes: BTreeMap<String, String> = BTreeMap::new();
     let mut successful_poll = false;
+    let rebaseline = seen.needs_rebaseline();
     let mut observed_rows = 0usize;
     let mut emitted_rows = 0usize;
     for account in &config.accounts {
@@ -496,6 +563,27 @@ async fn poll_once(
                 continue;
             }
         }
+        let mailbox = result
+            .get("mailbox")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let account_observe_only = if seen.mailbox_changed(account, &mailbox) {
+            diag::account_observe_only(&env.topic, account, "mailbox_changed", &mailbox);
+            true
+        } else if seen.account_needs_bootstrap(account) {
+            diag::account_observe_only(&env.topic, account, "account_bootstrap", &mailbox);
+            true
+        } else {
+            false
+        };
+        if !mailbox.is_empty() {
+            if !seen.mailboxes.contains_key(account) && !account.eq_ignore_ascii_case(&mailbox) {
+                diag::account_mismatch(&env.topic, account, &mailbox);
+            }
+            observed_mailboxes.insert(account.clone(), mailbox);
+        }
         let rows = result
             .get("rows")
             .and_then(Value::as_array)
@@ -507,17 +595,37 @@ async fn poll_once(
                 continue;
             };
             let key = format!("{account}:{id}");
-            newly_seen.insert(key.clone());
-            if should_emit_row(seen, &key, &row) {
+            if newly_seen.iter().any(|k| k == &key) {
+                // Two rows collapsed to one content-hash fallback id: emit at
+                // most once per poll (the persistent seen set only updates
+                // after the loop, so it cannot catch this).
+                diag::row_skipped(&env.topic, account, &key, "poll_duplicate");
+                continue;
+            }
+            newly_seen.push(key.clone());
+            if rebaseline || account_observe_only {
+                // Key format or mailbox identity changed, or a new account
+                // joined an established store: observe silently, never
+                // flood (#594 and the mailbox-flip variant of it).
+                continue;
+            }
+            if let Some(reason) = row_skip_reason(seen, &key, &row) {
+                diag::row_skipped(&env.topic, account, &key, reason);
+            } else {
                 emitted_rows += 1;
                 emit_message(env, account, &key, row)?;
             }
         }
     }
-    if successful_poll {
-        seen.seen.extend(newly_seen);
-        seen.initialized = true;
+    if rebaseline {
+        diag::rebaseline_key_version(
+            &env.topic,
+            seen.key_version,
+            SEEN_KEY_VERSION,
+            newly_seen.len(),
+        );
     }
+    apply_poll_observation(seen, newly_seen, observed_mailboxes, successful_poll);
     diag::poll_complete(
         &env.topic,
         successful_poll,
@@ -611,15 +719,31 @@ fn poll_account_at_url(
     }
 }
 
+/// Builds the event text for one inbox row. The from-address leads because it
+/// is the strongest deterministic notification-class signal for the
+/// downstream classifier and ignore rules (#592).
+fn message_event_text(row: &Value) -> String {
+    let sender = row.get("sender").and_then(Value::as_str).unwrap_or("");
+    let from_email = row.get("fromEmail").and_then(Value::as_str).unwrap_or("");
+    let subject = row.get("subject").and_then(Value::as_str).unwrap_or("");
+    let snippet = row.get("snippet").and_then(Value::as_str).unwrap_or("");
+    let from_line = if from_email.trim().is_empty() {
+        String::new()
+    } else {
+        format!("from: {from_email}")
+    };
+    [from_line.as_str(), sender, subject, snippet]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn emit_message(env: &SubscriberEnv, account: &str, dedup_key: &str, row: Value) -> Result<()> {
     let sender = row.get("sender").and_then(Value::as_str).unwrap_or("");
     let subject = row.get("subject").and_then(Value::as_str).unwrap_or("");
     let snippet = row.get("snippet").and_then(Value::as_str).unwrap_or("");
-    let text = [sender, subject, snippet]
-        .into_iter()
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = message_event_text(&row);
     diag::emit_message(
         &env.topic,
         account,
@@ -710,15 +834,66 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-fn should_emit_row(seen: &SeenState, key: &str, row: &Value) -> bool {
-    if seen.seen.contains(key) {
-        return false;
+/// Returns why a row must NOT emit, or `None` when it should emit.
+fn row_skip_reason(seen: &SeenState, key: &str, row: &Value) -> Option<&'static str> {
+    if seen.contains(key) {
+        return Some("seen_duplicate");
     }
     if !seen.initialized || seen.seen.is_empty() {
-        return row.get("index").and_then(Value::as_u64).unwrap_or(u64::MAX)
-            < INITIAL_ROW_EMIT_LIMIT;
+        let in_window =
+            row.get("index").and_then(Value::as_u64).unwrap_or(u64::MAX) < INITIAL_ROW_EMIT_LIMIT;
+        return if in_window {
+            None
+        } else {
+            Some("initial_window_excluded")
+        };
     }
-    true
+    None
+}
+
+/// Folds one successful poll's observed keys into the seen state. On a
+/// key-version rebaseline the old-format keys are dropped and the store is
+/// re-stamped; on a mailbox-identity flip only that account's keys are
+/// dropped (they identify rows of a different mailbox). Re-observed keys
+/// move to the back so still-visible rows are never the eviction victims
+/// (a pinned thread outliving SEEN_MAX_KEYS new mails must not be evicted
+/// and re-emit as new).
+fn apply_poll_observation(
+    seen: &mut SeenState,
+    newly_observed: Vec<String>,
+    observed_mailboxes: BTreeMap<String, String>,
+    successful_poll: bool,
+) {
+    if !successful_poll {
+        return;
+    }
+    if seen.needs_rebaseline() {
+        seen.seen.clear();
+        seen.key_version = SEEN_KEY_VERSION;
+    }
+    for (account, mailbox) in &observed_mailboxes {
+        if seen.mailbox_changed(account, mailbox) {
+            let prefix = format!("{account}:");
+            seen.seen.retain(|key| !key.starts_with(&prefix));
+        }
+    }
+    seen.mailboxes.extend(observed_mailboxes);
+    let batch_len = newly_observed.len();
+    for key in newly_observed {
+        if let Some(position) = seen.seen.iter().position(|k| k == &key) {
+            seen.seen.remove(position);
+        }
+        seen.seen.push(key);
+    }
+    if seen.seen.len() > SEEN_MAX_KEYS {
+        // Never evict this poll's batch (contiguous at the tail after the
+        // recency refresh): those rows are still visible and would re-emit
+        // as new next poll if dropped (>1000 visible rows across accounts).
+        let keep_from =
+            (seen.seen.len() - SEEN_MAX_KEYS / 2).min(seen.seen.len().saturating_sub(batch_len));
+        seen.seen.drain(..keep_from);
+    }
+    seen.initialized = true;
 }
 
 fn gmail_poll_result_ready(result: &Value) -> bool {
@@ -862,45 +1037,273 @@ mod tests {
         assert!(!dir.join(AUTH_STATE_FILE).exists());
     }
 
-    #[test]
-    fn first_snapshot_only_emits_the_top_row() {
-        let seen = SeenState::default();
-
-        assert!(should_emit_row(
-            &seen,
-            "me@example.com:1",
-            &json!({ "unread": false, "index": 0 })
-        ));
-        assert!(!should_emit_row(
-            &seen,
-            "me@example.com:2",
-            &json!({ "unread": true, "index": 1 })
-        ));
-        assert!(!should_emit_row(
-            &seen,
-            "me@example.com:3",
-            &json!({ "unread": false, "index": 2 })
-        ));
+    fn seen_v2(keys: &[&str]) -> SeenState {
+        SeenState {
+            initialized: true,
+            key_version: SEEN_KEY_VERSION,
+            seen: keys.iter().map(|k| k.to_string()).collect(),
+            mailboxes: BTreeMap::new(),
+        }
     }
 
     #[test]
-    fn initialized_seen_cache_emits_new_rows() {
+    fn skip_reason_none_for_fresh_key() {
+        let seen = seen_v2(&["acct:c1"]);
+        assert_eq!(
+            row_skip_reason(&seen, "acct:c2", &json!({"index": 5})),
+            None
+        );
+    }
+
+    #[test]
+    fn skip_reason_seen_duplicate() {
+        let seen = seen_v2(&["acct:c1"]);
+        assert_eq!(
+            row_skip_reason(&seen, "acct:c1", &json!({"index": 0})),
+            Some("seen_duplicate")
+        );
+    }
+
+    #[test]
+    fn skip_reason_initial_window() {
+        // Fresh state: only index < INITIAL_ROW_EMIT_LIMIT emits.
+        let fresh = SeenState {
+            initialized: false,
+            key_version: SEEN_KEY_VERSION,
+            seen: Vec::new(),
+            mailboxes: BTreeMap::new(),
+        };
+        assert_eq!(
+            row_skip_reason(&fresh, "acct:c9", &json!({"index": 0})),
+            None
+        );
+        assert_eq!(
+            row_skip_reason(&fresh, "acct:c9", &json!({"index": 3})),
+            Some("initial_window_excluded")
+        );
+    }
+
+    #[test]
+    fn index_shift_does_not_resurface_seen_rows() {
+        // #594 core regression: archive shifts every remaining row's index;
+        // content keys are index-free so nothing re-emits.
+        let seen = seen_v2(&["acct:cA", "acct:cB", "acct:cC"]);
+        for (key, shifted_index) in [("acct:cA", 0), ("acct:cB", 1), ("acct:cC", 2)] {
+            assert_eq!(
+                row_skip_reason(&seen, key, &json!({"index": shifted_index})),
+                Some("seen_duplicate")
+            );
+        }
+    }
+
+    #[test]
+    fn key_version_mismatch_rebaselines_and_restamps() {
+        // Old-format seen (version 0) + new code: the rebaseline poll drops
+        // every old-format key and stamps the new version. Emission
+        // suppression is poll_once's `rebaseline` branch, gated on the same
+        // `needs_rebaseline` predicate asserted here.
         let mut seen = SeenState {
             initialized: true,
-            seen: BTreeSet::new(),
+            key_version: 0,
+            seen: (0..75).map(|i| format!("acct:old-{i}")).collect(),
+            mailboxes: BTreeMap::new(),
         };
-        seen.seen.insert("me@example.com:1".to_string());
+        assert!(seen.needs_rebaseline(), "old store must rebaseline");
+        apply_poll_observation(
+            &mut seen,
+            vec!["acct:c1".into(), "acct:c2".into()],
+            BTreeMap::new(),
+            true,
+        );
+        assert_eq!(seen.key_version, SEEN_KEY_VERSION);
+        assert!(!seen.needs_rebaseline());
+        assert!(
+            seen.seen.iter().all(|k| !k.starts_with("acct:old-")),
+            "old-format keys dropped"
+        );
+        assert!(seen.contains("acct:c1"));
+    }
 
-        assert!(!should_emit_row(
-            &seen,
-            "me@example.com:1",
-            &json!({ "unread": true, "index": 0 })
-        ));
-        assert!(should_emit_row(
-            &seen,
-            "me@example.com:2",
-            &json!({ "unread": false, "index": 25 })
-        ));
+    #[test]
+    fn fresh_install_is_not_a_rebaseline() {
+        // A brand-new store starts on the current key version, so the
+        // initial-window top-row emit still fires; only stores persisted by
+        // older code (serde field default key_version 0) migrate.
+        let fresh = SeenState::default();
+        assert!(!fresh.needs_rebaseline());
+        assert_eq!(
+            row_skip_reason(&fresh, "acct:c1", &json!({"index": 0})),
+            None
+        );
+        assert_eq!(
+            row_skip_reason(&fresh, "acct:c9", &json!({"index": 3})),
+            Some("initial_window_excluded")
+        );
+        // Pin the exact `< INITIAL_ROW_EMIT_LIMIT` boundary: index 1 must be
+        // excluded, or fresh installs double-notify.
+        assert_eq!(
+            row_skip_reason(&fresh, "acct:c9", &json!({"index": 1})),
+            Some("initial_window_excluded")
+        );
+    }
+
+    #[test]
+    fn key_version_downgrade_also_rebaselines() {
+        let seen = SeenState {
+            initialized: true,
+            key_version: SEEN_KEY_VERSION + 1,
+            seen: vec!["acct:x".into()],
+            mailboxes: BTreeMap::new(),
+        };
+        assert!(seen.needs_rebaseline());
+    }
+
+    #[test]
+    fn seen_capped_evicts_oldest_half() {
+        let mut seen = SeenState {
+            initialized: true,
+            key_version: SEEN_KEY_VERSION,
+            seen: (0..SEEN_MAX_KEYS).map(|i| format!("acct:k{i}")).collect(),
+            mailboxes: BTreeMap::new(),
+        };
+        apply_poll_observation(&mut seen, vec!["acct:new".into()], BTreeMap::new(), true);
+        assert_eq!(seen.seen.len(), SEEN_MAX_KEYS / 2);
+        assert_eq!(seen.seen.last().map(String::as_str), Some("acct:new"));
+        assert!(!seen.contains("acct:k0"), "oldest evicted");
+    }
+
+    #[test]
+    fn eviction_never_drops_current_poll_batch() {
+        // >1000 visible rows across many accounts: the cap must not evict
+        // keys observed this poll, or still-visible rows re-emit next poll.
+        let mut seen = SeenState {
+            initialized: true,
+            key_version: SEEN_KEY_VERSION,
+            seen: (0..SEEN_MAX_KEYS).map(|i| format!("acct:k{i}")).collect(),
+            mailboxes: BTreeMap::new(),
+        };
+        let batch: Vec<String> = (0..1500).map(|i| format!("acct:n{i}")).collect();
+        apply_poll_observation(&mut seen, batch.clone(), BTreeMap::new(), true);
+        assert!(
+            batch.iter().all(|k| seen.contains(k)),
+            "every key observed this poll must survive the cap"
+        );
+        assert_eq!(seen.seen.len(), batch.len(), "only pre-batch keys evicted");
+    }
+
+    #[test]
+    fn reobserved_key_refreshes_recency_and_survives_eviction() {
+        // A long-lived visible row (e.g. a pinned thread) is re-observed on
+        // every poll; it must not be evicted by stale insertion order and
+        // then re-emit as new.
+        let mut seen = SeenState {
+            initialized: true,
+            key_version: SEEN_KEY_VERSION,
+            seen: (0..SEEN_MAX_KEYS).map(|i| format!("acct:k{i}")).collect(),
+            mailboxes: BTreeMap::new(),
+        };
+        apply_poll_observation(
+            &mut seen,
+            vec!["acct:k0".into(), "acct:new".into()],
+            BTreeMap::new(),
+            true,
+        );
+        assert!(
+            seen.contains("acct:k0"),
+            "re-observed key survives eviction"
+        );
+        assert!(!seen.contains("acct:k1"), "unrefreshed oldest evicted");
+    }
+
+    #[test]
+    fn mailbox_flip_wipes_only_that_accounts_keys() {
+        // `?authuser=` fallback flipped account `a`'s mailbox: every row id
+        // under `a:` identifies a different mailbox now, so those keys are
+        // dropped and the batch re-baselines them; account `b` is untouched.
+        let mut seen = SeenState {
+            initialized: true,
+            key_version: SEEN_KEY_VERSION,
+            seen: vec!["a:old1".into(), "b:keep".into(), "a:old2".into()],
+            mailboxes: BTreeMap::from([
+                ("a".to_string(), "one@example.com".to_string()),
+                ("b".to_string(), "b@example.com".to_string()),
+            ]),
+        };
+        assert!(seen.mailbox_changed("a", "two@example.com"));
+        assert!(!seen.mailbox_changed("a", ""), "extraction miss is inert");
+        apply_poll_observation(
+            &mut seen,
+            vec!["a:new1".into()],
+            BTreeMap::from([("a".to_string(), "two@example.com".to_string())]),
+            true,
+        );
+        assert!(!seen.contains("a:old1") && !seen.contains("a:old2"));
+        assert!(seen.contains("b:keep"), "other account untouched");
+        assert!(seen.contains("a:new1"));
+        assert_eq!(
+            seen.mailboxes.get("a").map(String::as_str),
+            Some("two@example.com")
+        );
+    }
+
+    #[test]
+    fn first_mailbox_record_does_not_rebaseline() {
+        // Upgrade path: existing stores have no mailboxes map; the first
+        // observation records identity without wiping anything.
+        let mut seen = seen_v2(&["acct:c1"]);
+        assert!(!seen.mailbox_changed("acct", "real@example.com"));
+        apply_poll_observation(
+            &mut seen,
+            Vec::new(),
+            BTreeMap::from([("acct".to_string(), "real@example.com".to_string())]),
+            true,
+        );
+        assert!(seen.contains("acct:c1"), "no wipe on first record");
+        assert_eq!(
+            seen.mailboxes.get("acct").map(String::as_str),
+            Some("real@example.com")
+        );
+    }
+
+    #[test]
+    fn new_account_on_established_store_bootstraps_silently() {
+        // Adding a second account to an established store must not flood its
+        // whole backlog; existing single-account stores never bootstrap.
+        let seen = seen_v2(&["a:k1"]);
+        assert!(seen.account_needs_bootstrap("b"), "new account bootstraps");
+        assert!(
+            !seen.account_needs_bootstrap("a"),
+            "account with keys does not bootstrap even without a mailbox record"
+        );
+        assert!(
+            !SeenState::default().account_needs_bootstrap("a"),
+            "fresh store uses the initial window instead"
+        );
+    }
+
+    #[test]
+    fn inbox_script_extracts_logged_in_mailbox() {
+        assert!(GMAIL_INBOX_SCRIPT.contains("SignOutOptions"));
+        assert!(GMAIL_INBOX_SCRIPT.contains("mailbox:"));
+    }
+
+    #[test]
+    fn event_text_leads_with_from_email() {
+        let row = json!({
+            "sender": "GitHub",
+            "fromEmail": "notifications@github.com",
+            "subject": "PR #1 review requested",
+            "snippet": "please review"
+        });
+        let text = message_event_text(&row);
+        assert!(text.starts_with("from: notifications@github.com\n"));
+        assert!(text.contains("PR #1 review requested"));
+    }
+
+    #[test]
+    fn event_text_omits_from_line_when_absent() {
+        let row = json!({ "sender": "Alice", "subject": "hi", "snippet": "hello" });
+        assert!(message_event_text(&row).starts_with("Alice\n"));
     }
 
     #[test]
@@ -928,6 +1331,29 @@ mod tests {
     fn gmail_inbox_script_emits_attachment_flag() {
         assert!(GMAIL_INBOX_SCRIPT.contains("hasAttachment"));
         assert!(GMAIL_INBOX_SCRIPT.contains("attachment"));
+    }
+
+    #[test]
+    fn inbox_script_fallback_id_is_position_independent() {
+        // #594: archive shifts row indexes; identity must not include index.
+        assert!(GMAIL_INBOX_SCRIPT.contains("fnv1a"));
+        assert!(!GMAIL_INBOX_SCRIPT.contains("snippet, index].join"));
+    }
+
+    #[test]
+    fn inbox_script_fallback_id_includes_thread_identity() {
+        // #772: same-content messageId-less rows in different Gmail threads
+        // must not collapse to the same content-hash fallback id.
+        assert!(GMAIL_INBOX_SCRIPT.contains("threadId || rawThreadId"));
+        assert!(GMAIL_INBOX_SCRIPT
+            .contains("[threadId || rawThreadId, sender, fromEmail, subject, snippet]"));
+    }
+
+    #[test]
+    fn seen_key_version_tracks_thread_aware_fallback_ids() {
+        // The fallback id derivation changed for #772, so existing stores
+        // must observe one clean rebaseline poll instead of flooding users.
+        assert_eq!(SEEN_KEY_VERSION, 3);
     }
 
     fn test_paths(temp: &tempfile::TempDir) -> ConfigPaths {

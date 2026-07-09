@@ -39,6 +39,8 @@ struct AgentToolInput {
     #[serde(default)]
     run_in_background: bool,
     #[serde(default)]
+    durable: bool,
+    #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
     isolation: Option<String>,
@@ -161,6 +163,8 @@ struct PreparedAgentExecution {
     mode: Option<String>,
     max_turns: Option<u32>,
     worktree: Option<AgentWorktree>,
+    durable: bool,
+    owner_turn_context: Option<crate::CurrentTurnContext>,
 }
 
 /// Executes the runtime-backed `Agent` tool by running a nested model turn.
@@ -429,6 +433,8 @@ fn prepare_agent_execution(
             .filter(|value| !value.is_empty()),
         max_turns: input.max_turns.or(agent.value.max_turns),
         worktree,
+        durable: input.durable,
+        owner_turn_context: state.current_turn_context().cloned(),
     })
 }
 
@@ -539,15 +545,32 @@ fn launch_background_agent(
     )
     .with_context(|| format!("failed to initialize {}", output_file.display()))?;
 
-    // Register with the centralized task manager for tracking and limit enforcement.
+    // Register with the centralized task manager for tracking, limit
+    // enforcement, and owner-scoped stopping.
+    use super::background_tasks::{
+        BackgroundTaskDurability, BackgroundTaskKind, BackgroundTaskRegistration,
+    };
+    let cancel = crate::runtime::CancelToken::new();
     let task_output_buf = task_manager()
-        .register(
-            &prepared.agent_id,
-            &prepared.description,
-            Some(&prepared.agent_id),
-            Some(&output_file.display().to_string()),
-            false, // not auto-backgrounded
-        )
+        .register_with_options(BackgroundTaskRegistration {
+            task_id: prepared.agent_id.clone(),
+            description: prepared.description.clone(),
+            kind: BackgroundTaskKind::Agent,
+            agent_id: Some(prepared.agent_id.clone()),
+            output_file: Some(output_file.display().to_string()),
+            auto_backgrounded: false,
+            owner_turn_id: prepared
+                .owner_turn_context
+                .as_ref()
+                .map(|c| c.turn_id.clone()),
+            owner_session_id: prepared
+                .owner_turn_context
+                .as_ref()
+                .map(|c| c.session_id.clone()),
+            durability: BackgroundTaskDurability::from_durable_flag(prepared.durable),
+            cancel: Some(cancel.clone()),
+            process_id: None,
+        })
         .map_err(|err| anyhow!(err))?;
 
     let response = AgentAsyncOutput {
@@ -611,6 +634,11 @@ fn launch_background_agent(
             let mut failed = false;
 
             for outer in 0..max_outer {
+                if cancel.is_cancelled() {
+                    failed = true;
+                    last_text = "stopped: owner turn finished or TaskStop".to_string();
+                    break;
+                }
                 let prompt = if outer == 0 {
                     prepared.prompt.clone()
                 } else {
@@ -626,6 +654,11 @@ fn launch_background_agent(
                         &prompt,
                     )
                 };
+                if cancel.is_cancelled() {
+                    failed = true;
+                    last_text = "stopped: owner turn finished or TaskStop".to_string();
+                    break;
+                }
                 match result {
                     Ok(turn) => {
                         total_tool_uses += turn.tool_invocations.len();

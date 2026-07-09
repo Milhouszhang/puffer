@@ -6,9 +6,8 @@ use anyhow::{bail, Context, Result};
 use puffer_core::{CancelToken, UserQuestionPromptResponse};
 use puffer_subscriptions::{ConnectionRecord, ConnectionState};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const QR_SIGN_IN_QUESTION: &str =
@@ -19,7 +18,9 @@ const BROWSER_HEIGHT: u32 = 820;
 const LOGIN_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const LOGIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-type PendingQuestions = Arc<Mutex<HashMap<String, mpsc::Sender<UserQuestionPromptResponse>>>>;
+use crate::daemon_turn_scope::{PendingWait, TurnScope};
+
+type PendingQuestions = Arc<TurnScope>;
 
 struct SetupFlow {
     state: Arc<DaemonState>,
@@ -179,11 +180,9 @@ impl SetupFlow {
             .next_request_id
             .fetch_add(1, Ordering::SeqCst)
             .to_string();
-        let (tx, rx) = mpsc::channel();
-        self.pending_questions
-            .lock()
-            .unwrap()
-            .insert(request_id.clone(), tx);
+        let rx = self
+            .pending_questions
+            .register_user_question(request_id.clone());
 
         let mut payload = Map::new();
         payload.insert("type".to_string(), json!("user-question-request"));
@@ -200,8 +199,14 @@ impl SetupFlow {
             payload: Value::Object(payload),
         });
 
-        rx.recv()
-            .map_err(|_| anyhow::anyhow!("connector setup question channel closed"))
+        match self.pending_questions.wait_user_question(&request_id, rx) {
+            PendingWait::Resolved(response) => Ok(response),
+            PendingWait::TimedOut => {
+                bail!("connector setup question timed out waiting for a response")
+            }
+            PendingWait::Cancelled => bail!("connector setup was cancelled"),
+            PendingWait::Released => bail!("connector setup question channel closed"),
+        }
     }
 }
 

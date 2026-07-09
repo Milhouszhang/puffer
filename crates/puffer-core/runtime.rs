@@ -26,6 +26,13 @@ mod blocking_loop;
 mod browser_auto_review;
 pub mod claude_tools;
 mod context_usage;
+mod copilot;
+/// Drops the cached GitHub Copilot bearer for a stored GitHub token. Called on
+/// logout so a logged-out account's still-valid short-lived bearer isn't kept
+/// resident in the process cache until it expires.
+pub fn invalidate_copilot_bearer(github_token: &str) {
+    copilot::invalidate_bearer(github_token);
+}
 pub mod errors;
 mod filesystem_access;
 pub mod goals;
@@ -41,6 +48,7 @@ mod microcompact;
 mod openai;
 mod openai_sse;
 mod openai_ws;
+pub mod outbound_budget;
 pub(crate) mod overflow;
 mod permission_prompt;
 mod plan_events;

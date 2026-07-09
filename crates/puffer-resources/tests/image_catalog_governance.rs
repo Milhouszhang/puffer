@@ -59,6 +59,14 @@ const ALL_PROVIDER_YAMLS: &[(&str, &str)] = &[
         include_str!("../../../resources/providers/cerebras.yaml"),
     ),
     (
+        "github-copilot",
+        include_str!("../../../resources/providers/github-copilot.yaml"),
+    ),
+    (
+        "google",
+        include_str!("../../../resources/providers/google.yaml"),
+    ),
+    (
         "groq",
         include_str!("../../../resources/providers/groq.yaml"),
     ),

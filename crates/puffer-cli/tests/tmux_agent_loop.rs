@@ -366,11 +366,11 @@ fn tmux_agent_loop_renders_assistant_reply_from_mock_anthropic() {
         "sh",
         &[
             "-lc",
-            // HOME=workspace makes `.puffer/` in the workspace be the
-            // workspace config dir. Tracing PUFFER_HTTP_TRACE_PATH lets
+            // PUFFER_HOME=workspace makes `.puffer/` in the workspace be the
+            // user config dir. Tracing PUFFER_HTTP_TRACE_PATH lets
             // post-mortem inspection see the wire bytes if the test fails.
             &format!(
-                "HOME='{ws}' PUFFER_HTTP_TRACE_PATH='{ws}/wire.log' '{bin}'",
+                "PUFFER_HOME='{ws}' HOME='{ws}' PUFFER_HTTP_TRACE_PATH='{ws}/wire.log' '{bin}'",
                 ws = workspace.display(),
                 bin = binary
             ),
@@ -440,7 +440,7 @@ fn tmux_agent_loop_accepts_codex_default_provider_alias() {
         &[
             "-lc",
             &format!(
-                "HOME='{ws}' PUFFER_HTTP_TRACE_PATH='{ws}/wire.log' '{bin}'",
+                "PUFFER_HOME='{ws}' HOME='{ws}' PUFFER_HTTP_TRACE_PATH='{ws}/wire.log' '{bin}'",
                 ws = workspace.display(),
                 bin = binary
             ),
@@ -548,7 +548,7 @@ fn tmux_agent_loop_drives_tool_round_trip_in_tui() {
         &[
             "-lc",
             &format!(
-                "HOME='{ws}' PUFFER_HTTP_TRACE_PATH='{ws}/wire.log' '{bin}'",
+                "PUFFER_HOME='{ws}' HOME='{ws}' PUFFER_HTTP_TRACE_PATH='{ws}/wire.log' '{bin}'",
                 ws = workspace.display(),
                 bin = binary
             ),
@@ -641,7 +641,7 @@ fn tmux_agent_loop_validates_workflow_shorthand_in_tui() {
         &[
             "-lc",
             &format!(
-                "HOME='{ws}' PUFFER_HTTP_TRACE_PATH='{ws}/wire.log' '{bin}'",
+                "PUFFER_HOME='{ws}' HOME='{ws}' PUFFER_HTTP_TRACE_PATH='{ws}/wire.log' '{bin}'",
                 ws = workspace.display(),
                 bin = binary
             ),
@@ -743,7 +743,7 @@ fn tmux_agent_loop_answers_ask_user_question_with_keyboard_selection() {
         &[
             "-lc",
             &format!(
-                "HOME='{ws}' PUFFER_HTTP_TRACE_PATH='{ws}/wire.log' '{bin}'",
+                "PUFFER_HOME='{ws}' HOME='{ws}' PUFFER_HTTP_TRACE_PATH='{ws}/wire.log' '{bin}'",
                 ws = workspace.display(),
                 bin = binary
             ),

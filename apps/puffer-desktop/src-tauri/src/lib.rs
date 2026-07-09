@@ -45,6 +45,8 @@ const REGISTERED_TAURI_COMMANDS: &[&str] = &[
     "load_settings_snapshot",
     "login_with_oauth",
     "login_with_agentenv",
+    "copilot_login_start",
+    "copilot_login_poll",
     "login_with_api_key",
     "logout_provider",
     "list_external_credentials",
@@ -63,6 +65,7 @@ const REGISTERED_TAURI_COMMANDS: &[&str] = &[
     "resolve_permission",
     "resolve_user_question",
     "cancel_turn",
+    "open_url",
     "open_image_dir",
     "open_video_dir",
     "summon_mini_window",
@@ -208,6 +211,25 @@ fn login_with_oauth(
 fn login_with_agentenv(app: AppHandle, state: State<'_, SharedBackend>) -> Result<Value, String> {
     agentenv_auth::login_with_agentenv().map_err(|error| error.to_string())?;
     backend_call(app, state, "load_settings_snapshot", json!({}))
+}
+
+#[tauri::command]
+fn copilot_login_start(app: AppHandle, state: State<'_, SharedBackend>) -> Result<Value, String> {
+    backend_call(app, state, "copilot_login_start", json!({}))
+}
+
+#[tauri::command]
+fn copilot_login_poll(
+    app: AppHandle,
+    state: State<'_, SharedBackend>,
+    device_code: String,
+) -> Result<Value, String> {
+    backend_call(
+        app,
+        state,
+        "copilot_login_poll",
+        json!({ "deviceCode": device_code }),
+    )
 }
 
 #[tauri::command]
@@ -412,21 +434,46 @@ fn run_agent_turn(
 
 #[tauri::command]
 fn resolve_permission(
-    _turn_id: String,
-    _request_id: String,
-    _action: String,
+    app: AppHandle,
+    state: State<'_, SharedBackend>,
+    turn_id: String,
+    request_id: String,
+    action: String,
 ) -> Result<(), String> {
-    Ok(())
+    backend_call(
+        app,
+        state,
+        "resolve_permission",
+        json!({
+            "turnId": turn_id,
+            "requestId": request_id,
+            "action": action,
+        }),
+    )
+    .map(|_| ())
 }
 
 #[tauri::command]
 fn resolve_user_question(
-    _turn_id: String,
-    _request_id: String,
-    _answers: Value,
-    _annotations: Value,
+    app: AppHandle,
+    state: State<'_, SharedBackend>,
+    turn_id: String,
+    request_id: String,
+    answers: Value,
+    annotations: Value,
 ) -> Result<(), String> {
-    Ok(())
+    backend_call(
+        app,
+        state,
+        "resolve_user_question",
+        json!({
+            "turnId": turn_id,
+            "requestId": request_id,
+            "answers": answers,
+            "annotations": annotations,
+        }),
+    )
+    .map(|_| ())
 }
 
 #[tauri::command]
@@ -436,6 +483,25 @@ fn cancel_turn(
     turn_id: String,
 ) -> Result<(), String> {
     backend_call(app, state, "cancel_turn", json!({ "turnId": turn_id })).map(|_| ())
+}
+
+/// Opens an external URL in the user's default browser. Used by flows like the
+/// GitHub Copilot device login where `window.open` is unreliable in the webview.
+///
+/// Only `http`/`https` are allowed: this command is reachable from any webview
+/// JS via `invoke`, and handing an arbitrary scheme to the OS opener would let
+/// injected page content open `file://` targets or trigger native protocol
+/// handlers. Reject everything else before touching the opener.
+#[tauri::command]
+fn open_url(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let parsed = url::Url::parse(&url).map_err(|error| error.to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("refusing to open non-http(s) URL: {url}"));
+    }
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -584,6 +650,8 @@ pub fn run() {
             load_settings_snapshot,
             login_with_oauth,
             login_with_agentenv,
+            copilot_login_start,
+            copilot_login_poll,
             login_with_api_key,
             logout_provider,
             list_external_credentials,
@@ -602,6 +670,7 @@ pub fn run() {
             resolve_permission,
             resolve_user_question,
             cancel_turn,
+            open_url,
             open_image_dir,
             open_video_dir,
             mini_window::summon_mini_window,

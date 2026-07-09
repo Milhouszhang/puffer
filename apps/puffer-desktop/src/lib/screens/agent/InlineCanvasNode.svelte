@@ -2,6 +2,7 @@
   import { onDestroy } from "svelte";
   import InlineCanvasNode from "./InlineCanvasNode.svelte";
   import CanvasMediaPreview from "./CanvasMediaPreview.svelte";
+  import { actionIntent, actionLabel, locationText } from "./canvasActions";
   import { filterDependentOptions, resolveDependentValue } from "./dependentSelect";
   import { appendRow } from "./editableTableRows";
   import {
@@ -34,9 +35,10 @@
     values: Record<string, unknown>;
     sessionId: string | null;
     onChange: (id: string, value: unknown) => void;
+    onAction?: (node: CanvasNode, action: CanvasNode) => void;
   };
 
-  let { node, values, sessionId, onChange }: Props = $props();
+  let { node, values, sessionId, onChange, onAction }: Props = $props();
 
   function text(value: unknown): string {
     if (value === null || value === undefined) return "";
@@ -379,26 +381,26 @@
   <section class="ic-section">
     {#if node.title}<h4>{text(node.title)}</h4>{/if}
     {#each children(node.children) as child, index (`${text(child.type)}-${index}`)}
-      <InlineCanvasNode node={child} {values} {sessionId} {onChange} />
+      <InlineCanvasNode node={child} {values} {sessionId} {onChange} {onAction} />
     {/each}
   </section>
 {:else if componentType === "grid"}
   <div class="ic-grid" style={`--ic-min:${numeric(node.min, 190)}px`}>
     {#each children(node.children) as child, index (`${text(child.type)}-${index}`)}
-      <InlineCanvasNode node={child} {values} {sessionId} {onChange} />
+      <InlineCanvasNode node={child} {values} {sessionId} {onChange} {onAction} />
     {/each}
   </div>
 {:else if componentType === "columns"}
   <div class="ic-columns">
     {#each children(node.children) as child, index (`${text(child.type)}-${index}`)}
-      <InlineCanvasNode node={child} {values} {sessionId} {onChange} />
+      <InlineCanvasNode node={child} {values} {sessionId} {onChange} {onAction} />
     {/each}
   </div>
 {:else if componentType === "card"}
   <div class="ic-card">
     {#if node.title}<div class="ic-card-title">{text(node.title)}</div>{/if}
     {#each children(node.children) as child, index (`${text(child.type)}-${index}`)}
-      <InlineCanvasNode node={child} {values} {sessionId} {onChange} />
+      <InlineCanvasNode node={child} {values} {sessionId} {onChange} {onAction} />
     {/each}
   </div>
 {:else if componentType === "divider"}
@@ -659,10 +661,24 @@
       {#if node.status}<em>{text(node.status)}</em>{/if}
     </div>
     {#if Array.isArray(node.locations)}
-      <div class="ic-location">{node.locations.map(text).join("  ")}</div>
+      <div class="ic-location">{node.locations.map(locationText).filter(Boolean).join("  ")}</div>
     {/if}
     {#if node.body}<div class="ic-text">{text(node.body)}</div>{/if}
     {#if node.evidence}<pre class="ic-code">{text(node.evidence)}</pre>{/if}
+    {#if onAction && children(node.actions).length > 0}
+      <div class="ic-finding-actions">
+        {#each children(node.actions) as action, index (`action-${index}`)}
+          <button
+            type="button"
+            class="ic-action"
+            class:primary={actionIntent(action) === "fix"}
+            onclick={() => onAction?.(node, action)}
+          >
+            {actionLabel(action)}
+          </button>
+        {/each}
+      </div>
+    {/if}
   </article>
 {:else if componentType === "code" || componentType === "diff"}
   <pre class="ic-code">{text(node.text)}</pre>

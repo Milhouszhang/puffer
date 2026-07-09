@@ -1892,6 +1892,14 @@ test("Secrets settings save and import without rendering raw secret values", asy
   const pane = page.locator(".pf-settings-pane");
   await expect(pane.locator(".label").filter({ hasText: "Secret store" })).toBeVisible();
 
+  // The add form is hidden until "Add secret" is clicked; cancel returns to the list.
+  await expect(pane.getByRole("button", { name: "Save secret" })).toHaveCount(0);
+  await pane.getByRole("button", { name: "Add secret" }).click();
+  await expect(pane.getByPlaceholder("Search secrets")).toHaveCount(0);
+  await pane.getByRole("button", { name: "Cancel" }).click();
+  await expect(pane.getByPlaceholder("Search secrets")).toBeVisible();
+
+  await pane.getByRole("button", { name: "Add secret" }).click();
   await pane.getByRole("textbox", { name: "Name", exact: true }).fill("Build token");
   await pane.getByLabel("Description").fill("CI deployment token");
   await pane.getByLabel("Username").fill("ci");
@@ -1908,8 +1916,10 @@ test("Secrets settings save and import without rendering raw secret values", asy
     value: "super-secret-token"
   });
   await expect(page.getByText("super-secret-token")).toHaveCount(0);
+  // A successful save closes the form and shows the stored list again.
   await expect(pane.locator(".pf-mcp-card").filter({ hasText: "Build token" })).toBeVisible();
 
+  await pane.getByRole("button", { name: "Add secret" }).click();
   await pane.getByRole("button", { name: "Sync from Chrome" }).click();
   await daemon.waitForRequest("import_browser_secrets");
   await expect(

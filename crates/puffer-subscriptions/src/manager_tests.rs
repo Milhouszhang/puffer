@@ -333,6 +333,73 @@ fn manager_test_event_with_payload(envelope_id: &str, text: &str, payload: Value
     }
 }
 
+fn control_health_envelope(kind: &str, payload: Value) -> EventEnvelope {
+    EventEnvelope {
+        envelope_id: kind.into(),
+        subscriber_id: "telegram-user".into(),
+        received_at_ms: 1_700_000_000_000,
+        event: Event {
+            topic: "telegram-user".into(),
+            kind: kind.into(),
+            control: true,
+            dedup_key: None,
+            text: String::new(),
+            payload,
+        },
+    }
+}
+
+#[test]
+fn resume_failed_auth_maps_to_auth_required() {
+    let envelope = control_health_envelope(
+        "resume_failed",
+        json!({ "class": "auth", "reason": "session_expired", "detail": "bad key" }),
+    );
+    let health = health_from_control_event(&envelope).expect("auth resume_failed maps to health");
+    assert_eq!(health.status, ConnectionHealthStatus::AuthRequired);
+    assert_eq!(health.detail.as_deref(), Some("bad key"));
+}
+
+#[test]
+fn resume_failed_network_maps_to_retrying() {
+    let envelope = control_health_envelope(
+        "resume_failed",
+        json!({ "class": "network", "detail": "connect timeout" }),
+    );
+    let health =
+        health_from_control_event(&envelope).expect("network resume_failed maps to health");
+    assert_eq!(health.status, ConnectionHealthStatus::Retrying);
+}
+
+#[test]
+fn resume_failed_benign_is_ignored() {
+    let envelope = control_health_envelope("resume_failed", json!({ "class": "none" }));
+    assert!(health_from_control_event(&envelope).is_none());
+}
+
+#[test]
+fn update_loop_error_auth_maps_to_auth_required() {
+    let envelope = control_health_envelope(
+        "update_loop_error",
+        json!({ "class": "auth", "error": "AUTH_KEY_UNREGISTERED" }),
+    );
+    let health =
+        health_from_control_event(&envelope).expect("auth update_loop_error maps to health");
+    assert_eq!(health.status, ConnectionHealthStatus::AuthRequired);
+    assert_eq!(health.detail.as_deref(), Some("AUTH_KEY_UNREGISTERED"));
+}
+
+#[test]
+fn update_loop_error_other_maps_to_retrying() {
+    let envelope = control_health_envelope(
+        "update_loop_error",
+        json!({ "class": "other", "error": "weird stream stop" }),
+    );
+    let health =
+        health_from_control_event(&envelope).expect("other update_loop_error maps to health");
+    assert_eq!(health.status, ConnectionHealthStatus::Retrying);
+}
+
 #[test]
 fn start_subscriber_allows_immediate_control_command() {
     let temp = tempdir().unwrap();
@@ -546,6 +613,70 @@ fn control_health_event_marks_connection_degraded_and_ready_restores_active() {
         recovered.health.as_ref().map(|health| health.status),
         Some(ConnectionHealthStatus::Ok)
     );
+
+    manager.shutdown();
+}
+
+#[test]
+fn login_complete_clears_degraded_health() {
+    let temp = tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let manager = SubscriptionManagerBuilder::new(temp.path().join("subscriptions.json"))
+        .build(runtime.handle().clone())
+        .unwrap();
+    manager
+        .connection_store()
+        .create(ConnectionRecord {
+            state: ConnectionState::Degraded,
+            auth_failure_notified: true,
+            health: Some(ConnectionHealth {
+                status: ConnectionHealthStatus::AuthRequired,
+                reason: Some("login_required".into()),
+                detail: None,
+                updated_at_ms: 1_700_000_000_000,
+                next_retry_at_ms: None,
+            }),
+            ..ConnectionRecord::authenticated(
+                "telegram-user",
+                "telegram-login",
+                "Personal Telegram",
+            )
+        })
+        .unwrap();
+
+    manager.bus().publish(EventEnvelope {
+        envelope_id: "login-complete".into(),
+        subscriber_id: "telegram-user".into(),
+        received_at_ms: 1_700_000_020_000,
+        event: Event {
+            topic: "telegram-user".into(),
+            kind: "login_complete".into(),
+            control: true,
+            dedup_key: None,
+            text: String::new(),
+            payload: json!({ "user_id": 42, "first_name": "Ann" }),
+        },
+    });
+    runtime.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(50)).await });
+
+    let connection = manager.connection_store().get("telegram-user").unwrap();
+    assert_eq!(connection.state, ConnectionState::Authenticated);
+    assert_eq!(
+        connection.health.as_ref().map(|health| health.status),
+        Some(ConnectionHealthStatus::Ok)
+    );
+    assert_eq!(
+        connection
+            .health
+            .as_ref()
+            .and_then(|health| health.reason.clone()),
+        Some("login_complete".to_string())
+    );
+    assert!(!connection.auth_failure_notified);
 
     manager.shutdown();
 }

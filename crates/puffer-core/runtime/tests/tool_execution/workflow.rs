@@ -1169,3 +1169,40 @@ fn task_stop_rejects_unrecorded_shell_pid() {
 
     assert!(error.to_string().contains("unknown task `shell-1`"));
 }
+
+#[test]
+fn task_stop_stops_live_registry_agent() {
+    use crate::runtime::background_tasks::{
+        task_manager, BackgroundTaskDurability, BackgroundTaskKind, BackgroundTaskRegistration,
+    };
+    use crate::runtime::CancelToken;
+
+    let mut state = temp_state();
+    let cwd = state.cwd.clone();
+    let cancel = CancelToken::new();
+    task_manager()
+        .register_with_options(BackgroundTaskRegistration {
+            task_id: "agent-stop-me".into(),
+            description: "agent".into(),
+            kind: BackgroundTaskKind::Agent,
+            agent_id: Some("agent-stop-me".into()),
+            output_file: None,
+            auto_backgrounded: false,
+            owner_turn_id: Some("turn-1".into()),
+            owner_session_id: Some(state.session.id.to_string()),
+            durability: BackgroundTaskDurability::DurableAcrossTurns,
+            cancel: Some(cancel.clone()),
+            process_id: None,
+        })
+        .unwrap();
+
+    let output = crate::runtime::claude_tools::workflow::task_stop::execute_task_stop(
+        &mut state,
+        &cwd,
+        json!({ "task_id": "agent-stop-me" }),
+    )
+    .unwrap();
+
+    assert!(cancel.is_cancelled());
+    assert!(output.contains("agent-stop-me"));
+}

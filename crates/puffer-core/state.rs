@@ -336,7 +336,7 @@ pub struct AppState {
     /// (`scheme://host:port`). Set by /pentest start/resume; cleared by stop.
     pub pentest_in_scope_origin: Option<String>,
     /// Request-scoped monitor reply binding. Set by daemon-validated monitor
-    /// action turns so `MonitorReplyDraft` cannot write arbitrary tasks.
+    /// action turns so outbound drafts cannot write arbitrary tasks.
     pub(crate) monitor_reply_scope: Option<MonitorReplyScope>,
     /// True while a monitor triage turn is running. Lets the triage agent complete
     /// human-gated monitor tasks from a conversational "done" signal (the message
@@ -381,6 +381,8 @@ pub struct AppState {
     pub(crate) masked_secrets: Arc<Mutex<HashMap<String, String>>>,
     /// Trusted exact media discovery entries available to workflow tools.
     pub(crate) exact_media_discovery_cache: Option<ExactMediaDiscoveryCache>,
+    /// Identifies the live daemon turn this state is executing under, when any.
+    pub(crate) current_turn_context: Option<CurrentTurnContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +390,13 @@ pub(crate) struct MonitorReplyScope {
     pub task_id: String,
     pub session_id: String,
     pub turn_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentTurnContext {
+    pub turn_id: String,
+    pub session_id: String,
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,7 +526,20 @@ impl AppState {
             secret_values: Arc::new(Mutex::new(HashMap::new())),
             masked_secrets: Arc::new(Mutex::new(HashMap::new())),
             exact_media_discovery_cache: None,
+            current_turn_context: None,
         }
+    }
+
+    pub fn set_current_turn_context(&mut self, context: CurrentTurnContext) {
+        self.current_turn_context = Some(context);
+    }
+
+    pub fn clear_current_turn_context(&mut self) {
+        self.current_turn_context = None;
+    }
+
+    pub fn current_turn_context(&self) -> Option<&CurrentTurnContext> {
+        self.current_turn_context.as_ref()
     }
 
     pub fn set_monitor_reply_scope_for_turn(
@@ -1420,6 +1442,31 @@ mod tests {
             tags: Vec::new(),
             note: None,
         }
+    }
+
+    #[test]
+    fn current_turn_context_round_trips() {
+        let mut state = AppState::new(
+            PufferConfig::default(),
+            PathBuf::from("."),
+            sample_metadata(),
+        );
+
+        assert!(state.current_turn_context().is_none());
+
+        state.set_current_turn_context(CurrentTurnContext {
+            turn_id: "turn-1".to_string(),
+            session_id: "session-1".to_string(),
+            task_id: Some("task-1".to_string()),
+        });
+
+        let ctx = state.current_turn_context().expect("turn context");
+        assert_eq!(ctx.turn_id, "turn-1");
+        assert_eq!(ctx.session_id, "session-1");
+        assert_eq!(ctx.task_id.as_deref(), Some("task-1"));
+
+        state.clear_current_turn_context();
+        assert!(state.current_turn_context().is_none());
     }
 
     fn stored_image_attachment() -> puffer_session_store::StoredAttachment {

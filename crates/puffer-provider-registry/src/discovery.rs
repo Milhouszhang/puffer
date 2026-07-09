@@ -1,4 +1,5 @@
 use crate::auth::{AuthStore, StoredCredential};
+use crate::copilot_identity::{apply_copilot_client_identity, COPILOT_TOKEN_URL};
 use crate::input_capability::infer_input_modalities;
 use crate::model::{
     ModelCompat, ModelDescriptor, ModelDiscoveryConfig, ModelDiscoveryFormat,
@@ -8,6 +9,104 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client;
 use reqwest::blocking::RequestBuilder;
 use serde_json::Value;
+use std::time::Duration;
+
+/// Exchanges a stored GitHub token for a short-lived Copilot token plus the
+/// account-specific API endpoint (individual / business / enterprise), so model
+/// discovery hits the right `/models` host. Returns `None` on failure.
+///
+/// The client-identity headers matter — GitHub personalizes/gates parts of the
+/// Copilot API by client identity and `X-GitHub-Api-Version` (see
+/// `copilot_filter_selectable`) — so they come from the single source in
+/// [`crate::copilot_identity`], shared with the runtime token exchange.
+fn copilot_discovery_bearer(github_token: &str) -> Option<(String, String)> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .ok()?;
+    let request = client
+        .get(COPILOT_TOKEN_URL)
+        .header("Authorization", format!("token {github_token}"))
+        .header("Accept", "application/json");
+    let response = apply_copilot_client_identity(request).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let value: Value = response.json().ok()?;
+    let token = value.get("token").and_then(|t| t.as_str())?.to_string();
+    // Only trust an https endpoint before sending the Copilot bearer to it;
+    // fall back to the default host otherwise (mirrors copilot.rs).
+    let api_url = value
+        .get("endpoints")
+        .and_then(|endpoints| endpoints.get("api"))
+        .and_then(|api| api.as_str())
+        .filter(|api| api.starts_with("https://"))
+        .unwrap_or("https://api.githubcopilot.com")
+        .trim_end_matches('/')
+        .to_string();
+    Some((token, api_url))
+}
+
+/// True when a Copilot /models entry is a chat model (not an embedding).
+/// `capabilities.type` is usually a string ("chat"/"embeddings") but some
+/// responses return an array; accept either shape. Absent → assume chat.
+fn copilot_model_is_chat(entry: &Value) -> bool {
+    let Some(kind) = entry.get("capabilities").and_then(|caps| caps.get("type")) else {
+        return true;
+    };
+    match kind {
+        Value::String(s) => s == "chat",
+        Value::Array(items) => items.iter().any(|v| v.as_str() == Some("chat")),
+        _ => true,
+    }
+}
+
+/// True when GitHub offers this model in the manual model picker for THIS
+/// account. GitHub sets the flag per-account from the SKU + org admin policy, so
+/// honoring it mirrors the VS Code Copilot Chat picker exactly. Absent → false.
+fn copilot_model_picker_enabled(entry: &Value) -> bool {
+    entry
+        .get("model_picker_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// True when the account/org policy permits this model. `policy` is optional;
+/// when absent the model needs no policy and is usable. When present, only
+/// `state == "enabled"` is usable — "disabled" (org-blocked) and "unconfigured"
+/// (terms not yet accepted) both return `model_not_supported` at chat time.
+fn copilot_policy_ok(entry: &Value) -> bool {
+    match entry.get("policy") {
+        None | Some(Value::Null) => true,
+        Some(policy) => policy.get("state").and_then(|s| s.as_str()) == Some("enabled"),
+    }
+}
+
+/// True when the server marks this entry as the account's default or fallback
+/// chat model (`is_chat_default` / `is_chat_fallback`). Used only as the
+/// last-resort display set when the session endpoint is unreachable — these
+/// flags are queried per-account, so plan reshuffles surface as data changes,
+/// not code changes.
+fn copilot_model_is_default_or_fallback(entry: &Value) -> bool {
+    let flag = |key: &str| entry.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    flag("is_chat_default") || flag("is_chat_fallback")
+}
+
+/// True for Copilot's internal / experimental models — routing helpers,
+/// compaction, IDE-internal — which are never user-selectable chat models even
+/// though some carry chat capabilities or default/fallback flags (e.g.
+/// `oswe-vscode-prime`, `mai-code-*`). Excluded from every displayed tier.
+fn copilot_model_is_internal(entry: &Value) -> bool {
+    let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    let vendor = entry
+        .get("vendor")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    vendor.eq_ignore_ascii_case("experimental")
+        || id.starts_with("mai-code")
+        || id == "oswe-vscode-prime"
+        || id == "trajectory-compaction"
+}
 
 const OPENAI_CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const OPENAI_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -51,10 +150,38 @@ impl ModelDiscoveryClient {
             return Ok(Vec::new());
         };
         let discovery_mode = discovery_mode(provider, auth_store);
-        let url = discovery_url(provider, discovery, &discovery_mode);
-        let mut request = self.client.get(&url);
-        request = apply_discovery_headers(request, provider, discovery, &discovery_mode);
-        request = apply_discovery_auth(request, provider, auth_store, &discovery_mode);
+        // Copilot needs its exchanged (token, api_url) again after the /models
+        // fetch, to filter the catalog down to this account's usable models.
+        let mut copilot_ctx: Option<(String, String)> = None;
+        // GitHub Copilot resolves both its /models host and bearer from the
+        // token exchange (account-specific endpoint), so build the request from
+        // the exchange rather than the descriptor's placeholder host.
+        let (url, request) = if provider.id == "github-copilot" {
+            let exchanged = match auth_store.get(provider.id.as_str()) {
+                Some(StoredCredential::OAuth(credential)) => {
+                    copilot_discovery_bearer(&credential.access_token)
+                }
+                _ => None,
+            };
+            let (token, api_url) = exchanged
+                .ok_or_else(|| anyhow!("copilot token exchange failed for model discovery"))?;
+            copilot_ctx = Some((token.clone(), api_url.clone()));
+            let url = format!(
+                "{}{}",
+                api_url.trim_end_matches('/'),
+                normalized_discovery_path(&api_url, &discovery.path)
+            );
+            let mut request = self.client.get(&url);
+            request = apply_discovery_headers(request, provider, discovery, &discovery_mode);
+            request = request.header("Authorization", format!("Bearer {token}"));
+            (url, request)
+        } else {
+            let url = discovery_url(provider, discovery, &discovery_mode);
+            let mut request = self.client.get(&url);
+            request = apply_discovery_headers(request, provider, discovery, &discovery_mode);
+            request = apply_discovery_auth(request, provider, auth_store, &discovery_mode);
+            (url, request)
+        };
         let response = request
             .send()
             .with_context(|| format!("failed to fetch models from {url}"))?;
@@ -65,15 +192,170 @@ impl ModelDiscoveryClient {
                 provider.id
             ));
         }
-        let payload = response
+        let mut payload = response
             .json::<Value>()
             .with_context(|| format!("failed to parse discovery response from {url}"))?;
+        // GitHub Copilot's /models returns the full catalog for every account
+        // (embeddings and plan-gated models included); selecting a gated model
+        // returns `model_not_supported` at chat time. Narrow it to this
+        // account's usable set via metadata only — see copilot_filter_selectable.
+        if provider.id == "github-copilot" {
+            if let Some((token, api_url)) = copilot_ctx {
+                self.copilot_filter_selectable(&mut payload, &api_url, &token, &provider.headers);
+            }
+        }
         match discovery_mode {
             DiscoveryMode::Standard => parse_discovered_models(provider, discovery, &payload),
             DiscoveryMode::OpenAiOAuthCodex => {
                 parse_codex_discovered_models(provider, discovery, &payload)
             }
         }
+    }
+
+    /// Restricts a Copilot /models payload to the models THIS account can
+    /// actually select, using metadata only — never billable chat requests.
+    ///
+    /// Copilot's `/models` returns the full ~42-model catalog for every account;
+    /// what encodes the account's entitlement differs by plan, and GitHub has
+    /// changed this policy repeatedly (2026-03-12 Student SKU with premium
+    /// models removed; 2026-06-01 usage-based billing; 2026-06-24 Free/Student
+    /// lost manual model selection entirely). Expect this to need re-adaptation.
+    ///
+    /// Filter chain (all endpoints here are unbilled):
+    /// 1. Paid plans: `model_picker_enabled` is the server's authoritative
+    ///    "may hand-pick" flag — the VS Code picker is exactly
+    ///    `capabilities.type == "chat" && model_picker_enabled && policy ok`.
+    /// 2. Free/Student plans (since 2026-06-24) ship `model_picker_enabled:
+    ///    false` on EVERY model, so when step 1 matches nothing we ask the
+    ///    auto-mode routing endpoint `POST /models/session`, whose
+    ///    `available_models` lists what the backend will actually serve this
+    ///    account (chat requests then attach the session's
+    ///    `Copilot-Session-Token`; see puffer-core's copilot runtime).
+    /// 3. If that endpoint is unavailable, fall back to the server-marked
+    ///    `is_chat_default` / `is_chat_fallback` entries — also per-account
+    ///    metadata, so no model list is hardcoded anywhere in this chain.
+    fn copilot_filter_selectable(
+        &self,
+        payload: &mut Value,
+        api_url: &str,
+        token: &str,
+        headers: &indexmap::IndexMap<String, String>,
+    ) {
+        let Some(data) = payload
+            .get_mut("data")
+            .and_then(|value| value.as_array_mut())
+        else {
+            return;
+        };
+
+        // 1. The VS Code picker predicate (its only hardcoded extra is
+        //    gpt-4o-mini, force-included so the picker is never empty).
+        let strict = |entry: &Value| {
+            copilot_model_is_chat(entry)
+                && copilot_policy_ok(entry)
+                && !copilot_model_is_internal(entry)
+                && (copilot_model_picker_enabled(entry)
+                    || entry.get("id").and_then(|v| v.as_str()) == Some("gpt-4o-mini"))
+        };
+        // Tier 1 applies only to picker-capable (paid) plans: gate on a real
+        // model_picker_enabled entry, NOT on `strict` (which also matches the
+        // gpt-4o-mini safety net present in every catalog — that would make
+        // tier 1 always win and starve the tier-2 session lookup that Free/
+        // Student auto-only accounts depend on). Also require `strict` to yield
+        // something, so an all-gated picker plan falls through instead of
+        // returning an empty list.
+        if data.iter().any(copilot_model_picker_enabled) && data.iter().any(strict) {
+            data.retain(strict);
+            return;
+        }
+
+        // 2. Auto-only SKU: the picker flags are all false by design. Ask the
+        //    (unbilled) auto-mode session endpoint which models the backend is
+        //    willing to serve this account.
+        //    INVARIANT: models offered from this session set are only usable if
+        //    the chat path attaches `Copilot-Session-Token`, which puffer-core's
+        //    copilot runtime does when `copilot_sku_is_auto_only` (token-envelope
+        //    sku) is true. Both this branch and that runtime check rely on the
+        //    same "free/student ⟺ picker-disabled ⟺ auto-only" correspondence
+        //    GitHub currently maintains; if a future SKU breaks it (e.g. a paid
+        //    account with picker disabled on every model), keep the two in sync
+        //    so the session set is never offered without the token being sent.
+        if let Some(available) = self.copilot_session_available_models(api_url, token, headers) {
+            if !available.is_empty() {
+                let in_session = |entry: &Value| {
+                    copilot_model_is_chat(entry)
+                        && !copilot_model_is_internal(entry)
+                        && entry
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|id| available.contains(id))
+                            .unwrap_or(false)
+                };
+                // Only narrow to the session set if it actually intersects the
+                // catalog; otherwise leave `data` intact so tier 3 can still run
+                // on the full list instead of an emptied one.
+                if data.iter().any(in_session) {
+                    data.retain(in_session);
+                    return;
+                }
+            }
+        }
+
+        // 3. Last resort — reached when tier 1 found no picker model AND the
+        //    tier-2 session lookup was unavailable (a transient /models/session
+        //    outage on an auto-only account). Offer the server-marked
+        //    default/fallback chat models as a best-effort guess (excluding
+        //    internal ones). BEST-EFFORT ONLY: for an auto-only account the
+        //    session is the real source of truth for what's usable, and the
+        //    chat path attaches Copilot-Session-Token, so a model shown here
+        //    that the recovered session doesn't include will be rejected
+        //    (model_not_supported) until the next discovery/TTL re-runs tier 2.
+        //    There is no reliable list to show while the session is down.
+        data.retain(|entry| {
+            copilot_model_is_chat(entry)
+                && copilot_policy_ok(entry)
+                && !copilot_model_is_internal(entry)
+                && copilot_model_is_default_or_fallback(entry)
+        });
+    }
+
+    /// Queries Copilot's auto-mode session endpoint (`POST /models/session`) —
+    /// an unbilled routing endpoint — and returns its `available_models` ids.
+    /// This is the only metadata source of per-account model availability on
+    /// SKUs whose `/models` picker flags are all false (Free/Student).
+    fn copilot_session_available_models(
+        &self,
+        api_url: &str,
+        token: &str,
+        headers: &indexmap::IndexMap<String, String>,
+    ) -> Option<std::collections::HashSet<String>> {
+        let url = format!("{}/models/session", api_url.trim_end_matches('/'));
+        let mut request = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json");
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+        let body = serde_json::json!({ "auto_mode": { "model_hints": ["auto"] } });
+        let response = request.json(&body).send().ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let value: Value = response.json().ok()?;
+        let models = value
+            .get("available_models")?
+            .as_array()?
+            .iter()
+            .filter_map(|entry| match entry {
+                // Observed as plain id strings; tolerate object entries too.
+                Value::String(id) => Some(id.clone()),
+                Value::Object(_) => entry.get("id").and_then(|v| v.as_str()).map(String::from),
+                _ => None,
+            })
+            .collect();
+        Some(models)
     }
 }
 

@@ -5,13 +5,15 @@ use anyhow::{Context, Result};
 use puffer_config::ConfigPaths;
 use puffer_subscriptions::{
     connector_slug_accepts_contact_id, contact_display_name_from_payload, contact_id_prefix,
-    contact_ids_from_payload, normalize_contact_id, normalize_contact_ids, ConnectorContact,
-    ContactContext, ContactDisplay, SavedContact,
+    contact_ids_from_payload, normalize_contact_id, normalize_contact_ids, ConnectionHealthStatus,
+    ConnectionState, ConnectorContact, ContactContext, ContactDisplay, SavedContact,
+    SubscriptionManager,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 use uuid::Uuid;
@@ -35,8 +37,9 @@ use daemon_contacts_store::{
     load_proposals, load_store, prune_proposals_for_contact_ids, save_proposals, save_store,
 };
 use daemon_contacts_telegram::{
-    collect_telegram_candidates, read_telegram_peer_avatars, read_telegram_peer_names,
-    recent_telegram_contacts, refresh_telegram_peer_caches, telegram_contact_picker_ready,
+    account_contact_book_view, collect_telegram_candidates, read_telegram_peer_avatars,
+    read_telegram_peer_names, recent_telegram_contacts, refresh_telegram_peer_caches,
+    request_hydration, telegram_recent_dialogs_satisfied,
 };
 use daemon_contacts_trace::ContactInferTrace;
 
@@ -51,6 +54,181 @@ const INFERENCE_CONTEXT_LIMIT: usize =
     TELEGRAM_RECENT_CONTEXT_LIMIT + (TELEGRAM_INTERACTION_CONTEXT_LIMIT * 2);
 const HISTORY_CANDIDATE_LIMIT: usize = 1_000;
 const DAY_MS: i128 = 86_400_000;
+/// Direct-user scan target dispatched with on-demand contact-book hydration.
+const CONTACTS_HYDRATE_TARGET: usize = 120;
+
+/// Coarse contact-sync state surfaced to the desktop `sync` contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncStateKind {
+    Ready,
+    Hydrating,
+    Failed,
+    AuthRequired,
+}
+
+impl SyncStateKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            SyncStateKind::Ready => "ready",
+            SyncStateKind::Hydrating => "hydrating",
+            SyncStateKind::Failed => "failed",
+            SyncStateKind::AuthRequired => "auth_required",
+        }
+    }
+
+    /// Aggregation weight, worst-first: hydrating > failed > auth_required > ready.
+    fn severity(self) -> u8 {
+        match self {
+            SyncStateKind::Hydrating => 3,
+            SyncStateKind::Failed => 2,
+            SyncStateKind::AuthRequired => 1,
+            SyncStateKind::Ready => 0,
+        }
+    }
+}
+
+/// The `sync` object returned by contacts RPCs. Exact shape:
+/// `{ "state": "ready"|"hydrating"|"failed"|"auth_required",
+///    "updated_at_ms": i64|null, "error": string|null }`.
+#[derive(Debug, Clone)]
+struct SyncState {
+    kind: SyncStateKind,
+    updated_at_ms: Option<i64>,
+    error: Option<String>,
+}
+
+impl SyncState {
+    fn ready() -> Self {
+        Self {
+            kind: SyncStateKind::Ready,
+            updated_at_ms: None,
+            error: None,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "state": self.kind.as_str(),
+            "updated_at_ms": self.updated_at_ms,
+            "error": self.error,
+        })
+    }
+}
+
+/// Whether an account dir participates in the aggregate sync state. Only dirs
+/// holding a Telegram session count: a session-less leftover (even with a
+/// stale peer cache) can never be hydrated, so letting it contribute would pin
+/// the aggregate on a state nothing can resolve (e.g. permanent `hydrating`).
+fn account_contributes_to_sync(account_dir: &Path) -> bool {
+    account_dir.join("telegram.session").exists()
+}
+
+/// Derives one account's sync state from its peer-cache `contact_book` metadata.
+/// `auth_required` is reported only when the manager is reachable and the
+/// account's connection is `Degraded` with `AuthRequired` health; otherwise the
+/// file-derived state stands.
+fn account_sync_state(account_dir: &Path, manager: Option<&SubscriptionManager>) -> SyncState {
+    let view = account_contact_book_view(account_dir);
+    let mut kind = match view.state.as_str() {
+        "ready" => SyncStateKind::Ready,
+        "failed" => SyncStateKind::Failed,
+        _ => SyncStateKind::Hydrating,
+    };
+    if let Some(manager) = manager {
+        if account_connection_auth_required(manager, account_dir) {
+            kind = SyncStateKind::AuthRequired;
+        }
+    }
+    SyncState {
+        kind,
+        updated_at_ms: view.updated_at_ms,
+        error: view.error,
+    }
+}
+
+fn account_connection_auth_required(manager: &SubscriptionManager, account_dir: &Path) -> bool {
+    let Some(slug) = account_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(connection) = manager.connection_store().get(slug) else {
+        return false;
+    };
+    connection.state == ConnectionState::Degraded
+        && connection.health.map(|health| health.status)
+            == Some(ConnectionHealthStatus::AuthRequired)
+}
+
+/// Worst-first aggregate of per-account sync states. Empty (no telegram
+/// accounts) reports `ready`.
+fn aggregate_sync(states: Vec<SyncState>) -> SyncState {
+    states
+        .into_iter()
+        .max_by_key(|state| state.kind.severity())
+        .unwrap_or_else(SyncState::ready)
+}
+
+/// Scans the telegram-accounts root ONCE, deriving each participating
+/// account's sync state. The single scan feeds both the aggregate `sync`
+/// object and the hydration-dispatch decision so the two can never disagree
+/// (and each peer-cache.json is parsed once per RPC instead of twice).
+fn scan_telegram_sync(
+    paths: &ConfigPaths,
+    manager: Option<&SubscriptionManager>,
+) -> Vec<(PathBuf, SyncState)> {
+    let root = paths.user_config_dir.join("telegram-accounts");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|account_dir| account_contributes_to_sync(account_dir))
+        .map(|account_dir| {
+            let state = account_sync_state(&account_dir, manager);
+            (account_dir, state)
+        })
+        .collect()
+}
+
+/// Hydration auto-dispatch policy for one account.
+///
+/// - `Hydrating` (covers never-attempted `pending`, in-flight, and stale
+///   states): dispatch — the subscriber's single-flight slot dedups an
+///   in-flight run and restarts one lost to a crash.
+/// - `Ready` with an unsatisfied recent-dialog marker: dispatch — continues a
+///   partial multi-pass dialog scan (accounts needing >500 dialogs) until the
+///   direct-user target is met or dialogs are exhausted.
+/// - `AuthRequired`: dispatch — this only ensures the subscriber is running and
+///   (single-flight) asks it to hydrate. When the subscriber is unauthorized it
+///   answers `auth_required` WITHOUT dialing Telegram (no storm), and if the
+///   degraded state was stale, starting the subscriber lets it resume the still
+///   -valid session and clear the state. Without this, an `auth_required`
+///   connection can never self-heal through the contacts path.
+/// - `Failed`: never auto-dispatch. The subscriber was authorized, so a re-run
+///   re-dials Telegram (contact book + up to 500 dialogs) on every read — an
+///   unbounded storm on persistent failures. The desktop's Refresh button
+///   (`contacts_refresh` dispatches unconditionally) is the explicit retry.
+fn should_dispatch_hydration(kind: SyncStateKind, recent_dialogs_satisfied: bool) -> bool {
+    match kind {
+        SyncStateKind::Hydrating | SyncStateKind::AuthRequired => true,
+        SyncStateKind::Ready => !recent_dialogs_satisfied,
+        SyncStateKind::Failed => false,
+    }
+}
+
+/// Fire-and-forget hydration nudge over one scan's results. Per-account no-op
+/// when the manager is unavailable (`request_hydration` returns quietly).
+fn dispatch_telegram_hydration_for_stale_accounts(
+    paths: &ConfigPaths,
+    scan: &[(PathBuf, SyncState)],
+) {
+    for (account_dir, state) in scan {
+        let satisfied = telegram_recent_dialogs_satisfied(account_dir, CONTACTS_HYDRATE_TARGET);
+        if should_dispatch_hydration(state.kind, satisfied) {
+            request_hydration(paths, account_dir, CONTACTS_HYDRATE_TARGET);
+        }
+    }
+}
 
 pub(crate) fn cached_telegram_peer_avatars(paths: &ConfigPaths) -> HashMap<String, String> {
     read_telegram_peer_avatars(paths)
@@ -166,23 +344,18 @@ pub(crate) fn handle_contacts_list(paths: &ConfigPaths, params: &Value) -> Resul
     let mut saved = filtered_saved_contacts(store.contacts, query);
     enrich_saved_contact_avatars(paths, &mut saved);
     let recent_request = is_recent_telegram_request(&params);
-    let (page, ready) = if recent_request {
-        let mut snapshot = recent_telegram_contacts(paths, limit)?;
-        reject_bot_candidates(&mut snapshot.candidates);
-        (
-            paginate_recent_candidates(snapshot.candidates, limit, params.cursor.as_deref())?,
-            snapshot.ready,
-        )
+    let manager = puffer_core::subscription_manager().ok();
+    let scan = scan_telegram_sync(paths, manager.as_deref());
+    if query.is_none() {
+        dispatch_telegram_hydration_for_stale_accounts(paths, &scan);
+    }
+    let sync = aggregate_sync(scan.into_iter().map(|(_, state)| state).collect());
+    let page = if recent_request {
+        let mut candidates = recent_telegram_contacts(paths)?;
+        reject_bot_candidates(&mut candidates);
+        paginate_recent_candidates(candidates, limit, params.cursor.as_deref())?
     } else {
-        let ready = if query.is_some() {
-            true
-        } else {
-            telegram_contact_picker_ready(paths, limit)?
-        };
-        (
-            filtered_candidates(paths, limit, params.cursor.as_deref(), query)?,
-            ready,
-        )
+        filtered_candidates(paths, limit, params.cursor.as_deref(), query)?
     };
     let returned_count = page.candidates.len();
     info!(
@@ -201,7 +374,7 @@ pub(crate) fn handle_contacts_list(paths: &ConfigPaths, params: &Value) -> Resul
             .as_deref()
             .is_some_and(|cursor| !cursor.trim().is_empty()),
         query_present = query.is_some(),
-        ready,
+        sync_state = sync.kind.as_str(),
         returned_count,
         candidate_count = page.candidate_count,
         has_more = page.has_more,
@@ -212,7 +385,7 @@ pub(crate) fn handle_contacts_list(paths: &ConfigPaths, params: &Value) -> Resul
         "contacts": saved,
         "candidates": candidates,
         "proposals": proposals,
-        "ready": ready,
+        "sync": sync.to_json(),
         "limit": limit,
         "returned_count": returned_count,
         "candidate_count": page.candidate_count,
@@ -235,6 +408,12 @@ pub(crate) fn handle_contacts_search(paths: &ConfigPaths, params: &Value) -> Res
     let proposals = load_proposals(paths)?;
     let mut saved = filtered_saved_contacts(store.contacts, query);
     enrich_saved_contact_avatars(paths, &mut saved);
+    // Search is a pure read of whatever is cached, but it still nudges stale
+    // accounts (plan trigger policy) so a search-only user eventually gets a
+    // populated cache instead of ranking against an empty one forever.
+    let manager = puffer_core::subscription_manager().ok();
+    let scan = scan_telegram_sync(paths, manager.as_deref());
+    dispatch_telegram_hydration_for_stale_accounts(paths, &scan);
     let page = searched_candidates(paths, limit, params.cursor.as_deref(), query)?;
     let returned_count = page.candidates.len();
     let candidates = page.candidates;
@@ -242,7 +421,7 @@ pub(crate) fn handle_contacts_search(paths: &ConfigPaths, params: &Value) -> Res
         "contacts": saved,
         "candidates": candidates,
         "proposals": proposals,
-        "ready": true,
+        "sync": SyncState::ready().to_json(),
         "limit": limit,
         "returned_count": returned_count,
         "candidate_count": page.candidate_count,

@@ -911,6 +911,69 @@ export async function loginWithAgentEnv(): Promise<SettingsSnapshot> {
   return invoke<BackendSettingsSnapshot>("login_with_agentenv");
 }
 
+export interface CopilotLoginStartResult {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  interval: number;
+  expiresIn: number;
+}
+
+export interface CopilotLoginPollResult {
+  status: "pending" | "slow_down" | "done" | "error";
+  error?: string;
+  snapshot?: BackendSettingsSnapshot;
+}
+
+// Starts the GitHub Copilot device flow. Returns the code the user must enter
+// at the verification URL; no credential is stored until polling succeeds.
+export async function copilotLoginStart(
+  remote?: RemoteConnection
+): Promise<CopilotLoginStartResult> {
+  if (shouldInvokeRemote(remote)) {
+    return invoke<CopilotLoginStartResult>("copilot_login_start", { ...remoteArgs(remote) });
+  }
+  if (canReachDaemon()) {
+    const client = await ensureLocalDaemonClient();
+    return client.request<CopilotLoginStartResult>("copilot_login_start", {});
+  }
+  if (!canInvokeTauri()) {
+    return {
+      deviceCode: "mock-device",
+      userCode: "MOCK-CODE",
+      verificationUri: "https://github.com/login/device",
+      interval: 5,
+      expiresIn: 900
+    };
+  }
+  return invoke<CopilotLoginStartResult>("copilot_login_start", { ...remoteArgs(remote) });
+}
+
+// Polls the Copilot device flow once. On "done" the snapshot reflects the new
+// github-copilot credential.
+export async function copilotLoginPoll(
+  deviceCode: string,
+  remote?: RemoteConnection
+): Promise<CopilotLoginPollResult> {
+  if (shouldInvokeRemote(remote)) {
+    return invoke<CopilotLoginPollResult>("copilot_login_poll", {
+      deviceCode,
+      ...remoteArgs(remote)
+    });
+  }
+  if (canReachDaemon()) {
+    const client = await ensureLocalDaemonClient();
+    return client.request<CopilotLoginPollResult>("copilot_login_poll", { deviceCode });
+  }
+  if (!canInvokeTauri()) {
+    return { status: "error", error: "GitHub Copilot login is unavailable in this build." };
+  }
+  return invoke<CopilotLoginPollResult>("copilot_login_poll", {
+    deviceCode,
+    ...remoteArgs(remote)
+  });
+}
+
 export async function loginWithApiKey(
   providerId: string,
   apiKey: string,
@@ -1262,6 +1325,18 @@ export async function subscribeWorkflowRunFinished(
   const client = await ensureLocalDaemonClient();
   return client.on("workflow-run:finished", (payload) => {
     handler(payload as { slug: string; runId: string; status: string });
+  });
+}
+
+/** Subscribe to `contacts:updated` — emitted when a subscriber finishes (or
+ *  attempts) hydrating a connector's contacts, so the contacts screen can
+ *  refetch without polling. Returns an unsubscribe function. */
+export async function subscribeContactsUpdated(
+  handler: (event: { connection: string; ok: boolean }) => void
+): Promise<() => void> {
+  const client = await ensureLocalDaemonClient();
+  return client.on("contacts:updated", (payload) => {
+    handler(payload as { connection: string; ok: boolean });
   });
 }
 
@@ -1946,7 +2021,34 @@ export async function saveMonitorMemory(connectionSlug: string, content: string)
   });
 }
 
-/** Execute a human-approved outbound connector action draft. */
+/** Execute a human-approved outbound action. */
+export async function executeOutboundAction(params: {
+  actionId: string;
+  version: number;
+  approvedMessage?: string;
+  approvedInput?: Record<string, unknown>;
+  clientRequestId: string;
+  duplicateRiskAck?: boolean;
+}): Promise<{ status: string; actionId: string; receipt?: unknown }> {
+  const client = await ensureLocalDaemonClient();
+  const payload: Record<string, unknown> = {
+    action_id: params.actionId,
+    version: params.version,
+    client_request_id: params.clientRequestId
+  };
+  if (params.approvedMessage !== undefined) {
+    payload.approved_message = params.approvedMessage;
+  }
+  if (params.approvedInput !== undefined) {
+    payload.approved_input = params.approvedInput;
+  }
+  if (params.duplicateRiskAck === true) {
+    payload.duplicate_risk_ack = true;
+  }
+  return client.request<{ status: string; actionId: string; receipt?: unknown }>("outbound_action_execute", payload);
+}
+
+/** Compatibility wrapper for Automation review drafts, now backed by outbound actions. */
 export async function executeConnectorActionDraft(params: {
   draftId: string;
   version: number;
@@ -1954,34 +2056,43 @@ export async function executeConnectorActionDraft(params: {
   approvedInput?: Record<string, unknown>;
   clientRequestId: string;
 }): Promise<{ status: string; draftId: string; receipt?: unknown }> {
-  const client = await ensureLocalDaemonClient();
-  const request: Record<string, unknown> = {
-    draft_id: params.draftId,
+  const result = await executeOutboundAction({
+    actionId: params.draftId,
     version: params.version,
-    client_request_id: params.clientRequestId
-  };
-  if (params.approvedMessage !== undefined) {
-    request.approved_message = params.approvedMessage;
-  }
-  if (params.approvedInput !== undefined) {
-    request.approved_input = params.approvedInput;
-  }
-  return client.request<{ status: string; draftId: string; receipt?: unknown }>("connector_action_execute", request);
+    approvedMessage: params.approvedMessage,
+    approvedInput: params.approvedInput,
+    clientRequestId: params.clientRequestId
+  });
+  return { status: result.status, draftId: params.draftId, receipt: result.receipt };
 }
 
-/** Read the persisted status for an outbound connector action draft. */
-export async function connectorActionDraftStatus(params: {
-  draftId: string;
+/** Read the persisted status for an outbound action. */
+export async function outboundActionStatus(params: {
+  actionId: string;
   version: number;
-}): Promise<{ status: string; draftId: string; version: number; error?: unknown; receipt?: unknown }> {
+}): Promise<{ status: string; actionId: string; version: number; error?: unknown; receipt?: unknown }> {
   const client = await ensureLocalDaemonClient();
-  return client.request<{ status: string; draftId: string; version: number; error?: unknown; receipt?: unknown }>(
-    "connector_action_draft_status",
+  return client.request<{ status: string; actionId: string; version: number; error?: unknown; receipt?: unknown }>(
+    "outbound_action_status",
     {
-      draft_id: params.draftId,
+      action_id: params.actionId,
       version: params.version
     }
   );
+}
+
+/** Cancel a pending outbound action. */
+export async function cancelOutboundAction(params: {
+  actionId: string;
+  version: number;
+  reason?: string;
+}): Promise<{ status: string; actionId: string }> {
+  const client = await ensureLocalDaemonClient();
+  return client.request<{ status: string; actionId: string }>("outbound_action_cancel", {
+    action_id: params.actionId,
+    version: params.version,
+    reason: params.reason?.trim() || undefined
+  });
 }
 
 /** Add one include or exclude monitor rule and return the refreshed workflow snapshot. */
@@ -2278,14 +2389,8 @@ export async function resolvePermission(
   requestId: string,
   action: PermissionAction
 ): Promise<void> {
-  try {
-    const client = await ensureLocalDaemonClient();
-    await client.request("resolve_permission", { turnId, requestId, action });
-    return;
-  } catch (daemonError) {
-    if (!canInvokeTauri()) throw daemonError;
-    await invoke("resolve_permission", { turnId, requestId, action });
-  }
+  const client = await ensureLocalDaemonClient();
+  await client.request("resolve_permission", { turnId, requestId, action });
 }
 
 /** Resolves a pending AskUserQuestion prompt for an in-flight turn. */
@@ -2295,14 +2400,8 @@ export async function resolveUserQuestion(
   answers: UserQuestionAnswers,
   annotations: UserQuestionAnnotations = {}
 ): Promise<void> {
-  try {
-    const client = await ensureLocalDaemonClient();
-    await client.request("resolve_user_question", { turnId, requestId, answers, annotations });
-    return;
-  } catch (daemonError) {
-    if (!canInvokeTauri()) throw daemonError;
-    await invoke("resolve_user_question", { turnId, requestId, answers, annotations });
-  }
+  const client = await ensureLocalDaemonClient();
+  await client.request("resolve_user_question", { turnId, requestId, answers, annotations });
 }
 
 /** Best-effort cancel: the current model/tool step completes then the turn

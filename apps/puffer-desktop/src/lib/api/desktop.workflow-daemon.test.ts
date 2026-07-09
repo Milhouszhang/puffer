@@ -64,6 +64,31 @@ test("rejects daemon-only requests before Tauri backend fallback", async () => {
   expect(invoke).not.toHaveBeenCalled();
 });
 
+test("sends duplicate risk acknowledgement only for explicit outbound retries", async () => {
+  const { request } = mockDesktopDaemonClient();
+  request.mockResolvedValueOnce({ status: "sent", actionId: "action-1", receipt: { ok: true } });
+  const api = await import("./desktop");
+
+  await api.executeOutboundAction({
+    actionId: "action-1",
+    version: 5,
+    approvedMessage: "Approved text",
+    clientRequestId: "client-ack",
+    duplicateRiskAck: true
+  });
+
+  expect(request).toHaveBeenCalledWith(
+    "outbound_action_execute",
+    {
+      action_id: "action-1",
+      version: 5,
+      approved_message: "Approved text",
+      client_request_id: "client-ack",
+      duplicate_risk_ack: true
+    }
+  );
+});
+
 test("marks automation and workflow runtime API calls as daemon-only", async () => {
   const { invoke, request } = mockDesktopDaemonClient();
   const api = await import("./desktop");
@@ -194,6 +219,52 @@ test("marks automation and workflow runtime API calls as daemon-only", async () 
     ["workflow_binding_delete", workflowOptions],
     ["workflow_connection_delete", workflowOptions],
     ["workflow_toggle", workflowOptions]
+  ]);
+  expect(invoke).not.toHaveBeenCalled();
+});
+
+test("routes outbound action approval APIs to unified daemon RPCs", async () => {
+  const { invoke, request } = mockDesktopDaemonClient();
+  request
+    .mockResolvedValueOnce({ status: "sent", actionId: "action-1", receipt: { ok: true } })
+    .mockResolvedValueOnce({ status: "draft_ready", actionId: "action-1", version: 2 })
+    .mockResolvedValueOnce({ status: "cancelled", actionId: "action-1" });
+  const api = await import("./desktop");
+
+  await api.executeOutboundAction({
+    actionId: "action-1",
+    version: 2,
+    approvedMessage: "Approved text",
+    clientRequestId: "client-1"
+  });
+  await api.outboundActionStatus({ actionId: "action-1", version: 2 });
+  await api.cancelOutboundAction({ actionId: "action-1", version: 2, reason: "user" });
+
+  expect(request.mock.calls.map(([method, params]) => [method, params])).toEqual([
+    [
+      "outbound_action_execute",
+      {
+        action_id: "action-1",
+        version: 2,
+        approved_message: "Approved text",
+        client_request_id: "client-1"
+      }
+    ],
+    [
+      "outbound_action_status",
+      {
+        action_id: "action-1",
+        version: 2
+      }
+    ],
+    [
+      "outbound_action_cancel",
+      {
+        action_id: "action-1",
+        version: 2,
+        reason: "user"
+      }
+    ]
   ]);
   expect(invoke).not.toHaveBeenCalled();
 });

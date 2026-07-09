@@ -10,6 +10,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
 
 #[derive(Debug, Deserialize)]
 struct MonitorRuleAddParams {
@@ -63,8 +65,12 @@ pub(crate) fn handle_monitor_rule_add(paths: &ConfigPaths, params: &Value) -> Re
         }
     }
     manager.store().upsert(binding)?;
-    manager.refresh_connection_consumers()?;
-    super::handle_workflow_list(paths)
+    refresh_connection_consumers_background(
+        Arc::clone(&manager),
+        connection_slug.to_string(),
+        "adding monitor rule",
+    );
+    super::handle_workflow_list_with_runtime(paths, false)
 }
 
 /// Deletes one include or exclude monitor rule and returns a refreshed snapshot.
@@ -87,8 +93,40 @@ pub(crate) fn handle_monitor_rule_delete(paths: &ConfigPaths, params: &Value) ->
         }
     }
     manager.store().upsert(binding)?;
-    manager.refresh_connection_consumers()?;
-    super::handle_workflow_list(paths)
+    refresh_connection_consumers_background(
+        Arc::clone(&manager),
+        connection_slug.to_string(),
+        "deleting monitor rule",
+    );
+    super::handle_workflow_list_with_runtime(paths, false)
+}
+
+fn refresh_connection_consumers_background(
+    manager: Arc<SubscriptionManager>,
+    connection_slug: String,
+    operation: &'static str,
+) {
+    let spawn_connection_slug = connection_slug.clone();
+    if let Err(error) = thread::Builder::new()
+        .name("puffer-monitor-rule-refresh".to_string())
+        .spawn(move || {
+            if let Err(error) = manager.refresh_connection_consumers() {
+                tracing::warn!(
+                    connection = %spawn_connection_slug,
+                    %error,
+                    operation,
+                    "failed to refresh connection consumers after monitor rule change"
+                );
+            }
+        })
+    {
+        tracing::warn!(
+            connection = %connection_slug,
+            %error,
+            operation,
+            "failed to spawn connection consumer refresh after monitor rule change"
+        );
+    }
 }
 
 pub(super) fn include_filters_json(filter: Option<&FilterSpec>) -> Value {
@@ -232,7 +270,7 @@ fn simplify_filters(mut filters: Vec<FilterSpec>) -> Option<FilterSpec> {
     }
 }
 
-fn push_unique_rule(filters: &mut Vec<FilterSpec>, rule: FilterSpec) {
+pub(super) fn push_unique_rule(filters: &mut Vec<FilterSpec>, rule: FilterSpec) {
     if !filters
         .iter()
         .any(|existing| filter_json_eq(existing, &rule))

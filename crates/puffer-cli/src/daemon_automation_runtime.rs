@@ -75,7 +75,9 @@ enum ConnectorActionPosition {
     TopLevelTerminal,
     /// A top-level gated action with steps after it. `resume_step_index` is the
     /// index of the first step to run once the drafted action is approved.
-    TopLevelNonTerminal { resume_step_index: usize },
+    TopLevelNonTerminal {
+        resume_step_index: usize,
+    },
     LoopBody,
 }
 
@@ -483,7 +485,11 @@ fn find_suspension_for_draft(
 
 /// Removes any suspensions for a draft (called after a resume completes) or for
 /// a whole run (called on reject). Idempotent.
-fn remove_suspensions(paths: &ConfigPaths, draft_id: Option<&str>, run_id: Option<&str>) -> Result<()> {
+fn remove_suspensions(
+    paths: &ConfigPaths,
+    draft_id: Option<&str>,
+    run_id: Option<&str>,
+) -> Result<()> {
     let path = automation_suspensions_path(paths);
     if !path.exists() {
         return Ok(());
@@ -678,8 +684,13 @@ pub(crate) fn resume_automation_run(
         resources: Some(&inputs.resources),
     };
     let record = state.automation_store().get(&suspension.automation_id)?;
-    let execution =
-        execute_resumed_automation(paths, &record, &suspension, receipt, Some(&provider_context))?;
+    let execution = execute_resumed_automation(
+        paths,
+        &record,
+        &suspension,
+        receipt,
+        Some(&provider_context),
+    )?;
     update_automation_run_after_resume(paths, &suspension, &execution)?;
     // Resume finished (completed, or re-suspended at a later gated step which
     // wrote its own suspension): drop this step's suspension.
@@ -754,9 +765,7 @@ fn update_automation_run_after_resume(
     let run = history
         .runs
         .iter_mut()
-        .find(|run| {
-            run.automation_id == suspension.automation_id && run.id == suspension.run_id
-        })
+        .find(|run| run.automation_id == suspension.automation_id && run.id == suspension.run_id)
         .with_context(|| {
             format!(
                 "automation run `{}` for automation `{}` not found",
@@ -769,10 +778,13 @@ fn update_automation_run_after_resume(
     run.error = None;
     // A completed resume means a human approved and the flow finished; a
     // re-suspend keeps the awaiting_approval draft state from the flow output.
-    run.approval = execution.approval.clone().or(Some(AutomationRunApprovalRecord {
-        required: true,
-        status: "approved".to_string(),
-    }));
+    run.approval = execution
+        .approval
+        .clone()
+        .or(Some(AutomationRunApprovalRecord {
+            required: true,
+            status: "approved".to_string(),
+        }));
     write_run_history(&path, &history)
 }
 
@@ -1357,7 +1369,10 @@ fn execute_ordered_flow_after_root(
                 None,
             )
             .with_context(|| {
-                format!("run continuation after resumed connector action `{}`", resume.step_id)
+                format!(
+                    "run continuation after resumed connector action `{}`",
+                    resume.step_id
+                )
             })?;
         }
         start_index = resume.resume_step_index;
@@ -1529,7 +1544,10 @@ fn execute_ordered_flow_after_root_in_memory(
                 None,
             )
             .with_context(|| {
-                format!("run continuation after resumed connector action `{}`", resume.step_id)
+                format!(
+                    "run continuation after resumed connector action `{}`",
+                    resume.step_id
+                )
             })?;
         }
         start_index = resume.resume_step_index;
@@ -2139,9 +2157,15 @@ fn execute_agent_step(
 
         let mut tool_results = Vec::new();
         for call in &decision.tool_calls {
-            let tool = tools.iter().find(|tool| tool.id == call.tool_id).with_context(|| {
-                format!("agent step `{id}` requested unknown tool `{}`", call.tool_id)
-            })?;
+            let tool = tools
+                .iter()
+                .find(|tool| tool.id == call.tool_id)
+                .with_context(|| {
+                    format!(
+                        "agent step `{id}` requested unknown tool `{}`",
+                        call.tool_id
+                    )
+                })?;
             // Agent tools run through the same connector-action executor as
             // loop-body actions. Gated (human-approval) actions are rejected
             // mid-loop by ConnectorActionPosition::LoopBody; the reviewed

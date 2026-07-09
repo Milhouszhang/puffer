@@ -33,6 +33,9 @@
     errorMessage: string | null;
     externals: ExternalCredential[];
     busyImportKey: string | null;
+    copilotLogin: { userCode: string; verificationUri: string } | null;
+    onLoginCopilot: (providerId: string) => void;
+    onCancelLogin: () => void;
     onLoginOauth: (providerId: string) => void;
     onLoginApiKey: (
       providerId: string,
@@ -310,6 +313,9 @@
               errorMessage={props.errorMessage}
               externals={props.externals}
               busyImportKey={props.busyImportKey}
+              copilotLogin={props.copilotLogin}
+              onLoginCopilot={props.onLoginCopilot}
+              onCancelLogin={props.onCancelLogin}
               onLoginOauth={props.onLoginOauth}
               onLoginApiKey={props.onLoginApiKey}
               onLogout={props.onLogout}
@@ -334,6 +340,9 @@
             errorMessage={props.errorMessage}
             externals={props.externals}
             busyImportKey={props.busyImportKey}
+            copilotLogin={props.copilotLogin}
+            onLoginCopilot={props.onLoginCopilot}
+            onCancelLogin={props.onCancelLogin}
             onLoginOauth={props.onLoginOauth}
             onLoginApiKey={props.onLoginApiKey}
             onLogout={props.onLogout}
@@ -761,7 +770,7 @@
     gap: 18px;
   }
   .pf-onboard-provider-setup :global(.provider-grid) {
-    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .pf-analyzing {
     display: flex;

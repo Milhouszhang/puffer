@@ -120,6 +120,7 @@ pub(crate) fn execute_tool(
                 .unwrap_or_else(puffer_media::ExactMediaDiscoveryCache::empty);
             let session_id = state.session.id;
             let process_store = state.process_store.clone();
+            let turn_context = state.current_turn_context().cloned();
             let mut internal_permission_handler = |request| match request {
                 bash_internal_permissions::InternalToolBrokerRequest::Permission(request) => {
                     bash_internal_permissions::InternalToolBrokerResponse::Permission(
@@ -149,6 +150,7 @@ pub(crate) fn execute_tool(
                 input,
                 Some(&process_store),
                 Some(&mut internal_permission_handler),
+                turn_context,
             )?;
             let output = serde_json::to_string_pretty(&execution.output)
                 .context("failed to serialize Bash output")?;
@@ -394,6 +396,7 @@ pub(crate) fn execute_parallel_bash_with_media_broker(
         args,
         media_ctx.process_store,
         Some(&mut handler),
+        None,
     )?;
     let output = serde_json::to_string_pretty(&execution.output)
         .context("failed to serialize Bash output")?;
@@ -977,15 +980,6 @@ fn execute_workflow_tool_with_media_context(
         "McpToolCall" => workflow::mcp_tool_call::execute_mcp_tool_call(state, cwd, input),
         "McpStatus" => workflow::mcp_status::execute_mcp_status(state, cwd, input),
         "ModalAction" => workflow::modal_action::execute_modal_action(state, cwd, input),
-        "MonitorActionDraft" => {
-            workflow::monitor_action_draft::execute_monitor_action_draft(state, cwd, input)
-        }
-        "MonitorReplyDraft" => {
-            workflow::monitor_reply_draft::execute_monitor_reply_draft(state, cwd, input)
-        }
-        "MonitorReplySend" => {
-            workflow::monitor_reply_send::execute_monitor_reply_send(state, cwd, input)
-        }
         "NativeMcpAction" => {
             workflow::native_mcp_action::execute_native_mcp_action(state, cwd, input)
         }

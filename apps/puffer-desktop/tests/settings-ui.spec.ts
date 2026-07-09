@@ -215,7 +215,7 @@ test("automation runtime settings switch between Local and Cloud defaults", asyn
 
   await pane.getByRole("radio", { name: /Run on AgentEnv Cloud/ }).check();
   await expect(pane.getByLabel("API URL")).toHaveValue("https://api.agentenv.io");
-  await expect(pane.getByLabel("Automation Console URL")).toHaveValue("https://agentenv.io");
+  await expect(pane.getByLabel("Automation Console URL")).toHaveCount(0);
   expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
 });
 
@@ -266,11 +266,34 @@ test("automation runtime settings test connection success", async ({ page }) => 
   expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
 });
 
+test("automation runtime local repair requires confirmation", async ({ page }) => {
+  const daemon = new FakeDaemon();
+  await daemon.install(page);
+  await daemon.open(page);
+
+  const pane = await openAutomationRuntimeSettings(page);
+  page.once("dialog", async (dialog) => {
+    expect(dialog.message()).toContain("Repair the Puffer-managed local automation runtime");
+    await dialog.accept();
+  });
+  await pane.getByRole("button", { name: "Repair Runtime" }).click();
+
+  const repair = await daemon.waitForRequest("workflow_backend_repair_local_runtime");
+  expect(repair.params).toMatchObject({ confirm: true });
+  await expect(pane.getByText("Local automation runtime repaired. Previous runtime data was archived.")).toBeVisible();
+  expect(daemon.requests.some((request) => request.method === "workflow_list")).toBe(false);
+});
+
 test("automation runtime settings test connection failure", async ({ page }) => {
   const daemon = new FakeDaemon();
   daemon.setWorkflowBackendConnection({
     success: false,
-    runtime: { state: "passed", message: "Automation runtime API is reachable." },
+    ready: { state: "passed", message: "Automation runtime readiness endpoint is healthy." },
+    runtime: {
+      state: "failed",
+      message: "invalid token",
+      error: { kind: "invalid_token", message: "invalid token", statusCode: 401 }
+    },
     auth: {
       state: "failed",
       message: "invalid token",

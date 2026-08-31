@@ -1,413 +1,464 @@
-# Automation Approval And Recovery Design
+# Automation Approval And Terminal Settlement Design
 
 Date: 2026-07-10
 
-## Context
+## Context And Decision
 
-PR #505 introduces Automation activation, run history, human-reviewed connector
-actions, and local/AgentEnv runtime integration. The current implementation
-splits one Automation run across run-history and suspension files, embeds
-Automation provenance inside connector input, and does not settle or resume a
-run after the unified outbound action path sends its draft. It also advertises
-runtime combinations that cannot execute end to end.
+PR #505 introduces Automation activation, run history, and human-reviewed
+connector actions. The current implementation splits one run across history and
+suspension files, embeds Automation provenance inside connector input, trusts
+client-editable side-effect flags, and loses run settlement after the unified
+outbound path sends an action.
 
-This design replaces those boundaries rather than preserving the unreleased
-schema and RPC compatibility. The priorities are long-term correctness,
-recoverability, bounded performance, and a small implementation surface.
+The first design proposed durable mid-flow continuation replay. Independent
+state-machine, YAGNI, and repository-fit reviews found that this would create a
+partial workflow engine without sufficient per-step checkpoint or effect
+semantics. Replaying provider, AgentEnv, filesystem, shell, or agent work is not
+safe merely because connector sends are gated.
+
+This revision therefore supports human approval only for a terminal top-level
+connector action. It keeps the safety mechanisms required for drafting,
+delivery uncertainty, terminal settlement, and crash recovery while deferring
+continuation replay.
+
+Compatibility with the unreleased Automation review schemas is not required.
+Monitor RPC aliases named by the repository's monitor guardrails remain intact.
 
 ## Goals
 
-- Make each Automation run have one durable source of truth.
-- Preserve the human gate for every connector operation with an outward side
-  effect.
-- Never report that delivery failed after a sent receipt has been committed.
-- Recover safely from crashes at every boundary between run state, draft state,
-  connector delivery, and continuation execution.
-- Prevent action provenance, routing metadata, and arbitrary edited payloads
-  from crossing the connector boundary.
-- Expose and activate only runtime combinations that Puffer can execute end to
-  end.
-- Serialize local runtime lifecycle mutations and keep in-memory config in sync
-  with persisted config.
-- Keep storage and recovery bounded without adding a database, event bus, or
-  general job framework.
+- Give each Automation run one durable lifecycle record.
+- Make side-effect and editability policy server-owned.
+- Ensure every outward connector effect is either explicitly ungated by trusted
+  catalog policy or protected by human approval.
+- Never report delivery failure after a sent receipt is committed.
+- Recover missing drafts and incomplete terminal run settlement without
+  resending.
+- Represent ambiguous delivery honestly and require explicit risk
+  acknowledgement before retry or abandonment.
+- Expose and activate only runtime combinations Puffer can execute end to end.
+- Serialize local runtime lifecycle/config mutations and protect generated
+  secrets.
+- Keep the implementation bounded to the existing single-daemon, local-JSON
+  architecture.
 
 ## Non-Goals
 
-- Bridging AgentEnv schedule or webhook triggers back into Puffer-owned agent or
-  connector boundaries.
-- Human-gated side effects inside loop bodies or inside a first-class agent
-  step.
-- Arbitrary JSON payload editing during approval.
-- A false exactly-once guarantee for external delivery.
-- SQLite, a durable general-purpose queue, or a new runtime management daemon.
-- Migration or compatibility parsing for the unreleased run, suspension,
-  outbound, or RPC schemas replaced by this change.
+- Resuming steps after a human-gated action.
+- Approval gates with successors, joins, loop nesting, or agent nesting.
+- AgentEnv schedule/webhook ingress into Puffer-owned boundaries.
+- Side-effecting tools inside first-class Agent or legacy `puffer_agent` steps.
+- Arbitrary JSON payload editing during review.
+- A false exactly-once guarantee for connector delivery.
+- SQLite, a durable general-purpose queue, an artifact deployment journal, or a
+  new runtime-management daemon.
+- Migration or compatibility parsing for the superseded Automation run,
+  suspension, origin, and approval schemas.
+
+## Superseded Contracts
+
+This design and the new component update specs supersede:
+
+- `specs/puffer-automation/02.md` where it permits non-terminal suspensions,
+  `approved_input`, or client-controlled review policy.
+- `specs/puffer-cli/249.md` where it advertises schedule/webhook/transform
+  capabilities, persists continuation suspensions, or uses Automation-specific
+  execute/reject mutations.
+- `specs/puffer-desktop/792.md` where review detail exposes raw input or Desktop
+  sends `approved_input`, `connector_action_execute`, or
+  `automation_pending_action_reject`.
 
 ## Core Invariants
 
-1. `AutomationRunStore` is the source of truth for Automation execution state.
-2. `OutboundStore` is the source of truth for human decisions and connector
+1. `AutomationRunStore` is the source of truth for Automation lifecycle state.
+2. `OutboundStore` is the source of truth for review decisions and connector
    delivery state.
-3. Internal origin and routing data never appear in connector input.
-4. A run resumes from the immutable definition snapshot captured for that run,
-   not from the current editable Automation record.
-5. A sent action is never made unsent by a later Automation failure.
-6. All mutations of one outbound action use the same per-action coordination
-   lock.
-7. All continuation execution for one run uses the same per-run lock.
-8. File locks are held only for short read-modify-write operations, never for
-   connector, provider, Docker, or AgentEnv calls.
-9. Unsupported runtime ownership combinations fail closed before deployment.
-10. An Automation is Active only after every required artifact and binding is
-    deployed and enabled.
+3. A generated opaque action ID is persisted in the run before draft
+   materialization.
+4. Internal provenance and routing metadata never enter connector input.
+5. Client-authored flags may tighten review but can never weaken the trusted
+   connector permission floor.
+6. A sent action remains sent even if terminal run settlement fails.
+7. All mutations of one action use the same per-action coordination lock.
+8. An interrupted `Running` run is never automatically replayed.
+9. Recovery performs local store reconciliation only; it never calls a
+   connector, provider, AgentEnv, or Docker.
+10. An Automation is Active only after fresh preflight and successful live
+    binding enablement.
 
-## Domain Model
+## Server-Owned Policy
 
-### Automation Run Aggregate
+### Side-Effect Classification
 
-The separate suspension file is removed. The run store contains bounded run
-records, and run history is a projection of those records.
+Automation save/compile resolves the connector, connection, and action through
+the installed connector catalog. It derives the effective permission through
+`outbound_gate::effective_action_permission`, including the builtin permission
+floor. Product Automation does not use the standing-approval semantics of
+`SendOrigin::RuleAutomation`.
+
+`draft_only` and node-level `human_approval_required` may require review for an
+otherwise ungated action. They cannot make a catalog-gated action synchronous.
+The Automation-level review setting is a default for outward effects, not a
+request to gate read-only actions, and `false` cannot disable mandatory review.
+
+Unknown connectors/actions and unknown effect classifications fail closed.
+First-class Agent and legacy `puffer_agent` steps may declare only connector
+tools that trusted catalog policy permits without a review draft. A tool that
+requires review cannot run inside an agent step and is rejected before
+activation. This does not introduce a general idempotency taxonomy.
+
+### Approval Metadata
+
+`ConnectorActionDefinition` gains optional server-owned review metadata. The
+default policy is exact approval:
 
 ```text
-AutomationRunRecord
-  id
-  automation_id
-  version
-  definition
-    automation_revision
-    spec_hash
-    normalized_spec?       # retained only while non-terminal
-  state
-  started_at_ms
-  updated_at_ms
-  summary
-  result?
+Exact
+EditableText {
+  allowed_input_fields,
+  max_bytes,
+  allow_empty
+}
 ```
 
-The persisted state is a tagged Rust enum:
+The metadata names an ordered, non-empty set of accepted connector aliases. At
+draft creation the daemon resolves exactly one field present in the input and
+stores `EditableText { input_field }` on that action. Conflicting aliases fail
+closed; there is no heuristic outside the declared metadata. The daemon
+validates fields against the connector schema, applies a host maximum, and
+treats all other input as immutable. Connection slug, connector slug, action,
+recipient, origin, trigger context, and authorization data are never editable.
+
+The daemon validates that the selected connection belongs to the connector and
+derives the stable recipient from server-recognized action input. It forwards
+only declared connector input. It does not inject connector/connection slugs,
+action names, trigger/root/previous outputs, or `__automation` metadata.
+
+## Automation Run Store
+
+`DaemonState` owns one `AutomationRunStore`. The separate
+`automation_suspensions.json` file is removed, and run history is a sanitized
+projection of run records.
+
+Run IDs are UUIDs, not timestamp-derived identifiers. Persisted states are:
 
 ```text
 Running
 AwaitingApproval {
-  action_intent,
-  continuation_checkpoint?
-}
-ResumePending {
   action_id,
-  receipt,
-  continuation_checkpoint?,
-  attempts,
-  last_error?
+  step_id,
+  action_intent,
+  base_intent_hash
 }
-Completed
+Completed { result? }
 Rejected { reason }
-Failed { error_code, message }
-```
-
-There is no durable `Resuming` state. A per-run process lock represents an
-in-flight continuation. The durable `ResumePending` state remains recoverable
-if the process exits before, during, or after the continuation call.
-
-`ContinuationCheckpoint` contains the next top-level step index, trigger input,
-root output, and previous output. Terminal gated actions have no checkpoint.
-
-The run captures a normalized Automation spec, revision, and spec hash before
-execution. Resume compiles from that snapshot. Credentials and secret values
-are resolved at execution time and are never copied into the snapshot. Terminal
-runs discard the normalized spec and checkpoint while retaining revision, hash,
-result, and audit summary.
-
-### Pending Action Intent
-
-When execution reaches a gate, it builds a typed action intent containing the
-connector, connection, action, connector-owned input, recipient identity,
-display information, and approval policy. The action ID is derived from
-`run_id`, `step_id`, and a stable gate sequence.
-
-The run is first atomically changed to `AwaitingApproval`, including this
-intent and any checkpoint. `OutboundStore::ensure_draft` then materializes the
-action idempotently. A matching existing action is returned. An existing action
-with different content or origin is treated as corruption and fails closed.
-
-This ordering lets startup recovery recreate a missing draft without placing
-continuation state inside the outbound record.
-
-### Typed Outbound Origin
-
-The generic optional origin fields and `input.__automation` convention are
-replaced by a tagged enum:
-
-```rust
-enum OutboundOrigin {
-    Session(SessionOrigin),
-    Monitor(MonitorOrigin),
-    Automation(AutomationActionOrigin),
+Failed {
+  error_code,
+  message,
+  delivery_may_have_occurred
 }
 ```
 
-`AutomationActionOrigin` contains `automation_id`, `run_id`, `step_id`, and
-`spec_hash`. Constructors require the appropriate typed origin. Queue filtering
-and run settlement never infer origin from connector input or user-controlled
-metadata.
+The Automation revision and canonical spec hash are stored for audit and UI
+diagnostics. No normalized spec snapshot or continuation checkpoint is stored.
 
-### Approval Policy
+`action_intent` contains the immutable connector-owned input, recipient,
+approval policy, and typed origin required to recreate the draft. It is never
+returned by run-history RPCs or written to logs.
 
-Every outbound action stores one server-selected policy:
+The store owns a bounded in-memory snapshot behind one mutex. A mutation builds
+the candidate file, atomically persists it, and only then publishes it in
+memory. The file uses an explicit schema version and mode `0600`. An unknown
+schema fails with an actionable reset error and is never silently mutated.
 
-```text
-Exact
-EditableText { input_field }
-```
+All active runs and at most 500 terminal runs are retained. Terminal results
+are sanitized and capped at 64 KiB serialized; summaries/errors are capped at
+4 KiB. Oversized values are replaced by a truncation marker and digest.
 
-The execute RPC accepts only optional `approved_text`. `Exact` rejects any
-edit. `EditableText` maps the text to the stored field and leaves every other
-input field unchanged. The server never falls back to inventing a `message`
-field. Review detail responses contain sanitized display fields and editable
-text, not the raw connector input.
+## Terminal Gate Execution
 
-Connector slug, connection slug, action name, origin, and authorization data
-remain separate from connector-owned input. Connector execution receives them
-through typed arguments rather than injected payload keys.
+A run is persisted as `Running` before its first provider, AgentEnv, or
+connector-related runtime call.
 
-## State Transitions
+Compiler validation requires every mandatory-review connector action to be the
+terminal top-level step. It may not have a successor or appear inside a loop,
+branch/join, first-class Agent, or legacy `puffer_agent` tool call.
 
-### Outbound Action
+When execution reaches the terminal gate:
+
+1. Generate one opaque UUID action ID.
+2. Build the typed action intent and canonical base-intent hash.
+3. Persist `AwaitingApproval` with the action ID and intent.
+4. Call `OutboundStore::ensure_draft(action_id, intent)`.
+5. Return `awaiting_approval`.
+
+`ensure_draft` returns a matching existing action. A matching ID with different
+origin, base intent, connector, action, destination, or approval policy is a
+corruption error and becomes non-sendable.
+
+If execution completes without a gate, the run becomes `Completed`; a runtime
+error becomes `Failed`. There is no post-approval continuation.
+
+## Outbound State And Idempotency
+
+Outbound states remain explicit:
 
 ```text
 DraftReady or Failed -> Sending -> Sent
                        |
-                       +-> Failed       only when no-send is definitive
-                       +-> Uncertain    when delivery cannot be determined
+                       +-> Uncertain
 
-DraftReady, Failed, or Uncertain -> Cancelled
+DraftReady or Failed -> Cancelled
+Uncertain -> Sending       only with duplicate-risk acknowledgement
+Uncertain -> Cancelled     only with delivery-risk acknowledgement
+DraftReady or Failed -> Expired
+DraftReady, Failed, or Uncertain -> Quarantined   recovery mismatch only
 ```
 
-Retrying `Uncertain` requires explicit duplicate-risk acknowledgement.
-Connector execution returns a typed delivery outcome so pre-dispatch failures
-can be distinguished from ambiguous transport or timeout failures.
+All payload, policy, connection, recipient, schema, and run-link validation
+occurs before `Sending`. Once the connector executor is invoked, any returned
+error is conservatively `Uncertain` unless a future connector contract can
+prove that dispatch did not occur. Pre-invocation validation errors are
+`Failed` and remain reviewable.
 
-### Automation Run
+`begin_send` records the client request ID and approved-content hash. Replaying
+the same request ID is idempotent only when the approved content hash matches.
+Reusing a request ID with changed text fails.
 
-```text
-Running -> Completed | Failed | AwaitingApproval
-AwaitingApproval + sent action -> ResumePending
-AwaitingApproval + cancelled action -> Rejected
-ResumePending -> Completed | AwaitingApproval | ResumePending with error
-```
+The outbound action file contains message bodies and connector input and must
+also be mode `0600`. Generic terminal-action retention and audit rotation are
+separate repository-wide follow-ups rather than part of this PR.
 
-Illegal transitions return stable error codes and do not mutate either store.
+## Approval And Terminal Settlement
 
-## Approval And Settlement Flow
+The origin-aware outbound execute handler receives `DaemonState`.
 
-The unified outbound execute handler receives `DaemonState` and uses one
-origin-aware service.
+1. Acquire the action coordination lock and re-read the action.
+2. Validate version, state, typed origin, run link, connection, schema, and
+   approval policy.
+3. Apply optional `approved_text` only to the declared editable field.
+4. Persist `Sending`, request ID, attempt ID, and approved-content hash.
+5. Invoke the connector.
+6. Persist `Sent` and receipt before touching the run store.
+7. Release the action coordination lock.
+8. Best-effort transition the matching run from `AwaitingApproval` to
+   `Completed`.
 
-1. Acquire the action coordination lock.
-2. Load and validate action ID, version, status, origin, and approval policy.
-3. For Automation origin, confirm the run is waiting for the same action and
-   spec hash.
-4. Apply the optional approved text to the daemon-selected input field.
-5. Persist `Sending`, request ID, attempt ID, approved text, and approved
-   content hash.
-6. Execute the connector.
-7. Persist `Sent` and the receipt before any origin settlement.
-8. Move the Automation run from `AwaitingApproval` to `ResumePending`.
-9. Release the action lock.
-10. Under the run lock, settle `ResumePending` using the pinned definition and
-    checkpoint.
+After step 6, the RPC always reports delivery as sent. If step 8 fails, the
+response sets `runSettlementPending: true`; it never asks the user to resend.
+Same-request replay and startup reconciliation retry the local settlement.
 
-After step 7 the RPC response must report delivery as sent even if steps 8-10
-fail. It may report the run as `resume_pending`, allowing the UI to distinguish
-delivery success from continuation progress.
+## Rejection, Expiry, And Uncertain Abandonment
 
-An idempotent replay with the same client request ID returns the existing sent
-action and still invokes origin settlement. It must not return early before
-settlement.
+Execute and cancel use the same action lock, so approve/reject races have one
+winner.
 
-## Rejection And Cancellation
+- Cancelling `DraftReady` or `Failed` first commits `Cancelled`, releases the
+  action lock, then settles the run as `Rejected`. Automation-origin
+  cancellation requires a non-empty reason.
+- `Expired` settles the run as `Failed` with
+  `automation_approval_expired` and `delivery_may_have_occurred = false`.
+- Cancelling `Uncertain` requires an explicit acknowledgement that delivery may
+  already have occurred. The action records that it was cancelled from
+  uncertain, and the run becomes `Failed` with
+  `automation_delivery_uncertain_abandoned` and
+  `delivery_may_have_occurred = true`. It must never appear as an ordinary
+  rejection.
 
-Execute, Automation reject, and generic cancel use the same action lock.
+If local run settlement fails after an action terminal state commits, the
+action result still succeeds and startup reconciliation completes the run.
 
-1. Persist the action as `Cancelled`.
-2. Settle an Automation-origin cancellation by moving the matching run to
-   `Rejected` with the review reason.
-3. If run settlement fails after cancellation commits, return cancellation
-   success with recovery pending and let reconciliation finish the run.
+## Startup Reconciliation
 
-The first terminal action state wins an approve/reject race. The losing request
-receives a state-conflict error. A run is never marked rejected before the
-action has become non-sendable.
+Recovery is local-only and bounded. It runs after stores are loaded and before
+mutation RPCs are served; it performs no remote or Docker calls.
 
-## Crash Recovery
+First, scan all non-terminal outbound actions, regardless of origin. Any
+`Sending` left by the previous daemon process becomes `Uncertain`.
 
-Recovery runs once during daemon startup and can also be invoked explicitly for
-a run. It scans only non-terminal runs.
+Then scan active Automation runs:
 
-- Any outbound action left in `Sending` by the previous daemon process becomes
-  `Uncertain`; recovery never guesses whether that connector call delivered.
-- `AwaitingApproval`, missing action: call `ensure_draft` from the stored intent.
-- `AwaitingApproval`, matching sent action: move to `ResumePending` and settle.
-- `AwaitingApproval`, matching cancelled action: move to `Rejected`.
-- `AwaitingApproval`, mismatched origin/content: mark recovery required and do
-  not send.
-- `ResumePending`: verify the linked action is sent and execute the pinned
-  continuation.
+- `Running` -> `Failed(automation_run_interrupted)`.
+- `AwaitingApproval`, action missing -> `ensure_draft` from the persisted
+  intent.
+- matching `Sent` -> `Completed` without resending.
+- matching normal `Cancelled` -> `Rejected`.
+- matching `Cancelled` from `Uncertain` -> uncertain-abandoned `Failed`.
+- matching `Expired` -> approval-expired `Failed`.
+- `DraftReady`, `Failed`, or `Uncertain` -> remain awaiting review.
+- mismatched origin/content/policy -> quarantine the action as non-sendable and
+  fail the run with `automation_recovery_required`.
 
-The normal send path attempts settlement immediately. There is no polling loop.
-If immediate and startup recovery both fail, the run remains visibly
-`ResumePending` with a stable error code and supports explicit retry.
+No explicit run-retry RPC or background continuation worker is required for
+terminal settlement.
 
-Continuation execution has at-least-once semantics. This is safe only because
-all outward connector effects are gated. Until a durable mid-agent checkpoint
-exists, first-class agent steps may use only read-only or idempotent tools.
-Side-effecting agent tools and loop-body approval gates are rejected at save or
-activation time.
+## Concurrency
 
-## Concurrency And Storage
+The existing daemon singleton remains the cross-process ownership boundary.
+`OutboundStore` retains its path-keyed store mutex because drafts are created
+from multiple crate layers. Automation run state is daemon-owned.
 
-`AutomationRunStore` and `OutboundStore` each use a process-wide lock keyed by
-canonical path. Mutations re-read under the lock and atomically replace their
-file. Temporary filenames must be unique per write rather than a shared
-`.tmp` path.
+Execute and cancel share a daemon-owned per-action keyed lock. Lock entries must
+not accumulate without bound. The handler re-reads after acquiring the lock and
+never holds an action coordination lock together with a run-store mutex.
+Different actions remain concurrent.
 
-The daemon singleton remains the cross-process ownership boundary. Per-action
-and per-run lock registries use weak references or cleanup so completed IDs do
-not leak memory. Different actions and different runs may progress concurrently.
+A separate per-Automation lifecycle lock coordinates save/pause, activation,
+trigger admission, and deletion. It prevents a new run from starting between a
+delete check and binding removal.
 
-No store mutex is held across network or Docker calls, and code does not hold
-both store mutexes simultaneously. Cross-file consistency comes from durable
-states and reconciliation rather than nested locks or an attempted two-file
-transaction.
+## Runtime Catalog And Activation
 
-The run store keeps all active runs and at most 500 terminal records. Active
-runs are never removed by history retention. Terminal records do not retain
-large definition snapshots or checkpoints.
+The current product surface exposes Puffer connector-event triggers and
+server-validated connector actions. AgentEnv schedule/webhook triggers are not
+listed and are rejected at activation. Local JavaScript Transform is not listed
+or activatable until the selected runtime has an authoritative executable
+capability; the current local Compose stack is treated as unsupported.
 
-The replacement stores use explicit schema versions. An unexpected version
-fails with an actionable reset error; the daemon neither mutates nor silently
-deletes an incompatible file.
+Catalog generation must not start Docker. Ownership validation is pure.
+Activation performs a fresh runtime-target and executable-capability preflight.
+The deployment stores a non-secret runtime-target key derived from mode,
+normalized endpoint, and workspace ID; capability fingerprints are deferred
+until AgentEnv exposes a stable capability-generation contract.
 
-## Runtime Compatibility And Activation
+Activation guarantees observable invariants rather than pretending to provide
+a multi-system transaction:
 
-Compilation produces an execution plan that identifies trigger and step
-ownership plus required runtime capabilities. One server-side compatibility
-analyzer is reused by save diagnostics, preview, activation, and catalog
-generation.
+1. Compile and preflight before enabling live ingress.
+2. Prepare required helper artifacts and paused Puffer bindings.
+3. Enable the binding only after helpers are ready.
+4. Mark the Automation enabled last.
 
-Supported ownership combinations are:
+Failure leaves no enabled Puffer binding and keeps a visible paused/error
+record. Orphan helper cleanup is best effort. An AgentEnv helper that cannot be
+prepared without live ingress is unsupported rather than called "inactive."
 
-| Trigger owner | Flow ownership | Result |
-| --- | --- | --- |
-| Puffer connector event | Mixed Puffer and AgentEnv | Supported |
-| AgentEnv schedule/webhook | AgentEnv only | Structurally supported |
-| AgentEnv schedule/webhook | Any Puffer boundary | Rejected |
+Live trigger admission performs only local revision, spec-hash, runtime-target,
+and enabled-state checks. It does not probe a remote runtime for every event.
 
-The current Desktop catalog does not expose schedule or webhook triggers.
-There is no cross-runtime ingress bridge in this change.
+## Local Runtime Lifecycle And Secrets
 
-The catalog publishes an AgentEnv node only when the selected runtime reports
-and verifies the required execution capability. Listing a node definition is
-not sufficient. The current local Compose stack does not provide the executor
-sandbox required by `transform_js`, so the catalog hides it and activation of
-an existing transform plan fails with a capability error.
+`DaemonState` owns one local-runtime lifecycle mutex. Start, ensure-ready, test,
+repair, stop, and inspect use the same coordinator; no method-for-method manager
+class or separate daemon is introduced.
 
-Activation is phased:
+Persistent and transient local modes remain distinct:
 
-1. Pure compile and validation.
-2. Fresh runtime, auth, connector, ownership, and capability preflight.
-3. Deploy inactive AgentEnv artifacts.
-4. Deploy disabled Puffer bindings.
-5. Enable the bindings.
-6. Mark the Automation enabled.
+- When Local is the selected backend, a helper returns a candidate config. The
+  handler saves it, then calls `state.replace_config`, then reports success.
+- When the global selection is Cloud and Puffer uses transient Local runtime
+  state, only the stored transient-local config changes; global in-memory config
+  is not replaced.
 
-Failure leaves the Automation paused with a runtime error and no enabled Puffer
-binding. Newly created intermediate artifacts are cleaned up best effort. The
-runtime state records compiled revision, spec hash, backend identity, and
-capability fingerprint. A backend identity change makes the deployment stale
-and requires reactivation.
+If secret creation succeeds but config persistence fails, the newly created
+secret is deleted best effort and the previous in-memory config remains active.
+All lifecycle functions use the supplied `ConfigPaths`; they do not rediscover
+paths from cwd.
 
-Live trigger handling performs only cheap local identity, revision, and hash
-checks. It does not run a remote health probe for every event.
-
-## Local Runtime Lifecycle
-
-`DaemonState` owns one `LocalRuntimeManager` with a lifecycle mutex. Start,
-ensure-ready, test, repair, stop, and inspect all use this manager so Docker,
-port allocation, bootstrap files, and runtime config cannot be mutated
-concurrently.
-
-Lifecycle helpers return status plus an updated config and do not silently save
-user config. The RPC handler persists the config and then calls
-`state.replace_config` before returning. A persistence failure leaves the
-in-memory config unchanged. Config or lifecycle changes invalidate cached
-capabilities and the backend identity used by deployments.
-
-The runtime directory is mode `0700`. Secret-bearing `.env`, `seed.sql`, and
-stored local config files are written atomically with mode `0600`, without
-following symlinks. Logs and RPC responses never include generated secrets or
-file contents.
+The runtime root directory is mode `0700`. Secret-bearing `.env`, `seed.sql`,
+and stored local config files use atomic, non-symlink-following writes with mode
+`0600`. Logs and RPC responses exclude tokens, peppers, JWT secrets, seed
+contents, and message bodies.
 
 ## Deletion
 
-Automation deletion receives `DaemonState` and checks the run store. Any
-`Running`, `AwaitingApproval`, or `ResumePending` run blocks deletion. The user
-must first resolve the run; deletion does not perform an implicit cross-store
-cascade.
+Deletion acquires the per-Automation lifecycle lock, stops new admission and
+disables the live binding, then rechecks the run store.
 
-When no active run exists, live bindings are removed before the Automation
-record. A binding-removal failure keeps the record. Terminal outbound actions
-remain as audit history but are excluded from the review inbox.
+- `Running` or `AwaitingApproval` blocks deletion.
+- A blocked deletion leaves the Automation paused and visible.
+- With no active run, bindings are removed before the Automation record.
+- Deletion never implicitly sends, rejects, or abandons an uncertain action.
 
 ## RPC And Desktop Contract
 
-The canonical mutation RPCs are `outbound_action_execute` and
-`outbound_action_cancel`. Automation compatibility wrappers and legacy aliases
-are removed.
+The Automation review queries remain:
 
-Execute parameters are `action_id`, `version`, optional `approved_text`,
-`client_request_id`, and optional `duplicate_risk_ack`. Responses report the
-action delivery result separately from optional Automation run settlement.
+- `automation_pending_action_list`
+- `automation_pending_action_get`
 
-Stable subsystem error codes include:
+Mutations use:
+
+- `outbound_action_execute`
+- `outbound_action_cancel`
+
+Automation-only `connector_action_execute`,
+`automation_pending_action_reject`, and Desktop compatibility wrappers are
+removed. `monitor_action_execute` and `task_monitor_action_execute` remain as
+required Monitor aliases and continue using their existing response contract.
+No new dual-case aliases are added for Automation fields.
+
+Execute accepts `action_id`, `version`, optional `approved_text`,
+`client_request_id`, and optional `duplicate_risk_ack`. Cancel accepts
+`action_id`, `version`, reason, and optional `uncertain_delivery_ack`.
+
+Review detail returns the server-selected approval policy, editable text, and
+sanitized display/destination fields. It never returns raw connector input.
+
+Desktop behavior is:
+
+- `EditableText` shows one editor; `Exact` shows read-only sanitized fields.
+- The builder permits at most one mandatory-review action and places it last;
+  server validation remains authoritative.
+- A sent action leaves the inbox immediately.
+- `runSettlementPending` may show a transient "Sent; updating run history"
+  notice, but no resend or continuation retry control.
+- `Uncertain` requires duplicate-risk acknowledgement before retry and
+  delivery-risk acknowledgement before abandonment.
+- Expired and uncertain-abandoned runs display distinct, truthful outcomes.
+- Active is shown only after final activation success.
+- Snooze remains a local-only UI action.
+
+## Stable Errors
 
 - `outbound_action_version_mismatch`
 - `outbound_action_terminal`
 - `outbound_action_origin_mismatch`
 - `outbound_action_edit_not_allowed`
+- `outbound_action_request_content_mismatch`
 - `outbound_delivery_uncertain`
+- `outbound_uncertain_ack_required`
 - `automation_run_state_conflict`
+- `automation_run_interrupted`
+- `automation_approval_expired`
+- `automation_delivery_uncertain_abandoned`
 - `automation_runtime_capability_missing`
 - `automation_active_runs_prevent_delete`
+- `automation_store_version_unsupported`
 - `automation_recovery_required`
-
-The Desktop review UI renders the server approval policy. A sent action leaves
-the inbox even when its run remains `ResumePending`; history displays
-Continuing or Needs attention and provides an explicit retry. Uncertain actions
-require a visible duplicate-risk acknowledgement. Active is shown only from a
-successful final activation response.
 
 ## Test Strategy
 
 Implementation follows TDD. Required coverage includes:
 
-- Legal and illegal run/action state transitions.
-- Concurrent run updates without lost records or temporary-file collisions.
-- Typed origin validation and proof that internal metadata is not forwarded.
-- Exact versus editable-text approval behavior and destination pinning.
-- Terminal approval, mid-flow resume, next-gate suspension, and pinned-spec
-  resume after the editable Automation changes.
-- Sent-before-settlement, missing-draft, cancelled-before-run-settlement, and
-  startup `ResumePending` recovery.
-- Same-request replay without a duplicate connector call.
-- Approve/reject races and per-action parallelism.
-- Capability matrix, hidden unsupported catalog entries, and activation
-  failure without an executor sandbox.
-- Active-run deletion rejection.
-- Local runtime lifecycle serialization, config replacement, cache invalidation,
-  and Unix file modes.
-- Restored Desktop review Playwright coverage for editable approval, exact
-  approval, rejection, uncertain delivery, and resume-pending feedback.
+- Server-owned permission floors cannot be weakened by Automation flags.
+- Unknown or mandatory-review Agent/`puffer_agent` tools fail closed.
+- Mandatory-review actions are rejected unless terminal and top-level.
+- Run UUIDs, legal transitions, interrupted-Running recovery, retention,
+  `0600` permissions, concurrent updates, and incompatible schema handling.
+- Typed origin cannot be spoofed through input and is never forwarded.
+- Exact/editable policy, host/schema limits, empty-text rules, immutable
+  destination, and connection-to-connector validation.
+- Same request/content replay succeeds without duplicate execution; changed
+  content with the same request ID fails.
+- Sent-before-run-settlement recovery, missing-draft recreation, normal reject,
+  expiry, stale `Sending -> Uncertain`, uncertain retry, and uncertain
+  abandonment.
+- Approve/cancel races and parallel execution of different actions.
+- Activation rejection for schedule/webhook and unsupported transform, plus
+  enabled-last behavior and runtime-target mismatch.
+- Trigger-admission versus deletion race.
+- Local lifecycle serialization, persistent versus transient config behavior,
+  config replacement, orphan-secret cleanup, supplied paths, and secure modes.
+- Restored Desktop Playwright coverage for editable approval, exact approval,
+  normal rejection, uncertain acknowledgement, delayed terminal settlement,
+  expiry, hidden unsupported catalog entries, and active-run deletion errors.
 
-Focused crate and Desktop tests run before workspace formatting, clippy, and
-CI-equivalent gates.
+## Deferred Follow-Ups
+
+After the terminal-only launch is stable, separate issues may cover:
+
+- Durable mid-flow continuation with per-step effect/idempotency contracts.
+- AgentEnv schedule/webhook-to-Puffer ingress.
+- A supported local AgentEnv executor sandbox and executable-capability API.
+- General outbound terminal retention and audit-log rotation.
+- Richer cross-origin review UI and operational recovery dashboards.
